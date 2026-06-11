@@ -311,7 +311,36 @@ backends still overload. That strengthens the case that *some* load-aware
 diversion is genuinely needed, which puts the #442 cold-divert fix back on the
 critical path.
 
-### Experiment E — Cache-residency-aware routing (#527) under cache pressure [HARNESS READY — see 2026-06-10 update]
+### Experiment E — Cache-residency-aware routing (#527) under cache pressure [HARNESS READY — see 2026-06-10/11 updates]
+
+**⚠️ 2026-06-11 first hardware run (Lambda 8x A100-40GB, vLLM 0.15.1) — two
+findings, both fixed in the harness:**
+
+1. **bench.sh auto-max-model-len clamp silently mis-fired without `bc`.** The
+   integer fallback hardcoded an 85% budget regardless of `--gpu-mem-util`, so
+   at 0.80 it concluded Llama-3.1-8B's 131k native context "fits", skipped the
+   clamp without a word, and vLLM died at startup ("16.0 GiB KV cache needed >
+   15.38 GiB available"). Fixed: awk-based math (no bc dependency) and every
+   skip path now logs its decision. The A/B wrapper additionally defaults
+   `--max-model-len 8192` (the workload's 8k max prefix).
+2. **vLLM v1 `gpu_cache_usage_perc` counts only RUNNING-request blocks.**
+   Measured: `Running: 0 reqs … GPU KV cache usage: 0.0%, Prefix cache hit
+   rate: 91.2%` — cached prefix blocks are reclaimable and report as FREE. So
+   the residency signal (1−usage) fires on *active-demand saturation*, not
+   "cache full of prefixes": at 30u/0.80 on 40GB cards the gauge tops out far
+   below the 80% firing line, which is why this probe (and every earlier run)
+   showed `residency_route_downgrades_total = 0` despite healthy plumbing
+   (sent=896, received=1792 = exactly 2×sent across 3 nodes ✓). Harness
+   response: the wrapper now samples the gauge every 5s during each leg
+   (`vllm_usage_samples.csv`), reports the peak, and computes a measured
+   `--gpu-mem-util` suggestion on probe failure; default util dropped to 0.50
+   (firing region ≈0.47–0.50 for 8B/40GB/30u — non-KV overhead measured at
+   ~16.6 GiB/GPU). **Feature-level open question flagged for human decision:**
+   if the intent is "divert when the prefix was likely evicted", the v1 gauge
+   is the wrong source — prefix-cache hit counters or push eviction events
+   (docs/benchmarks/push-cache-eviction.md) would fire on the intended
+   condition. See docs/internals/cache-residency-routing.md caveat +
+   docs/benchmarks/cache-residency-ab-benchmark.md.
 
 **⚠️ 2026-06-10 harness update (supersedes the E0/E_on/E_off commands below):**
 

@@ -682,11 +682,9 @@ if [[ "$TP_SIZE" -eq 1 ]]; then
 
             # Check if the chosen TP fits at the user's current gpu-mem-util.
             # If not, auto-raise to 0.92 (only raise what's actually needed).
-            if command -v bc &> /dev/null; then
-                DEFAULT_BUDGET=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
-            else
-                DEFAULT_BUDGET=$(( GPU_VRAM_MIB * 85 / 100 ))
-            fi
+            # awk, not bc: bc is absent on minimal images, and the old integer
+            # fallback hardcoded 85%, silently mis-sizing every non-0.85 run.
+            DEFAULT_BUDGET=$(awk -v v="$GPU_VRAM_MIB" -v u="$GPU_MEM_UTIL" 'BEGIN{printf "%d", v*u}')
             WEIGHT_PER_GPU=$(( MODEL_WEIGHT_MIB / TP_SIZE ))
             if [[ $((WEIGHT_PER_GPU + MIN_HEADROOM_MIB)) -gt $DEFAULT_BUDGET ]]; then
                 GPU_MEM_UTIL="0.92"
@@ -695,11 +693,7 @@ if [[ "$TP_SIZE" -eq 1 ]]; then
 
             # Auto-set max-model-len based on actual KV cache headroom
             if [[ -z "$MAX_MODEL_LEN" ]]; then
-                if command -v bc &> /dev/null; then
-                    ACTUAL_BUDGET=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
-                else
-                    ACTUAL_BUDGET=$(( GPU_VRAM_MIB * 92 / 100 ))
-                fi
+                ACTUAL_BUDGET=$(awk -v v="$GPU_VRAM_MIB" -v u="$GPU_MEM_UTIL" 'BEGIN{printf "%d", v*u}')
                 KV_HEADROOM=$(( ACTUAL_BUDGET - WEIGHT_PER_GPU ))
                 # Less than 4 GiB headroom → constrain context to 4096 tokens
                 if [[ $KV_HEADROOM -lt 4096 ]]; then
@@ -757,20 +751,20 @@ except Exception:
 
     if [[ -n "$KV_INFO" && "$KV_BYTES_PER_TOK" =~ ^[0-9]+$ && "$KV_BYTES_PER_TOK" -gt 0 ]]; then
         # KV headroom (MiB) = VRAM*util - weights/TP - activation/graph reserve.
+        # awk, not bc: bc is absent on minimal images, and the old integer
+        # fallback hardcoded 85% — at --gpu-mem-util 0.80 it overstated the
+        # budget, concluded "native context fits", skipped the clamp silently,
+        # and vLLM died at startup (observed on Lambda 8xA100, June 2026).
         MODEL_WEIGHT_MIB=$(( MODEL_PARAMS_B * 2 * 1000 ))
         WEIGHT_PER_GPU=$(( MODEL_WEIGHT_MIB / TP_SIZE ))
-        if command -v bc &> /dev/null; then
-            BUDGET_MIB=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
-        else
-            BUDGET_MIB=$(( GPU_VRAM_MIB * 85 / 100 ))
-        fi
+        BUDGET_MIB=$(awk -v v="$GPU_VRAM_MIB" -v u="$GPU_MEM_UTIL" 'BEGIN{printf "%d", v*u}')
         KV_HEADROOM_MIB=$(( BUDGET_MIB - WEIGHT_PER_GPU - 1024 ))
 
         if [[ $KV_HEADROOM_MIB -gt 0 ]]; then
             # Tokens whose KV cache fits in the headroom.
             FIT_TOKENS=$(( KV_HEADROOM_MIB * 1024 * 1024 / KV_BYTES_PER_TOK ))
             if [[ "$NATIVE_CTX" =~ ^[0-9]+$ && "$NATIVE_CTX" -gt 0 && "$FIT_TOKENS" -ge "$NATIVE_CTX" ]]; then
-                : # native context already fits -- let vLLM use the model default
+                log_info "KV fit check: ~${FIT_TOKENS} tokens fit at util ${GPU_MEM_UTIL}; native ctx ${NATIVE_CTX} fits — no clamp"
             else
                 # Apply a 10% safety margin and round down to a multiple of 256.
                 SAFE_LEN=$(( (FIT_TOKENS * 9 / 10 / 256) * 256 ))
@@ -784,6 +778,11 @@ except Exception:
         else
             log_warn "Weights leave no KV headroom at --gpu-mem-util $GPU_MEM_UTIL; consider --tp 2"
         fi
+    else
+        # An unclamped large-context model can kill vLLM at startup ("KV cache
+        # needed is larger than available"), so never skip this check silently.
+        log_warn "Could not estimate KV fit for $MODEL (transformers missing, or config fetch failed)."
+        log_warn "If vLLM fails to start with a KV-cache error, pass --max-model-len explicitly (e.g. 8192)."
     fi
 fi
 

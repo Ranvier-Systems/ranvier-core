@@ -34,6 +34,18 @@ cycle. We reuse that exact path: `residency_weight = 1 - effective_cache_pressur
 (`VLLMMetrics::estimated_prefix_retention()`, compression-adjusted). No new
 scrape, no new collection mechanism.
 
+> **vLLM v1 semantics caveat (measured 2026-06-11, vLLM 0.15.1):**
+> `gpu_cache_usage_perc` counts only blocks held by *running* requests;
+> freed-but-cached prefix blocks are reclaimable and report as free (the
+> engine logs `Running: 0 reqs … usage: 0.0%` alongside a 91% prefix-cache
+> hit rate). The downgrade therefore fires on **active-demand saturation**,
+> not on "prefix cache is populated" — much later than this doc's prose
+> implies. Usage >80% still entails rampant prefix eviction, so the signal is
+> directionally sound, but a per-prefix source (prefix-cache hit counters, or
+> the push eviction-events path) would fire on the intended condition. Open
+> question for a human decision; benchmark + details:
+> [cache-residency-ab-benchmark.md](../benchmarks/cache-residency-ab-benchmark.md).
+
 **Extensibility without speculative build.** `deserialize()` accepts
 `len >= PACKET_SIZE` (not `==`) and reads only the fields it knows. A future
 version may append additional per-node aggregate signals (bumping `version`)

@@ -49,7 +49,12 @@ ORIGINAL_CMD="$0 $*"
 MODEL="meta-llama/Llama-3.1-8B-Instruct"
 DURATION="30m"
 USERS="30"
-GPU_MEM_UTIL="0.80"          # Deliberately low: less KV headroom -> pressure
+# vLLM v1's gpu_cache_usage_perc counts only blocks held by RUNNING requests
+# (cached prefixes are reclaimable = free), so the residency signal fires only
+# when ACTIVE demand nears KV capacity. 0.50 sizes the KV cache toward live
+# demand for the reference config (8B on 40GB A100, 30 users); the probe
+# prints a measured suggestion for anything else.
+GPU_MEM_UTIL="0.50"
 THRESHOLD_ON="0.2"           # Server default; the ON leg's threshold
 PROBE_DURATION="8m"
 OUTPUT_ROOT="benchmark-reports/residency-ab_$(date +%Y%m%d_%H%M%S)"
@@ -58,7 +63,10 @@ PROBE_ONLY=false
 WITH_LOAD_AWARE=false        # Default: --no-load-aware in BOTH legs (isolation)
 WITH_RR_BASELINE=false       # Default: 2 prefix legs only (no --compare RR legs)
 ORDER="off-first"
-MAX_MODEL_LEN=""
+# Default 8192: covers the workload's 8k max prefix + output, and avoids the
+# startup failure where a 128k native context can't fit one sequence in a
+# deliberately-small KV cache (observed with Llama-3.1-8B at low mem-util).
+MAX_MODEL_LEN="8192"
 TP_SIZE=""
 PREFIX_MAX_TOKENS=""
 EXTRA_BENCH_ARGS=""
@@ -82,8 +90,9 @@ OPTIONS:
     --duration TIME        Duration per A/B leg (default: 30m; 30m minimum for
                            quotable numbers per the benchmark methodology)
     --users N              Concurrent users per leg (default: 30)
-    --gpu-mem-util F       vLLM GPU memory utilization (default: 0.80).
-                           LOWER this to shrink the KV cache and raise pressure.
+    --gpu-mem-util F       vLLM GPU memory utilization (default: 0.50; tuned for
+                           8B on 40GB A100 at 30 users). LOWER this to shrink KV
+                           capacity toward live demand — see PRESSURE TUNING.
     --threshold F          Residency threshold for the ON leg (default: 0.2)
     --probe-duration TIME  Pressure probe duration (default: 8m)
     --output-dir DIR       Output root (default: benchmark-reports/residency-ab_<ts>)
@@ -97,7 +106,9 @@ OPTIONS:
     --with-rr-baseline     Run each leg with --compare (adds a round-robin
                            baseline per leg; ~2x total runtime). Anchors the A/B
                            against environmental drift.
-    --max-model-len N      Forwarded to bench.sh
+    --max-model-len N      vLLM max sequence length (default: 8192 — covers the
+                           workload's 8k max prefix; prevents vLLM refusing to
+                           start when the native context can't fit in a small KV)
     --tp N                 Forwarded to bench.sh
     --prefix-max-tokens N  Forwarded to bench.sh
     --churn-universe N     Churn prefix universe size (default: 200)
@@ -120,12 +131,21 @@ WHAT IT DOES:
        (OFF leg downgrades == 0, ON leg > 0, gossip flowing in both), and
        writes REPORT.md + ab-summary.txt into the output dir.
 
-PRESSURE TUNING (if the probe shows 0 downgrades), in order of preference:
-    1. Lower --gpu-mem-util (e.g. 0.80 -> 0.75) — smaller KV cache
-    2. Raise --churn-active (24 -> 40) — bigger live working set
-    3. Raise --users (30 -> 40)
-    4. Raise --prefix-max-tokens / LARGE_PREFIX_MIN_TOKENS — bigger prefixes
-    Avoid raising --threshold to force firing: that changes what is measured.
+PRESSURE TUNING (if the probe shows 0 downgrades):
+    vLLM v1 semantics: gpu_cache_usage_perc counts only blocks held by RUNNING
+    requests — cached prefixes are reclaimable and count as FREE (the engine
+    log shows "Running: 0 reqs ... usage: 0.0%" even with a hot prefix cache).
+    The residency signal (1 - usage) therefore crosses the threshold only when
+    ACTIVE demand (in-flight prefill+decode tokens) nears KV capacity.
+    The probe samples the gauge and prints a measured --gpu-mem-util
+    suggestion on failure. Levers, in order of preference:
+    1. Lower --gpu-mem-util — shrink KV capacity toward live demand (primary)
+    2. Raise --users — more in-flight tokens holding blocks
+    3. Raise --max-tokens (bench.sh) — longer decode holds blocks longer
+    4. Bigger prefixes (--prefix-max-tokens / LARGE_PREFIX_MIN_TOKENS)
+    Note: --churn-active shapes eviction realism (stale-hit frequency), but it
+    does NOT move the usage gauge — don't use it to force firing. And avoid
+    raising --threshold: that changes the decision rule under test.
 EOF
 }
 
@@ -181,6 +201,10 @@ export CHURN_SEED="$CHURN_SEED_VAL"
 
 mkdir -p "$OUTPUT_ROOT"
 
+# Usage level (%) above which the residency downgrade can fire:
+# residency = 1 - usage < threshold  ⇔  usage > 1 - threshold.
+FIRE_PCT=$(awk -v t="$THRESHOLD_ON" 'BEGIN{printf "%.0f", (1-t)*100}')
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -201,6 +225,52 @@ sum_metric() {
 find_leg_dir() {
     local root="$1" mode="$2"
     ls -td "$root"/*_"$mode" 2>/dev/null | head -1 || true
+}
+
+# ---------------------------------------------------------------------------
+# vLLM KV-usage sampler
+# ---------------------------------------------------------------------------
+# Samples vllm:gpu_cache_usage_perc from the local vLLM backends (bench.sh
+# default ports 8000..8015) every 5s — the same instantaneous gauge, at the
+# same cadence, that Ranvier's health scrape feeds the residency signal, so
+# its peak ≈ the best the router could have seen. vLLM v1 counts only blocks
+# held by RUNNING requests (cached prefixes are reclaimable = free), which is
+# why this gauge — not prefix-cache fullness — decides whether residency
+# fires. Best-effort: dead/not-yet-started ports are skipped silently.
+USAGE_SAMPLER_PID=""
+
+start_usage_sampler() {
+    local out="$1"
+    echo "epoch,port,gpu_cache_usage_perc" > "$out"
+    (
+        while :; do
+            ts=$(date +%s)
+            for port in $(seq 8000 8015); do
+                v=$(curl -sf --max-time 1 "http://localhost:$port/metrics" 2>/dev/null \
+                    | awk '/^vllm:gpu_cache_usage_perc/ {print $NF; exit}' || true)
+                [[ -n "$v" ]] && echo "$ts,$port,$v"
+            done
+            sleep 5
+        done >> "$out"
+    ) &
+    USAGE_SAMPLER_PID=$!
+}
+
+stop_usage_sampler() {
+    if [[ -n "${USAGE_SAMPLER_PID:-}" ]] && kill -0 "$USAGE_SAMPLER_PID" 2>/dev/null; then
+        kill "$USAGE_SAMPLER_PID" 2>/dev/null || true
+        wait "$USAGE_SAMPLER_PID" 2>/dev/null || true
+    fi
+    USAGE_SAMPLER_PID=""
+}
+trap stop_usage_sampler EXIT
+
+# Prints "<peak> <mean>" in percent across all samples, or "NA NA".
+usage_summary() {
+    local csv="$1"
+    if [[ ! -f "$csv" ]]; then echo "NA NA"; return; fi
+    awk -F, 'NR>1 && $3 != "" { if ($3+0 > max) max=$3+0; s+=$3; n++ }
+             END { if (n) printf "%.1f %.1f", max*100, s/n*100; else print "NA NA" }' "$csv"
 }
 
 # Assemble per-leg bench.sh args. $1 = residency threshold, $2 = leg output dir.
@@ -229,7 +299,9 @@ build_bench_args() {
 
 # Run one leg. $1 = label, $2 = threshold, $3 = leg output dir.
 # Each bench.sh invocation cold-starts vLLM and the Ranvier cluster and tears
-# both down on exit, so legs are symmetric by construction.
+# both down on exit, so legs are symmetric by construction. A KV-usage sampler
+# runs alongside and leaves <outdir>/vllm_usage_samples.csv as the pressure
+# record for the leg.
 run_leg() {
     local label="$1" threshold="$2" outdir="$3"
     local args
@@ -239,11 +311,20 @@ run_leg() {
     log_info "bench.sh $args $EXTRA_BENCH_ARGS"
     echo ""
 
+    mkdir -p "$outdir"
+    start_usage_sampler "$outdir/vllm_usage_samples.csv"
+
     # shellcheck disable=SC2086
     if ! "$BENCH" $args $EXTRA_BENCH_ARGS; then
+        stop_usage_sampler
         log_error "bench.sh failed for leg '$label' — see logs under $outdir"
         exit 1
     fi
+    stop_usage_sampler
+
+    local peak_mean
+    peak_mean=$(usage_summary "$outdir/vllm_usage_samples.csv")
+    log_info "Leg '$label' sampled KV usage (peak mean %): $peak_mean  -> $outdir/vllm_usage_samples.csv"
 }
 
 # Print + record one leg's residency/gossip counters. $1 = leg dir.
@@ -295,6 +376,8 @@ if [[ "$SKIP_PROBE" = false ]]; then
     log_header "Probe Result"
     log_info "Report dir: ${PROBE_LEG:-<missing>}"
     leg_counters "$PROBE_LEG"
+    read -r PROBE_PEAK PROBE_MEAN <<< "$(usage_summary "$PROBE_DIR/vllm_usage_samples.csv")"
+    log_info "Sampled KV usage: peak ${PROBE_PEAK}%, mean ${PROBE_MEAN}% (residency fires above ${FIRE_PCT}% at threshold $THRESHOLD_ON)"
 
     if [[ "$PROBE_DOWNGRADES" == "NA" ]]; then
         log_error "Could not read $PROBE_PROM — probe inconclusive. Check the run logs."
@@ -306,15 +389,43 @@ if [[ "$SKIP_PROBE" = false ]]; then
         exit 1
     fi
     if [[ "$PROBE_DOWNGRADES" == "0" ]]; then
-        log_error "residency_route_downgrades_total == 0: the KV cache never crossed the"
-        log_error "threshold (usage stayed below ~$(python3 -c "print(f'{(1-float('$THRESHOLD_ON'))*100:.0f}')" 2>/dev/null || echo 80)%) — an A/B now would measure nothing."
-        echo ""
-        log_info "Raise the pressure and re-probe (in order of preference):"
-        log_info "  1. --gpu-mem-util $(python3 -c "print(f'{float('$GPU_MEM_UTIL')-0.05:.2f}')" 2>/dev/null || echo "lower")  (smaller KV cache)"
-        log_info "  2. --churn-active $((CHURN_ACTIVE + 16))  (bigger live working set)"
-        log_info "  3. --users $((USERS + 10))"
-        log_info "  4. --prefix-max-tokens / LARGE_PREFIX_MIN_TOKENS up (bigger prefixes)"
-        log_info "Also check vLLM KV capacity: grep 'KV cache' /tmp/vllm_gpu0.log"
+        log_error "residency_route_downgrades_total == 0 — an A/B now would measure nothing."
+
+        if [[ "$PROBE_PEAK" != "NA" ]] && awk -v p="$PROBE_PEAK" -v f="$FIRE_PCT" 'BEGIN{exit !(p >= f)}'; then
+            # Gauge crossed the line at some sampled instant yet the router never
+            # downgraded: the pressured windows were likely too brief for the 5s
+            # health scrape, or ART hits aren't landing on pressured backends.
+            log_warn "Sampled peak (${PROBE_PEAK}%) DID cross ${FIRE_PCT}% — but the router never saw it"
+            log_warn "at scrape time, or no ART hit targeted a pressured backend. Lengthen the"
+            log_warn "probe (--probe-duration 15m), raise --users for sustained pressure, and check"
+            log_warn "the cache hit rate in the probe report before re-running."
+        else
+            echo ""
+            # vLLM v1: the usage gauge counts only blocks held by RUNNING requests,
+            # so firing requires ACTIVE demand near KV capacity. Size capacity so
+            # the demand this probe actually measured sits at ~85% of it.
+            KV_GIB=$(grep -h "Available KV cache memory" /tmp/vllm_gpu0.log 2>/dev/null | tail -1 | grep -oE '[0-9]+(\.[0-9]+)?' | tail -1 || true)
+            VRAM_GIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | awk '{printf "%.1f", $1/1024}' || true)
+            if [[ -n "$KV_GIB" && -n "$VRAM_GIB" && "$PROBE_PEAK" != "NA" ]]; then
+                SUGGEST_UTIL=$(awk -v vram="$VRAM_GIB" -v util="$GPU_MEM_UTIL" -v kv="$KV_GIB" -v peak="$PROBE_PEAK" '
+                    BEGIN {
+                        nonkv = vram*util - kv            # weights + activations + graphs
+                        need_kv = kv * (peak/100) / 0.85  # capacity putting observed demand at 85%
+                        if (need_kv < 1.5) need_kv = 1.5  # keep room for one max-len sequence
+                        s = (nonkv + need_kv) / vram
+                        if (s > 0.92) s = 0.92
+                        printf "%.2f", s
+                    }')
+                NONKV_GIB=$(awk -v v="$VRAM_GIB" -v u="$GPU_MEM_UTIL" -v k="$KV_GIB" 'BEGIN{printf "%.1f", v*u-k}')
+                log_info "Measured on this box: KV capacity ${KV_GIB} GiB at util ${GPU_MEM_UTIL} (non-KV ≈ ${NONKV_GIB} GiB of ${VRAM_GIB} GiB/GPU)."
+                log_info "Suggested next probe: --gpu-mem-util ${SUGGEST_UTIL}  (sizes KV so this probe's peak demand ≈ 85% of capacity)"
+            else
+                log_info "Could not compute a suggestion (missing vLLM log / nvidia-smi / samples)."
+            fi
+            log_info "Other levers (vLLM v1: only ACTIVE in-flight demand moves the gauge):"
+            log_info "  --users $((USERS + 10))   |   --max-tokens up (via --extra-bench-args)   |   bigger prefixes"
+            log_info "(--churn-active changes eviction realism, not the gauge — don't use it to force firing)"
+        fi
         exit 1
     fi
 
@@ -365,10 +476,14 @@ OFF_RECV=$(sum_metric "$OFF_PROM" "gossip_cache_states_received_total")
 ON_RECV=$(sum_metric "$ON_PROM" "gossip_cache_states_received_total")
 
 VALID=true
+read -r OFF_PEAK OFF_MEAN <<< "$(usage_summary "$OFF_DIR/vllm_usage_samples.csv")"
+read -r ON_PEAK ON_MEAN <<< "$(usage_summary "$ON_DIR/vllm_usage_samples.csv")"
 echo "OFF leg ($OFF_LEG):"
 leg_counters "$OFF_LEG"
+echo "  kv_usage peak/mean: ${OFF_PEAK}% / ${OFF_MEAN}%"
 echo "ON leg ($ON_LEG):"
 leg_counters "$ON_LEG"
+echo "  kv_usage peak/mean: ${ON_PEAK}% / ${ON_MEAN}%"
 echo ""
 
 if [[ "$OFF_DOWN" != "0" ]]; then
@@ -402,8 +517,11 @@ SUMMARY="$OUTPUT_ROOT/ab-summary.txt"
     echo "Leg counters:"
     echo "OFF ($OFF_LEG):"
     leg_counters "$OFF_LEG"
+    echo "  kv_usage peak/mean: ${OFF_PEAK}% / ${OFF_MEAN}%"
     echo "ON ($ON_LEG):"
     leg_counters "$ON_LEG"
+    echo "  kv_usage peak/mean: ${ON_PEAK}% / ${ON_MEAN}%"
+    echo "(kv_usage = sampled vllm:gpu_cache_usage_perc; residency fires above ${FIRE_PCT}%)"
     echo ""
 } > "$SUMMARY"
 
@@ -447,6 +565,7 @@ GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,
     echo "| Client cache hit rate | TBD | TBD | TBD |"
     echo "| Incomplete/timeouts | TBD | TBD | TBD |"
     echo "| residency_route_downgrades_total | $OFF_DOWN | $ON_DOWN | — |"
+    echo "| Sampled KV usage peak/mean | ${OFF_PEAK}% / ${OFF_MEAN}% | ${ON_PEAK}% / ${ON_MEAN}% | — |"
     echo ""
     echo "Raw comparison: [ab-summary.txt](ab-summary.txt)"
     echo ""

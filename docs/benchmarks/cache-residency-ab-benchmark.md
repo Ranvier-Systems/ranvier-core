@@ -87,28 +87,78 @@ This is measured under **cache pressure**, not a warm-cache best case: the
 point of the experiment is the regime where `gpu_cache_usage_perc` sits above
 the threshold on hot backends and evictions are continuous.
 
+## What `gpu_cache_usage_perc` actually measures (vLLM v1 — critical)
+
+**Empirical finding (2026-06-11, Lambda 8x A100-40GB, vLLM 0.15.1):** the
+engine log printed, after minutes of heavy prefix traffic,
+
+```
+Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 91.2%
+```
+
+i.e. in vLLM v1 the `vllm:gpu_cache_usage_perc` gauge counts **only blocks
+held by RUNNING requests**. Freed-but-cached prefix blocks are reclaimable and
+count as *free* — a cache physically full of warm prefixes reads 0% when idle.
+
+Consequences for this benchmark:
+
+- The residency signal (`residency = 1 − usage`) crosses the 0.2 threshold
+  only when **active in-flight demand** (prefill + decode tokens of running
+  requests) exceeds ~80% of KV capacity — not when the prefix cache is "full".
+  Usage >80% does still imply rampant prefix-cache eviction (almost no
+  reclaimable blocks survive), so the signal is *directionally* sound, but it
+  fires far later than the "cache 80% populated" reading of the design doc.
+- Workload knobs that grow the *dormant* working set (`--churn-active`,
+  universe size) shape eviction realism and stale-hit frequency but **do not
+  move the gauge**. Only live load does.
+- The gauge is instantaneous and the health scrape samples it every 5s, so
+  the router sees a noisy series that dips to ~0 between batches. Expect the
+  downgrade to fire stochastically during pressure bursts, not continuously.
+- **Feature-level open question (flagged for human decision, not changed
+  here):** if the intent is "divert when the *prefix* was likely evicted", a
+  better signal source than v1 usage would be the prefix-cache hit counters
+  (`vllm:gpu_prefix_cache_{queries,hits}`) or per-prefix push eviction events
+  ([push-cache-eviction.md](push-cache-eviction.md)). This benchmark measures
+  the mechanism **as shipped**.
+
 ## Inducing real pressure (sizing guide)
 
-The KV cache must run >80% full on routed-to backends or the ON leg never
-fires. Knobs, in order of preference:
+Per the above: to make residency fire, size KV capacity *down toward live
+demand* (or push demand up toward capacity). The wrapper samples the gauge
+during every leg (`vllm_usage_samples.csv`) and, when a probe fails, prints a
+**measured `--gpu-mem-util` suggestion** computed from this run's numbers — so
+one failed probe yields the corrected setting, no guesswork.
 
-1. **`--gpu-mem-util`** (default 0.80 in the A/B wrapper): the primary lever.
-   Lower ⇒ less memory left for KV after weights. Check the resulting capacity
-   in the vLLM startup log: `grep -i "KV cache" /tmp/vllm_gpu0.log` (prints
-   usable KV tokens per backend). Don't go so low that vLLM refuses to start
-   (it must still fit one `--max-model-len` sequence).
-2. **`--churn-active`**: live working set ≈ `CHURN_ACTIVE_PREFIXES × avg
-   prefix tokens` spread over N backends. Aim for live-set-per-backend plus
-   in-flight decode comfortably **exceeding** per-backend KV tokens.
-3. **`--users`**: more concurrent decodes = more KV held by in-flight requests.
+The arithmetic it uses (also good for picking a starting point):
+
+```
+capacity_tokens   = KV_GiB / kv_bytes_per_token        (vLLM logs both at startup:
+                                                        "Available KV cache memory" /
+                                                        "GPU KV cache size: N tokens")
+non_KV_GiB        = VRAM × util − KV_GiB               (weights + activations + graphs)
+in_flight_tokens  ≈ concurrent_reqs_per_backend × avg_prompt_tokens
+suggested_util    = (non_KV_GiB + in_flight_GiB / 0.85) / VRAM
+```
+
+Reference config (8x A100-40GB, Llama-3.1-8B, 30 users): non-KV measured
+≈16.6 GiB/GPU; KV per token 128 KiB (GQA, 32 layers × 8 KV heads × 128 dim).
+At util 0.80 capacity is ~126k tokens vs ~12–22k tokens of live demand — usage
+peaks far below 80%, residency can never fire (this is exactly what the first
+hardware probe measured). The firing region is **util ≈ 0.47–0.50**, hence the
+wrapper's default of 0.50.
+
+Levers, in order of preference:
+
+1. **`--gpu-mem-util`** (default 0.50): the primary lever. Keep enough KV for
+   one `--max-model-len` sequence or vLLM refuses to start (8192 tokens of 8B
+   GQA = 1.0 GiB; 13B MHA = 6.4 GiB — 13B needs much gentler clamping).
+2. **`--users`**: more in-flight tokens holding blocks.
+3. **`--max-tokens`** (bench.sh): longer decode holds blocks longer.
 4. **Prefix sizes** (`LARGE_PREFIX_MIN_TOKENS`, `--prefix-max-tokens`).
 
-Avoid raising the threshold (e.g. 0.5) to force firing — that changes the
-decision rule under test, not the pressure. Sanity inputs: a 13B MHA model
-holds ~0.78 MiB/token of KV (huge — small caches saturate fast); Llama-3.1-8B
-with GQA holds ~0.125 MiB/token (needs a larger working set or lower
-mem-util). The probe (below) is the empirical gate; the arithmetic is only for
-picking a starting point.
+`--churn-active` / universe stay workload-shape knobs: keep them for eviction
+realism, don't use them to force firing. And avoid raising the threshold
+(e.g. 0.5) to force firing — that changes the decision rule under test.
 
 ## Procedure
 
@@ -125,17 +175,21 @@ repo root on the GPU box, `HF_TOKEN` exported):
 # Or in one go with explicit knobs (example for an 8x A100-40GB box):
 ./scripts/bench-residency-ab.sh \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --duration 30m --users 30 --gpu-mem-util 0.80 \
+  --duration 30m --users 30 --gpu-mem-util 0.50 \
   --churn-universe 200 --churn-active 24
 ```
+
+The wrapper defaults `--max-model-len 8192` (the workload's 8k max prefix):
+a 128k-native model like Llama-3.1 cannot fit one native-length sequence in a
+deliberately-small KV cache, and vLLM refuses to start without the clamp.
 
 What the wrapper does per leg (manual equivalent):
 
 ```bash
 # OFF leg
 ./scripts/bench.sh --model <MODEL> --duration 30m --users 30 \
-  --gpu-mem-util 0.80 --prompt-dist churn --warmup --no-load-aware \
-  --cache-residency-threshold 0.0 --output-dir <ROOT>/off
+  --gpu-mem-util 0.50 --max-model-len 8192 --prompt-dist churn --warmup \
+  --no-load-aware --cache-residency-threshold 0.0 --output-dir <ROOT>/off
 
 # ON leg — identical except the threshold
 ./scripts/bench.sh ... --cache-residency-threshold 0.2 --output-dir <ROOT>/on
@@ -155,6 +209,10 @@ Design choices baked into the wrapper:
   effect; report it separately.
 - **Each leg cold-starts vLLM + 1m warmup** — legs are symmetric by
   construction (bench.sh tears everything down on exit).
+- **A KV-usage sampler runs alongside every leg** (5s cadence, same gauge and
+  cadence as the router's health scrape), leaving
+  `<leg>/vllm_usage_samples.csv` as the pressure record. Probe failures report
+  the sampled peak and a measured `--gpu-mem-util` suggestion.
 - **30m minimum duration** at ≥20 users (shorter runs can't separate steady
   state from warm-up; established floor from the May 2026 investigations).
 - **`--with-rr-baseline`** optionally adds a round-robin leg per run
@@ -172,10 +230,14 @@ A run is quotable only if **all** of these hold:
 4. **ON leg:** `residency_route_downgrades_total > 0` during the measured run
    (ideally ≥ ~1% of total requests; a handful of downgrades is noise).
 5. **Signal plumbing both legs:** `gossip_cache_states_received_total > 0`
-   and `residency_cache_size > 0`.
-6. **No thermal confound:** `clocks_throttle_reasons.active` is
+   and `residency_cache_size > 0`. (Sanity cross-check: with 3 nodes,
+   `received` ≈ 2 × `sent` per node — each node's broadcasts reach 2 peers.)
+6. **Pressure regime held:** sampled KV usage peak (in
+   `vllm_usage_samples.csv`) above `100×(1 − threshold)%` during the ON leg —
+   recorded in `ab-summary.txt`.
+7. **No thermal confound:** `clocks_throttle_reasons.active` is
    `0x0000000000000000` in `nvidia_smi_{start,end}.csv` for both legs.
-7. **Comparable error rates:** incomplete/timeout counts within ~1pp of each
+8. **Comparable error rates:** incomplete/timeout counts within ~1pp of each
    other — a leg drowning in timeouts invalidates its tail percentiles.
 
 ## Metrics to capture (per leg)
@@ -190,7 +252,7 @@ A run is quotable only if **all** of these hold:
 | `ranvier_router_residency_cache_size` | `prometheus_metrics.txt` | residency cache populated |
 | `ranvier_routing_load_aware_fallbacks_total` | `prometheus_metrics.txt` | must be 0 with `--no-load-aware` (confound check) |
 | Incompletes / timeouts, per-backend distribution | parser report | validity gate 7, concentration effects |
-| `vllm:gpu_cache_usage_perc` over the run | vLLM `/metrics` (optionally the `monitoring` Prometheus profile) | proof the pressure regime held |
+| `vllm:gpu_cache_usage_perc` over the run | sampled automatically into `<leg>/vllm_usage_samples.csv` by the wrapper | proof the pressure regime held (vLLM v1: gauge = running-request blocks only) |
 
 ## Results — TO BE MEASURED
 
@@ -214,6 +276,13 @@ duration, churn knobs, git commit, both full command lines. The wrapper
 pre-fills most of this in `REPORT.md`.
 
 ## Interpreting the outcome
+
+Frame the result correctly: given the v1 usage semantics, the regime where
+residency fires is **active-demand saturation** (backends near KV capacity,
+prefix-cache eviction rampant, possible preemptions). The A/B answers "does
+diverting stale ART hits away from saturated backends help TTFT *in that
+regime*" — it says nothing about lighter regimes, where the shipped signal
+simply never fires.
 
 - **ON improves hit-tail / overall P99 without a worse miss tail** — residency
   is paying for itself: stale hits (full prefill billed as "hits") are being
