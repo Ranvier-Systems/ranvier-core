@@ -416,9 +416,16 @@ HealthService::scrape_vllm_metrics(socket_address addr) {
             if (std::isfinite(*v) && *v >= 0) m.num_requests_waiting = static_cast<uint32_t>(*v);
         }
 
-        // KV cache usage
+        // KV cache usage. vLLM v1 renamed the gauge (gpu_cache_usage_perc →
+        // kv_cache_usage_perc) and newer engines may emit only the new name;
+        // accept both. Parsing neither leaves the default 0.0, which reads as
+        // "cache empty" — residency then broadcasts a constant 1.0 and the
+        // downgrade path (#527) can never fire, silently (observed against
+        // vLLM 0.15.1, 2026-06-11).
         if (auto v = extract_prometheus_metric(body, "vllm:gpu_cache_usage_perc")) {
             m.gpu_cache_usage_percent = *v;
+        } else if (auto v2 = extract_prometheus_metric(body, "vllm:kv_cache_usage_perc")) {
+            m.gpu_cache_usage_percent = *v2;
         }
 
         // Throughput

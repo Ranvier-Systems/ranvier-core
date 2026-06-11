@@ -175,6 +175,15 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
+      # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
+      # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
+      # leg). Must be listed here or the host env var never reaches the server.
+      - RANVIER_CACHE_RESIDENCY_THRESHOLD=${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}
+      # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
+      # vLLM's Python endpoint exactly when the engine is busy, censoring the
+      # cache-usage signal at peak pressure (the instants residency routing
+      # needs). 1000ms keeps the scrape honest under benchmark load.
+      - RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
       # Priority queue scheduler
@@ -238,6 +247,15 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
+      # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
+      # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
+      # leg). Must be listed here or the host env var never reaches the server.
+      - RANVIER_CACHE_RESIDENCY_THRESHOLD=${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}
+      # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
+      # vLLM's Python endpoint exactly when the engine is busy, censoring the
+      # cache-usage signal at peak pressure (the instants residency routing
+      # needs). 1000ms keeps the scrape honest under benchmark load.
+      - RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
       # Priority queue scheduler
@@ -301,6 +319,15 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
+      # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
+      # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
+      # leg). Must be listed here or the host env var never reaches the server.
+      - RANVIER_CACHE_RESIDENCY_THRESHOLD=${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}
+      # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
+      # vLLM's Python endpoint exactly when the engine is busy, censoring the
+      # cache-usage signal at peak pressure (the instants residency routing
+      # needs). 1000ms keeps the scrape honest under benchmark load.
+      - RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
       # Priority queue scheduler

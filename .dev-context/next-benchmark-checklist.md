@@ -148,6 +148,12 @@ investigation.
 > Note: `RANVIER_CACHE_RESIDENCY_THRESHOLD` is a plain env var (no bench.sh
 > clobber — bench.sh doesn't export it), so the prefix form works for it. Only
 > `RANVIER_LOAD_AWARE_ROUTING` / imbalance vars are flag-controlled.
+>
+> **CORRECTION (2026-06-10):** the above was only half-true — bench.sh didn't
+> clobber it, but docker-compose didn't pass it into the containers either, so
+> the env prefix was a silent no-op on every run before the compose fix.
+> On current builds use `--cache-residency-threshold 0.0` (or the env prefix,
+> which now genuinely reaches the servers).
 
 ### Experiment A2 — Isolate residency routing (load-aware off, residency ON) [LIKELY MOOT]
 
@@ -305,7 +311,144 @@ backends still overload. That strengthens the case that *some* load-aware
 diversion is genuinely needed, which puts the #442 cold-divert fix back on the
 critical path.
 
-### Experiment E — Cache-residency-aware routing (#527) under cache pressure [OPEN]
+### Experiment E — Cache-residency-aware routing (#527) under cache pressure [MEASURED 2026-06-11 ✅ — see finding 5 + new open issue]
+
+**✅ 2026-06-11 RESULT (8x A100-40GB, Llama-3.1-8B, vLLM 0.15.1, 60u/400tok,
+util 0.50, churn workload, 30m/leg, commit `30fd329`): residency ON vs OFF
+under sustained KV saturation —**
+
+5. **Overall TTFT P99 −57.1% (2800 → 1200 ms), P50 unchanged, throughput
+   +1.2%, zero errors/timeouts both legs.** ON-leg downgrades 39 (0.2% of
+   18,491 requests); OFF-leg exactly 0 (and zero route changes of any kind:
+   misses == unique prefixes). Split metrics are composition-caveated (pool
+   reclassification): Hit P99 −68.5%, XLarge Hit P99 −77.7%, Miss P99 +412%,
+   client hit rate −8.4pp of which ~1,485/1,563 extra "misses" ran at
+   hit-grade P50 (warm, backend-alternation accounting). Full table +
+   interpretation: docs/benchmarks/cache-residency-ab-benchmark.md §Results.
+   Verdict: at saturation, the shipped mechanism is a clear net tail win; it
+   is inert below the firing line (see finding 2 semantics).
+
+   **NEW OPEN ISSUE — cross-node route flapping after any divert:** 39
+   downgrades produced 1,485 client-observed backend flips. Mechanism:
+   `learn_route_global()` dedups only same-backend routes, each node
+   re-learns + re-broadcasts whatever it last served, ROUTE_ANNOUNCEMENTs
+   carry no version/tie-break → sustained cluster disagreement; flapped
+   prefixes end up warm on TWO backends (replication-like latency benefit,
+   duplicate KV cost, repeated announcement traffic). Applies to EVERY
+   route-changing mechanism (load-aware, cost divert #545, backend death) —
+   residency just made it measurable against a zero-route-change baseline.
+   Needs its own investigation: route-announcement convergence semantics
+   (versioning / last-writer-wins / don't-relearn-when-warm). Human decision
+   on fix direction. **Tracked in BACKLOG.md § 2.3 (Gossip Protocol
+   Reliability).**
+
+**⚠️ 2026-06-11 third hardware probe (post parser fix) — finding 4: the gauge
+parses (sampler peak 88.6%!) but pressure is SPIKY, and spiky doesn't fire.**
+
+4. With the dual-name parser + `--build-image`, the sampler finally read real
+   values — peak 88.6%, mean 7.8%, most samples 0.0 (one backend touched 0.34
+   then back to 0.0 within 5s). Downgrades still 0 because two mechanisms
+   compound against transient prefill spikes: (a) a residency entry stays
+   "cold" only ~5s until the next scrape rewrites it, and a spike must
+   coincide with a scrape AND an ART hit on that backend; (b) the shipped
+   `vllm_metrics_timeout` of **200ms** is exceeded by vLLM's Python /metrics
+   endpoint precisely at busy instants, censoring the pressured samples (the
+   wrapper's own sampler allows 2s — likely why it saw the spike the router
+   missed). Harness response: leg counters now print
+   `health_vllm_scrapes_success/failed/suppressed`; probe prints the pressure
+   shape (samples ≥ firing line + longest streak); benchmark compose sets
+   `RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=1000` (env-only, no rebuild);
+   wrapper gained `--max-tokens`. **Sustained-pressure recipe: `--users 60
+   --max-tokens 400`** — decode holds KV blocks for seconds, prefill for an
+   instant, so long overlapping decodes plateau the gauge instead of pulsing
+   it. Product-default question (200ms scrape timeout vs busy-engine reality)
+   flagged for human decision alongside the signal-source question. **Both
+   now tracked in BACKLOG.md § 2.1 (next to the push-eviction item).**
+
+**⚠️ 2026-06-11 second hardware probe — ROOT CAUSE FOUND (finding 3 below):
+the residency signal has been parse-blind against vLLM 0.15.1 all along.**
+
+3. **`vllm:gpu_cache_usage_perc` does not match anything in 0.15.1's
+   /metrics** (vLLM v1 renamed it to `vllm:kv_cache_usage_perc`). Evidence:
+   the wrapper's KV-usage sampler — an independent grep of the same name —
+   got zero matches across an entire 8m probe while bench.sh's own health
+   checks proved the same host:ports were serving; and every run ever made
+   shows downgrades=0 with healthy gossip. `health_service.cpp` parsed only
+   the old name; an unmatched metric silently leaves
+   `gpu_cache_usage_percent = 0.0`, so **`residency_weight` broadcast a
+   constant 1.0 in every benchmark to date** — the prior "KV cache simply
+   never crossed the threshold" interpretation was wrong; the router never
+   saw the cache at all. Also affected by the same blindness: capacity-aware
+   hash fallback (`effective_cache_pressure` = 0) and `load_score`'s 0.3
+   cache term. (`num_requests_running/waiting` still exist in v1, so
+   load-aware routing itself was unaffected.) Fixes shipped:
+   - `health_service.cpp` accepts both names (old first, then
+     `vllm:kv_cache_usage_perc`).
+   - **`--build-image`** added to bench.sh + wrapper: forces a local image
+     build so branch C++ actually reaches the benchmark (GHCR tracks main;
+     an existing `ranvier:latest` was previously reused with only a note).
+     Any run of this branch MUST pass it.
+   - Sampler matches both names and records `nomatch` rows when an endpoint
+     responds without either; probe and A/B verdicts treat blind-signal runs
+     as INVALID with the exact diagnosis instead of "raise the pressure".
+   - Confirm the live gauge name with:
+     `curl -s localhost:8000/metrics | grep -iE '^vllm:.*(cache|usage)'`.
+
+**⚠️ 2026-06-11 first hardware run (Lambda 8x A100-40GB, vLLM 0.15.1) — two
+findings, both fixed in the harness:**
+
+1. **bench.sh auto-max-model-len clamp silently mis-fired without `bc`.** The
+   integer fallback hardcoded an 85% budget regardless of `--gpu-mem-util`, so
+   at 0.80 it concluded Llama-3.1-8B's 131k native context "fits", skipped the
+   clamp without a word, and vLLM died at startup ("16.0 GiB KV cache needed >
+   15.38 GiB available"). Fixed: awk-based math (no bc dependency) and every
+   skip path now logs its decision. The A/B wrapper additionally defaults
+   `--max-model-len 8192` (the workload's 8k max prefix).
+2. **vLLM v1 `gpu_cache_usage_perc` counts only RUNNING-request blocks.**
+   Measured: `Running: 0 reqs … GPU KV cache usage: 0.0%, Prefix cache hit
+   rate: 91.2%` — cached prefix blocks are reclaimable and report as FREE. So
+   the residency signal (1−usage) fires on *active-demand saturation*, not
+   "cache full of prefixes": at 30u/0.80 on 40GB cards the gauge tops out far
+   below the 80% firing line, which is why this probe (and every earlier run)
+   showed `residency_route_downgrades_total = 0` despite healthy plumbing
+   (sent=896, received=1792 = exactly 2×sent across 3 nodes ✓). Harness
+   response: the wrapper now samples the gauge every 5s during each leg
+   (`vllm_usage_samples.csv`), reports the peak, and computes a measured
+   `--gpu-mem-util` suggestion on probe failure; default util dropped to 0.50
+   (firing region ≈0.47–0.50 for 8B/40GB/30u — non-KV overhead measured at
+   ~16.6 GiB/GPU). **Feature-level open question flagged for human decision:**
+   if the intent is "divert when the prefix was likely evicted", the v1 gauge
+   is the wrong source — prefix-cache hit counters or push eviction events
+   (docs/benchmarks/push-cache-eviction.md) would fire on the intended
+   condition. See docs/internals/cache-residency-routing.md caveat +
+   docs/benchmarks/cache-residency-ab-benchmark.md.
+
+**⚠️ 2026-06-10 harness update (supersedes the E0/E_on/E_off commands below):**
+
+1. **The env-prefix claim below was WRONG until now.**
+   `docker-compose.benchmark-real.yml` did not list
+   `RANVIER_CACHE_RESIDENCY_THRESHOLD` in the ranvier services' `environment:`
+   blocks, so `RANVIER_CACHE_RESIDENCY_THRESHOLD=0.0 ./scripts/bench.sh` set
+   the var on the HOST (where the banner reads it) but it never reached the
+   servers — they silently ran the 0.2 default. Every prior "residency off"
+   leg (Exp A, C1, D1) actually ran residency ON at 0.2. Conclusions are
+   unaffected (downgrades were 0 everywhere, so on ≡ off), but the
+   verification note further down was wrong. Fixed: compose now passes the
+   variable through, and bench.sh grew a first-class
+   `--cache-residency-threshold <F>` flag (preferred; shows in the banner).
+2. **New `churn` workload** (`--prompt-dist churn`): the static `stress` pool
+   keeps every prefix permanently hot, which is exactly why residency stayed
+   inert. Churn rotates the active working set over a 200-prefix universe
+   (knobs: `CHURN_PREFIX_UNIVERSE/ACTIVE_PREFIXES/ROTATION_SECONDS/
+   ROTATION_STEP/SEED`), so prefixes go dormant, get evicted, and RETURN as
+   stale ART hits — the event residency exists to intercept.
+3. **One-command orchestration:** `scripts/bench-residency-ab.sh` runs the
+   pressure probe (gates on `residency_route_downgrades_total > 0`), then the
+   paired OFF/ON legs, validity checks, parser compare, and a REPORT.md
+   skeleton. Methodology + sizing guide:
+   `docs/benchmarks/cache-residency-ab-benchmark.md`.
+4. bench.sh now rebuilds the locust image unconditionally (locustfiles are
+   baked in; a stale image used to silently run the old workload).
 
 **Prerequisite finding (2026-05-26):** residency routing was confirmed LIVE but
 INERT in every A/B/C/D run — `residency_route_downgrades_total = 0` while

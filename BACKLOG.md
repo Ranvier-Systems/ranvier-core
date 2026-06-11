@@ -115,6 +115,37 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
   _Approach:_ HTTP callback endpoint (`POST /v1/cache/events`) + `X-Ranvier-Prefix-Hash` header echoing. Optional sidecar for engines that can't implement directly. New gossip packet type for cluster propagation.
   _Complexity:_ High (4 phases: MVP, cluster propagation, load events + sidecar, upstream engagement)
 
+- [ ] **Residency signal source: vLLM v1 usage gauge fires only at saturation (#527)**
+  _Justification:_ The residency downgrade keys off `1 - gpu_cache_usage_perc`, but vLLM v1's
+  gauge counts only blocks held by RUNNING requests (cached prefixes are reclaimable and report
+  as free), so the signal crosses the 0.2 threshold only under active-demand saturation — far
+  later than the intended "prefix likely evicted" condition, and never in lighter regimes.
+  Candidate replacement signals: (a) scrape-side prefix-cache hit counters
+  (`vllm:gpu_prefix_cache_{queries,hits}` deltas — cheap, per-backend, no engine changes), or
+  (b) the per-prefix push eviction events above (exact, heavier). Decide the signal direction
+  before further residency threshold tuning; the current signal is benchmarked and is a net tail
+  win in the regime where it fires.
+  _Benchmark evidence:_ `docs/benchmarks/cache-residency-ab-benchmark.md` — gauge semantics
+  measured 2026-06-11 (engine logs `Running: 0 reqs ... usage 0.0%` beside a 91% prefix-cache
+  hit rate); A/B at saturation: overall TTFT P99 −57.1% at a 0.2% downgrade rate.
+  _Location:_ `src/health_service.cpp` (scrape), `src/vllm_metrics.hpp`
+  (`estimated_prefix_retention`), `src/router_service.cpp` (downgrade gate)
+  _Complexity:_ Medium (scrape-side hit-rate signal) / High (push-events path)
+
+- [ ] **Revisit `vllm_metrics_timeout` default (200ms plausibly censors the scrape under load)**
+  _Justification:_ vLLM's Python `/metrics` endpoint slows precisely when the engine is busy, so
+  a 200ms fetch timeout risks failing the health scrape at the very instants the cache-usage
+  signal matters (residency #527, capacity headroom, `load_score`'s cache term). The benchmark
+  compose now overrides to 1000ms via `RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS`; decide whether
+  the shipped default should follow. Caveat for the implementer: `scrape_all_vllm_metrics()`
+  awaits backends sequentially, so a raised timeout times N slow backends could stretch the 5s
+  health cadence — check scrape concurrency (Hard Rule #2) alongside the default change.
+  _Benchmark evidence:_ at 1000ms under sustained saturation, 0 scrape failures across both A/B
+  legs (3024/3016 successes); 200ms-era failure rates were never directly measured — the
+  success/failed/suppressed counters are now printed per leg by `scripts/bench-residency-ab.sh`.
+  _Location:_ `src/config_infra.hpp` (default), `src/health_service.cpp`
+  _Complexity:_ Low (default change) / Medium (with scrape parallelization)
+
 - [ ] **Add partition healing with route reconciliation**
   _Justification:_ After partition heals, nodes have divergent route tables. Need incremental sync protocol to merge without full state transfer.
   _Location:_ `src/gossip_service.cpp`
@@ -148,6 +179,25 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
   _Justification:_ Gossip only propagates new routes. Nodes that missed announcements have no catch-up mechanism. Periodic Merkle tree comparison ensures convergence.
   _Location:_ `src/gossip_service.cpp`
   _Complexity:_ High
+
+- [ ] **Route-announcement convergence after a divert (cross-node route flapping)**
+  _Justification:_ A route re-learn after any divert (residency downgrade, load-aware fallback,
+  cost divert #545, backend death) does not converge across the cluster: `learn_route_global()`
+  dedups only same-backend routes, each node re-learns and re-broadcasts whichever backend it
+  last served, and `ROUTE_ANNOUNCEMENT` carries no version or tie-break — so nodes sustain
+  disagreement and the prefix's backend flaps from the client's perspective. Candidate fixes:
+  versioned announcements (last-writer-wins), or suppressing re-learn when the served backend is
+  warm/healthy. Related but distinct from the anti-entropy item above: that one heals *missed*
+  announcements, this one resolves *conflicting* ones.
+  _Benchmark evidence:_ Residency A/B (2026-06-11, 8x A100-40GB, commit `30fd329`): 39 residency
+  downgrades produced 1,485 client-observed backend flips (38x amplification) over a 30m leg.
+  Side effects cut both ways — flapped prefixes end up warm on two backends (replication-like
+  tail benefit, visible in the run) at the cost of duplicate KV occupancy and repeated
+  announcement traffic. Details: `docs/benchmarks/cache-residency-ab-benchmark.md`
+  § "New finding: cross-node route flapping".
+  _Location:_ `src/router_service.cpp` (learn_route_global dedup, learn_route_remote),
+  `src/gossip_protocol.{hpp,cpp}` (ROUTE_ANNOUNCEMENT wire format)
+  _Complexity:_ High (wire-format versioning; Medium if relearn-suppression alone proves sufficient)
 
 ---
 

@@ -242,11 +242,23 @@ BENCHMARK OPTIONS:
                         this is applied to EACH benchmark, doubling total runtime.
     --users N           Concurrent users (default: 10)
     --spawn-rate N      Users spawned per second (default: 2)
-    --prompt-dist DIST  Prompt distribution: short|medium|long|mixed|stress (default: stress)
+    --prompt-dist DIST  Prompt distribution: short|medium|long|mixed|stress|churn (default: stress)
+                        "churn" rotates the active prefix working set over a large
+                        universe so backends genuinely evict prefixes (for cache-
+                        pressure / residency benchmarks). Knobs (env vars, defaults
+                        in parens): CHURN_PREFIX_UNIVERSE (200), CHURN_ACTIVE_PREFIXES
+                        (24), CHURN_ROTATION_SECONDS (20), CHURN_ROTATION_STEP (8),
+                        CHURN_SEED (42).
     --prompt-file FILE  Path to JSONL prompt file (ShareGPT/OpenAI format)
                         See tests/integration/data/prompts/ for examples
     --prefix-ratio R    Shared prefix ratio 0.0-1.0 (default: 0.9)
     --prefix-max-tokens N  Maximum prefix size in tokens (default: 8000)
+    --cache-residency-threshold F
+                        Cache-residency downgrade threshold (#527). ART hits whose
+                        backend reports residency < F are diverted. 0.0 disables
+                        residency routing entirely; server default is 0.2. This is
+                        the toggle for residency on/off A/B benchmarks (see
+                        scripts/bench-residency-ab.sh).
     --compare           Run A/B comparison (prefix vs round-robin). Restarts Ranvier
                         with the correct routing mode for each run and resets Prometheus
                         histograms. Total runtime is ~2x duration + ~90s (restarts).
@@ -299,6 +311,11 @@ EXTERNAL VLLM OPTIONS:
                             Example: --vllm-endpoints 10.0.0.1:8000,10.0.0.2:8000
 
 OTHER OPTIONS:
+    --build-image       Build ranvier:latest from this checkout before running
+                        (instead of reusing an existing image or pulling GHCR,
+                        which tracks main). REQUIRED when benchmarking C++
+                        changes from a branch — otherwise the run silently
+                        uses a stale server build.
     --skip-setup        Skip system configuration (for repeated runs)
     --dry-run           Show what would be done without executing
     --no-log            Disable full output logging (logging is ON by default)
@@ -455,6 +472,7 @@ MULTI_DEPTH=false
 LOAD_AWARE=true
 LOAD_IMBALANCE_FACTOR=""
 LOAD_IMBALANCE_FLOOR=""
+CACHE_RESIDENCY_THRESHOLD=""
 COMPRESSION_RATIO=""
 PRIORITY_QUEUE=false
 PROMPT_FILE=""
@@ -464,6 +482,7 @@ VLLM_VERSION="$DEFAULT_VLLM_VERSION"
 TP_SIZE=1
 GPU_MEM_UTIL="0.85"
 CPUSET_OVERRIDE=""
+BUILD_IMAGE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -494,6 +513,7 @@ while [[ $# -gt 0 ]]; do
         --compression-ratio) COMPRESSION_RATIO="$2"; shift 2 ;;
         --load-imbalance-factor) LOAD_IMBALANCE_FACTOR="$2"; shift 2 ;;
         --load-imbalance-floor)  LOAD_IMBALANCE_FLOOR="$2"; shift 2 ;;
+        --cache-residency-threshold) CACHE_RESIDENCY_THRESHOLD="$2"; shift 2 ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --tp)             TP_SIZE="$2"; shift 2 ;;
         --gpu-mem-util)   GPU_MEM_UTIL="$2"; shift 2 ;;
@@ -502,6 +522,7 @@ while [[ $# -gt 0 ]]; do
         --stop-timeout)   STOP_TIMEOUT="$2"; shift 2 ;;
         --cpuset)          CPUSET_OVERRIDE="$2"; shift 2 ;;
         --priority-queue) PRIORITY_QUEUE=true; shift ;;
+        --build-image)    BUILD_IMAGE=true; shift ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -668,11 +689,9 @@ if [[ "$TP_SIZE" -eq 1 ]]; then
 
             # Check if the chosen TP fits at the user's current gpu-mem-util.
             # If not, auto-raise to 0.92 (only raise what's actually needed).
-            if command -v bc &> /dev/null; then
-                DEFAULT_BUDGET=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
-            else
-                DEFAULT_BUDGET=$(( GPU_VRAM_MIB * 85 / 100 ))
-            fi
+            # awk, not bc: bc is absent on minimal images, and the old integer
+            # fallback hardcoded 85%, silently mis-sizing every non-0.85 run.
+            DEFAULT_BUDGET=$(awk -v v="$GPU_VRAM_MIB" -v u="$GPU_MEM_UTIL" 'BEGIN{printf "%d", v*u}')
             WEIGHT_PER_GPU=$(( MODEL_WEIGHT_MIB / TP_SIZE ))
             if [[ $((WEIGHT_PER_GPU + MIN_HEADROOM_MIB)) -gt $DEFAULT_BUDGET ]]; then
                 GPU_MEM_UTIL="0.92"
@@ -681,11 +700,7 @@ if [[ "$TP_SIZE" -eq 1 ]]; then
 
             # Auto-set max-model-len based on actual KV cache headroom
             if [[ -z "$MAX_MODEL_LEN" ]]; then
-                if command -v bc &> /dev/null; then
-                    ACTUAL_BUDGET=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
-                else
-                    ACTUAL_BUDGET=$(( GPU_VRAM_MIB * 92 / 100 ))
-                fi
+                ACTUAL_BUDGET=$(awk -v v="$GPU_VRAM_MIB" -v u="$GPU_MEM_UTIL" 'BEGIN{printf "%d", v*u}')
                 KV_HEADROOM=$(( ACTUAL_BUDGET - WEIGHT_PER_GPU ))
                 # Less than 4 GiB headroom → constrain context to 4096 tokens
                 if [[ $KV_HEADROOM -lt 4096 ]]; then
@@ -743,20 +758,20 @@ except Exception:
 
     if [[ -n "$KV_INFO" && "$KV_BYTES_PER_TOK" =~ ^[0-9]+$ && "$KV_BYTES_PER_TOK" -gt 0 ]]; then
         # KV headroom (MiB) = VRAM*util - weights/TP - activation/graph reserve.
+        # awk, not bc: bc is absent on minimal images, and the old integer
+        # fallback hardcoded 85% — at --gpu-mem-util 0.80 it overstated the
+        # budget, concluded "native context fits", skipped the clamp silently,
+        # and vLLM died at startup (observed on Lambda 8xA100, June 2026).
         MODEL_WEIGHT_MIB=$(( MODEL_PARAMS_B * 2 * 1000 ))
         WEIGHT_PER_GPU=$(( MODEL_WEIGHT_MIB / TP_SIZE ))
-        if command -v bc &> /dev/null; then
-            BUDGET_MIB=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
-        else
-            BUDGET_MIB=$(( GPU_VRAM_MIB * 85 / 100 ))
-        fi
+        BUDGET_MIB=$(awk -v v="$GPU_VRAM_MIB" -v u="$GPU_MEM_UTIL" 'BEGIN{printf "%d", v*u}')
         KV_HEADROOM_MIB=$(( BUDGET_MIB - WEIGHT_PER_GPU - 1024 ))
 
         if [[ $KV_HEADROOM_MIB -gt 0 ]]; then
             # Tokens whose KV cache fits in the headroom.
             FIT_TOKENS=$(( KV_HEADROOM_MIB * 1024 * 1024 / KV_BYTES_PER_TOK ))
             if [[ "$NATIVE_CTX" =~ ^[0-9]+$ && "$NATIVE_CTX" -gt 0 && "$FIT_TOKENS" -ge "$NATIVE_CTX" ]]; then
-                : # native context already fits -- let vLLM use the model default
+                log_info "KV fit check: ~${FIT_TOKENS} tokens fit at util ${GPU_MEM_UTIL}; native ctx ${NATIVE_CTX} fits — no clamp"
             else
                 # Apply a 10% safety margin and round down to a multiple of 256.
                 SAFE_LEN=$(( (FIT_TOKENS * 9 / 10 / 256) * 256 ))
@@ -770,6 +785,11 @@ except Exception:
         else
             log_warn "Weights leave no KV headroom at --gpu-mem-util $GPU_MEM_UTIL; consider --tp 2"
         fi
+    else
+        # An unclamped large-context model can kill vLLM at startup ("KV cache
+        # needed is larger than available"), so never skip this check silently.
+        log_warn "Could not estimate KV fit for $MODEL (transformers missing, or config fetch failed)."
+        log_warn "If vLLM fails to start with a KV-cache error, pass --max-model-len explicitly (e.g. 8192)."
     fi
 fi
 
@@ -1050,6 +1070,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Load-Aware:      $LOAD_AWARE"
     [[ -n "$LOAD_IMBALANCE_FACTOR" ]] && echo "  Imbalance Factor: $LOAD_IMBALANCE_FACTOR"
     [[ -n "$LOAD_IMBALANCE_FLOOR" ]] && echo "  Imbalance Floor:  $LOAD_IMBALANCE_FLOOR"
+    [[ -n "$CACHE_RESIDENCY_THRESHOLD" ]] && echo "  Residency Thresh: $CACHE_RESIDENCY_THRESHOLD"
     echo "  Max Tokens:      $MAX_TOKENS"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
     echo "  vLLM Version:    $VLLM_VERSION"
@@ -1328,6 +1349,17 @@ if [[ "${DEBUG_BUILD:-}" == "true" ]]; then
     log_info "Debug build requested - building with debug symbols..."
     docker build --build-arg BUILD_TYPE=Debug -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
     log_ok "Ranvier image built (Debug)"
+elif [[ "$BUILD_IMAGE" = true ]]; then
+    # Forced local build: the only way branch C++ changes reach the benchmark
+    # (GHCR tracks main, and an existing ranvier:latest is reused blindly).
+    log_info "Building Ranvier image from this checkout (--build-image)..."
+    if docker build -t ranvier:latest -f Dockerfile.production . > /tmp/ranvier_image_build.log 2>&1; then
+        log_ok "Ranvier image built from commit $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+    else
+        log_error "Ranvier image build failed — tail of /tmp/ranvier_image_build.log:"
+        tail -20 /tmp/ranvier_image_build.log
+        exit 1
+    fi
 elif ! docker image inspect ranvier:latest &> /dev/null; then
     # Try to pull from GHCR first (much faster), fall back to local build
     log_info "Pulling Ranvier image from GHCR..."
@@ -1339,14 +1371,17 @@ elif ! docker image inspect ranvier:latest &> /dev/null; then
         docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
         log_ok "Ranvier image built"
     fi
+else
+    IMAGE_CREATED=$(docker image inspect -f '{{.Created}}' ranvier:latest 2>/dev/null | cut -dT -f1)
+    log_info "Using existing ranvier:latest (created ${IMAGE_CREATED:-unknown}) — pass --build-image to rebuild from this checkout"
 fi
 
-# Build locust image if needed
-if ! docker image inspect ranvier-locust:latest &> /dev/null; then
-    log_info "Building Locust image..."
-    docker build -t ranvier-locust:latest -f tests/integration/Dockerfile.locust tests/integration/ > /dev/null 2>&1
-    log_ok "Locust image built"
-fi
+# Build locust image unconditionally: the locustfiles are baked into the image
+# (Dockerfile.locust COPY), so reusing a stale image silently runs an outdated
+# workload. With layer caching this is a no-op when nothing changed.
+log_info "Building Locust image..."
+docker build -t ranvier-locust:latest -f tests/integration/Dockerfile.locust tests/integration/ > /dev/null 2>&1
+log_ok "Locust image ready"
 
 # Export multi-depth routing setting for docker-compose
 if [[ "$MULTI_DEPTH" = true ]]; then
@@ -1369,6 +1404,13 @@ if [[ -n "$LOAD_IMBALANCE_FLOOR" ]]; then
     export RANVIER_LOAD_IMBALANCE_FLOOR="$LOAD_IMBALANCE_FLOOR"
     log_info "Load imbalance floor: $LOAD_IMBALANCE_FLOOR"
 fi
+# Residency routing toggle (#527). The flag takes precedence over a bare
+# RANVIER_CACHE_RESIDENCY_THRESHOLD=... env prefix; both reach the servers now
+# that docker-compose.benchmark-real.yml passes the variable through.
+if [[ -n "$CACHE_RESIDENCY_THRESHOLD" ]]; then
+    export RANVIER_CACHE_RESIDENCY_THRESHOLD="$CACHE_RESIDENCY_THRESHOLD"
+    log_info "Cache-residency threshold: $CACHE_RESIDENCY_THRESHOLD"
+fi
 
 # Effective routing config the server is about to launch with. Printed at
 # second 0 so a misconfigured load-aware experiment is caught immediately
@@ -1382,9 +1424,9 @@ log_info "RANVIER_LOAD_AWARE_ROUTING    = ${RANVIER_LOAD_AWARE_ROUTING}"
 log_info "RANVIER_LOAD_IMBALANCE_FACTOR = ${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0 (compose default)}"
 log_info "RANVIER_LOAD_IMBALANCE_FLOOR  = ${RANVIER_LOAD_IMBALANCE_FLOOR:-2 (compose default)}"
 # Residency routing (#527) is a SECOND diversion mechanism, on by default
-# (threshold 0.2). It is NOT controlled by --no-load-aware — only by this env
-# var (0.0 disables). Surfaced here because a silently-on residency threshold
-# confounds any load-aware A/B.
+# (threshold 0.2). It is NOT controlled by --no-load-aware — only by
+# --cache-residency-threshold (or the env var; 0.0 disables). Surfaced here
+# because a silently-on residency threshold confounds any load-aware A/B.
 log_info "RANVIER_CACHE_RESIDENCY_THRESHOLD = ${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2 (compose default — residency routing ON)}"
 if [[ "$LOAD_AWARE" = true ]]; then
     log_warn "Load-aware routing is ON. For a no-diversion A/B, pass --no-load-aware AND set RANVIER_CACHE_RESIDENCY_THRESHOLD=0.0."
@@ -1399,6 +1441,9 @@ fi
 log_info "NUM_LARGE_PREFIXES            = ${NUM_LARGE_PREFIXES:-50 (bench default)}  [workload, not routing]"
 if [[ "${NUM_LARGE_PREFIXES:-50}" -le "${NUM_BACKENDS:-0}" ]] 2>/dev/null; then
     log_warn "NUM_LARGE_PREFIXES (${NUM_LARGE_PREFIXES:-50}) <= backends (${NUM_BACKENDS:-?}): pure affinity cannot use all backends (pigeonhole concentration; intentional only for a stress test)."
+fi
+if [[ "$PROMPT_DIST" == "churn" ]]; then
+    log_info "CHURN workload                = universe=${CHURN_PREFIX_UNIVERSE:-200} active=${CHURN_ACTIVE_PREFIXES:-24} step=${CHURN_ROTATION_STEP:-8}/${CHURN_ROTATION_SECONDS:-20}s seed=${CHURN_SEED:-42}  [workload, not routing]"
 fi
 
 # Export compression ratio for docker-compose
@@ -1625,6 +1670,10 @@ run_benchmark() {
     # Pass NUM_LARGE_PREFIXES=5 explicitly only to stress prefix concentration.
     NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-50}"
 
+    # Forward churn-workload knobs (read by locustfile_real.py; only meaningful
+    # with --prompt-dist churn). Defaults mirror the locustfile's.
+    CHURN_ARGS="-e CHURN_PREFIX_UNIVERSE=${CHURN_PREFIX_UNIVERSE:-200} -e CHURN_ACTIVE_PREFIXES=${CHURN_ACTIVE_PREFIXES:-24} -e CHURN_ROTATION_SECONDS=${CHURN_ROTATION_SECONDS:-20} -e CHURN_ROTATION_STEP=${CHURN_ROTATION_STEP:-8} -e CHURN_SEED=${CHURN_SEED:-42}"
+
     # Run locust via docker compose
     # Mount report dir as volume so files persist after container exits
     LOCUST_RUN_TIME_SECS=$(parse_duration "$DURATION")
@@ -1674,6 +1723,7 @@ run_benchmark() {
         $PROMPT_FILE_ARGS \
         $PREFIX_MAX_ARGS \
         $NUM_PREFIXES_ARGS \
+        $CHURN_ARGS \
         locust \
         --headless \
         --users "$USERS" \
@@ -1787,6 +1837,10 @@ if [[ "$WARMUP" = true ]]; then
     # (default 50, see the main run block for rationale).
     NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-50}"
 
+    # Match the main run's churn knobs so warm-up exercises the same universe
+    # (CHURN_SEED makes the prefix content identical).
+    CHURN_ARGS="-e CHURN_PREFIX_UNIVERSE=${CHURN_PREFIX_UNIVERSE:-200} -e CHURN_ACTIVE_PREFIXES=${CHURN_ACTIVE_PREFIXES:-24} -e CHURN_ROTATION_SECONDS=${CHURN_ROTATION_SECONDS:-20} -e CHURN_ROTATION_STEP=${CHURN_ROTATION_STEP:-8} -e CHURN_SEED=${CHURN_SEED:-42}"
+
     # Run warm-up benchmark
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
@@ -1804,6 +1858,7 @@ if [[ "$WARMUP" = true ]]; then
         $PROMPT_FILE_ARGS \
         $PREFIX_MAX_ARGS \
         $NUM_PREFIXES_ARGS \
+        $CHURN_ARGS \
         locust \
         --headless \
         --users "$USERS" \
