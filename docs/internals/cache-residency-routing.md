@@ -151,11 +151,17 @@ with its own staleness TTL.
 
 ## Benchmarking
 
-The before/after methodology (residency on vs off under real cache pressure),
-the `churn` load-test workload that makes eviction actually happen, and the
-orchestration script live in
-[docs/benchmarks/cache-residency-ab-benchmark.md](../benchmarks/cache-residency-ab-benchmark.md)
-/ `scripts/bench-residency-ab.sh`. The A/B toggle is
+**Measured (2026-06-11, 8x A100-40GB, Llama-3.1-8B, vLLM 0.15.1):** under
+sustained KV saturation (the regime where the v1 usage signal fires),
+residency ON vs OFF cut overall TTFT P99 by **57%** (2800 → 1200 ms) at equal
+P50/throughput/error rates, with a 0.2% downgrade rate. Full results, the
+composition caveats on hit/miss splits, and a newly surfaced cross-node
+route-flapping issue triggered by divert re-learns live in
+[docs/benchmarks/cache-residency-ab-benchmark.md](../benchmarks/cache-residency-ab-benchmark.md).
+
+The before/after methodology, the `churn` load-test workload that makes
+eviction actually happen, and the orchestration script live in the same doc /
+`scripts/bench-residency-ab.sh`. The A/B toggle is
 `--cache-residency-threshold` (0.0 = off). A run is only meaningful when
 `ranvier_router_residency_route_downgrades_total > 0` — the wrapper's probe
 step gates on that.

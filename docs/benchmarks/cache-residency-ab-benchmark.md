@@ -1,16 +1,106 @@
-# Cache-Residency Routing A/B Benchmark (Methodology)
+# Cache-Residency Routing A/B Benchmark
 
-**Status: harness ready — numbers NOT yet measured.** This document defines the
-methodology and tooling; the results table below is intentionally empty until
-the first valid run on real GPU hardware. Until then there is **no measured
-TTFT figure for residency routing**.
+**Status: MEASURED (2026-06-11).** First valid residency on-vs-off run; results
+below. Methodology and tooling sections follow the results.
 
 > ⚠️ **Do not** attribute the repository's existing "~48% faster TTFT" /
 > "P99 -78%" figures to residency routing. Those measure **prefix-affinity
 > routing vs round-robin** ([kv-cache-prefix-routing-benchmark.md](kv-cache-prefix-routing-benchmark.md))
-> — a different feature. Residency routing (#527) has never produced a
-> measured number: in every benchmark run before June 2026 it was live but
-> inert (`residency_route_downgrades_total == 0`).
+> — a different feature. The residency numbers are the table below, measured
+> under the saturation regime described in this document, and nothing else.
+
+## Results (measured 2026-06-11)
+
+**Environment:** Lambda Labs 8x NVIDIA A100-SXM4-40GB (1 host) ·
+meta-llama/Llama-3.1-8B-Instruct · vLLM 0.15.1 (`--enable-prefix-caching`,
+`--gpu-memory-utilization 0.50`, `--max-model-len 8192`) · 3-node Ranvier
+cluster, commit `30fd329` (`--no-load-aware` both legs, scrape timeout 1000ms)
+· churn workload (universe 200, active 24, step 8/20s, seed 42, prefix-ratio
+0.9, prefixes 2000–8000 est. tokens) · 60 users · 400 output tokens/req ·
+30m per leg + 1m warmup, vLLM cold-started per leg.
+
+**Command:** `./scripts/bench-residency-ab.sh --skip-probe --users 60 --max-tokens 400`
+(preceded by a passed pressure probe at the same config: 20 downgrades / 8m).
+
+**Validity:** all gates passed. OFF downgrades 0; ON downgrades 39 (0.2% of
+requests); scrapes 3024/0 and 3016/0 (success/failed); gossip received = 2x
+sent on both legs; KV usage peak/mean 100%/35.6% (OFF) vs 99.8%/37.4% (ON);
+zero errors, zero timeouts, throughput within 1.2%.
+
+| Metric | Residency OFF | Residency ON | Delta |
+|--------|---------------|--------------|-------|
+| **TTFT P99 (all requests)** | **2800 ms** | **1200 ms** | **−57.1%** |
+| TTFT P50 (all requests) | 470 ms | 470 ms | 0% |
+| Cache Hit P99 † | 3074 ms | 968 ms | −68.5% |
+| XLarge-bucket Hit P99 † | 4396 ms | 982 ms | −77.7% |
+| Cache Miss P99 † | 986 ms | 5051 ms | +412% |
+| Client cache hit rate † | 88.8% | 80.4% | −8.4 pp |
+| Throughput | 57.7 req/s | 58.4 req/s | +1.2% |
+| Errors / timeouts | 0 / 0 | 0 / 0 | — |
+| `residency_route_downgrades_total` | 0 | 39 (0.2%) | — |
+| Backend distribution (Gini) | 0.081 | 0.076 | slightly more even |
+
+† Composition-caveated — see "How to read the split metrics" below. The
+headline is the **overall P99**, which is computed over all requests and is
+immune to hit/miss reclassification.
+
+Raw artifacts: `benchmark-reports/residency-ab_20260611_162343/ab-summary.txt`
+on the run host (validity block, per-bucket tables, Ranvier overhead, backend
+distributions).
+
+### How to read the split metrics
+
+The client classifies a request as a "hit" when the prefix landed on the same
+backend as its previous request. Residency-ON changes routing topology, so
+pools shift between legs:
+
+- **OFF leg = pure affinity, literally zero route changes** (misses 2054 ==
+  unique prefixes 2054). Every returning evicted prefix re-prefilled on its
+  original backend *inside the "hit" class* — that stale-hit population is
+  what put OFF's Hit P99 at 3.1–4.4 s.
+- **ON leg: 39 downgrades produced 1,485 route-change "misses"** (3617 misses
+  − 2132 unique prefixes), a 38x amplification explained by **cross-node
+  route flapping** (next section). Most of those "misses" ran at hit-grade
+  latency (ON Miss P50 454–500 ms ≈ Hit P50), i.e. they were warm — the −8.4
+  pp hit rate is mostly accounting, not lost cache efficiency. The genuinely
+  cold population (the diverted requests + fresh prefills under saturation)
+  forms ON's 5.1 s miss tail.
+- Net: what the toggle actually buys is the **−57% overall P99** at equal
+  throughput and error rates. Attribute it to the mechanism *as shipped* —
+  the 39 diverts **plus** their re-learn side effects (including accidental
+  dual-backend warming of flapped prefixes, which spreads hot-prefix load;
+  Gini improved slightly) — not to the diverts alone.
+
+### New finding: cross-node route flapping after a divert (open issue)
+
+`learn_route_global()` dedups a route only when the local ART already maps
+the prefix to the **same** backend (`router_service.cpp`, dedup block). After
+a downgrade re-learns node1's ART to backend B, the other nodes still route
+the prefix to A, each node keeps re-learning + re-broadcasting whatever it
+last served, and `ROUTE_ANNOUNCEMENT`s carry no version/tie-break — so the
+cluster sustains disagreement and the client (round-robining nodes) observes
+the backend alternating: 39 diverts → 1,485 observed flips. Side effects cut
+both ways: flapped prefixes end up warm on two backends (replication-like
+latency benefit, visible in this run) at the cost of duplicate KV occupancy
+and repeated announcement traffic. **This applies to every route-changing
+mechanism** (load-aware fallback, cost divert, backend death), not just
+residency — residency merely made it measurable because the OFF leg had zero
+route changes. Flagged in `.dev-context/next-benchmark-checklist.md` for a
+follow-up investigation (route-announcement convergence semantics).
+
+### Scope caveats
+
+- Measured in the **active-demand saturation regime** (60 users x 400-token
+  decodes against a deliberately small 0.50-util KV cache) — the only regime
+  where the shipped v1-usage signal fires (see semantics section below). The
+  result says nothing about lighter regimes, where residency-ON ≡ OFF.
+- Single run pair, one model/hardware combo. The May 2026 methodology notes
+  (30m floor, paired legs, same instance) were followed; replicate before
+  treating the exact percentages as stable.
+
+---
+
+# Methodology
 
 ## What is being measured
 
@@ -288,26 +378,11 @@ A run is quotable only if **all** of these hold:
 | Incompletes / timeouts, per-backend distribution | parser report | validity gate 7, concentration effects |
 | `vllm:gpu_cache_usage_perc` over the run | sampled automatically into `<leg>/vllm_usage_samples.csv` by the wrapper | proof the pressure regime held (vLLM v1: gauge = running-request blocks only) |
 
-## Results — TO BE MEASURED
+## Recording results
 
-Fill from `ab-summary.txt` / `REPORT.md` produced by the wrapper. **Do not
-quote any number until the validity gates pass.**
-
-| Metric | Residency OFF | Residency ON | Delta |
-|--------|---------------|--------------|-------|
-| TTFT P50 | TBD | TBD | TBD |
-| TTFT P99 | TBD | TBD | TBD |
-| Cache Hit P99 | TBD | TBD | TBD |
-| Cache Miss P99 | TBD | TBD | TBD |
-| Client cache hit rate | TBD | TBD | TBD |
-| Throughput (req/s) | TBD | TBD | TBD |
-| Incompletes / timeouts | TBD | TBD | TBD |
-| `residency_route_downgrades_total` (% of reqs) | 0 (by construction) | TBD | — |
-
-Hardware/config record (fill in): GPU model × count, driver, vLLM version,
-model, `--gpu-mem-util`, per-backend KV tokens (from vLLM log), users,
-duration, churn knobs, git commit, both full command lines. The wrapper
-pre-fills most of this in `REPORT.md`.
+Measured results live in the **Results** section at the top of this document.
+For repeat runs: fill from `ab-summary.txt` / `REPORT.md` produced by the
+wrapper, and **do not quote any number until the validity gates pass**.
 
 ## Interpreting the outcome
 

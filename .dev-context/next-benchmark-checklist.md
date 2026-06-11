@@ -311,7 +311,35 @@ backends still overload. That strengthens the case that *some* load-aware
 diversion is genuinely needed, which puts the #442 cold-divert fix back on the
 critical path.
 
-### Experiment E — Cache-residency-aware routing (#527) under cache pressure [HARNESS READY — see 2026-06-10/11 updates]
+### Experiment E — Cache-residency-aware routing (#527) under cache pressure [MEASURED 2026-06-11 ✅ — see finding 5 + new open issue]
+
+**✅ 2026-06-11 RESULT (8x A100-40GB, Llama-3.1-8B, vLLM 0.15.1, 60u/400tok,
+util 0.50, churn workload, 30m/leg, commit `30fd329`): residency ON vs OFF
+under sustained KV saturation —**
+
+5. **Overall TTFT P99 −57.1% (2800 → 1200 ms), P50 unchanged, throughput
+   +1.2%, zero errors/timeouts both legs.** ON-leg downgrades 39 (0.2% of
+   18,491 requests); OFF-leg exactly 0 (and zero route changes of any kind:
+   misses == unique prefixes). Split metrics are composition-caveated (pool
+   reclassification): Hit P99 −68.5%, XLarge Hit P99 −77.7%, Miss P99 +412%,
+   client hit rate −8.4pp of which ~1,485/1,563 extra "misses" ran at
+   hit-grade P50 (warm, backend-alternation accounting). Full table +
+   interpretation: docs/benchmarks/cache-residency-ab-benchmark.md §Results.
+   Verdict: at saturation, the shipped mechanism is a clear net tail win; it
+   is inert below the firing line (see finding 2 semantics).
+
+   **NEW OPEN ISSUE — cross-node route flapping after any divert:** 39
+   downgrades produced 1,485 client-observed backend flips. Mechanism:
+   `learn_route_global()` dedups only same-backend routes, each node
+   re-learns + re-broadcasts whatever it last served, ROUTE_ANNOUNCEMENTs
+   carry no version/tie-break → sustained cluster disagreement; flapped
+   prefixes end up warm on TWO backends (replication-like latency benefit,
+   duplicate KV cost, repeated announcement traffic). Applies to EVERY
+   route-changing mechanism (load-aware, cost divert #545, backend death) —
+   residency just made it measurable against a zero-route-change baseline.
+   Needs its own investigation: route-announcement convergence semantics
+   (versioning / last-writer-wins / don't-relearn-when-warm). Human decision
+   on fix direction.
 
 **⚠️ 2026-06-11 third hardware probe (post parser fix) — finding 4: the gauge
 parses (sampler peak 88.6%!) but pressure is SPIKY, and spiky doesn't fire.**
