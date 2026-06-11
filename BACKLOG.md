@@ -149,6 +149,25 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
   _Location:_ `src/gossip_service.cpp`
   _Complexity:_ High
 
+- [ ] **Route-announcement convergence after a divert (cross-node route flapping)**
+  _Justification:_ A route re-learn after any divert (residency downgrade, load-aware fallback,
+  cost divert #545, backend death) does not converge across the cluster: `learn_route_global()`
+  dedups only same-backend routes, each node re-learns and re-broadcasts whichever backend it
+  last served, and `ROUTE_ANNOUNCEMENT` carries no version or tie-break — so nodes sustain
+  disagreement and the prefix's backend flaps from the client's perspective. Candidate fixes:
+  versioned announcements (last-writer-wins), or suppressing re-learn when the served backend is
+  warm/healthy. Related but distinct from the anti-entropy item above: that one heals *missed*
+  announcements, this one resolves *conflicting* ones.
+  _Benchmark evidence:_ Residency A/B (2026-06-11, 8x A100-40GB, commit `30fd329`): 39 residency
+  downgrades produced 1,485 client-observed backend flips (38x amplification) over a 30m leg.
+  Side effects cut both ways — flapped prefixes end up warm on two backends (replication-like
+  tail benefit, visible in the run) at the cost of duplicate KV occupancy and repeated
+  announcement traffic. Details: `docs/benchmarks/cache-residency-ab-benchmark.md`
+  § "New finding: cross-node route flapping".
+  _Location:_ `src/router_service.cpp` (learn_route_global dedup, learn_route_remote),
+  `src/gossip_protocol.{hpp,cpp}` (ROUTE_ANNOUNCEMENT wire format)
+  _Complexity:_ High (wire-format versioning; Medium if relearn-suppression alone proves sufficient)
+
 ---
 
 

@@ -339,7 +339,8 @@ under sustained KV saturation —**
    residency just made it measurable against a zero-route-change baseline.
    Needs its own investigation: route-announcement convergence semantics
    (versioning / last-writer-wins / don't-relearn-when-warm). Human decision
-   on fix direction.
+   on fix direction. **Tracked in BACKLOG.md § 2.3 (Gossip Protocol
+   Reliability).**
 
 **⚠️ 2026-06-11 third hardware probe (post parser fix) — finding 4: the gauge
 parses (sampler peak 88.6%!) but pressure is SPIKY, and spiky doesn't fire.**
