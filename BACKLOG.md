@@ -938,7 +938,7 @@ Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build
   _Location:_ `src/router_service.hpp` (cache-event API), `src/vllm_metrics.hpp`, `src/health_service.cpp`
   _Complexity:_ High
 
-- [ ] **Unified weighted scorer** (P0.2)
+- [x] **Unified weighted scorer** (P0.2) — _Done 2026-06-11._
   _Justification:_ Routing currently layers ART → load redirect → cost redirect as sequential
   *overrides* (`PrefixRouteResult.was_load_redirect`, `was_cost_redirect`). The state of the art
   uses one tunable weighted score blending prefix overlap + queue depth + KV utilization
@@ -948,6 +948,14 @@ Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build
   weights, leaving room for a future SLO term.
   _Location:_ `src/router_service.cpp` (`get_backend_for_prefix`, `route_request`), `src/config_schema.hpp` (`RoutingConfig`)
   _Complexity:_ Medium
+  _Completion note:_ Shipped as `src/route_scorer.hpp` (pure, reactor-free decision core) +
+  one scoring pass in `get_backend_for_prefix`. Placement score (affinity + hardware price)
+  → `original_selected`/learning; dispatch score (+ load hinge over the strategy allowance,
+  + cost-budget hinge) → final backend. Weights in `RoutingConfig::scoring`
+  (`routing.scoring.*`, `RANVIER_SCORING_*`), incl. the reserved `slo_weight` seam. Neutral
+  defaults reproduce the pre-scorer decisions exactly; P0.1 plugs in by grading
+  `affinity(b)` per backend from native KV events, P0.3 by adding a pool-role gate to the
+  same pass. See `docs/internals/prefix-affinity-routing.md` § Unified Route Scoring.
 
 - [ ] **Disaggregated prefill/decode awareness** (P0.3)
   _Justification:_ `BackendType` is engine class, not pool role. Disaggregated (P/D) serving is

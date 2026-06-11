@@ -10,6 +10,7 @@
 #pragma once
 
 #include "config_infra.hpp"
+#include "route_scorer.hpp"  // ScoringWeights (pure data struct, no Seastar deps)
 #include "types.hpp"
 
 namespace ranvier {
@@ -283,6 +284,20 @@ struct RoutingConfig {
     // Cost-Based Routing (overlays on load-aware routing)
     // =========================================================================
     CostBasedRoutingConfig cost_routing;
+
+    // =========================================================================
+    // Unified Route Scoring (per-signal weights)
+    // =========================================================================
+    // The post-anchor routing decision (formerly sequential load-redirect ->
+    // cost-redirect -> hardware-cost-preference overrides) is one weighted
+    // ranking over the live candidates; these weights blend the signals.
+    // The shipped defaults are NEUTRAL: each term reduces to the pre-scorer
+    // rule and the existing keys above (bounded_load_epsilon, p2c_load_bias,
+    // load_imbalance_factor/floor, cache_residency_threshold, cost_routing.*,
+    // per-backend cost_per_hour) keep their authority, so an un-tuned config
+    // routes exactly as before. See src/route_scorer.hpp for term semantics.
+    // YAML: routing.scoring.*  Env: RANVIER_SCORING_*
+    ScoringWeights scoring;
 
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }

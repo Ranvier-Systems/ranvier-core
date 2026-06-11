@@ -4,6 +4,7 @@
 #include "metrics_service.hpp"
 #include "node_slab.hpp"
 #include "parse_utils.hpp"
+#include "route_scorer.hpp"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/smp.hh>
@@ -17,7 +18,6 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -103,8 +103,8 @@ struct BackendInfo {
 
     // Hardware-tier / cost fields (operator-set; default unset). gpu_tier is
     // a coarse informational label ("h100", "a10g") surfaced in routing logs;
-    // cost_per_hour > 0 opts the backend into the cache-miss hardware-cost
-    // preference (apply_hardware_cost_preference). 0.0 means unpriced: never
+    // cost_per_hour > 0 opts the backend into the cache-miss hardware-price
+    // term of the unified route score. 0.0 means unpriced: never
     // preferred, never diverted from. Written via
     // set_backend_hardware_cost_global; like the telemetry labels above,
     // re-registration resets both to defaults.
@@ -274,6 +274,8 @@ struct ShardLocalState {
         // Cache-residency-aware routing: minimum gossiped residency below which
         // an ART prefix hit is treated as a likely miss. 0.0 disables.
         double cache_residency_threshold = 0.2;
+        // Unified route scoring weights (neutral defaults = pre-scorer behavior)
+        ScoringWeights scoring;
     } config;
 
     // ========================================================================
@@ -523,6 +525,8 @@ struct ShardLocalState {
         config.max_ttl_multiplier = cfg.max_ttl_multiplier;
         // Cache-residency-aware routing
         config.cache_residency_threshold = cfg.cache_residency_threshold;
+        // Unified route scoring weights
+        config.scoring = cfg.scoring;
 
         // Pre-allocate cross-shard load snapshot storage (one entry per shard)
         // Resized to smp::count so we can index by shard_id without bounds checks.
@@ -573,6 +577,8 @@ struct ShardLocalState {
         config.max_ttl_multiplier = cfg.max_ttl_multiplier;
         // Cache-residency-aware routing
         config.cache_residency_threshold = cfg.cache_residency_threshold;
+        // Unified route scoring weights
+        config.scoring = cfg.scoring;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -1049,272 +1055,60 @@ double get_backend_cost(BackendId id) {
     return it->second.current_cost_budget;
 }
 
-// Find backend with lowest cost budget among candidates.
-// O(n) scan, same pattern as get_least_loaded_backend.
-// Callers pass pre-filtered live_backends (dead/draining already excluded).
-static std::pair<BackendId, double> get_least_cost_backend(
-    const std::vector<BackendId>& candidates) {
-    if (!g_shard_state || candidates.empty()) {
-        return {0, std::numeric_limits<double>::max()};
-    }
-
-    BackendId best_id = 0;
-    double best_cost = std::numeric_limits<double>::max();
-
-    for (BackendId id : candidates) {
-        auto it = g_shard_state->backends.find(id);
-        if (it == g_shard_state->backends.end()) continue;
-
-        double cost = it->second.current_cost_budget;
-        if (cost < best_cost) {
-            best_cost = cost;
-            best_id = id;
-        }
-    }
-    return {best_id, best_cost};
-}
-
-// Find a backend with available budget, excluding one backend.
-// Uses random-two-choices selection to avoid thundering herd.
-// Returns nullopt if no backend has sufficient budget headroom.
-// Stack-allocated: no heap allocation for up to 256 backends.
-static std::optional<BackendId> find_backend_with_budget(
-    const std::vector<BackendId>& candidates,
-    double request_cost,
-    double max_budget,
-    BackendId exclude_id) {
-    if (!g_shard_state || candidates.size() < 2) return std::nullopt;
-
-    // Build list of eligible candidates on the stack (no heap allocation).
-    // 256 is the hard limit on backends (ShardLocalState::GpuLoadCache::MAX_ENTRIES).
-    static constexpr size_t MAX_ELIGIBLE = 256;
-    std::array<BackendId, MAX_ELIGIBLE> eligible{};
-    size_t eligible_count = 0;
-
-    for (BackendId id : candidates) {
-        if (id == exclude_id) continue;
-        auto it = g_shard_state->backends.find(id);
-        if (it == g_shard_state->backends.end()) continue;
-        // Scale budget ceiling by backend's compression ratio
-        double effective_max = max_budget * it->second.compression_ratio;
-        if (it->second.current_cost_budget + request_cost <= effective_max) {
-            if (eligible_count < MAX_ELIGIBLE) {
-                eligible[eligible_count++] = id;
-            }
-        }
-    }
-
-    if (eligible_count == 0) return std::nullopt;
-    if (eligible_count == 1) return eligible[0];
-
-    // Random-two-choices: pick 2 random candidates, return whichever has more headroom
-    auto& rng = g_shard_state->rng;
-    std::uniform_int_distribution<size_t> dist(0, eligible_count - 1);
-    size_t idx_a = dist(rng);
-    size_t idx_b = dist(rng);
-    if (idx_a == idx_b) {
-        idx_b = (idx_b + 1) % eligible_count;
-    }
-
-    double cost_a = get_backend_cost(eligible[idx_a]);
-    double cost_b = get_backend_cost(eligible[idx_b]);
-    return (cost_a <= cost_b) ? eligible[idx_a] : eligible[idx_b];
-}
-
-// Check if preferred backend is significantly more loaded than its peers and
-// find a less-loaded alternative if so.
-//
-// Uses a RELATIVE threshold: the preferred backend is "overloaded" when its
-// queue depth exceeds (median_load * factor + floor). This auto-adapts to any
-// workload, model size, or cluster size — no per-model tuning needed.
-//
-// Called once per request from get_backend_for_prefix(), after the final backend
-// has been selected by either the ART or hash path. This single call site avoids
-// redundant O(N) scans and keeps load-balancing logic in one place.
-//
-// Parameters:
-//   preferred_id: The backend selected by ART or hash
-//   live_backends: List of available backends to consider
-//   request_id: For logging (can be empty)
-//   source: Description for logging ("ART" or "hash")
-//
-// Rule #1: Lock-free - shard-local state, no synchronization needed
-//
-// Performance notes:
-// - Early exits minimize work in the common case (balanced load)
-// - Config values cached in shard-local state (no cross-shard access)
-// - All reads are shard-local plain integers (no atomics needed)
-// - Median computed via nth_element (O(n), n is typically <16 backends)
-static BackendId apply_load_aware_selection(
-    BackendId preferred_id,
-    const std::vector<BackendId>& live_backends,
-    const std::string& request_id,
-    const char* source)
-{
-    // Fast path: check if load-aware routing is enabled before any other work
-    if (!g_shard_state || !g_shard_state->config.load_aware_routing) {
-        return preferred_id;
-    }
-
-    // Need at least 2 backends for load comparison to make sense
-    if (live_backends.size() < 2) {
-        return preferred_id;
-    }
-
-    // Cache config values locally to avoid repeated struct access
-    const double factor = g_shard_state->config.load_imbalance_factor;
-    const uint64_t floor = g_shard_state->config.load_imbalance_floor;
-
-    // Check preferred backend's composite load (local + GPU)
-    uint64_t preferred_load = get_composite_backend_load(preferred_id);
-
-    // Fast path: zero load is never overloaded
-    if (preferred_load == 0) {
-        return preferred_id;
-    }
-
-    // Collect loads from all live backends to compute median.
-    // live_backends.size() is typically <16, so stack allocation is fine.
-    // Rule #4: bounded by live_backends.size() (already bounded upstream).
-    std::vector<uint64_t> loads;
-    loads.reserve(live_backends.size());
-    for (BackendId id : live_backends) {
-        loads.push_back(get_composite_backend_load(id));
-    }
-
-    // Compute median via nth_element (O(n), partial sort)
-    size_t mid = loads.size() / 2;
-    std::nth_element(loads.begin(), loads.begin() + static_cast<ptrdiff_t>(mid), loads.end());
-    uint64_t median = loads[mid];
-
-    // Relative threshold: divert only if preferred is significantly above median
-    // The floor prevents flapping when all backends are at low/zero load
-    uint64_t threshold = static_cast<uint64_t>(static_cast<double>(median) * factor) + floor;
-    if (preferred_load <= threshold) {
-        return preferred_id;
-    }
-
-    // Preferred backend is a genuine outlier — find the least-loaded alternative
-    auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
-
-    // No viable alternative found
-    if (least_loaded_id == 0) {
-        return preferred_id;
-    }
-
-    // Divert to less-loaded backend
-    g_shard_state->stats.load_aware_fallbacks++;
-    if (g_metrics) {
-        metrics().record_load_aware_fallback();
-    }
-
-    log_router.debug("[{}] Load-aware routing: {} preferred backend {} has {} in-flight "
-                     "(median={}, threshold={}), routing to {} with {} in-flight",
-                     request_id, source, preferred_id, preferred_load,
-                     median, threshold, least_loaded_id, least_load);
-
-    return least_loaded_id;
-}
-
 // ============================================================================
-// Hardware-Cost Preference (cache-miss path only)
+// Unified Route Scoring — input builders
 // ============================================================================
-// Operators running mixed GPU types price backends via the per-backend
-// cost_per_hour field; cache-miss requests then prefer cheaper hardware. A
-// miss recomputes the prefix wherever it lands, so the KV cache gives no
-// reason to keep the hash-selected backend. ART hits never reach this
-// function: recomputing a warm prefix on a cheaper cold backend costs more
-// than the hardware saving, so cache-warm requests stay put regardless of
-// cost.
-//
-// Selection contract:
-//   - Fires only between PRICED backends: both the hash-selected backend and
-//     the alternative need cost_per_hour > 0. Unpriced (0.0) backends are
-//     never preferred and never diverted from, so an unpriced fleet keeps
-//     pre-feature behavior exactly and a partially priced fleet only
-//     re-routes among priced backends.
-//   - The alternative must be strictly cheaper; equal cost keeps the hash
-//     choice (preserves deterministic spread within a tier).
-//   - Overload guard: candidates whose composite load exceeds
-//     median * load_imbalance_factor + load_imbalance_floor are skipped —
-//     the same "overloaded" definition apply_load_aware_selection uses —
-//     bounding the load imbalance the preference can create. Cost ties among
-//     eligible candidates break toward lower load.
-//
-// Unlike the Step 3/4 overrides, this runs BEFORE original_selected is
-// captured: the divert IS the miss-path selection, so the learned route pins
-// the prefix to the cheap backend and subsequent requests ART-hit warm on
-// the hardware that actually computed it. cost_per_hour is static operator
-// config, so this is a stable placement policy, not a transient divert.
-//
-// Rule #1: Lock-free — shard-local reads only.
-// Rule #4: vectors bounded by candidates.size() (≤ live backend count).
-static BackendId apply_hardware_cost_preference(
-    BackendId selected,
-    const std::vector<BackendId>& candidates,
-    const std::string& request_id)
+// The post-anchor decision (formerly sequential load-redirect -> cost-redirect
+// -> hardware-cost-preference overrides) is one weighted ranking; the pure
+// scorer lives in route_scorer.hpp and the helpers below turn shard-local
+// signals into its inputs. The allowance is the load hinge pivot: a candidate
+// at or under it pays no load penalty, so at neutral weights the anchor stays
+// put exactly where the former per-strategy override would have kept it.
+
+// Strategy load allowance over `loads` (the strategy-appropriate flavor,
+// index-aligned with the candidate set).
+//   BOUNDED_LOAD: cap - 1 where cap = max(1, ceil(avg * (1 + epsilon))) —
+//                 the former override diverted at load >= cap, and loads are
+//                 integral, so the hinge must open strictly above cap - 1.
+//   P2C:          least + p2c_load_bias (divert only when the anchor exceeds
+//                 the least-loaded candidate by more than the bias).
+//   JUMP/MODULAR: median * load_imbalance_factor + load_imbalance_floor (the
+//                 legacy relative threshold; auto-adapts to workload size).
+// Rule #1: Lock-free — pure arithmetic over caller-collected loads.
+static double compute_load_allowance(
+    RoutingConfig::HashStrategy strategy,
+    const std::vector<uint64_t>& loads)
 {
-    if (!g_shard_state || candidates.size() < 2) {
-        return selected;
+    if (!g_shard_state || loads.empty()) {
+        return 0.0;
     }
-    auto& state = *g_shard_state;
+    const auto& cfg = g_shard_state->config;
 
-    auto sel_it = state.backends.find(selected);
-    if (sel_it == state.backends.end()) {
-        return selected;
+    switch (strategy) {
+    case RoutingConfig::HashStrategy::BOUNDED_LOAD: {
+        uint64_t total = 0;
+        for (uint64_t l : loads) total += l;
+        double avg = static_cast<double>(total) / static_cast<double>(loads.size());
+        uint64_t cap = std::max(static_cast<uint64_t>(1),
+                                static_cast<uint64_t>(std::ceil(avg * (1.0 + cfg.bounded_load_epsilon))));
+        return static_cast<double>(cap) - 1.0;
     }
-    const double selected_cost = sel_it->second.cost_per_hour;
-    if (selected_cost <= 0.0) {
-        return selected;  // Selected backend is unpriced — no comparison possible
+    case RoutingConfig::HashStrategy::P2C: {
+        uint64_t least = *std::min_element(loads.begin(), loads.end());
+        return static_cast<double>(least + cfg.p2c_load_bias);
     }
-
-    // Composite loads, index-aligned with candidates; reused by the median
-    // computation (nth_element mutates, hence the copy) and the per-candidate
-    // guard below.
-    std::vector<uint64_t> loads;
-    loads.reserve(candidates.size());
-    for (BackendId id : candidates) {
-        loads.push_back(get_composite_backend_load(id));
+    case RoutingConfig::HashStrategy::JUMP:
+    case RoutingConfig::HashStrategy::MODULAR:
+    default: {
+        std::vector<uint64_t> sorted_loads = loads;  // nth_element mutates
+        size_t mid = sorted_loads.size() / 2;
+        std::nth_element(sorted_loads.begin(),
+                         sorted_loads.begin() + static_cast<ptrdiff_t>(mid),
+                         sorted_loads.end());
+        return static_cast<double>(sorted_loads[mid]) * cfg.load_imbalance_factor
+             + static_cast<double>(cfg.load_imbalance_floor);
     }
-    std::vector<uint64_t> sorted_loads = loads;
-    size_t mid = sorted_loads.size() / 2;
-    std::nth_element(sorted_loads.begin(), sorted_loads.begin() + static_cast<ptrdiff_t>(mid),
-                     sorted_loads.end());
-    const uint64_t threshold = static_cast<uint64_t>(
-        static_cast<double>(sorted_loads[mid]) * state.config.load_imbalance_factor)
-        + state.config.load_imbalance_floor;
-
-    // Cheapest strictly-cheaper priced candidate under the overload guard.
-    BackendId best_id = 0;
-    const BackendInfo* best_info = nullptr;
-    double best_cost = selected_cost;
-    uint64_t best_load = std::numeric_limits<uint64_t>::max();
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        const BackendId id = candidates[i];
-        if (id == selected) continue;
-        auto it = state.backends.find(id);
-        if (it == state.backends.end()) continue;
-        const double cost = it->second.cost_per_hour;
-        if (cost <= 0.0 || cost >= selected_cost) continue;
-        if (loads[i] > threshold) continue;
-        if (cost < best_cost || (cost == best_cost && loads[i] < best_load)) {
-            best_id = id;
-            best_info = &it->second;
-            best_cost = cost;
-            best_load = loads[i];
-        }
     }
-    if (best_id == 0) {
-        return selected;
-    }
-
-    state.stats.hardware_cost_diverts++;
-    log_router.debug("[{}] Hardware-cost preference: cache miss diverted from backend {} "
-                     "(gpu_tier='{}', cost={:.2f}/h) to backend {} (gpu_tier='{}', "
-                     "cost={:.2f}/h, load={})",
-                     request_id, selected, sel_it->second.gpu_tier, selected_cost,
-                     best_id, best_info->gpu_tier, best_cost, best_load);
-    return best_id;
 }
 
 // ============================================================================
@@ -1388,8 +1182,8 @@ inline int32_t jump_consistent_hash(uint64_t key, int32_t num_buckets) {
 // jump-hash bucket exceeds capacity, probe subsequent buckets until one
 // with headroom is found. Falls back to least-loaded on full saturation.
 //
-// This replaces apply_load_aware_selection() for BOUNDED_LOAD strategy —
-// load awareness is built into the hash selection itself.
+// Load awareness is built into the hash selection itself, so the post-anchor
+// load term does not re-apply to BOUNDED_LOAD hash anchors.
 //
 // Rule #1: Lock-free — all reads are shard-local plain integers.
 // Rule #4: probe loop bounded by live_backends.size().
@@ -2575,10 +2369,9 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     // 3. If no match in ART, we use consistent hashing on the prefix for
     //    deterministic routing. The route will be learned after success.
 
-    // Track which branch selected the backend for the single load-aware call below
+    // Track which branch selected the anchor for the scoring pass below
     BackendId selected = 0;
     bool art_hit = false;
-    const char* source = "hash";
     // Hash values only computed in the hash fallback path; declared here for debug logging
     uint64_t prefix_hash = 0;
     int32_t hash_index = 0;
@@ -2586,6 +2379,9 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     // gossiped residency is below threshold, we treat it as a likely miss and
     // exclude that (cache-cold) backend from the load-based fallback. 0 = none.
     BackendId residency_cold_backend = 0;
+    // ART anchor's reported residency (-1 = no signal); feeds the optional
+    // residency discount on the affinity term in the scoring pass.
+    double anchor_residency = -1.0;
 
     // Step 1: Try ART lookup for longest prefix match
     RadixTree* tree = state.tree.get();
@@ -2606,12 +2402,12 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 // route would pay a cache miss while believing we hit. Treat it
                 // as a miss and fall through to load-based selection, skipping
                 // this cache-cold backend (only when an alternative exists).
-                double residency = -1.0;
-                if (state.config.cache_residency_threshold > 0.0) {
-                    residency = get_cached_residency(art_backend);
+                if (state.config.cache_residency_threshold > 0.0 ||
+                    state.config.scoring.residency_weight > 0.0) {
+                    anchor_residency = get_cached_residency(art_backend);
                 }
-                bool cache_cold = (residency >= 0.0 &&
-                                   residency < state.config.cache_residency_threshold);
+                bool cache_cold = (anchor_residency >= 0.0 &&
+                                   anchor_residency < state.config.cache_residency_threshold);
 
                 if (cache_cold && live_backends.size() > 1) {
                     // Likely-stale route: downgrade to the hash/load fallback.
@@ -2621,7 +2417,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     state.stats.residency_downgrades++;
                     log_router.debug("[{}] ART backend {} cache-cold (residency={:.2f} < {:.2f}); "
                                      "downgrading prefix hit to load-based selection",
-                                     request_id, art_backend, residency,
+                                     request_id, art_backend, anchor_residency,
                                      state.config.cache_residency_threshold);
                     // Leave art_hit=false so Step 2 runs the load-based fallback.
                 } else {
@@ -2638,7 +2434,6 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
 
                     selected = art_backend;
                     art_hit = true;
-                    source = "ART";
                 }
             } else {
                 // Backend is dead/draining, fall through to hash-based selection
@@ -2720,12 +2515,9 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
             }
         }
 
-        // Hardware-cost preference: a miss recomputes the prefix wherever it
-        // lands, so prefer cheaper priced hardware (contract on the helper).
-        // Mutates `selected` — not final_backend — BEFORE original_selected
-        // is captured: the divert is the placement decision the route-learning
-        // policy should pin, unlike the transient Step 3/4 overrides.
-        selected = apply_hardware_cost_preference(selected, *candidates, request_id);
+        // Hardware-price placement (prefer cheaper hardware on a miss) is now
+        // a term in the scoring pass below — it still moves placement, not
+        // just dispatch, so the learned route pins to the cheap backend.
 
         // This is a cache miss — the route will be learned after successful response
         state.stats.cache_misses++;
@@ -2735,174 +2527,299 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         }
     }
 
-    // Step 3: Apply load-aware override.
-    // BOUNDED_LOAD and P2C have load awareness built in for both ART and hash paths.
-    // JUMP and MODULAR use the legacy median-based threshold.
+    // ========================================================================
+    // Unified weighted scoring: placement + dispatch over the live candidates
+    // ========================================================================
+    // One ranked pass replaces the former sequential overrides (load redirect,
+    // cost redirect, hardware-cost preference). Stable terms (prefix affinity,
+    // hardware price) pick the PLACEMENT — original_selected, what route
+    // learning pins. Transient terms (load hinge, cost-budget hinge) pick the
+    // DISPATCH — where this request goes. At the neutral default weights every
+    // term reduces to the former override's exact rule; see route_scorer.hpp
+    // for the term semantics and the default-weight parity contract.
     //
-    // All three paths respect the load_aware_routing toggle: when disabled,
-    // Step 3 is a no-op and routing returns the ART/hash choice unmodified.
-    // This matches the gating inside bounded_load_select / p2c_select /
-    // apply_load_aware_selection so the toggle has a single, consistent meaning.
-    BackendId final_backend = selected;
-    if (state.config.load_aware_routing) {
-        switch (state.config.hash_strategy) {
-        case RoutingConfig::HashStrategy::BOUNDED_LOAD: {
-            // For ART hits under bounded-load, check if the ART-selected backend
-            // exceeds the capacity cap. If so, fall back to bounded-load selection.
+    // Rule #1: Lock-free — shard-local reads only, synchronous throughout.
+    // Rule #4: scratch vectors bounded by live_backends.size() (≤ 256).
+    // Rule #17: all loops bounded by the live backend count (≤ 256, typically
+    //           <10) — well under the preemption threshold.
+
+    const ScoringWeights& weights = state.config.scoring;
+    const auto strategy = state.config.hash_strategy;
+    const bool median_strategy =
+        strategy == RoutingConfig::HashStrategy::JUMP ||
+        strategy == RoutingConfig::HashStrategy::MODULAR;
+
+    // The load term applies exactly where the former Step 3 did: to ART
+    // anchors (never load-vetted) and, under the load-blind JUMP/MODULAR
+    // strategies, to hash anchors too. BOUNDED_LOAD/P2C hash anchors were
+    // load-vetted during selection — that signal is spent; applying it again
+    // would double-count load on the miss path.
+    const bool load_term = state.config.load_aware_routing &&
+                           (art_hit || median_strategy);
+    const bool cost_term = state.config.cost_routing_enabled && estimated_cost > 0.0;
+
+    // Hardware-price preference is miss-only: a miss recomputes the prefix
+    // wherever it lands, so cheaper priced hardware wins; an ART hit stays on
+    // the cache-warm backend regardless of price (recompute cost dominates
+    // the hardware saving). Fires only between PRICED backends: unpriced
+    // (cost_per_hour == 0) backends are never preferred and never diverted
+    // from. A residency-downgraded backend is not a legal price target.
+    auto sel_it = state.backends.find(selected);
+    const double anchor_price =
+        (sel_it != state.backends.end()) ? sel_it->second.cost_per_hour : 0.0;
+    const size_t price_candidate_count =
+        live_backends.size() - (residency_cold_backend != 0 ? 1 : 0);
+    const bool price_term = !art_hit && weights.price_weight > 0.0 &&
+                            anchor_price > 0.0 && price_candidate_count >= 2;
+
+    // Fast path: with no active term nothing can outrank the anchor — the
+    // ranking degenerates to the anchor itself. Keeps the default-config
+    // BOUNDED_LOAD miss path (the hottest: every unlearned prefix) at
+    // pre-scorer cost.
+    if (!load_term && !cost_term && !price_term) {
+        if (!request_id.empty()) {
             if (art_hit) {
-                uint64_t total_load = 0;
-                for (BackendId id : live_backends) {
-                    total_load += get_capacity_adjusted_load(id, estimated_cost);
-                }
-                double avg = static_cast<double>(total_load) / static_cast<double>(live_backends.size());
-                uint64_t cap = std::max(static_cast<uint64_t>(1),
-                                        static_cast<uint64_t>(std::ceil(avg * (1.0 + state.config.bounded_load_epsilon))));
-                uint64_t sel_load = get_capacity_adjusted_load(selected, estimated_cost);
-                if (sel_load >= cap) {
-                    prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
-                    final_backend = bounded_load_select(prefix_hash, live_backends,
-                                                        state.config.bounded_load_epsilon, request_id,
-                                                        estimated_cost);
-                }
+                log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
+                                 request_id, tokens.size(), selected);
+            } else {
+                log_router.debug("[{}] Prefix affinity (hash): {} tokens, hash={}, index={}/{} -> backend {}",
+                                 request_id, prefix_len, prefix_hash, hash_index,
+                                 live_backends.size(), selected);
             }
-            // Hash path: already handled in step 2
-            break;
         }
-        case RoutingConfig::HashStrategy::P2C:
-            // For ART hits under P2C, check if ART-selected backend is overloaded
-            // vs the least-loaded alternative. Use same bias threshold.
-            //
-            // Metric alignment: compare capacity-adjusted loads to match
-            // p2c_select()'s primary/secondary comparison. Without this, the
-            // ART override would see a different (lower) "selected load" than
-            // the hash-fallback path, biasing against diversion when cache
-            // pressure is high.
-            if (art_hit && live_backends.size() >= 2) {
-                uint64_t sel_load = get_capacity_adjusted_load(selected, estimated_cost);
-                BackendId least_id = 0;
-                uint64_t least_load = UINT64_MAX;
-                for (BackendId id : live_backends) {
-                    uint64_t load = get_capacity_adjusted_load(id, estimated_cost);
-                    if (load < least_load) {
-                        least_load = load;
-                        least_id = id;
-                    }
-                }
-                if (least_id != 0 && least_id != selected &&
-                    least_load + state.config.p2c_load_bias < sel_load) {
-                    final_backend = least_id;
-                    g_shard_state->stats.load_aware_fallbacks++;
-                    if (g_metrics) {
-                        metrics().record_load_aware_fallback();
-                    }
-                    log_router.debug("[{}] P2C (ART override): backend {} has {} in-flight, "
-                                     "least-loaded backend {} has {} (bias={})",
-                                     request_id, selected, sel_load, least_id, least_load,
-                                     state.config.p2c_load_bias);
-                }
-            }
-            break;
-        case RoutingConfig::HashStrategy::JUMP:
-        case RoutingConfig::HashStrategy::MODULAR:
-        default:
-            // Legacy median-based load-aware override for both ART and hash paths
-            final_backend = apply_load_aware_selection(selected, live_backends, request_id, source);
-            break;
+        return {selected, art_hit, 0.0, false, false, false, 0.0, selected};
+    }
+
+    // Strategy-appropriate dispatch loads, index-aligned with live_backends:
+    // capacity-adjusted for BOUNDED_LOAD/P2C (matches the former Step 3
+    // comparisons), composite for the legacy JUMP/MODULAR median threshold.
+    std::vector<uint64_t> dispatch_loads;
+    dispatch_loads.reserve(live_backends.size());
+    for (BackendId id : live_backends) {
+        dispatch_loads.push_back(median_strategy
+                                     ? get_composite_backend_load(id)
+                                     : get_capacity_adjusted_load(id, estimated_cost));
+    }
+
+    const double allowance =
+        load_term ? compute_load_allowance(strategy, dispatch_loads) : 0.0;
+
+    // Anchor affinity: 1.0 for an ART hit, optionally discounted by reported
+    // cache-cooling (residency_weight > 0; the hard gate at
+    // cache_residency_threshold already ran in Step 1). Misses have no
+    // cache-warm candidate — the hash anchor holds its seat through the
+    // tie-break order alone, which is what preserves the deterministic hash
+    // spread at neutral weights.
+    double anchor_affinity = 0.0;
+    if (art_hit) {
+        anchor_affinity = 1.0;
+        if (weights.residency_weight > 0.0 && anchor_residency >= 0.0) {
+            anchor_affinity = std::max(
+                0.0, 1.0 - weights.residency_weight * (1.0 - anchor_residency));
         }
     }
 
-    // Track GPU-load-driven redirect for observability.
-    // Note: This is a heuristic — we check if GPU metrics existed for the original
-    // backend when a redirect happened, but the redirect may have been caused by
-    // local load alone. The metric is useful for "are GPU metrics influencing
-    // routing?" not precise per-redirect attribution.
+    // Cost-budget hinges (the former Step 4 triggers, as score penalties):
+    //   small requests (fast lane on): pressure above min_pressure * imbalance
+    //   all other requests:            projected pressure above the
+    //                                  compression-scaled budget ceiling
+    // When NO candidate has budget headroom the budget signal is saturated
+    // and uninformative: all hinges drop to zero so the anchor keeps its seat
+    // (the former "route anyway, best effort" path) and budget_exhausted is
+    // accounted. Budgets stay advisory — reservation itself is CostBudgetGuard.
+    bool small_request = false;
+    std::vector<double> cost_hinges;
+    std::vector<double> cost_pressures;
+    if (cost_term) {
+        small_request = estimated_cost < state.config.cost_routing_small_threshold &&
+                        state.config.cost_routing_fast_lane;
+        const double max_budget = state.config.cost_routing_max_cost;
+        cost_hinges.assign(live_backends.size(), 0.0);
+        cost_pressures.assign(live_backends.size(), 0.0);
+
+        double min_pressure = std::numeric_limits<double>::max();
+        for (size_t i = 0; i < live_backends.size(); ++i) {
+            cost_pressures[i] = get_backend_cost(live_backends[i]) / max_budget;
+            min_pressure = std::min(min_pressure, cost_pressures[i]);
+        }
+
+        if (small_request) {
+            const double imbalance = state.config.cost_routing_imbalance_factor;
+            for (size_t i = 0; i < live_backends.size(); ++i) {
+                cost_hinges[i] =
+                    std::max(0.0, cost_pressures[i] - min_pressure * imbalance);
+            }
+        } else {
+            bool any_headroom = false;
+            for (size_t i = 0; i < live_backends.size(); ++i) {
+                auto it = state.backends.find(live_backends[i]);
+                const double compression =
+                    (it != state.backends.end()) ? it->second.compression_ratio : 1.0;
+                const double budget =
+                    (it != state.backends.end()) ? it->second.current_cost_budget : 0.0;
+                const double press_after =
+                    (budget + estimated_cost) / (max_budget * compression);
+                cost_hinges[i] = std::max(0.0, press_after - 1.0);
+                if (cost_hinges[i] == 0.0) {
+                    any_headroom = true;
+                }
+            }
+            if (!any_headroom) {
+                std::fill(cost_hinges.begin(), cost_hinges.end(), 0.0);
+                state.stats.budget_exhausted++;
+                log_router.debug("[{}] Cost budget exhausted: all backends over budget, "
+                                 "routing best effort without the budget term",
+                                 request_id);
+            }
+        }
+    }
+
+    // Hardware-price advantages: eligibility encoded as advantage > 0 — both
+    // ends priced, strictly cheaper, and under the overload guard (the legacy
+    // median * load_imbalance_factor + floor definition over the eligible
+    // candidates' composite loads). Equal price keeps the hash choice; price
+    // ties among eligible candidates break toward lower composite load.
+    std::vector<double> price_advantages;
+    std::vector<uint64_t> composite_loads;
+    if (price_term) {
+        price_advantages.assign(live_backends.size(), 0.0);
+        composite_loads.resize(live_backends.size());
+        for (size_t i = 0; i < live_backends.size(); ++i) {
+            composite_loads[i] = get_composite_backend_load(live_backends[i]);
+        }
+        std::vector<uint64_t> guard_loads;
+        guard_loads.reserve(price_candidate_count);
+        for (size_t i = 0; i < live_backends.size(); ++i) {
+            if (live_backends[i] == residency_cold_backend) continue;
+            guard_loads.push_back(composite_loads[i]);
+        }
+        const double guard_threshold =
+            compute_load_allowance(RoutingConfig::HashStrategy::JUMP, guard_loads);
+
+        for (size_t i = 0; i < live_backends.size(); ++i) {
+            const BackendId id = live_backends[i];
+            if (id == selected || id == residency_cold_backend) continue;
+            auto it = state.backends.find(id);
+            if (it == state.backends.end()) continue;
+            const double price = it->second.cost_per_hour;
+            if (price <= 0.0 || price >= anchor_price) continue;
+            if (static_cast<double>(composite_loads[i]) > guard_threshold) continue;
+            price_advantages[i] = (anchor_price - price) / anchor_price;
+        }
+    }
+
+    std::vector<ScoreCandidate> scored;
+    scored.reserve(live_backends.size());
+    size_t anchor_index = 0;
+    for (size_t i = 0; i < live_backends.size(); ++i) {
+        ScoreCandidate c;
+        c.id = live_backends[i];
+        c.is_anchor = (c.id == selected);
+        if (c.is_anchor) {
+            anchor_index = i;
+        }
+        c.affinity = c.is_anchor ? anchor_affinity : 0.0;
+        c.load = static_cast<double>(dispatch_loads[i]);
+        c.load_allowance = allowance;
+        if (cost_term) {
+            c.cost_hinge = cost_hinges[i];
+            c.cost_pressure = cost_pressures[i];
+        }
+        if (price_term) {
+            c.price_advantage = price_advantages[i];
+            c.price_tiebreak_load = static_cast<double>(composite_loads[i]);
+        }
+        scored.push_back(c);
+    }
+
+    // BOUNDED_LOAD spillover order: when an ART anchor forfeits its
+    // allowance, the former override re-probed the jump-hash sequence and
+    // took the first under-cap candidate — a deterministic, cluster-
+    // consistent target. Probe ranks reproduce it through the comparator,
+    // filled only for under-allowance candidates so the saturated case falls
+    // through to the least-loaded tie-break.
+    if (load_term && strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD &&
+        art_hit && load_hinge(scored[anchor_index].load, allowance) > 0.0) {
+        prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
+        const auto n = static_cast<int32_t>(live_backends.size());
+        for (int32_t probe = 0; probe < n; ++probe) {
+            int32_t idx = jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n);
+            auto& cand = scored[static_cast<size_t>(idx)];
+            if (cand.probe_rank == std::numeric_limits<uint32_t>::max() &&
+                load_hinge(cand.load, allowance) == 0.0) {
+                cand.probe_rank = static_cast<uint32_t>(probe);
+            }
+        }
+    }
+
+    const ScoreDecision decision =
+        score_and_select(scored.data(), scored.size(), weights, load_term);
+    const BackendId placement_backend = scored[decision.placement].id;
+    const BackendId final_backend = scored[decision.dispatch].id;
+
+    // Placement divert == the hardware-price preference fired. Stable and
+    // learned: original_selected follows it so the route pins the prefix to
+    // the backend that actually computes it.
+    if (placement_backend != selected) {
+        state.stats.hardware_cost_diverts++;
+        auto placed_it = state.backends.find(placement_backend);
+        log_router.debug("[{}] Hardware-cost preference: cache miss diverted from backend {} "
+                         "(gpu_tier='{}', cost={:.2f}/h) to backend {} (gpu_tier='{}', "
+                         "cost={:.2f}/h)",
+                         request_id, selected,
+                         sel_it != state.backends.end() ? sel_it->second.gpu_tier : "",
+                         anchor_price, placement_backend,
+                         placed_it != state.backends.end() ? placed_it->second.gpu_tier : "",
+                         placed_it != state.backends.end() ? placed_it->second.cost_per_hour : 0.0);
+    }
+
     bool was_load_redirect = false;
     double load_at_decision = 0.0;
-    if (final_backend != selected) {
-        auto gpu_score = get_cached_gpu_load(selected);
+    if (decision.load_diverted) {
+        // Every load-driven dispatch divert counts here. (The former
+        // BOUNDED_LOAD re-probe under-counted diverts that landed on the
+        // primary hash bucket; the counter is unified — decisions unchanged.)
+        state.stats.load_aware_fallbacks++;
+        if (g_metrics) {
+            metrics().record_load_aware_fallback();
+        }
+        // GPU-presence heuristic preserved from the former pipeline: answers
+        // "are GPU metrics influencing routing?", not precise per-redirect
+        // attribution.
+        auto gpu_score = get_cached_gpu_load(placement_backend);
         if (gpu_score >= 0.0) {
-            // GPU metrics were present when this redirect occurred
             was_load_redirect = true;
             load_at_decision = gpu_score;
-            g_shard_state->stats.gpu_load_redirects++;
+            state.stats.gpu_load_redirects++;
             log_router.debug("[{}] GPU load redirect: backend {} overloaded (gpu_load={:.2f}), "
                              "redirected to backend {}",
-                             request_id, selected, gpu_score, final_backend);
+                             request_id, placement_backend, gpu_score, final_backend);
+        } else {
+            log_router.debug("[{}] Load-aware divert: backend {} over allowance "
+                             "(load={:.1f} > {:.1f}), routing to backend {}",
+                             request_id, placement_backend,
+                             scored[decision.placement].load, allowance, final_backend);
         }
     }
 
-    // ====================================================================
-    // Step 4: Cost-aware override
-    // ====================================================================
-    // Only runs when cost_routing.enabled is true and estimated_cost > 0.
-    // Overlays on top of Steps 1-3 — does NOT modify ART or hash strategies.
-    //
-    // 4a. Small request fast lane: route cheap requests to least-cost backend
-    // 4b. Large request budget check: avoid overloading already expensive backends
-    // Note: cost budget reservation is handled by CostBudgetGuard in http_controller
     bool was_cost_redirect = false;
     bool was_fast_lane = false;
     double cost_at_decision = 0.0;
-
-    if (g_shard_state && state.config.cost_routing_enabled && estimated_cost > 0.0) {
-        double selected_cost = 0.0;
-        double selected_compression = 1.0;
-        auto sel_it = state.backends.find(final_backend);
-        if (sel_it != state.backends.end()) {
-            selected_cost = sel_it->second.current_cost_budget;
-            selected_compression = sel_it->second.compression_ratio;
-        }
-        double max_budget = state.config.cost_routing_max_cost;
-        cost_at_decision = selected_cost;
-
-        // 4a. Small request fast lane
-        if (estimated_cost < state.config.cost_routing_small_threshold &&
-            state.config.cost_routing_fast_lane) {
-
-            auto [least_cost_id, least_cost] = get_least_cost_backend(live_backends);
-            if (least_cost_id != 0 && least_cost_id != final_backend &&
-                selected_cost > least_cost * state.config.cost_routing_imbalance_factor) {
-                BackendId prev = final_backend;
-                final_backend = least_cost_id;
-                was_cost_redirect = true;
+    if (cost_term) {
+        cost_at_decision = get_backend_cost(final_backend);
+        if (decision.cost_diverted) {
+            was_cost_redirect = true;
+            state.stats.cost_redirects++;
+            if (small_request) {
                 was_fast_lane = true;
-                cost_at_decision = get_backend_cost(final_backend);
-                state.stats.cost_redirects++;
                 state.stats.fast_lane_routes++;
-                log_router.debug("[{}] Cost fast lane: backend {} cost={:.1f} > {:.1f}*{:.1f}, "
-                                 "redirected small request (cost={:.1f}) to backend {} (cost={:.1f})",
-                                 request_id, prev, selected_cost,
-                                 least_cost, state.config.cost_routing_imbalance_factor,
-                                 estimated_cost, least_cost_id, least_cost);
             }
+            log_router.debug("[{}] Cost-budget divert: backend {} (hinge={:.3f}) -> "
+                             "backend {} (budget={:.1f}, fast_lane={})",
+                             request_id, placement_backend,
+                             scored[decision.placement].cost_hinge,
+                             final_backend, cost_at_decision, was_fast_lane);
         }
-        // 4b. Large request budget check
-        // Scale budget ceiling by selected backend's compression ratio:
-        // compressed backends have more effective KV-cache capacity.
-        else {
-            double effective_max = max_budget * selected_compression;
-            if (selected_cost + estimated_cost > effective_max) {
-                auto alt = find_backend_with_budget(live_backends, estimated_cost,
-                                                    max_budget, final_backend);
-                if (alt.has_value()) {
-                    BackendId prev = final_backend;
-                    final_backend = *alt;
-                    was_cost_redirect = true;
-                    cost_at_decision = get_backend_cost(final_backend);
-                    state.stats.cost_redirects++;
-                    log_router.debug("[{}] Cost budget redirect: backend {} budget={:.1f} + cost={:.1f} > max={:.1f}, "
-                                     "redirected to backend {} (budget={:.1f})",
-                                     request_id, prev, selected_cost, estimated_cost, effective_max,
-                                     *alt, get_backend_cost(*alt));
-                } else {
-                    // No backend has budget — route anyway (best effort, advisory budget)
-                    state.stats.budget_exhausted++;
-                    log_router.debug("[{}] Cost budget exhausted: all backends over budget, "
-                                     "routing to backend {} anyway (best effort)",
-                                     request_id, final_backend);
-                }
-            }
-        } // else (large request path)
     }
 
     if (!request_id.empty() && final_backend == selected && !was_cost_redirect) {
@@ -2916,7 +2833,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     }
 
     return {final_backend, art_hit, load_at_decision, was_load_redirect,
-            was_cost_redirect, was_fast_lane, cost_at_decision, selected};
+            was_cost_redirect, was_fast_lane, cost_at_decision, placement_backend};
 }
 
 std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<int32_t>& tokens,

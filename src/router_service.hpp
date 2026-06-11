@@ -83,19 +83,20 @@ struct RouteResult {
     std::string error_message;            // Non-empty if backend_id is nullopt
 
     // GPU load observability (populated when vLLM metrics influence routing)
-    double backend_load_at_decision = 0.0;  // Composite load when route was chosen
-    bool was_load_redirect = false;          // True if load-aware override changed the backend
+    double backend_load_at_decision = 0.0;  // GPU load score when a load divert fired
+    bool was_load_redirect = false;          // True if the load term moved dispatch off placement
 
     // Cost-based routing observability (populated when cost routing is enabled)
-    bool was_cost_redirect = false;          // True if cost budget changed backend
-    bool was_fast_lane = false;              // True if small-request fast lane was used
+    bool was_cost_redirect = false;          // True if the cost-budget term moved dispatch
+    bool was_fast_lane = false;              // True if a small request was cost-diverted
     double backend_cost_at_decision = 0.0;   // Cost budget when route was chosen
 
-    // The ART/hash choice BEFORE Step 3/4 transient overrides (load + cost
-    // redirects). Equal to backend_id when no divert occurred. Lets the
-    // route-learning policy preserve consistent-hash cache affinity instead
-    // of pinning prefixes to load-driven targets. Zero when no backend was
-    // selected.
+    // The PLACEMENT winner of the unified route score: the stable choice
+    // (anchor, possibly moved by the hardware-price term) before the
+    // transient load/cost terms pick the dispatch target. Equal to
+    // backend_id when no transient divert occurred. Lets the route-learning
+    // policy pin prefixes to stable placement instead of load-driven
+    // targets. Zero when no backend was selected.
     BackendId original_selected = 0;
 
     // Number of tokens of the input prefix that were matched (cache_hit
@@ -112,18 +113,20 @@ struct PrefixRouteResult {
     std::optional<BackendId> backend_id;  // Selected backend (nullopt if no backends)
     bool art_hit = false;                 // True only when ART lookup found a live backend
 
-    // GPU load observability (populated in Step 3 when load-aware override fires)
-    double backend_load_at_decision = 0.0;  // Composite load of originally-selected backend
-    bool was_load_redirect = false;          // True if load-aware override changed the backend
+    // GPU load observability (populated when the score's load term diverts)
+    double backend_load_at_decision = 0.0;  // GPU load score of the placement backend
+    bool was_load_redirect = false;          // True if the load term moved dispatch off placement
 
-    // Cost-based routing observability (populated in Step 4 when cost override fires)
-    bool was_cost_redirect = false;          // True if cost budget changed backend
-    bool was_fast_lane = false;              // True if small-request fast lane was used
+    // Cost-based routing observability (populated when cost routing is enabled)
+    bool was_cost_redirect = false;          // True if the cost-budget term moved dispatch
+    bool was_fast_lane = false;              // True if a small request was cost-diverted
     double backend_cost_at_decision = 0.0;   // Cost budget when route was chosen
 
-    // The ART/hash choice BEFORE Step 3/4 transient overrides. For BOUNDED_LOAD
-    // and P2C this is the post-probe / post-secondary result — internal probing
-    // is part of the strategy itself, not a transient divert.
+    // The PLACEMENT winner of the unified route score (see route_scorer.hpp):
+    // the ART/hash anchor, possibly moved by the stable hardware-price term.
+    // For BOUNDED_LOAD and P2C the anchor is the post-probe / post-secondary
+    // result — internal probing is part of the strategy itself, not a
+    // transient divert.
     BackendId original_selected = 0;
 
     // See RouteResult::matched_prefix_depth. Mirrored here so route_request()

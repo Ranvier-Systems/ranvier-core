@@ -519,6 +519,173 @@ TEST_F(RouterServiceTest, ResidencyDowngradedMissPrefersCheapestEligible) {
 }
 
 // =============================================================================
+// 1d. Unified Weighted Scoring (default-weight parity + tunability)
+// =============================================================================
+// The post-anchor decision is one weighted ranking (route_scorer.hpp). At the
+// neutral default weights it must reproduce the former per-strategy override
+// rules exactly; the new RoutingConfig::scoring weights then shift behavior
+// continuously. These cases pin both through the public routing API.
+
+TEST_F(RouterServiceTest, JumpLoadDivertGoesToLeastLoadedAtDefaults) {
+    cfg_.load_aware_routing = true;  // fixture default is off
+    recreate_router(cfg_);
+    register_three_backends();
+    std::vector<int32_t> tokens = {131, 132, 133, 134};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Loads [7, 1, 0]: median 1 -> threshold 1*2 + 2 = 4; 7 > 4 diverts to
+    // the least-loaded backend. The hit flag survives (the route WAS warm;
+    // the divert is transient) and placement stays on the warm backend.
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 7; ++i) guards.emplace_back(1);
+    guards.emplace_back(2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 3);
+    EXPECT_TRUE(result.cache_hit);
+    EXPECT_EQ(result.original_selected, 1);
+    // No GPU metrics in shard state: the gpu-presence heuristic keeps the
+    // load-redirect flag clear even though the divert happened.
+    EXPECT_FALSE(result.was_load_redirect);
+}
+
+TEST_F(RouterServiceTest, JumpLoadKeepsAnchorWithinThresholdAtDefaults) {
+    cfg_.load_aware_routing = true;
+    recreate_router(cfg_);
+    register_three_backends();
+    std::vector<int32_t> tokens = {135, 136, 137, 138};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Loads [3, 1, 0]: median 1 -> threshold 4; 3 <= 4 keeps the warm route.
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 3; ++i) guards.emplace_back(1);
+    guards.emplace_back(2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+}
+
+TEST_F(RouterServiceTest, P2cArtOverrideKeepsAtBiasBoundaryDivertsAbove) {
+    cfg_.load_aware_routing = true;
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::P2C;
+    recreate_router(cfg_);
+    register_two_backends();
+    std::vector<int32_t> tokens = {141, 142, 143, 144};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Allowance = least(0) + bias(2). Load exactly AT the boundary keeps the
+    // anchor (the former trigger was strict: least + bias < load).
+    std::vector<BackendRequestGuard> guards;
+    guards.emplace_back(1);
+    guards.emplace_back(1);
+    auto at_boundary = router_->route_request(tokens);
+    ASSERT_TRUE(at_boundary.backend_id.has_value());
+    EXPECT_EQ(at_boundary.backend_id.value(), 1);
+
+    // One more in-flight request crosses the bias: divert to the idle backend.
+    guards.emplace_back(1);
+    auto above = router_->route_request(tokens);
+    ASSERT_TRUE(above.backend_id.has_value());
+    EXPECT_EQ(above.backend_id.value(), 2);
+    EXPECT_TRUE(above.cache_hit);
+    EXPECT_EQ(above.original_selected, 1);
+}
+
+TEST_F(RouterServiceTest, PrefixWeightKeepsWarmRouteUnderLoad) {
+    cfg_.load_aware_routing = true;
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::P2C;
+    cfg_.scoring.prefix_weight = 4.0;  // absorb up to 4 load units over allowance
+    recreate_router(cfg_);
+    register_two_backends();
+    std::vector<int32_t> tokens = {145, 146, 147, 148};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Hinge = 3 - (0 + 2) = 1 load unit over allowance: the neutral default
+    // diverts (previous test), but prefix_weight 4.0 buys the headroom.
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 3; ++i) guards.emplace_back(1);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+}
+
+TEST_F(RouterServiceTest, ResidencyWeightModulatesAffinityContinuously) {
+    cfg_.load_aware_routing = true;
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::P2C;
+    cfg_.cache_residency_threshold = 0.0;  // disable the hard gate
+    cfg_.scoring.prefix_weight = 2.0;
+    cfg_.scoring.residency_weight = 1.0;
+    recreate_router(cfg_);
+    register_two_backends();
+    std::vector<int32_t> tokens = {151, 152, 153, 154};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Hinge = 3 - 2 = 1. High residency keeps most of the 2.0 bonus:
+    // 2.0 * (1 - 1.0*(1-0.9)) = 1.8 > 1 -> keep.
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 3; ++i) guards.emplace_back(1);
+    RouterService::set_residency_for_testing(1, 0.9);
+    auto warm = router_->route_request(tokens);
+    ASSERT_TRUE(warm.backend_id.has_value());
+    EXPECT_EQ(warm.backend_id.value(), 1);
+
+    // Low residency melts the bonus: 2.0 * (1 - 0.9) = 0.2 < 1 -> divert.
+    RouterService::set_residency_for_testing(1, 0.1);
+    auto cooled = router_->route_request(tokens);
+    ASSERT_TRUE(cooled.backend_id.has_value());
+    EXPECT_EQ(cooled.backend_id.value(), 2);
+}
+
+TEST_F(RouterServiceTest, BoundedLoadArtOverCapDivertsOffWarmBackend) {
+    cfg_.load_aware_routing = true;
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+    recreate_router(cfg_);
+    register_three_backends();
+    std::vector<int32_t> tokens = {155, 156, 157, 158};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Loads [5, 0, 0]: cap = max(1, ceil(5/3 * 1.25)) = 3; 5 >= 3 forfeits
+    // the warm route. The spillover target is probe-order-deterministic, so
+    // only assert it left the over-cap backend.
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 5; ++i) guards.emplace_back(1);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_NE(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+    EXPECT_EQ(result.original_selected, 1);
+}
+
+TEST_F(RouterServiceTest, LoadAwareDisabledNeverDivertsRegardlessOfStrategy) {
+    // The fixture default (load_aware_routing=false) must hold under the
+    // scorer for every strategy: the warm route wins no matter the load skew.
+    for (auto strategy : {RoutingConfig::HashStrategy::JUMP,
+                          RoutingConfig::HashStrategy::P2C,
+                          RoutingConfig::HashStrategy::BOUNDED_LOAD}) {
+        cfg_.load_aware_routing = false;
+        cfg_.hash_strategy = strategy;
+        recreate_router(cfg_);
+        register_two_backends();
+        std::vector<int32_t> tokens = {161, 162, 163, 164};
+        RouterService::insert_route_for_testing(tokens, 1);
+
+        std::vector<BackendRequestGuard> guards;
+        for (int i = 0; i < 50; ++i) guards.emplace_back(1);
+
+        auto result = router_->route_request(tokens);
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 1)
+            << "strategy=" << static_cast<int>(strategy);
+    }
+}
+
+// =============================================================================
 // 2. Route TTL Expiration and Cleanup
 // =============================================================================
 // TTL cleanup requires the Seastar reactor (run_ttl_cleanup uses smp::submit_to).
