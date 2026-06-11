@@ -115,6 +115,37 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
   _Approach:_ HTTP callback endpoint (`POST /v1/cache/events`) + `X-Ranvier-Prefix-Hash` header echoing. Optional sidecar for engines that can't implement directly. New gossip packet type for cluster propagation.
   _Complexity:_ High (4 phases: MVP, cluster propagation, load events + sidecar, upstream engagement)
 
+- [ ] **Residency signal source: vLLM v1 usage gauge fires only at saturation (#527)**
+  _Justification:_ The residency downgrade keys off `1 - gpu_cache_usage_perc`, but vLLM v1's
+  gauge counts only blocks held by RUNNING requests (cached prefixes are reclaimable and report
+  as free), so the signal crosses the 0.2 threshold only under active-demand saturation — far
+  later than the intended "prefix likely evicted" condition, and never in lighter regimes.
+  Candidate replacement signals: (a) scrape-side prefix-cache hit counters
+  (`vllm:gpu_prefix_cache_{queries,hits}` deltas — cheap, per-backend, no engine changes), or
+  (b) the per-prefix push eviction events above (exact, heavier). Decide the signal direction
+  before further residency threshold tuning; the current signal is benchmarked and is a net tail
+  win in the regime where it fires.
+  _Benchmark evidence:_ `docs/benchmarks/cache-residency-ab-benchmark.md` — gauge semantics
+  measured 2026-06-11 (engine logs `Running: 0 reqs ... usage 0.0%` beside a 91% prefix-cache
+  hit rate); A/B at saturation: overall TTFT P99 −57.1% at a 0.2% downgrade rate.
+  _Location:_ `src/health_service.cpp` (scrape), `src/vllm_metrics.hpp`
+  (`estimated_prefix_retention`), `src/router_service.cpp` (downgrade gate)
+  _Complexity:_ Medium (scrape-side hit-rate signal) / High (push-events path)
+
+- [ ] **Revisit `vllm_metrics_timeout` default (200ms plausibly censors the scrape under load)**
+  _Justification:_ vLLM's Python `/metrics` endpoint slows precisely when the engine is busy, so
+  a 200ms fetch timeout risks failing the health scrape at the very instants the cache-usage
+  signal matters (residency #527, capacity headroom, `load_score`'s cache term). The benchmark
+  compose now overrides to 1000ms via `RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS`; decide whether
+  the shipped default should follow. Caveat for the implementer: `scrape_all_vllm_metrics()`
+  awaits backends sequentially, so a raised timeout times N slow backends could stretch the 5s
+  health cadence — check scrape concurrency (Hard Rule #2) alongside the default change.
+  _Benchmark evidence:_ at 1000ms under sustained saturation, 0 scrape failures across both A/B
+  legs (3024/3016 successes); 200ms-era failure rates were never directly measured — the
+  success/failed/suppressed counters are now printed per leg by `scripts/bench-residency-ab.sh`.
+  _Location:_ `src/config_infra.hpp` (default), `src/health_service.cpp`
+  _Complexity:_ Low (default change) / Medium (with scrape parallelization)
+
 - [ ] **Add partition healing with route reconciliation**
   _Justification:_ After partition heals, nodes have divergent route tables. Need incremental sync protocol to merge without full state transfer.
   _Location:_ `src/gossip_service.cpp`

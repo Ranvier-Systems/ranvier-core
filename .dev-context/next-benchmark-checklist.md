@@ -362,7 +362,8 @@ parses (sampler peak 88.6%!) but pressure is SPIKY, and spiky doesn't fire.**
    --max-tokens 400`** — decode holds KV blocks for seconds, prefill for an
    instant, so long overlapping decodes plateau the gauge instead of pulsing
    it. Product-default question (200ms scrape timeout vs busy-engine reality)
-   flagged for human decision alongside the signal-source question.
+   flagged for human decision alongside the signal-source question. **Both
+   now tracked in BACKLOG.md § 2.1 (next to the push-eviction item).**
 
 **⚠️ 2026-06-11 second hardware probe — ROOT CAUSE FOUND (finding 3 below):
 the residency signal has been parse-blind against vLLM 0.15.1 all along.**
