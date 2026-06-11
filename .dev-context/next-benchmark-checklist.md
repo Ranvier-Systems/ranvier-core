@@ -313,6 +313,35 @@ critical path.
 
 ### Experiment E — Cache-residency-aware routing (#527) under cache pressure [HARNESS READY — see 2026-06-10/11 updates]
 
+**⚠️ 2026-06-11 second hardware probe — ROOT CAUSE FOUND (finding 3 below):
+the residency signal has been parse-blind against vLLM 0.15.1 all along.**
+
+3. **`vllm:gpu_cache_usage_perc` does not match anything in 0.15.1's
+   /metrics** (vLLM v1 renamed it to `vllm:kv_cache_usage_perc`). Evidence:
+   the wrapper's KV-usage sampler — an independent grep of the same name —
+   got zero matches across an entire 8m probe while bench.sh's own health
+   checks proved the same host:ports were serving; and every run ever made
+   shows downgrades=0 with healthy gossip. `health_service.cpp` parsed only
+   the old name; an unmatched metric silently leaves
+   `gpu_cache_usage_percent = 0.0`, so **`residency_weight` broadcast a
+   constant 1.0 in every benchmark to date** — the prior "KV cache simply
+   never crossed the threshold" interpretation was wrong; the router never
+   saw the cache at all. Also affected by the same blindness: capacity-aware
+   hash fallback (`effective_cache_pressure` = 0) and `load_score`'s 0.3
+   cache term. (`num_requests_running/waiting` still exist in v1, so
+   load-aware routing itself was unaffected.) Fixes shipped:
+   - `health_service.cpp` accepts both names (old first, then
+     `vllm:kv_cache_usage_perc`).
+   - **`--build-image`** added to bench.sh + wrapper: forces a local image
+     build so branch C++ actually reaches the benchmark (GHCR tracks main;
+     an existing `ranvier:latest` was previously reused with only a note).
+     Any run of this branch MUST pass it.
+   - Sampler matches both names and records `nomatch` rows when an endpoint
+     responds without either; probe and A/B verdicts treat blind-signal runs
+     as INVALID with the exact diagnosis instead of "raise the pressure".
+   - Confirm the live gauge name with:
+     `curl -s localhost:8000/metrics | grep -iE '^vllm:.*(cache|usage)'`.
+
 **⚠️ 2026-06-11 first hardware run (Lambda 8x A100-40GB, vLLM 0.15.1) — two
 findings, both fixed in the harness:**
 

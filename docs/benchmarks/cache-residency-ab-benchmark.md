@@ -89,6 +89,21 @@ the threshold on hot backends and evictions are continuous.
 
 ## What `gpu_cache_usage_perc` actually measures (vLLM v1 — critical)
 
+**Finding 0 — the gauge was renamed and the scrape parsed nothing.** vLLM v1
+renamed `vllm:gpu_cache_usage_perc` → `vllm:kv_cache_usage_perc`. Against
+0.15.1, a probe's KV-usage sampler found **zero** occurrences of the old name
+while the same endpoints served `/health`, and Ranvier's health scrape looked
+for the same single name — leaving `gpu_cache_usage_percent` at its 0.0
+default, i.e. `residency_weight` broadcast a constant **1.0** in every
+benchmark to date. The scrape now accepts both names (`health_service.cpp`);
+the wrapper's sampler matches both and records `nomatch` rows when an endpoint
+responds without either, so a blind-signal run is called out as INVALID
+instead of read as "no pressure". **When running from a branch that carries
+this C++ fix, pass `--build-image`** — otherwise bench.sh reuses a stale
+`ranvier:latest` (or pulls GHCR, which tracks main) and the servers won't have
+the parser. Confirm the live name on your vLLM build with:
+`curl -s localhost:8000/metrics | grep -iE '^vllm:.*(cache|usage)'`.
+
 **Empirical finding (2026-06-11, Lambda 8x A100-40GB, vLLM 0.15.1):** the
 engine log printed, after minutes of heavy prefix traffic,
 
@@ -166,11 +181,13 @@ Everything is wrapped in **`scripts/bench-residency-ab.sh`** (run from the
 repo root on the GPU box, `HF_TOKEN` exported):
 
 ```bash
-# 1. Pressure probe (~8m + model load): verifies downgrades actually fire
-./scripts/bench-residency-ab.sh --probe-only
+# 1. Pressure probe (~8m + model load): verifies downgrades actually fire.
+#    --build-image rebuilds ranvier:latest from this checkout — required while
+#    the dual-name cache-usage parser fix lives on this branch.
+./scripts/bench-residency-ab.sh --probe-only --build-image
 
 # 2. Full A/B (probe again, then OFF and ON legs, 30m each + warmup):
-./scripts/bench-residency-ab.sh
+./scripts/bench-residency-ab.sh --build-image
 
 # Or in one go with explicit knobs (example for an 8x A100-40GB box):
 ./scripts/bench-residency-ab.sh \

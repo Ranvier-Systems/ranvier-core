@@ -69,6 +69,7 @@ ORDER="off-first"
 MAX_MODEL_LEN="8192"
 TP_SIZE=""
 PREFIX_MAX_TOKENS=""
+BUILD_IMAGE=false
 EXTRA_BENCH_ARGS=""
 
 # Churn workload knobs (forwarded to bench.sh -> locust as env vars)
@@ -111,6 +112,11 @@ OPTIONS:
                            start when the native context can't fit in a small KV)
     --tp N                 Forwarded to bench.sh
     --prefix-max-tokens N  Forwarded to bench.sh
+    --build-image          Rebuild ranvier:latest from this checkout before the
+                           runs (forwarded to bench.sh). REQUIRED when the
+                           branch carries C++ changes — e.g. the dual-name
+                           cache-usage parser fix — or the servers run a stale
+                           build and the A/B is invalid.
     --churn-universe N     Churn prefix universe size (default: 200)
     --churn-active N       Active window size (default: 24)
     --churn-rotation-seconds N  Window advance period (default: 20)
@@ -176,6 +182,7 @@ while [[ $# -gt 0 ]]; do
         --churn-rotation-seconds) CHURN_ROT_SECS="$2"; shift 2 ;;
         --churn-step)       CHURN_STEP="$2"; shift 2 ;;
         --churn-seed)       CHURN_SEED_VAL="$2"; shift 2 ;;
+        --build-image)      BUILD_IMAGE=true; shift ;;
         --extra-bench-args) EXTRA_BENCH_ARGS="$2"; shift 2 ;;
         -h|--help)          print_help; exit 0 ;;
         *)                  log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -241,14 +248,20 @@ USAGE_SAMPLER_PID=""
 
 start_usage_sampler() {
     local out="$1"
-    echo "epoch,port,gpu_cache_usage_perc" > "$out"
+    echo "epoch,port,kv_cache_usage" > "$out"
     (
         while :; do
             ts=$(date +%s)
             for port in $(seq 8000 8015); do
-                v=$(curl -sf --max-time 1 "http://localhost:$port/metrics" 2>/dev/null \
-                    | awk '/^vllm:gpu_cache_usage_perc/ {print $NF; exit}' || true)
-                [[ -n "$v" ]] && echo "$ts,$port,$v"
+                # vLLM v1 renamed the gauge (gpu_ -> kv_); match either. A
+                # responding endpoint with NO match records "nomatch" — that
+                # distinguishes "metric renamed/absent" (Ranvier is blind too)
+                # from "backend not up yet" (no row at all).
+                body=$(curl -sf --max-time 2 "http://localhost:$port/metrics" 2>/dev/null || true)
+                [[ -z "$body" ]] && continue
+                v=$(printf '%s\n' "$body" \
+                    | awk '/^vllm:(gpu|kv)_cache_usage_perc/ {print $NF; exit}' || true)
+                echo "$ts,$port,${v:-nomatch}"
             done
             sleep 5
         done >> "$out"
@@ -265,12 +278,20 @@ stop_usage_sampler() {
 }
 trap stop_usage_sampler EXIT
 
-# Prints "<peak> <mean>" in percent across all samples, or "NA NA".
+# Prints "<peak> <mean> <nomatch_count>": peak/mean in percent across numeric
+# samples (or NA NA), plus how many scrapes responded WITHOUT the cache-usage
+# metric. nomatch>0 with no numeric samples means the metric name is wrong for
+# this vLLM build — the router's own scrape is blind to it as well.
 usage_summary() {
     local csv="$1"
-    if [[ ! -f "$csv" ]]; then echo "NA NA"; return; fi
-    awk -F, 'NR>1 && $3 != "" { if ($3+0 > max) max=$3+0; s+=$3; n++ }
-             END { if (n) printf "%.1f %.1f", max*100, s/n*100; else print "NA NA" }' "$csv"
+    if [[ ! -f "$csv" ]]; then echo "NA NA 0"; return; fi
+    awk -F, '
+        NR > 1 && $3 == "nomatch" { nm++ }
+        NR > 1 && $3 ~ /^[0-9.eE+-]+$/ { if ($3+0 > max) max=$3+0; s+=$3; n++ }
+        END {
+            if (n) printf "%.1f %.1f %d", max*100, s/n*100, nm+0
+            else   printf "NA NA %d", nm+0
+        }' "$csv"
 }
 
 # Assemble per-leg bench.sh args. $1 = residency threshold, $2 = leg output dir.
@@ -294,6 +315,9 @@ build_bench_args() {
     [[ -n "$MAX_MODEL_LEN" ]] && args+=(--max-model-len "$MAX_MODEL_LEN")
     [[ -n "$TP_SIZE" ]] && args+=(--tp "$TP_SIZE")
     [[ -n "$PREFIX_MAX_TOKENS" ]] && args+=(--prefix-max-tokens "$PREFIX_MAX_TOKENS")
+    if [[ "$BUILD_IMAGE" = true ]]; then
+        args+=(--build-image)
+    fi
     echo "${args[@]}"
 }
 
@@ -322,9 +346,15 @@ run_leg() {
     fi
     stop_usage_sampler
 
-    local peak_mean
-    peak_mean=$(usage_summary "$outdir/vllm_usage_samples.csv")
-    log_info "Leg '$label' sampled KV usage (peak mean %): $peak_mean  -> $outdir/vllm_usage_samples.csv"
+    local leg_peak leg_mean leg_nomatch
+    read -r leg_peak leg_mean leg_nomatch <<< "$(usage_summary "$outdir/vllm_usage_samples.csv")"
+    log_info "Leg '$label' sampled KV usage: peak ${leg_peak}%, mean ${leg_mean}%  -> $outdir/vllm_usage_samples.csv"
+    if [[ "$leg_peak" == "NA" && "$leg_nomatch" -gt 0 ]]; then
+        log_warn "vLLM /metrics responded ($leg_nomatch scrapes) but exposed neither"
+        log_warn "vllm:gpu_cache_usage_perc nor vllm:kv_cache_usage_perc — the residency"
+        log_warn "signal is blind on this vLLM build. Identify the real gauge name with:"
+        log_warn "  curl -s localhost:8000/metrics | grep -iE '^vllm:.*(cache|usage)'"
+    fi
 }
 
 # Print + record one leg's residency/gossip counters. $1 = leg dir.
@@ -376,7 +406,7 @@ if [[ "$SKIP_PROBE" = false ]]; then
     log_header "Probe Result"
     log_info "Report dir: ${PROBE_LEG:-<missing>}"
     leg_counters "$PROBE_LEG"
-    read -r PROBE_PEAK PROBE_MEAN <<< "$(usage_summary "$PROBE_DIR/vllm_usage_samples.csv")"
+    read -r PROBE_PEAK PROBE_MEAN PROBE_NOMATCH <<< "$(usage_summary "$PROBE_DIR/vllm_usage_samples.csv")"
     log_info "Sampled KV usage: peak ${PROBE_PEAK}%, mean ${PROBE_MEAN}% (residency fires above ${FIRE_PCT}% at threshold $THRESHOLD_ON)"
 
     if [[ "$PROBE_DOWNGRADES" == "NA" ]]; then
@@ -391,7 +421,32 @@ if [[ "$SKIP_PROBE" = false ]]; then
     if [[ "$PROBE_DOWNGRADES" == "0" ]]; then
         log_error "residency_route_downgrades_total == 0 — an A/B now would measure nothing."
 
-        if [[ "$PROBE_PEAK" != "NA" ]] && awk -v p="$PROBE_PEAK" -v f="$FIRE_PCT" 'BEGIN{exit !(p >= f)}'; then
+        if [[ "$PROBE_PEAK" == "NA" && "$PROBE_NOMATCH" -gt 0 ]]; then
+            # Root cause class, not a tuning problem: the cache-usage gauge is
+            # missing from this vLLM build's /metrics. Ranvier's health scrape
+            # looks for the same names, so residency_weight was a constant 1.0
+            # all run — no amount of pressure can fire the downgrade.
+            log_error "vLLM /metrics responded ($PROBE_NOMATCH scrapes) but exposed neither"
+            log_error "vllm:gpu_cache_usage_perc nor vllm:kv_cache_usage_perc. The router's"
+            log_error "scrape is blind to cache usage on this vLLM build — pressure tuning"
+            log_error "cannot help until the signal parses."
+            echo ""
+            log_info "Identify the real gauge name (fast — model weights are already cached):"
+            log_info "  curl -s localhost:8000/metrics | grep -iE '^vllm:.*(cache|usage)'"
+            log_info "with a vLLM instance up, and check the Ranvier image carries the"
+            log_info "dual-name parser fix (health_service.cpp): rerun with --build-image"
+            log_info "so ranvier:latest is rebuilt from this checkout."
+            exit 1
+        fi
+
+        if [[ "$PROBE_PEAK" == "NA" ]]; then
+            log_error "No KV-usage samples at all (endpoints never responded to the sampler"
+            log_error "while bench.sh's own health checks passed) — sampler environment issue."
+            log_info "Inspect: $PROBE_DIR/vllm_usage_samples.csv"
+            exit 1
+        fi
+
+        if awk -v p="$PROBE_PEAK" -v f="$FIRE_PCT" 'BEGIN{exit !(p >= f)}'; then
             # Gauge crossed the line at some sampled instant yet the router never
             # downgraded: the pressured windows were likely too brief for the 5s
             # health scrape, or ART hits aren't landing on pressured backends.
@@ -476,8 +531,13 @@ OFF_RECV=$(sum_metric "$OFF_PROM" "gossip_cache_states_received_total")
 ON_RECV=$(sum_metric "$ON_PROM" "gossip_cache_states_received_total")
 
 VALID=true
-read -r OFF_PEAK OFF_MEAN <<< "$(usage_summary "$OFF_DIR/vllm_usage_samples.csv")"
-read -r ON_PEAK ON_MEAN <<< "$(usage_summary "$ON_DIR/vllm_usage_samples.csv")"
+read -r OFF_PEAK OFF_MEAN OFF_NOMATCH <<< "$(usage_summary "$OFF_DIR/vllm_usage_samples.csv")"
+read -r ON_PEAK ON_MEAN ON_NOMATCH <<< "$(usage_summary "$ON_DIR/vllm_usage_samples.csv")"
+if [[ ( "$OFF_PEAK" == "NA" && "$OFF_NOMATCH" -gt 0 ) || ( "$ON_PEAK" == "NA" && "$ON_NOMATCH" -gt 0 ) ]]; then
+    log_error "INVALID: cache-usage gauge missing from vLLM /metrics in at least one leg —"
+    log_error "the residency signal was blind (constant 1.0); the legs measured nothing."
+    VALID=false
+fi
 echo "OFF leg ($OFF_LEG):"
 leg_counters "$OFF_LEG"
 echo "  kv_usage peak/mean: ${OFF_PEAK}% / ${OFF_MEAN}%"

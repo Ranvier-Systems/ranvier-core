@@ -311,6 +311,11 @@ EXTERNAL VLLM OPTIONS:
                             Example: --vllm-endpoints 10.0.0.1:8000,10.0.0.2:8000
 
 OTHER OPTIONS:
+    --build-image       Build ranvier:latest from this checkout before running
+                        (instead of reusing an existing image or pulling GHCR,
+                        which tracks main). REQUIRED when benchmarking C++
+                        changes from a branch — otherwise the run silently
+                        uses a stale server build.
     --skip-setup        Skip system configuration (for repeated runs)
     --dry-run           Show what would be done without executing
     --no-log            Disable full output logging (logging is ON by default)
@@ -477,6 +482,7 @@ VLLM_VERSION="$DEFAULT_VLLM_VERSION"
 TP_SIZE=1
 GPU_MEM_UTIL="0.85"
 CPUSET_OVERRIDE=""
+BUILD_IMAGE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -516,6 +522,7 @@ while [[ $# -gt 0 ]]; do
         --stop-timeout)   STOP_TIMEOUT="$2"; shift 2 ;;
         --cpuset)          CPUSET_OVERRIDE="$2"; shift 2 ;;
         --priority-queue) PRIORITY_QUEUE=true; shift ;;
+        --build-image)    BUILD_IMAGE=true; shift ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -1342,6 +1349,17 @@ if [[ "${DEBUG_BUILD:-}" == "true" ]]; then
     log_info "Debug build requested - building with debug symbols..."
     docker build --build-arg BUILD_TYPE=Debug -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
     log_ok "Ranvier image built (Debug)"
+elif [[ "$BUILD_IMAGE" = true ]]; then
+    # Forced local build: the only way branch C++ changes reach the benchmark
+    # (GHCR tracks main, and an existing ranvier:latest is reused blindly).
+    log_info "Building Ranvier image from this checkout (--build-image)..."
+    if docker build -t ranvier:latest -f Dockerfile.production . > /tmp/ranvier_image_build.log 2>&1; then
+        log_ok "Ranvier image built from commit $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+    else
+        log_error "Ranvier image build failed — tail of /tmp/ranvier_image_build.log:"
+        tail -20 /tmp/ranvier_image_build.log
+        exit 1
+    fi
 elif ! docker image inspect ranvier:latest &> /dev/null; then
     # Try to pull from GHCR first (much faster), fall back to local build
     log_info "Pulling Ranvier image from GHCR..."
@@ -1353,6 +1371,9 @@ elif ! docker image inspect ranvier:latest &> /dev/null; then
         docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
         log_ok "Ranvier image built"
     fi
+else
+    IMAGE_CREATED=$(docker image inspect -f '{{.Created}}' ranvier:latest 2>/dev/null | cut -dT -f1)
+    log_info "Using existing ranvier:latest (created ${IMAGE_CREATED:-unknown}) — pass --build-image to rebuild from this checkout"
 fi
 
 # Build locust image unconditionally: the locustfiles are baked into the image
