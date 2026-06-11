@@ -530,7 +530,10 @@ if [[ "$SKIP_PROBE" = false ]]; then
 
     log_ok "Probe PASSED: $PROBE_DOWNGRADES residency downgrades — pressure is real."
     if [[ "$PROBE_ONLY" = true ]]; then
-        log_ok "--probe-only: stopping here. Re-run with --skip-probe to do the A/B."
+        # The A/B only fires if it reuses the SAME pressure config the probe
+        # validated — echo the exact continuation so the flags aren't lost.
+        log_ok "--probe-only: stopping here. Run the A/B with the validated config:"
+        log_ok "  ${ORIGINAL_CMD/--probe-only/--skip-probe}"
         exit 0
     fi
 elif [[ "$PROBE_ONLY" = true ]]; then
