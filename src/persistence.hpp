@@ -35,6 +35,9 @@ struct BackendRecord {
     // the service layer (application.cpp replay) calls parse_backend_type()
     // and decides what to do with unknown values (Rule #7).
     std::string backend_type = "vllm";
+    // Persisted pool_role column, same raw-string discipline as backend_type
+    // (the replay path calls parse_pool_role()).
+    std::string pool_role = "unified";
 };
 
 struct RouteRecord {
@@ -99,7 +102,8 @@ public:
     // Backend operations
     virtual bool save_backend(BackendId id, const std::string& ip, uint16_t port,
                               uint32_t weight = 100, uint32_t priority = 0,
-                              const std::string& backend_type = "vllm") = 0;
+                              const std::string& backend_type = "vllm",
+                              const std::string& pool_role = "unified") = 0;
     virtual bool remove_backend(BackendId id) = 0;
     virtual std::vector<BackendRecord> load_backends() = 0;
 

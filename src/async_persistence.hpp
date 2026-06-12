@@ -75,6 +75,7 @@ struct SaveBackendOp {
     uint32_t weight;
     uint32_t priority;
     std::string backend_type;
+    std::string pool_role;
 };
 
 struct RemoveBackendOp {
@@ -229,7 +230,8 @@ public:
     void queue_save_route(std::span<const TokenId> tokens, BackendId backend_id);
     void queue_save_backend(BackendId id, const std::string& ip, uint16_t port,
                            uint32_t weight = 100, uint32_t priority = 0,
-                           const std::string& backend_type = "vllm");
+                           const std::string& backend_type = "vllm",
+                           const std::string& pool_role = "unified");
     void queue_remove_backend(BackendId id);
     void queue_remove_routes_for_backend(BackendId backend_id);
     void queue_clear_all();

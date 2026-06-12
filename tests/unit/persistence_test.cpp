@@ -160,6 +160,49 @@ TEST_F(PersistenceTest, BackendTypeUpdateOnInsertOrReplace) {
     EXPECT_EQ(backends[0].backend_type, "cerebras");
 }
 
+TEST_F(PersistenceTest, PoolRoleDefaultsToUnifiedWhenOmitted) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+    // Caller omitted pool_role → default "unified" applies (default arg),
+    // and pre-feature rows get the same value via the column default.
+    EXPECT_TRUE(store_->save_backend(1, "192.168.1.100", 11434, 100, 0, "vllm"));
+
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 1u);
+    EXPECT_EQ(backends[0].pool_role, "unified");
+}
+
+TEST_F(PersistenceTest, PoolRoleRoundTripsAndSurvivesReopen) {
+    // Verify the ADD COLUMN migration + serialization round-trips across a
+    // close/reopen cycle (simulates a process restart).
+    ASSERT_TRUE(store_->open(test_db_path_));
+    EXPECT_TRUE(store_->save_backend(1, "10.0.0.1", 8000, 100, 0, "vllm", "prefill"));
+    EXPECT_TRUE(store_->save_backend(2, "10.0.0.2", 8000, 100, 0, "vllm", "decode"));
+    EXPECT_TRUE(store_->save_backend(3, "10.0.0.3", 8000, 100, 0, "vllm", "unified"));
+    store_->close();
+
+    auto store2 = create_persistence_store();
+    ASSERT_TRUE(store2->open(test_db_path_));
+    auto backends = store2->load_backends();
+    ASSERT_EQ(backends.size(), 3u);
+    for (const auto& b : backends) {
+        if (b.id == 1) EXPECT_EQ(b.pool_role, "prefill");
+        else if (b.id == 2) EXPECT_EQ(b.pool_role, "decode");
+        else EXPECT_EQ(b.pool_role, "unified");
+    }
+    store2->close();
+}
+
+TEST_F(PersistenceTest, PoolRoleUpdateOnInsertOrReplace) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+    EXPECT_TRUE(store_->save_backend(1, "10.0.0.1", 8000, 100, 0, "vllm", "decode"));
+    // Operator relabels the pool: INSERT OR REPLACE must update pool_role.
+    EXPECT_TRUE(store_->save_backend(1, "10.0.0.1", 8000, 100, 0, "vllm", "prefill"));
+
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 1u);
+    EXPECT_EQ(backends[0].pool_role, "prefill");
+}
+
 // =============================================================================
 // Route Tests
 // =============================================================================

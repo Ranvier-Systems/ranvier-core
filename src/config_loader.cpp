@@ -1737,6 +1737,9 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 if (entry["cost_per_hour"]) {
                     sb.cost_per_hour = entry["cost_per_hour"].as<double>();
                 }
+                if (entry["pool_role"]) {
+                    sb.pool_role = entry["pool_role"].as<std::string>();
+                }
                 config.backends.entries.push_back(std::move(sb));
             }
         }
@@ -2087,6 +2090,11 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
             if (!std::isfinite(sb.cost_per_hour) || !(sb.cost_per_hour >= 0.0)) {
                 return "backends entry id=" + std::to_string(sb.id)
                     + " has invalid cost_per_hour (must be a finite value >= 0; 0 = unset)";
+            }
+            if (!parse_pool_role(sb.pool_role)) {
+                return "backends entry id=" + std::to_string(sb.id)
+                    + " has invalid pool_role '" + sb.pool_role
+                    + "' (must be one of: unified, prefill, decode)";
             }
             if (!seen_ids.insert(sb.id).second) {
                 return "backends has duplicate id=" + std::to_string(sb.id);

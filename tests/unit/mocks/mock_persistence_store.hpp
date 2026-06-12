@@ -18,7 +18,7 @@
 //   using ::testing::NiceMock;
 //   auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
 //   store->open("/tmp/test");
-//   EXPECT_CALL(*store, save_backend(_, _, _, _, _, _)).WillOnce(Return(true));
+//   EXPECT_CALL(*store, save_backend(_, _, _, _, _, _, _)).WillOnce(Return(true));
 
 #pragma once
 
@@ -46,7 +46,7 @@ public:
             .WillByDefault(Invoke([this]() { return _open; }));
 
         // Write operations return success by default
-        ON_CALL(*this, save_backend(_, _, _, _, _, _)).WillByDefault(Return(true));
+        ON_CALL(*this, save_backend(_, _, _, _, _, _, _)).WillByDefault(Return(true));
         ON_CALL(*this, remove_backend(_)).WillByDefault(Return(true));
         ON_CALL(*this, save_route(_, _)).WillByDefault(Return(true));
         ON_CALL(*this, remove_route(_)).WillByDefault(Return(true));
@@ -87,7 +87,7 @@ public:
     MOCK_METHOD(bool, save_backend,
                 (BackendId id, const std::string& ip, uint16_t port,
                  uint32_t weight, uint32_t priority,
-                 const std::string& backend_type),
+                 const std::string& backend_type, const std::string& pool_role),
                 (override));
     MOCK_METHOD(bool, remove_backend, (BackendId id), (override));
     MOCK_METHOD(std::vector<BackendRecord>, load_backends, (), (override));

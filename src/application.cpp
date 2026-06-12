@@ -515,8 +515,14 @@ seastar::future<> Application::load_persisted_state() {
                                   rec.id, rec.backend_type);
                 }
                 BackendType type = type_opt.value_or(BackendType::VLLM);
+                auto role_opt = parse_pool_role(rec.pool_role);
+                if (!role_opt) {
+                    log_main.warn("Backend {}: unknown persisted pool_role '{}' - defaulting to unified",
+                                  rec.id, rec.pool_role);
+                }
+                PoolRole role = role_opt.value_or(PoolRole::UNIFIED);
                 co_await _router->register_backend_global(rec.id, addr, rec.weight, rec.priority,
-                    /*supports_token_ids=*/true, /*compression_ratio=*/1.0, type);
+                    /*supports_token_ids=*/true, /*compression_ratio=*/1.0, type, role);
             } catch (...) {
                 failed_backends++;
                 try {
@@ -634,6 +640,10 @@ seastar::future<> Application::register_static_backends() {
                 co_await _router->set_backend_api_key_global(sb.id, std::move(api_key));
             }
 
+            // pool_role was validated by RanvierConfig::validate(); value_or
+            // is belt-and-braces for a future validation gap, not a real path.
+            PoolRole pool_role = parse_pool_role(sb.pool_role).value_or(PoolRole::UNIFIED);
+
             co_await _router->register_backend_global(
                 sb.id, addr, sb.weight, sb.priority,
                 // CEREBRAS / OPENAI_COMPATIBLE are auto-downgraded to false
@@ -642,7 +652,7 @@ seastar::future<> Application::register_static_backends() {
                 // would pass through — but those are typically registered
                 // via local-discovery, not static config.
                 /*supports_token_ids=*/true,
-                sb.compression_ratio, sb.type);
+                sb.compression_ratio, sb.type, pool_role);
 
             // Hardware-tier / cost fields ride a separate broadcast (same
             // posture as the API-key side-map) so BackendRegistry's abstract
@@ -761,13 +771,13 @@ void Application::init_k8s_discovery() {
     // listening when K8s discovery fires events, so this window is real).
     _k8s_discovery->set_register_callback(
         [this](BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority,
-               BackendType type, std::string api_key) -> seastar::future<> {
+               BackendType type, std::string api_key, PoolRole role) -> seastar::future<> {
             if (!api_key.empty()) {
                 co_await _router->set_backend_api_key_global(id, std::move(api_key));
             }
             co_await _router->register_backend_global(id, addr, weight, priority,
                                                        /*supports_token_ids=*/true,
-                                                       /*compression_ratio=*/1.0, type);
+                                                       /*compression_ratio=*/1.0, type, role);
         });
     _k8s_discovery->set_drain_callback(
         [this](BackendId id) {

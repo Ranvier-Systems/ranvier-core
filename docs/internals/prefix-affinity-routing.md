@@ -543,7 +543,25 @@ dispatch(b)  = placement(b)
 | `price_weight` | `1.0` | `RANVIER_SCORING_PRICE_WEIGHT` | Hardware-price preference strength; `0` disables the cache-miss cheaper-hardware divert. |
 | `slo_weight` | `0.0` | `RANVIER_SCORING_SLO_WEIGHT` | Reserved seam for a future latency/SLO term; parsed but not read. |
 
-**Default-weight parity:** at the defaults above, every term reduces to its legacy rule — the per-step keys (`bounded_load_epsilon`, `p2c_load_bias`, `load_imbalance_factor/floor`, `cache_residency_threshold`, `cost_routing.*`, per-backend `cost_per_hour`) keep their authority and an un-tuned config routes exactly as the former sequential override pipeline did. The weights are the seam for BACKLOG §20.1: precise KV-event residency (P0.1) grades `affinity(b)` per backend instead of gating it, pool-role awareness (P0.3) adds a dimension to the same pass, and an SLO term plugs into the reserved weight.
+**Default-weight parity:** at the defaults above, every term reduces to its legacy rule — the per-step keys (`bounded_load_epsilon`, `p2c_load_bias`, `load_imbalance_factor/floor`, `cache_residency_threshold`, `cost_routing.*`, per-backend `cost_per_hour`) keep their authority and an un-tuned config routes exactly as the former sequential override pipeline did. The weights are the seam for BACKLOG §20.1: precise KV-event residency (P0.1) grades `affinity(b)` per backend instead of gating it, and an SLO term plugs into the reserved weight. Pool-role awareness (P0.3, below) composes as a candidate *filter* on this same pass.
+
+## Pool-Role Routing (disaggregated prefill/decode)
+
+For fleets running disaggregated serving (separate prefill and decode pools; KV transfer between them belongs to the serving stack — NIXL/LMCache/Mooncake — not to Ranvier), each backend carries a `PoolRole`: `unified` (default), `prefill`, or `decode`. Role is a **hard eligibility filter** on the scoring pass, not a weight — topology is a constraint, not a preference:
+
+| Path | Rule |
+|---|---|
+| Cache miss (hash anchor) | Candidates are live `prefill` + `unified` backends only; fresh prefixes never land on decode pools. Composes with the residency-cold exclusion. |
+| ART hit | The anchor is honored regardless of role — a learned route to a decode pool is exactly the affinity the role exists for. |
+| Dispatch diverts (load/cost/price) | The dispatch set is the anchor plus role-eligible candidates; non-anchor decode pools never receive diverted traffic, and the load allowance is computed over that eligible set. |
+| `random` / `hash` modes, fail-open | Decode pools excluded (no affinity concept on those paths). |
+| Availability valve | If filtering would leave zero candidates (only decode pools live), the filter is waived for that request, a debug log fires, and `router_pool_role_fallbacks_total` counts it. Availability outranks topology — labeling can never introduce a new 503 mode. |
+
+An unlabeled fleet (all `unified`) routes bit-identically to before the field existed — the same "unset = untouched" posture as `cost_per_hour`.
+
+**Labeling sources:** K8s EndpointSlice annotation `ranvier.io/pool-role`, static-backend YAML `pool_role:`, admin API `POST /admin/backends?...&pool_role=prefill`. Role is part of registration proper (it survives re-registration; it is not a side-broadcast) and persists in SQLite alongside `backend_type`. Local discovery always registers `unified`.
+
+P0.1 sharpens this model: with exact per-backend block residency, decode-pool affinity becomes *measured* (the affinity term scores resident blocks) rather than learned-route-driven.
 
 ## References
 

@@ -70,6 +70,55 @@ inline std::optional<BackendType> parse_backend_type(std::string_view s) {
     return std::nullopt;
 }
 
+// Per-backend pool role for disaggregated prefill/decode serving (BACKLOG
+// §20.1 P0.3). Orthogonal to BackendType (engine class): a vLLM instance can
+// be a prefill worker, a decode worker, or a conventional unified server.
+//
+// Routing semantics (a hard eligibility FILTER on the unified route score,
+// not a weight — topology is a constraint, not a preference):
+//   UNIFIED  - eligible everywhere (the default; an unlabeled fleet routes
+//              exactly as before this field existed).
+//   PREFILL  - eligible for new-prefix placement (cache misses) and all
+//              dispatch diverts.
+//   DECODE   - never a fresh-miss or divert target; reached only through
+//              affinity (a learned/ART route pointing at it). KV transfer
+//              between pools belongs to the serving stack (NIXL/LMCache),
+//              not to Ranvier.
+// When filtering would leave zero candidates (only decode pools live),
+// routing falls back to the full live set — availability outranks topology.
+//
+// The persisted/admin/annotation form is the string (pool_role_to_string);
+// ordinals are pinned append-only and fixed to uint8_t in case a future
+// telemetry dimension keys on them. UNIFIED = 0 is the default-when-unset
+// sentinel and is permanent.
+enum class PoolRole : uint8_t {
+    UNIFIED = 0,
+    PREFILL = 1,
+    DECODE  = 2,
+    // Append only — add a new role at the next integer.
+};
+
+// Stable string form for PoolRole. Used by the SQLite schema, the admin API,
+// the ranvier.io/pool-role K8s annotation, and static-backend YAML. Keep in
+// sync with parse_pool_role().
+inline std::string_view pool_role_to_string(PoolRole r) {
+    switch (r) {
+        case PoolRole::UNIFIED: return "unified";
+        case PoolRole::PREFILL: return "prefill";
+        case PoolRole::DECODE:  return "decode";
+    }
+    return "unified";
+}
+
+// Inverse of pool_role_to_string(). Returns std::nullopt for unknown strings;
+// the service layer logs and defaults to UNIFIED (Rule #7).
+inline std::optional<PoolRole> parse_pool_role(std::string_view s) {
+    if (s == "unified") return PoolRole::UNIFIED;
+    if (s == "prefill") return PoolRole::PREFILL;
+    if (s == "decode")  return PoolRole::DECODE;
+    return std::nullopt;
+}
+
 // Per-backend hardware label. An operator-applied tag resolved at backend
 // registration — NOT inferred by the data plane (nothing in routing derives a
 // hardware regime). Defaults to UNSPECIFIED so the dimension degrades

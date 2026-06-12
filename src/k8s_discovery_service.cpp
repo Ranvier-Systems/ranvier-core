@@ -853,10 +853,11 @@ seastar::future<> K8sDiscoveryService::reconcile(std::vector<K8sEndpoint> discov
             // New endpoint
             operations.emplace_back(ep, true);
         } else {
-            // Check if endpoint changed (weight, priority, readiness)
+            // Check if endpoint changed (weight, priority, role, readiness)
             if (it->second.ready != ep.ready ||
                 it->second.weight != ep.weight ||
-                it->second.priority != ep.priority) {
+                it->second.priority != ep.priority ||
+                it->second.role != ep.role) {
                 operations.emplace_back(ep, false);
             }
         }
@@ -951,7 +952,8 @@ seastar::future<> K8sDiscoveryService::register_with_secret(
 
         co_await _register_callback(backend_id, addr,
                                      endpoint.weight, endpoint.priority,
-                                     endpoint.type, std::move(api_key));
+                                     endpoint.type, std::move(api_key),
+                                     endpoint.role);
     } catch (const std::exception& e) {
         log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
     }
@@ -1201,6 +1203,7 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
     uint32_t base_weight = K8S_DEFAULT_WEIGHT;
     uint32_t base_priority = K8S_DEFAULT_PRIORITY;
     BackendType base_type = BackendType::VLLM;
+    PoolRole base_role = PoolRole::UNIFIED;
     std::string base_secret_ref;
 
     // 1. Extract Annotations (Weight/Priority/Type/SecretRef)
@@ -1254,6 +1257,18 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
                                  K8S_ANNOTATION_BACKEND_TYPE, type_str);
                 }
             }
+            if (ann.HasMember(K8S_ANNOTATION_POOL_ROLE)
+                    && ann[K8S_ANNOTATION_POOL_ROLE].IsString()) {
+                const char* role_str = ann[K8S_ANNOTATION_POOL_ROLE].GetString();
+                auto role_opt = parse_pool_role(std::string_view(role_str));
+                if (role_opt) {
+                    base_role = *role_opt;
+                } else {
+                    log_k8s.warn("Annotation '{}' has unknown value '{}' - defaulting to unified "
+                                 "(valid: unified, prefill, decode)",
+                                 K8S_ANNOTATION_POOL_ROLE, role_str);
+                }
+            }
             if (ann.HasMember(K8S_ANNOTATION_API_KEY_SECRET_REF)
                     && ann[K8S_ANNOTATION_API_KEY_SECRET_REF].IsString()) {
                 base_secret_ref = ann[K8S_ANNOTATION_API_KEY_SECRET_REF].GetString();
@@ -1301,6 +1316,7 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
                         endpoint.weight = base_weight;
                         endpoint.priority = base_priority;
                         endpoint.type = base_type;
+                        endpoint.role = base_role;
                         endpoint.api_key_secret_ref = base_secret_ref;
                         endpoints.push_back(std::move(endpoint));
                     }

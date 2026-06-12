@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Disaggregated prefill/decode pool roles** (BACKLOG §20.1 P0.3) — Backends
+  carry a `pool_role` (`unified` default / `prefill` / `decode`) through
+  registration, acting as a hard eligibility filter on the unified route
+  score: fresh cache misses and load/cost/price diverts target only
+  prefill/unified backends; decode pools are affinity-only (reached via a
+  learned/ART route), preserving decode affinity while new turns go to
+  prefill. KV transfer between pools stays with the serving stack
+  (NIXL/LMCache). If only decode pools are live the filter is waived
+  (availability first) and `router_pool_role_fallbacks_total` counts it.
+  Unlabeled fleets route identically to before. Labeling:
+  `ranvier.io/pool-role` EndpointSlice annotation, static-backend YAML
+  `pool_role:`, admin `POST /admin/backends?...&pool_role=`; persisted in
+  SQLite (`pool_role` column, additive migration, default `unified`) and
+  surfaced in `GET /admin/backends`.
+
 ### Changed
 
 - **Unified weighted route scorer** (BACKLOG §20.1 P0.2) — The post-anchor

@@ -111,17 +111,26 @@ struct BackendInfo {
     std::string gpu_tier;
     double      cost_per_hour = 0.0;
 
+    // Disaggregated pool role (BACKLOG §20.1 P0.3). Routing-critical, so it
+    // is part of registration proper — NOT a side-broadcast like the labels
+    // above — and therefore survives re-registration with whatever the
+    // registration source says. DECODE pools are affinity-only routing
+    // targets (see PoolRole in types.hpp for the full contract).
+    PoolRole pool_role = PoolRole::UNIFIED;
+
     BackendInfo() = default;
 
     BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_,
                 bool supports_token_ids_ = true, double compression_ratio_ = 1.0,
-                BackendType type_ = BackendType::VLLM)
+                BackendType type_ = BackendType::VLLM,
+                PoolRole pool_role_ = PoolRole::UNIFIED)
         : addr(std::move(addr_))
         , weight(weight_)
         , priority(priority_)
         , supports_token_ids(supports_token_ids_)
         , compression_ratio(compression_ratio_)
-        , type(type_) {}
+        , type(type_)
+        , pool_role(pool_role_) {}
 };
 
 // ============================================================================
@@ -201,6 +210,8 @@ struct ShardLocalState {
         uint64_t residency_downgrades = 0;          // ART hits downgraded due to low gossiped residency
         // Hardware-cost-aware routing stats
         uint64_t hardware_cost_diverts = 0;         // Cache misses diverted to cheaper cost_per_hour backend
+        // Pool-role routing stats
+        uint64_t pool_role_fallbacks = 0;           // Decisions where only DECODE pools were live and the role filter was waived
 
         void reset() {
             cache_hits = 0;
@@ -233,6 +244,7 @@ struct ShardLocalState {
             headroom_redirects = 0;
             residency_downgrades = 0;
             hardware_cost_diverts = 0;
+            pool_role_fallbacks = 0;
         }
     } stats;
 
@@ -661,6 +673,17 @@ struct ShardLocalState {
             result.emplace_back(id, &it->second);
         }
         return result;
+    }
+
+    // True when this backend may receive non-affinity traffic (fresh misses,
+    // dispatch diverts, random/hash selection). DECODE pools are reachable
+    // only through an affinity anchor. Unknown ids resolve eligible:
+    // registration propagates across shards asynchronously, and dropping a
+    // mid-registration backend is worse than briefly treating it as unified
+    // (same posture as should_cache_routes_for).
+    bool role_eligible(BackendId id) const {
+        auto it = backends.find(id);
+        return it == backends.end() || it->second.pool_role != PoolRole::DECODE;
     }
 
     // Destructor ensures proper cleanup order
@@ -1724,7 +1747,15 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         seastar::metrics::make_counter("router_hardware_cost_diverts_total",
             [] { return g_shard_state ? g_shard_state->stats.hardware_cost_diverts : 0UL; },
             seastar::metrics::description("Total cache-miss requests diverted to a live backend "
-                                         "with lower operator-set cost_per_hour"))
+                                         "with lower operator-set cost_per_hour")),
+
+        // Counter: pool-role availability valve activations. Non-zero means
+        // requests needed a prefill/unified target but only DECODE pools were
+        // live — a topology gap the operator should see.
+        seastar::metrics::make_counter("router_pool_role_fallbacks_total",
+            [] { return g_shard_state ? g_shard_state->stats.pool_role_fallbacks : 0UL; },
+            seastar::metrics::description("Routing decisions where the pool-role filter was "
+                                         "waived because only decode-role backends were live"))
 
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
@@ -2252,6 +2283,26 @@ std::optional<BackendId> RouterService::get_random_backend() {
 
     auto live_infos = state.get_live_backend_infos();
 
+    // Pool-role filter: random selection has no affinity concept, so DECODE
+    // pools are excluded. Availability valve: if only decode pools are live,
+    // waive the filter — random/fail-open routing must not invent a 503.
+    {
+        std::vector<std::pair<BackendId, const BackendInfo*>> eligible;
+        eligible.reserve(live_infos.size());
+        for (const auto& entry : live_infos) {
+            if (entry.second->pool_role != PoolRole::DECODE) {
+                eligible.push_back(entry);
+            }
+        }
+        if (eligible.empty() && !live_infos.empty()) {
+            state.stats.pool_role_fallbacks++;
+            log_router.debug("Pool-role valve: only decode-role backends live; "
+                             "random selection over the full live set");
+        } else {
+            live_infos = std::move(eligible);
+        }
+    }
+
     // Pass 1: find the highest priority group (lowest priority number)
     // and accumulate its total weight — no heap allocation needed.
     uint32_t min_priority = std::numeric_limits<uint32_t>::max();
@@ -2351,10 +2402,22 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
     }
     if (prefix_len == 0) {
-        // No tokens to route on, fall back to first backend (not an ART hit)
+        // No tokens to route on — fall back to the first role-eligible
+        // backend (not an ART hit). A token-less request is fresh traffic,
+        // so DECODE pools are skipped here too; if only decode pools are
+        // live, the first one serves (same availability-first posture as
+        // the pool-role valve, without the stats/log ceremony on a
+        // degenerate path).
+        BackendId fallback = live_backends[0];
+        for (BackendId id : live_backends) {
+            if (state.role_eligible(id)) {
+                fallback = id;
+                break;
+            }
+        }
         PrefixRouteResult r;
-        r.backend_id = live_backends[0];
-        r.original_selected = live_backends[0];
+        r.backend_id = fallback;
+        r.original_selected = fallback;
         return r;
     }
 
@@ -2382,6 +2445,9 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     // ART anchor's reported residency (-1 = no signal); feeds the optional
     // residency discount on the affinity term in the scoring pass.
     double anchor_residency = -1.0;
+    // Pool-role availability valve: set when the miss path found only
+    // DECODE pools live and waived the role filter for this request.
+    bool role_valve = false;
 
     // Step 1: Try ART lookup for longest prefix match
     RadixTree* tree = state.tree.get();
@@ -2448,16 +2514,39 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     if (!art_hit) {
         prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
 
-        // When the ART hit was downgraded for low residency, drop the cache-cold
-        // backend from the candidate set so the load-based fallback routes
-        // elsewhere. The downgrade path above only fires when live_backends.size()
-        // > 1, so the filtered list is always non-empty here.
+        // Miss-path candidate filter, two composed exclusions:
+        //   - the residency-cold backend (the downgrade above only fires when
+        //     an alternative exists, so this exclusion alone never empties
+        //     the set);
+        //   - DECODE-role pools (fresh prefixes never land on decode — they
+        //     are affinity-only targets).
+        // Valve: if the role exclusion would empty the set, waive it for
+        // this request (availability outranks topology), keeping the cold
+        // exclusion whose non-empty guarantee holds on its own.
         const std::vector<BackendId>* candidates = &live_backends;
         std::vector<BackendId> filtered;
-        if (residency_cold_backend != 0 && live_backends.size() > 1) {
-            filtered.reserve(live_backends.size() - 1);
+        bool any_role_excluded = false;
+        for (BackendId id : live_backends) {
+            if (!state.role_eligible(id)) {
+                any_role_excluded = true;
+                break;
+            }
+        }
+        if (residency_cold_backend != 0 || any_role_excluded) {
+            filtered.reserve(live_backends.size());
             for (BackendId id : live_backends) {
-                if (id != residency_cold_backend) filtered.push_back(id);
+                if (id == residency_cold_backend) continue;
+                if (any_role_excluded && !state.role_eligible(id)) continue;
+                filtered.push_back(id);
+            }
+            if (filtered.empty()) {
+                role_valve = true;
+                state.stats.pool_role_fallbacks++;
+                log_router.debug("[{}] Pool-role valve: only decode-role backends live; "
+                                 "miss placement over the full live set", request_id);
+                for (BackendId id : live_backends) {
+                    if (id != residency_cold_backend) filtered.push_back(id);
+                }
             }
             candidates = &filtered;
         }
@@ -2590,12 +2679,27 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         return {selected, art_hit, 0.0, false, false, false, 0.0, selected};
     }
 
-    // Strategy-appropriate dispatch loads, index-aligned with live_backends:
+    // Dispatch candidate set: the anchor (whatever its role — an ART route to
+    // a DECODE pool is exactly the affinity that role exists for) plus the
+    // role-eligible live candidates. Non-anchor DECODE pools never receive
+    // diverted or fresh traffic; when the miss-path valve fired, roles are
+    // waived for this request. With an unlabeled fleet this is identical to
+    // live_backends. The allowance below is computed over this eligible set:
+    // load competition only makes sense among legal targets.
+    std::vector<BackendId> dispatch_ids;
+    dispatch_ids.reserve(live_backends.size());
+    for (BackendId id : live_backends) {
+        if (id == selected || role_valve || state.role_eligible(id)) {
+            dispatch_ids.push_back(id);
+        }
+    }
+
+    // Strategy-appropriate dispatch loads, index-aligned with dispatch_ids:
     // capacity-adjusted for BOUNDED_LOAD/P2C (matches the former Step 3
     // comparisons), composite for the legacy JUMP/MODULAR median threshold.
     std::vector<uint64_t> dispatch_loads;
-    dispatch_loads.reserve(live_backends.size());
-    for (BackendId id : live_backends) {
+    dispatch_loads.reserve(dispatch_ids.size());
+    for (BackendId id : dispatch_ids) {
         dispatch_loads.push_back(median_strategy
                                      ? get_composite_backend_load(id)
                                      : get_capacity_adjusted_load(id, estimated_cost));
@@ -2634,25 +2738,25 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         small_request = estimated_cost < state.config.cost_routing_small_threshold &&
                         state.config.cost_routing_fast_lane;
         const double max_budget = state.config.cost_routing_max_cost;
-        cost_hinges.assign(live_backends.size(), 0.0);
-        cost_pressures.assign(live_backends.size(), 0.0);
+        cost_hinges.assign(dispatch_ids.size(), 0.0);
+        cost_pressures.assign(dispatch_ids.size(), 0.0);
 
         double min_pressure = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < live_backends.size(); ++i) {
-            cost_pressures[i] = get_backend_cost(live_backends[i]) / max_budget;
+        for (size_t i = 0; i < dispatch_ids.size(); ++i) {
+            cost_pressures[i] = get_backend_cost(dispatch_ids[i]) / max_budget;
             min_pressure = std::min(min_pressure, cost_pressures[i]);
         }
 
         if (small_request) {
             const double imbalance = state.config.cost_routing_imbalance_factor;
-            for (size_t i = 0; i < live_backends.size(); ++i) {
+            for (size_t i = 0; i < dispatch_ids.size(); ++i) {
                 cost_hinges[i] =
                     std::max(0.0, cost_pressures[i] - min_pressure * imbalance);
             }
         } else {
             bool any_headroom = false;
-            for (size_t i = 0; i < live_backends.size(); ++i) {
-                auto it = state.backends.find(live_backends[i]);
+            for (size_t i = 0; i < dispatch_ids.size(); ++i) {
+                auto it = state.backends.find(dispatch_ids[i]);
                 const double compression =
                     (it != state.backends.end()) ? it->second.compression_ratio : 1.0;
                 const double budget =
@@ -2682,22 +2786,22 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     std::vector<double> price_advantages;
     std::vector<uint64_t> composite_loads;
     if (price_term) {
-        price_advantages.assign(live_backends.size(), 0.0);
-        composite_loads.resize(live_backends.size());
-        for (size_t i = 0; i < live_backends.size(); ++i) {
-            composite_loads[i] = get_composite_backend_load(live_backends[i]);
+        price_advantages.assign(dispatch_ids.size(), 0.0);
+        composite_loads.resize(dispatch_ids.size());
+        for (size_t i = 0; i < dispatch_ids.size(); ++i) {
+            composite_loads[i] = get_composite_backend_load(dispatch_ids[i]);
         }
         std::vector<uint64_t> guard_loads;
-        guard_loads.reserve(price_candidate_count);
-        for (size_t i = 0; i < live_backends.size(); ++i) {
-            if (live_backends[i] == residency_cold_backend) continue;
+        guard_loads.reserve(dispatch_ids.size());
+        for (size_t i = 0; i < dispatch_ids.size(); ++i) {
+            if (dispatch_ids[i] == residency_cold_backend) continue;
             guard_loads.push_back(composite_loads[i]);
         }
         const double guard_threshold =
             compute_load_allowance(RoutingConfig::HashStrategy::JUMP, guard_loads);
 
-        for (size_t i = 0; i < live_backends.size(); ++i) {
-            const BackendId id = live_backends[i];
+        for (size_t i = 0; i < dispatch_ids.size(); ++i) {
+            const BackendId id = dispatch_ids[i];
             if (id == selected || id == residency_cold_backend) continue;
             auto it = state.backends.find(id);
             if (it == state.backends.end()) continue;
@@ -2709,11 +2813,11 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     }
 
     std::vector<ScoreCandidate> scored;
-    scored.reserve(live_backends.size());
+    scored.reserve(dispatch_ids.size());
     size_t anchor_index = 0;
-    for (size_t i = 0; i < live_backends.size(); ++i) {
+    for (size_t i = 0; i < dispatch_ids.size(); ++i) {
         ScoreCandidate c;
-        c.id = live_backends[i];
+        c.id = dispatch_ids[i];
         c.is_anchor = (c.id == selected);
         if (c.is_anchor) {
             anchor_index = i;
@@ -2741,7 +2845,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     if (load_term && strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD &&
         art_hit && load_hinge(scored[anchor_index].load, allowance) > 0.0) {
         prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
-        const auto n = static_cast<int32_t>(live_backends.size());
+        const auto n = static_cast<int32_t>(dispatch_ids.size());
         for (int32_t probe = 0; probe < n; ++probe) {
             int32_t idx = jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n);
             auto& cand = scored[static_cast<size_t>(idx)];
@@ -2852,6 +2956,24 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
     auto live_backends = state.get_live_backends();
     if (live_backends.empty()) {
         return std::nullopt;
+    }
+
+    // Pool-role filter: hash mode has no affinity concept, so DECODE pools
+    // are excluded. Valve: when only decode pools are live, waive the filter
+    // (availability outranks topology).
+    {
+        std::vector<BackendId> eligible;
+        eligible.reserve(live_backends.size());
+        for (BackendId id : live_backends) {
+            if (state.role_eligible(id)) eligible.push_back(id);
+        }
+        if (eligible.empty()) {
+            state.stats.pool_role_fallbacks++;
+            log_router.debug("[{}] Pool-role valve: only decode-role backends live; "
+                             "hash selection over the full live set", request_id);
+        } else if (eligible.size() != live_backends.size()) {
+            live_backends = std::move(eligible);
+        }
     }
 
     // Extract prefix (first N tokens)
@@ -3893,7 +4015,8 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
                                                           uint32_t weight, uint32_t priority,
                                                           bool supports_token_ids,
                                                           double compression_ratio,
-                                                          BackendType type) {
+                                                          BackendType type,
+                                                          PoolRole pool_role) {
     // Non-GPU backend classes don't speak vLLM's prompt_token_ids field;
     // forwarding it produces 400 rejections. Auto-downgrade so operators
     // don't have to set both flags consistently — type is the source of truth.
@@ -3920,23 +4043,35 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
                         id, backend_type_to_string(type));
     }
 
+    // Surface non-default topology once at registration: DECODE pools are
+    // affinity-only routing targets, an operationally significant property.
+    if (pool_role != PoolRole::UNIFIED) {
+        log_router.info("Backend {}: pool_role={} ({})", id, pool_role_to_string(pool_role),
+                        pool_role == PoolRole::DECODE
+                            ? "affinity-only: excluded from fresh-miss and divert targets"
+                            : "eligible for fresh-miss placement");
+    }
+
     return seastar::do_with(addr, weight, priority, supports_token_ids, compression_ratio, type,
+        pool_role,
         [id](seastar::socket_address& shared_addr, uint32_t& shared_weight,
              uint32_t& shared_priority, bool& shared_supports_token_ids,
-             double& shared_compression_ratio, BackendType& shared_type) {
+             double& shared_compression_ratio, BackendType& shared_type,
+             PoolRole& shared_pool_role) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [id, &shared_addr, &shared_weight, &shared_priority, &shared_supports_token_ids,
-             &shared_compression_ratio, &shared_type] (unsigned shard_id) {
+             &shared_compression_ratio, &shared_type, &shared_pool_role] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [id, addr = shared_addr,
                                                        weight = shared_weight,
                                                        priority = shared_priority,
                                                        supports_token_ids = shared_supports_token_ids,
                                                        compression_ratio = shared_compression_ratio,
-                                                       type = shared_type] {
+                                                       type = shared_type,
+                                                       pool_role = shared_pool_role] {
                 if (!g_shard_state) return seastar::make_ready_future<>();
                 auto& state = shard_state();
                 state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids,
-                                                  compression_ratio, type};
+                                                  compression_ratio, type, pool_role};
 
                 // Update vector (check for duplicates)
                 bool exists = false;
@@ -4163,6 +4298,7 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
         bs.supports_token_ids = info.supports_token_ids;
         bs.compression_ratio = info.compression_ratio;
         bs.type = info.type;
+        bs.pool_role = info.pool_role;
 
         if (info.is_draining) {
             // Convert steady_clock to wall-clock time:
@@ -4642,7 +4778,8 @@ void RouterService::register_backend_for_testing(BackendId id, seastar::socket_a
                                                    uint32_t weight, uint32_t priority,
                                                    bool supports_token_ids,
                                                    double compression_ratio,
-                                                   BackendType type) {
+                                                   BackendType type,
+                                                   PoolRole pool_role) {
     if (!g_shard_state) return;
     auto& state = *g_shard_state;
     // Mirror register_backend_global()'s auto-downgrade so tests see the
@@ -4652,7 +4789,7 @@ void RouterService::register_backend_for_testing(BackendId id, seastar::socket_a
         supports_token_ids = false;
     }
     state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids,
-                                      compression_ratio, type};
+                                      compression_ratio, type, pool_role};
 
     bool exists = false;
     for (auto existing : state.backend_ids) {
