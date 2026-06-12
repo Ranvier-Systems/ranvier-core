@@ -55,6 +55,9 @@ constexpr const char* K8S_ANNOTATION_API_KEY_SECRET_REF = "ranvier.io/api-key-se
 // Annotation key for disaggregated prefill/decode pools (BACKLOG §20.1 P0.3).
 // Values: "unified" (default) | "prefill" | "decode".
 constexpr const char* K8S_ANNOTATION_POOL_ROLE = "ranvier.io/pool-role";
+// Annotation key for the native KV-event stream port (BACKLOG §20.1 P0.1).
+// The subscriber connects to tcp://<pod-ip>:<port>; absent/0 = no stream.
+constexpr const char* K8S_ANNOTATION_KV_EVENTS_PORT = "ranvier.io/kv-events-port";
 
 // Conventional Secret data-map field that holds the API key. Operators run
 //   kubectl create secret generic my-key --from-literal=api-key=sk-...
@@ -97,6 +100,8 @@ struct K8sEndpoint {
     // Disaggregated pool role from the ranvier.io/pool-role annotation.
     // Default UNIFIED keeps unannotated fleets routing exactly as before.
     PoolRole role = PoolRole::UNIFIED;
+    // Native KV-event stream port (ranvier.io/kv-events-port). 0 = none.
+    uint16_t kv_events_port = 0;
     // Name of a K8s Secret whose `api-key` field holds the credential.
     // Empty string means "no auth header" — correct for vLLM on a cluster-
     // internal network. The Secret value is resolved at endpoint-discovery
@@ -118,7 +123,7 @@ struct K8sEndpoint {
 // callers that don't care can pass VLLM/""/UNIFIED.
 using BackendRegisterCallback = std::function<seastar::future<>(
     BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority,
-    BackendType type, std::string api_key, PoolRole role)>;
+    BackendType type, std::string api_key, PoolRole role, uint16_t kv_events_port)>;
 using BackendDrainCallback = std::function<seastar::future<>(BackendId id)>;
 
 // K8sDiscoveryService: Watches Kubernetes for GPU backend endpoints

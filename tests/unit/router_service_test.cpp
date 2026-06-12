@@ -13,6 +13,7 @@
 
 #include "router_service.hpp"
 #include "backend_registry.hpp"
+#include "parse_utils.hpp"
 #include "config.hpp"
 #include "radix_tree.hpp"
 #include "node_slab.hpp"
@@ -909,6 +910,126 @@ TEST_F(RouterServiceTest, PoolRoleToStringRoundTrip) {
     }
     EXPECT_FALSE(parse_pool_role("Prefill").has_value());  // case-sensitive
     EXPECT_FALSE(parse_pool_role("").has_value());
+}
+
+// =============================================================================
+// 1f. Native KV-Event Verified Residency
+// =============================================================================
+// When a backend's native KV stream is fresh, an ART hit is checked EXACTLY
+// against prefix_hash_index: present = verified resident (overrides the
+// probabilistic gossip gate), absent = verified evicted (downgrade fires with
+// certainty). Without freshness, the probabilistic path is unchanged.
+// Fixture note: block_alignment=1 and prefix_token_length=128, so the
+// request's routing hash is hash_prefix(tokens, tokens.size(), 1).
+
+TEST_F(RouterServiceTest, NativeVerifiedResidentOverridesProbabilisticGate) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {701, 702, 703, 704};
+    RouterService::insert_route_for_testing(tokens, 1);
+    // Gossip says nearly-evicted (would downgrade under the 0.2 default)...
+    RouterService::set_residency_for_testing(1, 0.01);
+    // ...but the native stream verifies the prefix IS resident.
+    RouterService::set_native_fresh_for_testing(1);
+    RouterService::update_prefix_hash_index_for_testing(
+        hash_prefix(tokens.data(), tokens.size(), 1), 1);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+}
+
+TEST_F(RouterServiceTest, NativeVerifiedEvictedDowngradesDespiteHighGossip) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {711, 712, 713, 714};
+    RouterService::insert_route_for_testing(tokens, 1);
+    // Gossip says plenty of residency (would keep the route)...
+    RouterService::set_residency_for_testing(1, 0.9);
+    // ...but the fresh native stream has no entry at this prefix: verified
+    // evicted, so the downgrade fires and the cold backend is skipped.
+    RouterService::set_native_fresh_for_testing(1);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 2);
+}
+
+TEST_F(RouterServiceTest, NoNativeFreshnessFallsBackToProbabilistic) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {721, 722, 723, 724};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.9);
+    // No native freshness: index absence means nothing; gossip keeps the route.
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+}
+
+TEST_F(RouterServiceTest, NativeVerifiedEvictedSingleBackendKeepsRoute) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    std::vector<int32_t> tokens = {731, 732, 733, 734};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_native_fresh_for_testing(1);
+
+    // Verified evicted but nowhere to divert: route anyway.
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+}
+
+TEST_F(RouterServiceTest, FreshnessTtlZeroDisablesVerifiedPath) {
+    cfg_.kv_residency_freshness_ttl = std::chrono::seconds(0);
+    recreate_router(cfg_);
+    register_two_backends();
+    std::vector<int32_t> tokens = {741, 742, 743, 744};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_native_fresh_for_testing(1);
+    // TTL 0 (the loader's value whenever kv_events is disabled): the verified
+    // path must never trigger, so the absent index entry is NOT an eviction.
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+}
+
+TEST_F(RouterServiceTest, ApplyNativeOpsLocalUpsertRemoveAndStaleness) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {751, 752, 753, 754};
+    RouterService::insert_route_for_testing(tokens, 1);
+    uint64_t h = hash_prefix(tokens.data(), tokens.size(), 1);
+
+    // UPSERT at t=1000 marks resident + fresh.
+    NativeKvOp upsert{NativeKvOp::Kind::UPSERT, 1, h, 1000};
+    RouterService::apply_native_kv_ops_local(&upsert, 1);
+    auto r1 = router_->route_request(tokens);
+    ASSERT_TRUE(r1.backend_id.has_value());
+    EXPECT_EQ(r1.backend_id.value(), 1);
+
+    // Stale REMOVE (t=500) must be ignored.
+    NativeKvOp stale{NativeKvOp::Kind::REMOVE, 1, h, 500};
+    RouterService::apply_native_kv_ops_local(&stale, 1);
+    auto r2 = router_->route_request(tokens);
+    ASSERT_TRUE(r2.backend_id.has_value());
+    EXPECT_EQ(r2.backend_id.value(), 1);
+
+    // Fresh REMOVE (t=2000) verifies eviction: downgrade to backend 2.
+    NativeKvOp remove{NativeKvOp::Kind::REMOVE, 1, h, 2000};
+    RouterService::apply_native_kv_ops_local(&remove, 1);
+    auto r3 = router_->route_request(tokens);
+    ASSERT_TRUE(r3.backend_id.has_value());
+    EXPECT_FALSE(r3.cache_hit);
+    EXPECT_EQ(r3.backend_id.value(), 2);
+
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.upserts, 1u);
+    EXPECT_EQ(stats.removes, 1u);
+    // r1 and r2 both verified resident (the stale remove left the entry).
+    EXPECT_EQ(stats.verified_hits, 2u);
+    EXPECT_EQ(stats.verified_downgrades, 1u);
 }
 
 // =============================================================================

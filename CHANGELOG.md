@@ -8,6 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Native KV-event mode, part 1: verified residency** (BACKLOG §20.1 P0.1) —
+  Opt-in subscriber for vLLM's native KV-cache event stream (ZMQ PUB,
+  msgpack `KVEventBatch`): `BlockStored`/`BlockRemoved` events maintain
+  `prefix_hash_index` as a block-exact, ~ms-fresh mirror of each opted-in
+  backend's cache. ART hits on stream-fresh backends are then VERIFIED —
+  present = resident (probabilistic gate skipped), absent = evicted
+  (downgrade fires with certainty); stream faults (sequence gaps, decode
+  errors) reset trust and fall back to the probabilistic gossip signal.
+  vLLM block hashes are bridged to Ranvier prefix hashes by incremental
+  FNV accumulation along block parent chains (`src/kv_event_ledger.hpp`) —
+  no shared hash function needed. Per-block evictions deliberately leave the
+  RadixTree untouched (the verified check neutralizes stale routes);
+  `AllBlocksCleared` purges. Build-gated behind `WITH_KV_EVENTS` (libzmq,
+  default OFF; production Docker images build it ON); config `kv_events:` /
+  `RANVIER_KV_EVENTS_*`; per-backend opt-in via static `kv_events_port` or
+  the `ranvier.io/kv-events-port` annotation. Metrics:
+  `router_native_kv_ops_total`, `router_native_verified_hits_total`,
+  `router_native_verified_evictions_total`, `router_native_stream_resets_total`,
+  `router_native_index_overflow_total`. Route materialization from stored
+  token IDs and replay-socket gap recovery follow in part 2.
+
 - **Disaggregated prefill/decode pool roles** (BACKLOG §20.1 P0.3) — Backends
   carry a `pool_role` (`unified` default / `prefill` / `decode`) through
   registration, acting as a hard eligibility filter on the unified route

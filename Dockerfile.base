@@ -38,6 +38,7 @@ RUN dnf install -y \
         gtest-devel \
         gmock-devel \
         sqlite-devel \
+        zeromq-devel \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 

@@ -19,6 +19,9 @@
 #include "http_controller.hpp"
 #include "k8s_discovery_service.hpp"
 #include "local_discovery.hpp"
+#ifdef RANVIER_WITH_KV_EVENTS
+#include "kv_event_subscriber.hpp"
+#endif
 #include "router_service.hpp"
 #include "shard_load_balancer.hpp"
 #include "sharded_config.hpp"
@@ -203,6 +206,14 @@ private:
 
     // Service discovery
     std::unique_ptr<K8sDiscoveryService> _k8s_discovery;
+
+#ifdef RANVIER_WITH_KV_EVENTS
+    // Native KV-event subscriber (vLLM ZMQ stream). Created on shard 0 when
+    // kv_events.enabled; stopped in stop_services() Step 1, before
+    // RouterService teardown (its in-flight shipments broadcast into router
+    // shard state).
+    std::unique_ptr<KvEventSubscriberService> _kv_subscriber;
+#endif
 
     // Local backend discovery (local mode only)
     std::unique_ptr<LocalDiscoveryService> _local_discovery;

@@ -122,6 +122,22 @@ biases toward *keeping* cache affinity (the feature's whole value) and only
 abandons a route when eviction is very likely. Setting the threshold to `0.0`
 disables downgrades entirely (pre-feature behavior).
 
+## Verified residency (native KV events)
+
+When a backend opts into the native vLLM KV-event stream (`kv_events:`
+section + per-backend port; build flag `WITH_KV_EVENTS`), residency for that
+backend graduates from the probabilistic estimate above to a VERIFIED,
+block-exact signal: `BlockStored`/`BlockRemoved` events maintain
+`prefix_hash_index` as a live mirror of the backend's cache, and an ART hit
+checks the request's prefix hash against it directly — present means
+resident (the probabilistic gate is skipped entirely), absent means evicted
+(the downgrade fires with certainty). Freshness is per backend
+(`freshness_ttl_seconds`, kept alive by events and subscriber heartbeats);
+when the stream goes stale or faults (sequence gap), routing falls back to
+the probabilistic path above with no operator action needed. See
+`src/kv_event_ledger.hpp` for how vLLM block hashes are bridged to Ranvier
+prefix hashes without sharing a hash function.
+
 Beyond the hard gate, the unified route score can blend residency continuously:
 `routing.scoring.residency_weight > 0` discounts the ART anchor's affinity bonus
 by reported cache-cooling (`affinity *= 1 - w*(1-residency)`), so a cooling-but-

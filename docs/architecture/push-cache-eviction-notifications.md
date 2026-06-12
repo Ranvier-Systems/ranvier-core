@@ -1,6 +1,13 @@
 # Push-Based Cache Eviction Notifications
 
 **Status:** Phases 1, 2, and 3a shipped. Phase 3b (sidecars) and Phase 4 (upstream) pending.
+**2026-06 update:** the Phase-3 *goals* (exact residency, sub-second per-prefix
+eviction; the path to cold-start sync) are being realized via vLLM's **native
+KV-event stream** (BACKLOG §20.1 P0.1) rather than this document's bespoke
+schema — the native `BlockStored` events carry token IDs, dissolving the
+no-tokens constraint that gated 3c. This protocol remains the engine-agnostic
+fallback for backends without a native stream. See
+`docs/internals/cache-residency-routing.md` § Verified residency.
 **Date:** 2026-03-20 (original), 2026-04-06 (last update)
 **Author:** Generated exploration
 

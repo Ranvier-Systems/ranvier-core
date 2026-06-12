@@ -82,6 +82,23 @@ option(WITH_TELEMETRY "Enable OpenTelemetry distributed tracing" ON)
 # See BACKLOG.md Section 8.5 for rationale
 option(RANVIER_DEBUG_METRICS "Enable gossip debug metrics (crypto offload stats, overflow counters)" OFF)
 
+# Native vLLM KV-event subscriber (BACKLOG §20.1 P0.1). Needs system libzmq;
+# OFF by default so plain source builds stay dependency-free while the wire
+# format is validated against deployed vLLM versions. CI / production Docker
+# images build with -DWITH_KV_EVENTS=ON (see Dockerfile.production).
+option(WITH_KV_EVENTS "Enable native vLLM KV-event subscription (requires libzmq)" OFF)
+
+if(WITH_KV_EVENTS)
+    find_library(ZMQ_LIBRARY NAMES zmq)
+    find_path(ZMQ_INCLUDE_DIR NAMES zmq.h)
+    if(NOT ZMQ_LIBRARY OR NOT ZMQ_INCLUDE_DIR)
+        message(FATAL_ERROR "WITH_KV_EVENTS=ON but libzmq not found (install zeromq-devel / libzmq3-dev)")
+    endif()
+    message(STATUS "Native KV events enabled: libzmq at ${ZMQ_LIBRARY}")
+else()
+    message(STATUS "Native KV events disabled - build with -DWITH_KV_EVENTS=ON to enable")
+endif()
+
 if(WITH_TELEMETRY)
     # OpenTelemetry C++ SDK Configuration
     # Provides distributed tracing with Zipkin HTTP export support
@@ -314,6 +331,14 @@ static GLOBAL: Jemalloc = Jemalloc;
     if(RANVIER_DEBUG_METRICS)
         target_compile_definitions(ranvier_core PUBLIC RANVIER_DEBUG_METRICS)
         message(STATUS "Gossip debug metrics enabled")
+    endif()
+
+    # Native KV-event subscriber (optional; libzmq confined to this TU's worker thread)
+    if(WITH_KV_EVENTS)
+        target_sources(ranvier_core PRIVATE src/kv_event_subscriber.cpp)
+        target_compile_definitions(ranvier_core PUBLIC RANVIER_WITH_KV_EVENTS)
+        target_include_directories(ranvier_core PRIVATE ${ZMQ_INCLUDE_DIR})
+        target_link_libraries(ranvier_core PUBLIC ${ZMQ_LIBRARY})
     endif()
 
     # OpenTelemetry configuration (optional)
@@ -804,6 +829,21 @@ target_link_libraries(route_scorer_test
   GTest::gtest_main
 )
 gtest_discover_tests(route_scorer_test)
+
+# Native KV-Event Decoder + Ledger Unit Tests (Pure C++, no Seastar, no ZMQ)
+# msgpack-subset decode of vLLM KVEventBatch payloads and the FNV hash-bridge
+# ledger that translates block events into Ranvier prefix-hash operations.
+add_executable(kv_event_translation_test
+  tests/unit/kv_event_translation_test.cpp
+)
+target_include_directories(kv_event_translation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(kv_event_translation_test
+  PRIVATE
+  absl::flat_hash_map
+  absl::flat_hash_set
+  GTest::gtest_main
+)
+gtest_discover_tests(kv_event_translation_test)
 
 # Quorum / Split-Brain Detection Unit Tests (Pure C++, no Seastar dependency)
 # Tests for quorum calculation, state transitions, and peer liveness with TestClock

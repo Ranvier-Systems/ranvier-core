@@ -793,6 +793,26 @@ void RanvierConfig::apply_env_overrides() {
         routing.scoring.slo_weight = *v;
     }
 
+    // Native KV-events overrides
+    if (auto v = get_env("RANVIER_KV_EVENTS_ENABLED")) {
+        kv_events.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_KV_EVENTS_TOPIC")) {
+        kv_events.topic = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_KV_EVENTS_POLL_INTERVAL_MS")) {
+        kv_events.poll_interval_ms = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_KV_EVENTS_FRESHNESS_TTL")) {
+        kv_events.freshness_ttl_seconds = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_KV_EVENTS_MAX_TRACKED_BLOCKS")) {
+        kv_events.max_tracked_blocks_per_backend = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH")) {
+        kv_events.max_indexed_token_depth = *v;
+    }
+
     // Cache events overrides
     if (auto v = get_env("RANVIER_CACHE_EVENTS_ENABLED")) {
         cache_events.enabled = (*v == "1" || *v == "true" || *v == "yes");
@@ -834,6 +854,15 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint32_t>("RANVIER_ATTRIBUTION_ADMIN_QUERY_MAX_ROWS")) {
         attribution.admin_query_max_rows = *v;
     }
+
+    // Mirror the kv_events freshness TTL into the routing config: shard-local
+    // routing state is built from RoutingConfig, but the operator-facing key
+    // lives in the kv_events: section. Runs after both YAML parse and env
+    // overrides (every load path ends here). Disabled kv_events => TTL 0 so
+    // the verified-residency path can never trigger without the feature.
+    routing.kv_residency_freshness_ttl = kv_events.enabled
+        ? std::chrono::seconds(kv_events.freshness_ttl_seconds)
+        : std::chrono::seconds(0);
 }
 
 // =============================================================================
@@ -1647,6 +1676,36 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             if (ce["inject_prefix_hash_header"]) config.cache_events.inject_prefix_hash_header = ce["inject_prefix_hash_header"].as<bool>();
         }
 
+        // Native KV-events section
+        if (yaml["kv_events"]) {
+            YAML::Node kv = yaml["kv_events"];
+            if (kv["enabled"]) config.kv_events.enabled = kv["enabled"].as<bool>();
+            if (kv["topic"]) config.kv_events.topic = kv["topic"].as<std::string>();
+            if (kv["poll_interval_ms"]) {
+                config.kv_events.poll_interval_ms = kv["poll_interval_ms"].as<uint32_t>();
+            }
+            if (kv["heartbeat_interval_ms"]) {
+                config.kv_events.heartbeat_interval_ms = kv["heartbeat_interval_ms"].as<uint32_t>();
+            }
+            if (kv["max_ops_per_shipment"]) {
+                config.kv_events.max_ops_per_shipment = kv["max_ops_per_shipment"].as<uint32_t>();
+            }
+            if (kv["max_inflight_shipments"]) {
+                config.kv_events.max_inflight_shipments = kv["max_inflight_shipments"].as<uint32_t>();
+            }
+            if (kv["max_tracked_blocks_per_backend"]) {
+                config.kv_events.max_tracked_blocks_per_backend =
+                    kv["max_tracked_blocks_per_backend"].as<uint32_t>();
+            }
+            if (kv["max_indexed_token_depth"]) {
+                config.kv_events.max_indexed_token_depth =
+                    kv["max_indexed_token_depth"].as<uint32_t>();
+            }
+            if (kv["freshness_ttl_seconds"]) {
+                config.kv_events.freshness_ttl_seconds = kv["freshness_ttl_seconds"].as<uint32_t>();
+            }
+        }
+
         // Dashboard section
         if (yaml["dashboard"]) {
             YAML::Node db = yaml["dashboard"];
@@ -1739,6 +1798,9 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 }
                 if (entry["pool_role"]) {
                     sb.pool_role = entry["pool_role"].as<std::string>();
+                }
+                if (entry["kv_events_port"]) {
+                    sb.kv_events_port = entry["kv_events_port"].as<uint16_t>();
                 }
                 config.backends.entries.push_back(std::move(sb));
             }
@@ -1834,6 +1896,24 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.routing.scoring.slo_weight < 0.0 || config.routing.scoring.slo_weight > 1000.0) {
         return "routing.scoring.slo_weight must be between 0.0 and 1000.0";
+    }
+
+    // Validate native KV-events settings
+    if (config.kv_events.enabled) {
+        if (config.kv_events.poll_interval_ms < 1 || config.kv_events.poll_interval_ms > 10000) {
+            return "kv_events.poll_interval_ms must be between 1 and 10000";
+        }
+        if (config.kv_events.max_ops_per_shipment < 1 ||
+            config.kv_events.max_ops_per_shipment > 65536) {
+            return "kv_events.max_ops_per_shipment must be between 1 and 65536";
+        }
+        if (config.kv_events.max_inflight_shipments < 1 ||
+            config.kv_events.max_inflight_shipments > 64) {
+            return "kv_events.max_inflight_shipments must be between 1 and 64";
+        }
+        if (config.kv_events.max_indexed_token_depth < config.routing.block_alignment) {
+            return "kv_events.max_indexed_token_depth must be >= routing.block_alignment";
+        }
     }
 
     // Validate timeout settings

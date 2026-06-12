@@ -299,6 +299,19 @@ struct RoutingConfig {
     // YAML: routing.scoring.*  Env: RANVIER_SCORING_*
     ScoringWeights scoring;
 
+    // =========================================================================
+    // Native KV-Event Verified Residency (routing-side half of kv_events)
+    // =========================================================================
+    // How long an applied native KV op / subscriber heartbeat keeps a
+    // backend's VERIFIED-residency trust. While fresh, an ART hit is checked
+    // exactly against prefix_hash_index (presence = resident, absence =
+    // evicted); once stale, routing falls back to the probabilistic gossiped
+    // residency signal. The operator-facing key lives in the kv_events: YAML
+    // section (freshness_ttl_seconds) — the loader mirrors it here because
+    // shard-local routing config is built from RoutingConfig. 0 disables the
+    // verified path entirely.
+    std::chrono::seconds kv_residency_freshness_ttl{300};
+
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }
@@ -511,6 +524,37 @@ struct CacheEventsConfig {
     bool inject_prefix_hash_header = true;         // Add X-Ranvier-Prefix-Hash to proxied requests
 };
 
+// =============================================================================
+// Native KV-Events Configuration (vLLM block-granular event stream)
+// =============================================================================
+
+// Subscribes directly to each opted-in vLLM backend's native KV-event
+// publisher (ZMQ PUB, msgpack), making residency EXACT per (backend, prefix)
+// instead of the probabilistic scrape estimate, with ~ms staleness instead of
+// scrape-cadence staleness. Engine-agnostic fallbacks (the bespoke
+// POST /v1/cache/events protocol and gossiped probabilistic residency) are
+// unchanged and remain in force for backends without a stream.
+//
+// Per-backend opt-in: a backend participates when it carries a KV-events
+// port (static YAML `kv_events_port`, K8s annotation
+// `ranvier.io/kv-events-port`); the subscriber connects to
+// tcp://<backend-ip>:<port>. The matching vLLM flag is --kv-events-config
+// with a zmq publisher bound on that port.
+//
+// Requires a build WITH_KV_EVENTS=ON (libzmq); with the feature compiled out
+// this section parses but is inert (a startup warning is logged if enabled).
+struct KvEventsConfig {
+    bool enabled = false;                       // Master switch (opt-in)
+    std::string topic;                          // ZMQ subscription topic ("" = all)
+    uint32_t poll_interval_ms = 100;            // Worker zmq_poll timeout
+    uint32_t heartbeat_interval_ms = 5000;      // ALIVE cadence for idle streams
+    uint32_t max_ops_per_shipment = 512;        // Bounds one reactor application (Rule #17)
+    uint32_t max_inflight_shipments = 4;        // Worker→shard-0 backpressure cap
+    uint32_t max_tracked_blocks_per_backend = 65536;  // Ledger entry cap (Rule #4)
+    uint32_t max_indexed_token_depth = 2048;    // Chains tracked only to routable depth
+    uint32_t freshness_ttl_seconds = 300;       // Mirrored into routing.kv_residency_freshness_ttl
+};
+
 // Static-config backend declaration.
 //
 // For backends that don't fit the K8s / local-discovery / admin-API
@@ -560,6 +604,12 @@ struct StaticBackendConfig {
     // fresh-miss or diverted traffic (see PoolRole in types.hpp). Validated
     // by RanvierConfig::validate(); parsed to the enum at registration.
     std::string pool_role = "unified";
+
+    // Native KV-event stream port on this backend's host (vLLM
+    // --kv-events-config zmq publisher). 0 = not subscribed (the default;
+    // the backend keeps probabilistic residency). Only meaningful when
+    // kv_events.enabled and the build has WITH_KV_EVENTS=ON.
+    uint16_t kv_events_port = 0;
 };
 
 struct StaticBackendsConfig {
@@ -641,6 +691,7 @@ struct RanvierConfig {
     AgentRegistryConfig agent_registry;
     DashboardConfig dashboard;
     CacheEventsConfig cache_events;
+    KvEventsConfig kv_events;
     AttributionConfig attribution;
     StaticBackendsConfig backends;
 

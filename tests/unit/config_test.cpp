@@ -2549,6 +2549,98 @@ TEST_F(ConfigTest, ScoringRejectsResidencyWeightAboveOne) {
 }
 
 // =============================================================================
+// Native KV-Events configuration (kv_events.*)
+// =============================================================================
+
+TEST_F(ConfigTest, KvEventsDefaultsDisabledAndMirrorZeroesTtl) {
+    auto config = RanvierConfig::defaults();
+    EXPECT_FALSE(config.kv_events.enabled);
+    // Disabled feature => routing-side freshness TTL forced to 0 so the
+    // verified-residency path can never trigger.
+    EXPECT_EQ(config.routing.kv_residency_freshness_ttl.count(), 0);
+}
+
+TEST_F(ConfigTest, KvEventsParsesFromYamlAndMirrorsTtl) {
+    auto config = RanvierConfig::load_from_string(R"(
+kv_events:
+  enabled: true
+  topic: "kv@"
+  poll_interval_ms: 50
+  heartbeat_interval_ms: 2000
+  max_ops_per_shipment: 256
+  max_inflight_shipments: 8
+  max_tracked_blocks_per_backend: 1024
+  max_indexed_token_depth: 512
+  freshness_ttl_seconds: 120
+)");
+    EXPECT_TRUE(config.kv_events.enabled);
+    EXPECT_EQ(config.kv_events.topic, "kv@");
+    EXPECT_EQ(config.kv_events.poll_interval_ms, 50u);
+    EXPECT_EQ(config.kv_events.heartbeat_interval_ms, 2000u);
+    EXPECT_EQ(config.kv_events.max_ops_per_shipment, 256u);
+    EXPECT_EQ(config.kv_events.max_inflight_shipments, 8u);
+    EXPECT_EQ(config.kv_events.max_tracked_blocks_per_backend, 1024u);
+    EXPECT_EQ(config.kv_events.max_indexed_token_depth, 512u);
+    EXPECT_EQ(config.kv_events.freshness_ttl_seconds, 120u);
+    EXPECT_EQ(config.routing.kv_residency_freshness_ttl.count(), 120);
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, KvEventsEnvOverrides) {
+    setenv("RANVIER_KV_EVENTS_ENABLED", "true", 1);
+    setenv("RANVIER_KV_EVENTS_FRESHNESS_TTL", "60", 1);
+
+    auto config = RanvierConfig::defaults();
+    EXPECT_TRUE(config.kv_events.enabled);
+    EXPECT_EQ(config.kv_events.freshness_ttl_seconds, 60u);
+    EXPECT_EQ(config.routing.kv_residency_freshness_ttl.count(), 60);
+
+    unsetenv("RANVIER_KV_EVENTS_ENABLED");
+    unsetenv("RANVIER_KV_EVENTS_FRESHNESS_TTL");
+}
+
+TEST_F(ConfigTest, KvEventsValidationBounds) {
+    RanvierConfig config;
+    config.kv_events.enabled = true;
+    config.kv_events.poll_interval_ms = 0;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("poll_interval_ms"), std::string::npos);
+
+    RanvierConfig config2;
+    config2.kv_events.enabled = true;
+    config2.kv_events.max_indexed_token_depth = 4;  // < block_alignment (16)
+    error = RanvierConfig::validate(config2);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("max_indexed_token_depth"), std::string::npos);
+
+    // Disabled feature: bounds not enforced (inert config parses freely).
+    RanvierConfig config3;
+    config3.kv_events.poll_interval_ms = 0;
+    error = RanvierConfig::validate(config3);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, StaticBackendsParseKvEventsPort) {
+    auto config = RanvierConfig::load_from_string(R"(
+backends:
+  - id: 21
+    host: 10.0.0.21
+    port: 8000
+    type: vllm
+    kv_events_port: 5557
+  - id: 22
+    host: 10.0.0.22
+    port: 8000
+    type: vllm
+)");
+    ASSERT_EQ(config.backends.entries.size(), 2u);
+    EXPECT_EQ(config.backends.entries[0].kv_events_port, 5557);
+    EXPECT_EQ(config.backends.entries[1].kv_events_port, 0);  // default: no stream
+}
+
+// =============================================================================
 // Static-config backends YAML schema
 // =============================================================================
 
