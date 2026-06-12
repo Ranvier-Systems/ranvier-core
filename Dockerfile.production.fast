@@ -13,6 +13,12 @@
 ARG BASE_IMAGE=ghcr.io/ranvier-systems/ranvier-base:latest
 FROM ${BASE_IMAGE} AS builder
 
+# zeromq-devel is in Dockerfile.base as of the WITH_KV_EVENTS feature, but
+# base images rebuild only on manual trigger — install explicitly so this
+# build works against ANY published base. No-op (cached, already-installed)
+# once the base image catches up; do not remove on that basis.
+RUN dnf install -y zeromq-devel && dnf clean all && rm -rf /var/cache/dnf
+
 WORKDIR /src
 
 # Copy CMakeLists.txt and cmake modules
@@ -69,7 +75,7 @@ FROM fedora:39
 # sqlite ships the `sqlite3` CLI used by integration tests for in-container DB
 # mutation (e.g. older-schema migration simulation).
 RUN dnf install -y \
-    libaio libasan libubsan yaml-cpp hwloc openssl curl sqlite \
+    libaio libasan libubsan yaml-cpp hwloc openssl curl sqlite zeromq \
     boost-program-options boost-thread boost-system \
     c-ares fmt lz4-libs liburing libatomic numactl-libs \
     gnutls protobuf protobuf-lite libxml2 cryptopp \
