@@ -57,6 +57,7 @@ RUN dnf install -y \
         compiler-rt \
         llvm \
         lld \
+        zeromq-devel \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 

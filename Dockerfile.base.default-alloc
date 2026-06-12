@@ -79,6 +79,10 @@ FROM ${BASE_IMAGE}
 LABEL org.opencontainers.image.title="Ranvier Base Builder (Seastar default allocator)"
 LABEL org.opencontainers.image.description="ranvier-base with Seastar rebuilt -DSeastar_USE_DEFAULT_ALLOCATOR=ON for libFuzzer + ASan/UBSan compatibility — NOT FOR PRODUCTION"
 
+# Explicit so this rebuilds correctly even from a ranvier-base published
+# before zeromq-devel joined its package list (base rebuilds are manual).
+RUN dnf install -y zeromq-devel && dnf clean all && rm -rf /var/cache/dnf
+
 # Reinstall Seastar over /usr/local with the default allocator. Mirrors
 # Dockerfile.base's Seastar layer except for one sed patch on Seastar's
 # CMakeLists before configure.
