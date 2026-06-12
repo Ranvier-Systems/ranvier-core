@@ -353,7 +353,8 @@ public:
                                                uint32_t weight = 100, uint32_t priority = 0,
                                                bool supports_token_ids = true,
                                                double compression_ratio = 1.0,
-                                               BackendType type = BackendType::VLLM) override;
+                                               BackendType type = BackendType::VLLM,
+                                               PoolRole pool_role = PoolRole::UNIFIED) override;
 
     // Remove a backend from all shards
     seastar::future<> unregister_backend_global(BackendId id) override;
@@ -453,6 +454,7 @@ public:
         bool supports_token_ids;  // Whether backend supports vLLM prompt_token_ids
         double compression_ratio;  // KV-cache compression ratio (>= 1.0, 1.0 = no compression)
         BackendType type;  // Engine class (VLLM, SGLANG, CEREBRAS, ...)
+        PoolRole pool_role;  // Disaggregated pool role (unified/prefill/decode)
         int64_t drain_start_ms;  // 0 if not draining
     };
 
@@ -682,7 +684,8 @@ public:
                                               uint32_t weight = 100, uint32_t priority = 0,
                                               bool supports_token_ids = true,
                                               double compression_ratio = 1.0,
-                                              BackendType type = BackendType::VLLM);
+                                              BackendType type = BackendType::VLLM,
+                                              PoolRole pool_role = PoolRole::UNIFIED);
 
     // Write a key directly into the shard-local api_key side-map.
     // Bypasses set_backend_api_key_global's parallel_for_each broadcast so

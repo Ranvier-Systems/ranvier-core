@@ -2630,6 +2630,45 @@ backends:
     EXPECT_DOUBLE_EQ(config.backends.entries[1].cost_per_hour, 1.2);
 }
 
+TEST_F(ConfigTest, StaticBackendsParsePoolRole) {
+    const std::string yaml = R"(
+backends:
+  - id: 11
+    host: 10.0.0.11
+    port: 8000
+    type: vllm
+    pool_role: prefill
+  - id: 12
+    host: 10.0.0.12
+    port: 8000
+    type: vllm
+    pool_role: decode
+  - id: 13
+    host: 10.0.0.13
+    port: 8000
+    type: vllm
+)";
+    auto config = RanvierConfig::load_from_string(yaml);
+    ASSERT_EQ(config.backends.entries.size(), 3u);
+    EXPECT_EQ(config.backends.entries[0].pool_role, "prefill");
+    EXPECT_EQ(config.backends.entries[1].pool_role, "decode");
+    EXPECT_EQ(config.backends.entries[2].pool_role, "unified");  // default when absent
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendUnknownPoolRole) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1;
+    sb.host = "10.0.0.1";
+    sb.pool_role = "prefil";  // typo must be caught at startup, not at routing time
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("pool_role"), std::string::npos);
+}
+
 TEST_F(ConfigTest, StaticBackendsParseMultipleEntries) {
     const std::string yaml = R"(
 backends:

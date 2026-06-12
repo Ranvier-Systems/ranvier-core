@@ -2562,7 +2562,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
 }
 
 future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
-    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0&supports_token_ids=true&type=vllm
+    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0&supports_token_ids=true&type=vllm&pool_role=unified
     // Also supports hostnames: POST /admin/backends?id=1&ip=host.docker.internal&port=11434
     sstring id_str = req->get_query_param("id");
     sstring ip_str = req->get_query_param("ip");
@@ -2572,6 +2572,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
     sstring supports_token_ids_str = req->get_query_param("supports_token_ids");
     sstring compression_ratio_str = req->get_query_param("compression_ratio");
     sstring type_str = req->get_query_param("type");
+    sstring pool_role_str = req->get_query_param("pool_role");
 
     // Check for required parameters
     if (id_str.empty() || port_str.empty() || ip_str.empty()) {
@@ -2666,6 +2667,20 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         backend_type = *type_opt;
     }
 
+    // pool_role: disaggregated prefill/decode pool role. Default unified.
+    // Invalid values are rejected (400), mirroring the type path.
+    PoolRole pool_role = PoolRole::UNIFIED;
+    if (!pool_role_str.empty()) {
+        auto role_opt = parse_pool_role(std::string_view(pool_role_str));
+        if (!role_opt) {
+            log_control.warn("POST /admin/backends: invalid pool_role '{}'", pool_role_str);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"Invalid pool_role: must be one of unified, prefill, decode\"}");
+            co_return std::move(rep);
+        }
+        pool_role = *role_opt;
+    }
+
     // Resolve address: supports both direct IP addresses and hostnames
     socket_address addr;
     std::string resolved_ip;
@@ -2733,11 +2748,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
     // Store the resolved IP, not the hostname, for persistence
     if (_persistence) {
         _persistence->queue_save_backend(id, resolved_ip, port, weight, priority,
-            std::string(backend_type_to_string(backend_type)));
+            std::string(backend_type_to_string(backend_type)),
+            std::string(pool_role_to_string(pool_role)));
     }
 
     co_await _router.register_backend_global(id, addr, weight, priority,
-        supports_token_ids, compression_ratio, backend_type);
+        supports_token_ids, compression_ratio, backend_type, pool_role);
 
     // Notify HealthService of compression ratio for compression-aware load scoring.
     // HealthService state lives on shard 0 — must submit_to(0) to avoid cross-shard
@@ -2748,14 +2764,15 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         });
     }
 
-    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={}, compression_ratio={}, type={})",
+    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={}, compression_ratio={}, type={}, pool_role={})",
         id, ip_str, port, weight, priority, supports_token_ids, compression_ratio,
-        backend_type_to_string(backend_type));
+        backend_type_to_string(backend_type), pool_role_to_string(pool_role));
     rep->write_body("json", "{\"status\": \"ok\", \"weight\": " + std::to_string(weight) +
         ", \"priority\": " + std::to_string(priority) +
         ", \"supports_token_ids\": " + (supports_token_ids ? "true" : "false") +
         ", \"compression_ratio\": " + std::to_string(compression_ratio) +
-        ", \"type\": \"" + std::string(backend_type_to_string(backend_type)) + "\"}");
+        ", \"type\": \"" + std::string(backend_type_to_string(backend_type)) +
+        "\", \"pool_role\": \"" + std::string(pool_role_to_string(pool_role)) + "\"}");
     co_return std::move(rep);
 }
 
@@ -3280,7 +3297,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_backen
         oss << "      \"is_dead\": " << (b.is_dead ? "true" : "false") << ",\n";
         oss << "      \"supports_token_ids\": " << (b.supports_token_ids ? "true" : "false") << ",\n";
         oss << "      \"compression_ratio\": " << b.compression_ratio << ",\n";
-        oss << "      \"type\": \"" << backend_type_to_string(b.type) << "\"";
+        oss << "      \"type\": \"" << backend_type_to_string(b.type) << "\",\n";
+        oss << "      \"pool_role\": \"" << pool_role_to_string(b.pool_role) << "\"";
         if (b.drain_start_ms > 0) {
             oss << ",\n      \"drain_start_ms\": " << b.drain_start_ms << "\n";
         } else {

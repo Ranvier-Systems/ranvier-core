@@ -957,7 +957,7 @@ Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build
   `affinity(b)` per backend from native KV events, P0.3 by adding a pool-role gate to the
   same pass. See `docs/internals/prefix-affinity-routing.md` § Unified Route Scoring.
 
-- [ ] **Disaggregated prefill/decode awareness** (P0.3)
+- [x] **Disaggregated prefill/decode awareness** (P0.3) — _Done 2026-06-12._
   _Justification:_ `BackendType` is engine class, not pool role. Disaggregated (P/D) serving is
   now table-stakes for frontier-model serving (cf. Mooncake). A topology-blind router silently
   misroutes and forfeits the gains. Add a `pool_role` (`prefill`/`decode`/`unified`) dimension
@@ -965,6 +965,15 @@ Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build
   need not own KV transfer (NIXL/LMCache do that).
   _Location:_ `src/backend_registry.hpp`, `src/router_service.cpp` (`register_backend_global`), `src/types.hpp`, `src/config_schema.hpp`
   _Complexity:_ Medium–High
+  _Completion note:_ `PoolRole` rides registration proper (8th `register_backend_global`
+  param, default `UNIFIED` = unlabeled fleets route bit-identically). Role acts as a hard
+  candidate FILTER on the P0.2 scoring pass, not a weight: misses and all dispatch diverts
+  target prefill/unified only; an ART anchor is honored regardless of role (decode
+  affinity); an availability valve waives the filter when only decode pools are live
+  (`router_pool_role_fallbacks_total`). Labeling via `ranvier.io/pool-role` annotation,
+  static-YAML `pool_role:`, admin API; persisted in SQLite next to `backend_type`.
+  See `docs/internals/prefix-affinity-routing.md` § Pool-Role Routing. P0.1 upgrade path:
+  measured per-backend residency replaces learned-route-driven decode affinity.
 
 ### 20.2 P1 — strategic parity / ecosystem
 

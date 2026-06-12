@@ -93,6 +93,9 @@ bool SqlitePersistence::create_tables() {
     // ADD COLUMN is itself idempotent-safe: the second invocation fails
     // harmlessly (we ignore exec_sql's return for migrations).
     exec_sql("ALTER TABLE backends ADD COLUMN backend_type TEXT NOT NULL DEFAULT 'vllm'");
+    // pool_role column added for disaggregated prefill/decode pools (BACKLOG
+    // §20.1 P0.3). Existing rows default to 'unified' = pre-feature behavior.
+    exec_sql("ALTER TABLE backends ADD COLUMN pool_role TEXT NOT NULL DEFAULT 'unified'");
 
     // Per-API-key attribution table (memo §7.1). Additive migration:
     // CREATE TABLE IF NOT EXISTS is idempotent, so older databases (with only
@@ -141,12 +144,13 @@ bool SqlitePersistence::exec_sql(const char* sql) {
 
 bool SqlitePersistence::save_backend(BackendId id, const std::string& ip, uint16_t port,
                                      uint32_t weight, uint32_t priority,
-                                     const std::string& backend_type) {
+                                     const std::string& backend_type,
+                                     const std::string& pool_role) {
     std::lock_guard<std::mutex> lock(_mutex);
 
     if (!_db) return false;
 
-    const char* sql = "INSERT OR REPLACE INTO backends (id, ip, port, weight, priority, backend_type) VALUES (?, ?, ?, ?, ?, ?)";
+    const char* sql = "INSERT OR REPLACE INTO backends (id, ip, port, weight, priority, backend_type, pool_role) VALUES (?, ?, ?, ?, ?, ?, ?)";
     sqlite3_stmt* stmt = nullptr;
 
     int rc = sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr);
@@ -158,6 +162,7 @@ bool SqlitePersistence::save_backend(BackendId id, const std::string& ip, uint16
     sqlite3_bind_int(stmt, 4, static_cast<int>(weight));
     sqlite3_bind_int(stmt, 5, static_cast<int>(priority));
     sqlite3_bind_text(stmt, 6, backend_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, pool_role.c_str(), -1, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -192,7 +197,7 @@ std::vector<BackendRecord> SqlitePersistence::load_backends() {
 
     if (!_db) return results;
 
-    const char* sql = "SELECT id, ip, port, weight, priority, backend_type FROM backends";
+    const char* sql = "SELECT id, ip, port, weight, priority, backend_type, pool_role FROM backends";
     sqlite3_stmt* stmt = nullptr;
 
     int rc = sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr);
@@ -218,6 +223,12 @@ std::vector<BackendRecord> SqlitePersistence::load_backends() {
         record.backend_type = safe_column_text(stmt, 5);
         if (record.backend_type.empty()) {
             record.backend_type = "vllm";
+        }
+        // Same NULL/empty discipline as backend_type; the replay path's
+        // parse_pool_role() nullopt branch handles unknown values.
+        record.pool_role = safe_column_text(stmt, 6);
+        if (record.pool_role.empty()) {
+            record.pool_role = "unified";
         }
         results.push_back(std::move(record));
     }

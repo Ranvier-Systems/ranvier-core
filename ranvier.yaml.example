@@ -646,6 +646,18 @@ attribution:
 #     preferred and never diverted from, so pricing only part of the
 #     fleet only re-routes among the priced backends.
 #
+# Optional disaggregated-serving field:
+#   `pool_role` — "unified" (default) / "prefill" / "decode". For fleets
+#     running disaggregated prefill/decode pools (KV transfer handled by the
+#     serving stack — NIXL/LMCache/etc., not Ranvier). DECODE pools are
+#     affinity-only routing targets: never chosen for fresh cache misses,
+#     never a load/cost divert target; reached only via a learned route.
+#     PREFILL/UNIFIED take fresh-miss placement. If only decode pools are
+#     live, the filter is waived (availability first) and
+#     router_pool_role_fallbacks_total counts the event. An unlabeled fleet
+#     routes exactly as before this field existed. K8s fleets label pods via
+#     the ranvier.io/pool-role EndpointSlice annotation instead.
+#
 # backends:
 #   - id: 101
 #     host: api.cerebras.ai

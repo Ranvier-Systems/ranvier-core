@@ -554,6 +554,12 @@ struct StaticBackendConfig {
     // (recompute cost dominates the hardware saving).
     std::string gpu_tier;
     double cost_per_hour = 0.0;   // 0.0 = unset (backend never priced-compared)
+
+    // Disaggregated pool role: "unified" (default) | "prefill" | "decode".
+    // DECODE pools are affinity-only routing targets — they never receive
+    // fresh-miss or diverted traffic (see PoolRole in types.hpp). Validated
+    // by RanvierConfig::validate(); parsed to the enum at registration.
+    std::string pool_role = "unified";
 };
 
 struct StaticBackendsConfig {

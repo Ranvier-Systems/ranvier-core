@@ -243,6 +243,7 @@ struct K8sEndpoint {
     uint32_t weight = K8S_DEFAULT_WEIGHT;
     uint32_t priority = K8S_DEFAULT_PRIORITY;
     BackendType type = BackendType::VLLM;
+    PoolRole role = PoolRole::UNIFIED;
     std::string api_key_secret_ref;
 
     // FNV-1a 64-bit hash, truncated to 31 bits for positive BackendId.
@@ -407,6 +408,7 @@ protected:
         uint32_t default_weight = K8S_DEFAULT_WEIGHT;
         uint32_t default_priority = K8S_DEFAULT_PRIORITY;
         BackendType default_type = BackendType::VLLM;
+        PoolRole default_role = PoolRole::UNIFIED;
         std::string default_secret_ref;
 
         if (metadata) {
@@ -466,6 +468,14 @@ protected:
                         default_type = *parsed;
                     }
                     // Unknown type falls back to VLLM (matches the production warn-and-default behavior)
+                }
+                auto role_str = k8s_json::get_string(*annotations, "ranvier.io/pool-role");
+                if (role_str) {
+                    auto parsed = parse_pool_role(*role_str);
+                    if (parsed) {
+                        default_role = *parsed;
+                    }
+                    // Unknown role falls back to UNIFIED (matches production warn-and-default)
                 }
                 auto secret_ref = k8s_json::get_string(*annotations,
                                                        "ranvier.io/api-key-secret-ref");
@@ -527,6 +537,7 @@ protected:
                 endpoint.weight = default_weight;
                 endpoint.priority = default_priority;
                 endpoint.type = default_type;
+                endpoint.role = default_role;
                 endpoint.api_key_secret_ref = default_secret_ref;
 
                 endpoints.push_back(std::move(endpoint));
@@ -861,6 +872,51 @@ TEST_F(K8sEndpointSliceTest, ParseBackendTypeAnnotation) {
     ASSERT_EQ(endpoints.size(), 1u);
     EXPECT_EQ(endpoints[0].type, BackendType::CEREBRAS);
     EXPECT_TRUE(endpoints[0].api_key_secret_ref.empty());
+}
+
+TEST_F(K8sEndpointSliceTest, ParsePoolRoleAnnotation) {
+    std::string json = R"({
+        "metadata": {"annotations": {"ranvier.io/pool-role": "prefill"}},
+        "ports": [{"port": 8000}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-1"}
+        }]
+    })";
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    EXPECT_EQ(endpoints[0].role, PoolRole::PREFILL);
+}
+
+TEST_F(K8sEndpointSliceTest, PoolRoleAnnotationAbsentDefaultsUnified) {
+    std::string json = R"({
+        "metadata": {"annotations": {"ranvier.io/weight": "200"}},
+        "ports": [{"port": 8000}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-1"}
+        }]
+    })";
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    EXPECT_EQ(endpoints[0].role, PoolRole::UNIFIED);
+}
+
+TEST_F(K8sEndpointSliceTest, UnknownPoolRoleAnnotationDefaultsUnified) {
+    std::string json = R"({
+        "metadata": {"annotations": {"ranvier.io/pool-role": "prefil"}},
+        "ports": [{"port": 8000}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-1"}
+        }]
+    })";
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    EXPECT_EQ(endpoints[0].role, PoolRole::UNIFIED);
 }
 
 TEST_F(K8sEndpointSliceTest, ParseSecretRefAnnotation) {

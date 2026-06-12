@@ -686,6 +686,232 @@ TEST_F(RouterServiceTest, LoadAwareDisabledNeverDivertsRegardlessOfStrategy) {
 }
 
 // =============================================================================
+// 1e. Pool-Role Routing (disaggregated prefill/decode awareness)
+// =============================================================================
+// DECODE pools are affinity-only routing targets: never a fresh-miss target,
+// never a divert target, reachable only through a learned/ART route. The
+// availability valve waives the filter when only decode pools are live.
+// An unlabeled fleet (all UNIFIED) must route identically to before.
+
+TEST_F(RouterServiceTest, MissNeverLandsOnDecodePool) {
+    // Two unified + one decode. Many distinct prefixes: every miss must
+    // avoid the decode pool regardless of where the hash points.
+    register_two_backends();
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+
+    for (int32_t seed = 0; seed < 40; ++seed) {
+        std::vector<int32_t> tokens = {200 + seed, 300 + seed, 400 + seed, 500 + seed};
+        auto result = router_->route_request(tokens);
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_NE(result.backend_id.value(), 3) << "seed=" << seed;
+        EXPECT_FALSE(result.cache_hit);
+    }
+}
+
+TEST_F(RouterServiceTest, ArtHitOnDecodePoolIsHonored) {
+    // A learned route to a decode pool IS the affinity the role exists for.
+    register_two_backends();
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+    std::vector<int32_t> tokens = {601, 602, 603, 604};
+    RouterService::insert_route_for_testing(tokens, 3);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 3);
+    EXPECT_TRUE(result.cache_hit);
+}
+
+TEST_F(RouterServiceTest, OnlyDecodePoolsLiveValveStillRoutes) {
+    // Topology gap: every live backend is decode-role. The valve must route
+    // anyway (availability outranks topology) and count the event.
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+
+    std::vector<int32_t> tokens = {611, 612, 613, 614};
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.cache_hit);
+}
+
+TEST_F(RouterServiceTest, LoadDivertOffDecodeAnchorTargetsEligibleOnly) {
+    // Warm route on an overloaded decode pool: load protection still outranks
+    // affinity, but the divert target must be a prefill backend, never the
+    // idle decode pool — which would win the least-loaded tie-break if it
+    // were (illegally) in the dispatch set.
+    cfg_.load_aware_routing = true;
+    recreate_router(cfg_);  // JUMP strategy from fixture
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::PREFILL);
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::PREFILL);
+    RouterService::register_backend_for_testing(4, make_addr("10.0.0.4", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+    std::vector<int32_t> tokens = {621, 622, 623, 624};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Eligible dispatch set {anchor=1, prefill=2, prefill=3} with loads
+    // [7, 1, 1]: median 1 -> threshold 4 -> anchor diverts. The idle decode
+    // pool 4 (load 0) would be the least-loaded winner if included; with it
+    // excluded, the prefill tie breaks toward the lower id.
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 7; ++i) guards.emplace_back(1);
+    guards.emplace_back(2);
+    guards.emplace_back(3);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 2);
+    EXPECT_TRUE(result.cache_hit);
+    EXPECT_EQ(result.original_selected, 1);
+}
+
+TEST_F(RouterServiceTest, PriceTermNeverTargetsDecodePool) {
+    // Cache miss with a cheap PRICED decode pool: the hardware-price
+    // placement must ignore it (decode is not a legal fresh-miss target).
+    register_two_backends();  // ids 1, 2 unified
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+    std::vector<int32_t> tokens = {631, 632, 633, 634};
+
+    auto baseline = router_->route_request(tokens);
+    ASSERT_TRUE(baseline.backend_id.has_value());
+    BackendId hash_choice = baseline.backend_id.value();
+    ASSERT_NE(hash_choice, 3);
+
+    // The decode pool is by far the cheapest; the unified alternative is
+    // priced higher than the anchor, so the only strictly-cheaper candidate
+    // is the (ineligible) decode pool -> selection must not move.
+    RouterService::set_backend_hardware_cost_for_testing(hash_choice, "h100", 4.50);
+    RouterService::set_backend_hardware_cost_for_testing(3, "a10g", 0.10);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), hash_choice);
+    EXPECT_EQ(result.original_selected, hash_choice);
+}
+
+TEST_F(RouterServiceTest, RandomModeExcludesDecodePools) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::RANDOM;
+    recreate_router(cfg_);
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::UNIFIED);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+
+    for (int i = 0; i < 50; ++i) {
+        auto result = router_->route_request({1, 2, 3});
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 1) << "draw " << i;
+    }
+}
+
+TEST_F(RouterServiceTest, RandomModeAllDecodeValveStillRoutes) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::RANDOM;
+    recreate_router(cfg_);
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+
+    auto result = router_->route_request({1, 2, 3});
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+}
+
+TEST_F(RouterServiceTest, HashModeExcludesDecodePools) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::HASH;
+    recreate_router(cfg_);
+    register_two_backends();  // unified
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+
+    for (int32_t seed = 0; seed < 40; ++seed) {
+        std::vector<int32_t> tokens = {700 + seed, 800 + seed, 900 + seed};
+        auto result = router_->route_request(tokens);
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_NE(result.backend_id.value(), 3) << "seed=" << seed;
+    }
+}
+
+TEST_F(RouterServiceTest, ResidencyColdAndDecodeExclusionsCompose) {
+    // The warm backend is cache-cold (residency downgrade) AND a decode pool
+    // exists: the miss fallback must land on the remaining unified backend.
+    register_two_backends();  // ids 1, 2 unified
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+    std::vector<int32_t> tokens = {641, 642, 643, 644};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.01);  // below 0.2 default
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 2);
+}
+
+TEST_F(RouterServiceTest, PrefillRoleIsMissEligible) {
+    // PREFILL is a first-class miss target, indistinguishable from UNIFIED
+    // on the placement path.
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::PREFILL);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+
+    std::vector<int32_t> tokens = {651, 652, 653, 654};
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+}
+
+TEST_F(RouterServiceTest, PoolRoleRoundTripsThroughBackendState) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::PREFILL);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+
+    auto states = router_->get_all_backend_states();
+    ASSERT_EQ(states.size(), 2u);
+    for (const auto& s : states) {
+        if (s.id == 1) {
+            EXPECT_EQ(s.pool_role, PoolRole::PREFILL);
+        } else {
+            EXPECT_EQ(s.pool_role, PoolRole::UNIFIED);
+        }
+    }
+}
+
+TEST_F(RouterServiceTest, PoolRoleToStringRoundTrip) {
+    for (auto r : {PoolRole::UNIFIED, PoolRole::PREFILL, PoolRole::DECODE}) {
+        auto s = pool_role_to_string(r);
+        auto parsed = parse_pool_role(s);
+        ASSERT_TRUE(parsed.has_value()) << s;
+        EXPECT_EQ(*parsed, r);
+    }
+    EXPECT_FALSE(parse_pool_role("Prefill").has_value());  // case-sensitive
+    EXPECT_FALSE(parse_pool_role("").has_value());
+}
+
+// =============================================================================
 // 2. Route TTL Expiration and Cleanup
 // =============================================================================
 // TTL cleanup requires the Seastar reactor (run_ttl_cleanup uses smp::submit_to).

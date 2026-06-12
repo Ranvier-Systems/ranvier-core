@@ -52,6 +52,9 @@ constexpr const char* K8S_ANNOTATION_PRIORITY = "ranvier.io/priority";
 // Annotation keys for heterogeneous-backend support (see BACKLOG §19).
 constexpr const char* K8S_ANNOTATION_BACKEND_TYPE = "ranvier.io/backend-type";
 constexpr const char* K8S_ANNOTATION_API_KEY_SECRET_REF = "ranvier.io/api-key-secret-ref";
+// Annotation key for disaggregated prefill/decode pools (BACKLOG §20.1 P0.3).
+// Values: "unified" (default) | "prefill" | "decode".
+constexpr const char* K8S_ANNOTATION_POOL_ROLE = "ranvier.io/pool-role";
 
 // Conventional Secret data-map field that holds the API key. Operators run
 //   kubectl create secret generic my-key --from-literal=api-key=sk-...
@@ -91,6 +94,9 @@ struct K8sEndpoint {
     // Heterogeneous-backend metadata. Default `VLLM` matches the historical
     // assumption baked into the rest of the codebase.
     BackendType type = BackendType::VLLM;
+    // Disaggregated pool role from the ranvier.io/pool-role annotation.
+    // Default UNIFIED keeps unannotated fleets routing exactly as before.
+    PoolRole role = PoolRole::UNIFIED;
     // Name of a K8s Secret whose `api-key` field holds the credential.
     // Empty string means "no auth header" — correct for vLLM on a cluster-
     // internal network. The Secret value is resolved at endpoint-discovery
@@ -108,10 +114,11 @@ struct K8sEndpoint {
 };
 
 // Callback types for router integration. `type` and `api_key` were added for
-// heterogeneous-fleet support — callers that don't care can pass VLLM/"".
+// heterogeneous-fleet support, `role` for disaggregated prefill/decode pools —
+// callers that don't care can pass VLLM/""/UNIFIED.
 using BackendRegisterCallback = std::function<seastar::future<>(
     BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority,
-    BackendType type, std::string api_key)>;
+    BackendType type, std::string api_key, PoolRole role)>;
 using BackendDrainCallback = std::function<seastar::future<>(BackendId id)>;
 
 // K8sDiscoveryService: Watches Kubernetes for GPU backend endpoints

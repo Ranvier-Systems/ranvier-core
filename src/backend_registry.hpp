@@ -34,7 +34,8 @@ public:
                                 uint32_t weight = 100, uint32_t priority = 0,
                                 bool supports_token_ids = true,
                                 double compression_ratio = 1.0,
-                                BackendType type = BackendType::VLLM) = 0;
+                                BackendType type = BackendType::VLLM,
+                                PoolRole pool_role = PoolRole::UNIFIED) = 0;
 
     virtual seastar::future<>
         unregister_backend_global(BackendId id) = 0;
