@@ -125,9 +125,9 @@ routing:
 # (present = resident, absent = evicted) instead of gated by the
 # probabilistic scrape estimate. Backends without a stream keep today's
 # probabilistic behavior; the bespoke POST /v1/cache/events protocol remains
-# the engine-agnostic fallback. Requires a build with -DWITH_KV_EVENTS=ON
-# (libzmq); per-backend opt-in via `kv_events_port` (static backends) or the
-# ranvier.io/kv-events-port annotation (K8s).
+# the engine-agnostic fallback. Compiled in by default (libzmq; disable with
+# -DWITH_KV_EVENTS=OFF); per-backend opt-in via `kv_events_port` (static
+# backends) or the ranvier.io/kv-events-port annotation (K8s).
 # Env: RANVIER_KV_EVENTS_ENABLED, RANVIER_KV_EVENTS_TOPIC,
 #      RANVIER_KV_EVENTS_POLL_INTERVAL_MS, RANVIER_KV_EVENTS_FRESHNESS_TTL,
 #      RANVIER_KV_EVENTS_MAX_TRACKED_BLOCKS,
@@ -681,9 +681,9 @@ attribution:
 # Optional native KV-event stream field:
 #   `kv_events_port` — port of this backend's vLLM KV-event publisher
 #     (--kv-events-config with a zmq publisher). 0/absent = no stream (the
-#     default). Requires the kv_events: section below to be enabled and a
-#     build with -DWITH_KV_EVENTS=ON. K8s fleets use the
-#     ranvier.io/kv-events-port EndpointSlice annotation instead.
+#     default). Requires the kv_events: section below to be enabled. K8s
+#     fleets use the ranvier.io/kv-events-port EndpointSlice annotation
+#     instead.
 #
 # Optional disaggregated-serving field:
 #   `pool_role` — "unified" (default) / "prefill" / "decode". For fleets

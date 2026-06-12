@@ -541,8 +541,9 @@ struct CacheEventsConfig {
 // tcp://<backend-ip>:<port>. The matching vLLM flag is --kv-events-config
 // with a zmq publisher bound on that port.
 //
-// Requires a build WITH_KV_EVENTS=ON (libzmq); with the feature compiled out
-// this section parses but is inert (a startup warning is logged if enabled).
+// Requires a WITH_KV_EVENTS build (the default; libzmq). With the feature
+// compiled out (-DWITH_KV_EVENTS=OFF) this section parses but is inert
+// (a startup warning is logged if enabled).
 struct KvEventsConfig {
     bool enabled = false;                       // Master switch (opt-in)
     std::string topic;                          // ZMQ subscription topic ("" = all)

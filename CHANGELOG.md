@@ -20,8 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   FNV accumulation along block parent chains (`src/kv_event_ledger.hpp`) —
   no shared hash function needed. Per-block evictions deliberately leave the
   RadixTree untouched (the verified check neutralizes stale routes);
-  `AllBlocksCleared` purges. Build-gated behind `WITH_KV_EVENTS` (libzmq,
-  default OFF; production Docker images build it ON); config `kv_events:` /
+  `AllBlocksCleared` purges. Build option `WITH_KV_EVENTS` (libzmq, default
+  ON; `-DWITH_KV_EVENTS=OFF` for a zmq-free server build — unit-test-only
+  builds never need libzmq); config `kv_events:` /
   `RANVIER_KV_EVENTS_*`; per-backend opt-in via static `kv_events_port` or
   the `ranvier.io/kv-events-port` annotation. Metrics:
   `router_native_kv_ops_total`, `router_native_verified_hits_total`,

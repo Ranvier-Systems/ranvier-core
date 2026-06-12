@@ -82,22 +82,12 @@ option(WITH_TELEMETRY "Enable OpenTelemetry distributed tracing" ON)
 # See BACKLOG.md Section 8.5 for rationale
 option(RANVIER_DEBUG_METRICS "Enable gossip debug metrics (crypto offload stats, overflow counters)" OFF)
 
-# Native vLLM KV-event subscriber (BACKLOG §20.1 P0.1). Needs system libzmq;
-# OFF by default so plain source builds stay dependency-free while the wire
-# format is validated against deployed vLLM versions. CI / production Docker
-# images build with -DWITH_KV_EVENTS=ON (see Dockerfile.production).
-option(WITH_KV_EVENTS "Enable native vLLM KV-event subscription (requires libzmq)" OFF)
-
-if(WITH_KV_EVENTS)
-    find_library(ZMQ_LIBRARY NAMES zmq)
-    find_path(ZMQ_INCLUDE_DIR NAMES zmq.h)
-    if(NOT ZMQ_LIBRARY OR NOT ZMQ_INCLUDE_DIR)
-        message(FATAL_ERROR "WITH_KV_EVENTS=ON but libzmq not found (install zeromq-devel / libzmq3-dev)")
-    endif()
-    message(STATUS "Native KV events enabled: libzmq at ${ZMQ_LIBRARY}")
-else()
-    message(STATUS "Native KV events disabled - build with -DWITH_KV_EVENTS=ON to enable")
-endif()
+# Native vLLM KV-event subscriber (BACKLOG §20.1 P0.1). ON by default so the
+# default build compiles the subscriber TU (runtime stays opt-in via
+# kv_events.enabled + per-backend ports). libzmq is required only when the
+# full server is built (Seastar found) — unit-test-only builds never touch
+# it. Pass -DWITH_KV_EVENTS=OFF for a zmq-free server build.
+option(WITH_KV_EVENTS "Enable native vLLM KV-event subscription (requires libzmq)" ON)
 
 if(WITH_TELEMETRY)
     # OpenTelemetry C++ SDK Configuration
@@ -333,12 +323,22 @@ static GLOBAL: Jemalloc = Jemalloc;
         message(STATUS "Gossip debug metrics enabled")
     endif()
 
-    # Native KV-event subscriber (optional; libzmq confined to this TU's worker thread)
+    # Native KV-event subscriber (libzmq confined to this TU's worker thread)
     if(WITH_KV_EVENTS)
+        find_library(ZMQ_LIBRARY NAMES zmq)
+        find_path(ZMQ_INCLUDE_DIR NAMES zmq.h)
+        if(NOT ZMQ_LIBRARY OR NOT ZMQ_INCLUDE_DIR)
+            message(FATAL_ERROR "WITH_KV_EVENTS=ON (the default) but libzmq was not found. "
+                                "Install zeromq-devel (Fedora) / libzmq3-dev (Debian), "
+                                "or pass -DWITH_KV_EVENTS=OFF for a zmq-free server build.")
+        endif()
+        message(STATUS "Native KV events enabled: libzmq at ${ZMQ_LIBRARY}")
         target_sources(ranvier_core PRIVATE src/kv_event_subscriber.cpp)
         target_compile_definitions(ranvier_core PUBLIC RANVIER_WITH_KV_EVENTS)
         target_include_directories(ranvier_core PRIVATE ${ZMQ_INCLUDE_DIR})
         target_link_libraries(ranvier_core PUBLIC ${ZMQ_LIBRARY})
+    else()
+        message(STATUS "Native KV events disabled (WITH_KV_EVENTS=OFF)")
     endif()
 
     # OpenTelemetry configuration (optional)
