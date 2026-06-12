@@ -36,7 +36,7 @@
 // Rule #4 (Bounded Memory via Slab Allocator):
 //   - All nodes allocated via NodeSlab (shard-local free-list allocator)
 //   - insert() triggers LRU eviction when route_count >= max_routes
-//   - evict_oldest() / evict_oldest_remote() implement LRU policy
+//   - evict_oldest() / evict_lowest_trust() implement LRU policy
 //   - compact() reclaims memory from tombstoned nodes periodically
 //   - Node transitions (Node4→Node16→Node48→Node256) use slab, not heap
 //
@@ -87,6 +87,17 @@ enum class RouteOrigin : uint8_t {
     REMOTE = 2   // Learned from cluster gossip (can be evicted more aggressively)
     // Numeric ordering is load-bearing: lower value = higher trust / lower
     // eviction priority. Eviction precedence is REMOTE > PUSH > LOCAL.
+};
+
+// Outcome of insert_if_trusted(). REFUSED means an existing higher-trust
+// route for a DIFFERENT backend held the key (the conflict-resolution table
+// in docs/architecture/push-cache-eviction-notifications.md: LOCAL wins over
+// PUSH, PUSH wins over REMOTE).
+enum class TrustInsertResult : uint8_t {
+    INSERTED_NEW,   // no route existed at this key
+    OVERWROTE,      // existing route had equal or lower trust
+    TOUCHED_SAME,   // same backend behind a higher-trust origin: LRU refresh only
+    REFUSED         // different backend behind a higher-trust origin
 };
 
 enum class NodeType : uint8_t {
@@ -363,6 +374,32 @@ public:
         }
     }
 
+    // Trust-aware insertion for backend-pushed routes (RouteOrigin::PUSH
+    // materialization). Same key encoding/alignment as insert(); the leaf
+    // update applies the conflict-resolution trust order instead of
+    // overwriting unconditionally. Returns what happened (see
+    // TrustInsertResult); REFUSED/TOUCHED_SAME leave the route untouched.
+    TrustInsertResult insert_if_trusted(std::span<const TokenId> tokens, BackendId backend,
+                                        RouteOrigin origin) {
+        size_t aligned_len = (tokens.size() / block_alignment_) * block_alignment_;
+        if (aligned_len == 0) return TrustInsertResult::REFUSED;
+
+        absl::InlinedVector<uint8_t, 1024> key_bytes;
+        key_bytes.reserve(aligned_len * sizeof(TokenId));
+        encode_tokens_be(tokens.subspan(0, aligned_len), key_bytes);
+
+        TrustInsertResult result = TrustInsertResult::REFUSED;
+        auto [new_root, is_new_route] = insert_recursive(
+            std::move(root_),
+            std::span<const uint8_t>(key_bytes.data(), key_bytes.size()),
+            backend, origin, &result);
+        root_ = std::move(new_root);
+        if (is_new_route) {
+            route_count_++;
+        }
+        return result;
+    }
+
     std::optional<BackendId> lookup(std::span<const TokenId> tokens) {
         // 1024-byte inline buffer = 256 tokens; covers every realistic
         // LLM prompt without heap allocation on the hot path.  See the
@@ -599,13 +636,15 @@ public:
     }
 
     // =========================================================================
-    // evict_oldest() / evict_oldest_remote() - LRU Eviction Policy
+    // evict_oldest() / evict_lowest_trust() - LRU Eviction Policy
     // =========================================================================
     //
     // HARD RULE #4 (Bounded Memory):
     // These methods enforce the LRU eviction policy to prevent unbounded growth:
     //   - evict_oldest(): Evicts the least-recently-accessed route (any origin)
-    //   - evict_oldest_remote(): Prefers evicting REMOTE routes first
+    //   - evict_lowest_trust(): Evicts by origin trust ladder — oldest REMOTE,
+    //     else oldest PUSH, else oldest of any origin — making the RouteOrigin
+    //     eviction-precedence comment (REMOTE > PUSH > LOCAL) literally true.
     //
     // Eviction strategy:
     //   1. Find leaf with oldest last_accessed timestamp
@@ -625,14 +664,17 @@ public:
         return true;
     }
 
-    bool evict_oldest_remote() {
-        // Scan from tail (oldest) looking for a REMOTE route.
-        for (Node* n = lru_tail_; n != nullptr; n = n->lru_prev) {
-            if (n->origin == RouteOrigin::REMOTE) {
-                lru_remove(n);
-                n->leaf_value = std::nullopt;
-                if (route_count_ > 0) route_count_--;
-                return true;
+    bool evict_lowest_trust() {
+        // Scan from tail (oldest) for REMOTE, then PUSH, then take the oldest
+        // of any origin. Two passes over the LRU list; capacity-hit path only.
+        for (RouteOrigin target : {RouteOrigin::REMOTE, RouteOrigin::PUSH}) {
+            for (Node* n = lru_tail_; n != nullptr; n = n->lru_prev) {
+                if (n->origin == target) {
+                    lru_remove(n);
+                    n->leaf_value = std::nullopt;
+                    if (route_count_ > 0) route_count_--;
+                    return true;
+                }
             }
         }
         return evict_oldest();
@@ -1500,7 +1542,8 @@ private:
     std::pair<NodePtr, bool> insert_recursive(NodePtr node,
                              std::span<const uint8_t> key_bytes,
                              BackendId backend,
-                             RouteOrigin origin) {
+                             RouteOrigin origin,
+                             TrustInsertResult* trust_result = nullptr) {
         // Calculate prefix match length
         size_t match_len = 0;
         while (match_len < node->prefix.size() && match_len < key_bytes.size()) {
@@ -1518,6 +1561,20 @@ private:
         // Exact match - update leaf
         if (remaining.empty()) {
             bool is_new = !node->leaf_value.has_value();
+            // Trust policy (insert_if_trusted only): an existing HIGHER-trust
+            // route (numerically lower origin) is never overwritten. Same
+            // backend gets an LRU refresh — the route is being re-confirmed,
+            // its provenance stays the more-trusted one.
+            if (trust_result != nullptr && !is_new && origin > node->origin) {
+                if (node->leaf_value == backend) {
+                    node->last_accessed = std::chrono::steady_clock::now();
+                    lru_touch(node.get());
+                    *trust_result = TrustInsertResult::TOUCHED_SAME;
+                } else {
+                    *trust_result = TrustInsertResult::REFUSED;
+                }
+                return {std::move(node), false};
+            }
             node->leaf_value = backend;
             node->origin = origin;
             node->last_accessed = std::chrono::steady_clock::now();
@@ -1526,6 +1583,10 @@ private:
             } else {
                 lru_touch(node.get());
             }
+            if (trust_result != nullptr) {
+                *trust_result = is_new ? TrustInsertResult::INSERTED_NEW
+                                       : TrustInsertResult::OVERWROTE;
+            }
             return {std::move(node), is_new};
         }
 
@@ -1533,13 +1594,16 @@ private:
         uint8_t next_key = remaining[0];
         if (find_child(node.get(), next_key)) {
             auto child_ptr = extract_child(node.get(), next_key);
-            auto [new_child, is_new] = insert_recursive(std::move(child_ptr), remaining.subspan(1), backend, origin);
+            auto [new_child, is_new] = insert_recursive(std::move(child_ptr), remaining.subspan(1), backend, origin, trust_result);
             set_child(node.get(), next_key, std::move(new_child));
             return {std::move(node), is_new};
         } else {
             auto new_child = make_node<Node4>();
             if (remaining.size() > 1) {
                 new_child->prefix.assign(remaining.begin() + 1, remaining.end());
+            }
+            if (trust_result != nullptr) {
+                *trust_result = TrustInsertResult::INSERTED_NEW;
             }
             new_child->leaf_value = backend;
             new_child->origin = origin;

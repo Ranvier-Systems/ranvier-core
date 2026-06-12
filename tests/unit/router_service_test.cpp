@@ -1033,6 +1033,107 @@ TEST_F(RouterServiceTest, ApplyNativeOpsLocalUpsertRemoveAndStaleness) {
 }
 
 // =============================================================================
+// 1g. Native Route Materialization (MATERIALIZE ops)
+// =============================================================================
+// BlockStored token chains insert RouteOrigin::PUSH routes at every newly
+// covered block boundary. Higher-trust LOCAL routes are never clobbered.
+// Fixture: block_alignment=1, so boundary_step can be small in tests.
+
+namespace {
+NativeKvOp materialize_op(BackendId backend, std::vector<int32_t> tokens,
+                          uint32_t first_new, uint32_t step, uint64_t ts) {
+    NativeKvOp op;
+    op.kind = NativeKvOp::Kind::MATERIALIZE;
+    op.backend = backend;
+    op.ts_ms = ts;
+    op.tokens = std::move(tokens);
+    op.first_new_token_count = first_new;
+    op.boundary_step = step;
+    return op;
+}
+}  // namespace
+
+TEST_F(RouterServiceTest, MaterializeInsertsRoutesAtBoundaries) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {801, 802, 803, 804, 805, 806, 807, 808};
+
+    // Boundaries 4 and 8 are new: both depths must become routable.
+    auto op = materialize_op(1, tokens, 4, 4, 1000);
+    RouterService::apply_native_kv_ops_local(&op, 1);
+
+    auto full = router_->route_request(tokens);
+    ASSERT_TRUE(full.backend_id.has_value());
+    EXPECT_TRUE(full.cache_hit);
+    EXPECT_EQ(full.backend_id.value(), 1);
+
+    std::vector<int32_t> shallow(tokens.begin(), tokens.begin() + 4);
+    auto part = router_->route_request(shallow);
+    ASSERT_TRUE(part.backend_id.has_value());
+    EXPECT_TRUE(part.cache_hit);
+    EXPECT_EQ(part.backend_id.value(), 1);
+
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.routes_materialized, 2u);
+}
+
+TEST_F(RouterServiceTest, MaterializeNeverClobbersLocalRoute) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {811, 812, 813, 814};
+    RouterService::insert_route_for_testing(tokens, 1);  // LOCAL origin
+
+    auto op = materialize_op(2, tokens, 4, 4, 1000);
+    RouterService::apply_native_kv_ops_local(&op, 1);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);  // LOCAL wins over PUSH
+
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.materialize_trust_skips, 1u);
+    EXPECT_EQ(stats.routes_materialized, 0u);
+}
+
+TEST_F(RouterServiceTest, MaterializeRespectsMinTokenLength) {
+    // Fixture min_token_length default is 4: a 2-token boundary is skipped,
+    // the 4-token boundary lands.
+    register_two_backends();
+    std::vector<int32_t> tokens = {821, 822, 823, 824};
+
+    auto op = materialize_op(1, tokens, 2, 2, 1000);
+    RouterService::apply_native_kv_ops_local(&op, 1);
+
+    std::vector<int32_t> two(tokens.begin(), tokens.begin() + 2);
+    auto shallow = router_->route_request(two);
+    ASSERT_TRUE(shallow.backend_id.has_value());
+    EXPECT_FALSE(shallow.cache_hit);  // below min_token_length: not materialized
+
+    auto full = router_->route_request(tokens);
+    ASSERT_TRUE(full.backend_id.has_value());
+    EXPECT_TRUE(full.cache_hit);
+    EXPECT_EQ(full.backend_id.value(), 1);
+}
+
+TEST_F(RouterServiceTest, MaterializeMakesVerifiedResidencyHit) {
+    // The same shipment carries the UPSERT for the boundary hash, so a
+    // materialized route on a stream-fresh backend verifies resident.
+    register_two_backends();
+    std::vector<int32_t> tokens = {831, 832, 833, 834};
+    uint64_t h = hash_prefix(tokens.data(), tokens.size(), 1);
+
+    NativeKvOp ops[2];
+    ops[0] = NativeKvOp{NativeKvOp::Kind::UPSERT, 1, h, 1000};
+    ops[1] = materialize_op(1, tokens, 4, 4, 1000);
+    RouterService::apply_native_kv_ops_local(ops, 2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_TRUE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 1);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.verified_hits, 1u);
+}
+
+// =============================================================================
 // 2. Route TTL Expiration and Cleanup
 // =============================================================================
 // TTL cleanup requires the Seastar reactor (run_ttl_cleanup uses smp::submit_to).

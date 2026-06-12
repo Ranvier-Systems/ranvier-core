@@ -244,6 +244,8 @@ struct K8sEndpoint {
     uint32_t priority = K8S_DEFAULT_PRIORITY;
     BackendType type = BackendType::VLLM;
     PoolRole role = PoolRole::UNIFIED;
+    uint16_t kv_events_port = 0;
+    uint16_t kv_events_replay_port = 0;
     std::string api_key_secret_ref;
 
     // FNV-1a 64-bit hash, truncated to 31 bits for positive BackendId.
@@ -409,6 +411,8 @@ protected:
         uint32_t default_priority = K8S_DEFAULT_PRIORITY;
         BackendType default_type = BackendType::VLLM;
         PoolRole default_role = PoolRole::UNIFIED;
+        uint16_t default_kv_port = 0;
+        uint16_t default_kv_replay_port = 0;
         std::string default_secret_ref;
 
         if (metadata) {
@@ -477,6 +481,25 @@ protected:
                     }
                     // Unknown role falls back to UNIFIED (matches production warn-and-default)
                 }
+                auto kv_port_str = k8s_json::get_string(*annotations, "ranvier.io/kv-events-port");
+                if (kv_port_str) {
+                    try {
+                        unsigned long v = std::stoul(*kv_port_str);
+                        if (v <= 65535) default_kv_port = static_cast<uint16_t>(v);
+                    } catch (const std::exception&) {
+                        // Keep 0 (matches production warn-and-disable)
+                    }
+                }
+                auto kv_replay_str = k8s_json::get_string(*annotations,
+                                                          "ranvier.io/kv-events-replay-port");
+                if (kv_replay_str) {
+                    try {
+                        unsigned long v = std::stoul(*kv_replay_str);
+                        if (v <= 65535) default_kv_replay_port = static_cast<uint16_t>(v);
+                    } catch (const std::exception&) {
+                        // Keep 0
+                    }
+                }
                 auto secret_ref = k8s_json::get_string(*annotations,
                                                        "ranvier.io/api-key-secret-ref");
                 if (secret_ref) {
@@ -538,6 +561,8 @@ protected:
                 endpoint.priority = default_priority;
                 endpoint.type = default_type;
                 endpoint.role = default_role;
+                endpoint.kv_events_port = default_kv_port;
+                endpoint.kv_events_replay_port = default_kv_replay_port;
                 endpoint.api_key_secret_ref = default_secret_ref;
 
                 endpoints.push_back(std::move(endpoint));
@@ -917,6 +942,41 @@ TEST_F(K8sEndpointSliceTest, UnknownPoolRoleAnnotationDefaultsUnified) {
     auto endpoints = parse_endpoint_slice(json);
     ASSERT_EQ(endpoints.size(), 1u);
     EXPECT_EQ(endpoints[0].role, PoolRole::UNIFIED);
+}
+
+TEST_F(K8sEndpointSliceTest, ParseKvEventsPortAnnotations) {
+    std::string json = R"({
+        "metadata": {"annotations": {
+            "ranvier.io/kv-events-port": "5557",
+            "ranvier.io/kv-events-replay-port": "5558"
+        }},
+        "ports": [{"port": 8000}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-1"}
+        }]
+    })";
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    EXPECT_EQ(endpoints[0].kv_events_port, 5557);
+    EXPECT_EQ(endpoints[0].kv_events_replay_port, 5558);
+}
+
+TEST_F(K8sEndpointSliceTest, KvEventsAnnotationsAbsentDefaultZero) {
+    std::string json = R"({
+        "metadata": {"annotations": {"ranvier.io/weight": "200"}},
+        "ports": [{"port": 8000}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-1"}
+        }]
+    })";
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    EXPECT_EQ(endpoints[0].kv_events_port, 0);
+    EXPECT_EQ(endpoints[0].kv_events_replay_port, 0);
 }
 
 TEST_F(K8sEndpointSliceTest, ParseSecretRefAnnotation) {

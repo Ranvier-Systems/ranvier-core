@@ -16,6 +16,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include <seastar/util/log.hh>
@@ -29,6 +30,7 @@ namespace {
 struct Subscription {
     void* socket = nullptr;
     std::string endpoint;
+    std::string replay_endpoint;  // empty = gaps reset instead of replaying
     uint64_t next_seq = 0;
     bool synced = false;  // false until the first frame fixes the sequence base
 };
@@ -85,13 +87,147 @@ bool split_seq_payload(const Message& msg, uint64_t& seq,
     return false;
 }
 
+// Recover missed batches from vLLM's replay ROUTER socket. Sends the start
+// sequence as 8 bytes big-endian; the publisher streams (seq, payload)
+// messages from its bounded buffer, ending with a sentinel (seq = -1, empty
+// payload). A DEALER socket is used deliberately: REQ's strict send/recv
+// alternation cannot consume a multi-message stream.
+//
+// Gap repair (upto_exclusive != UINT64_MAX): succeeds only when the stream
+// covers [from_seq, upto_exclusive) contiguously starting exactly at
+// from_seq — a hole or short buffer fails, and the caller falls back to the
+// reset path. Connect-backfill (upto_exclusive == UINT64_MAX): the first
+// received sequence sets the base (the buffer's tail is trimmed by design),
+// contiguity is required after it, and reaching the sentinel is success —
+// even with zero batches (fresh publisher).
+//
+// Runs entirely on the worker thread; blocking inside the poll deadline is
+// legal here (Rule #12: off-reactor).
+// flush_ops ships accumulated ops mid-replay: a full backfill can cover the
+// publisher's whole buffer (~10k batches), and holding every translated op
+// in one vector until the sentinel would be an unbounded spike (Rule #4).
+bool attempt_replay(void* ctx, Subscription& sub, BackendId backend,
+                    uint64_t from_seq, uint64_t upto_exclusive,
+                    uint32_t timeout_ms, KvBlockLedger& ledger,
+                    std::vector<NativeKvOp>& ops,
+                    const std::function<void(std::vector<NativeKvOp>&&)>& flush_ops,
+                    uint32_t flush_threshold,
+                    std::atomic<uint64_t>& replay_batches,
+                    std::atomic<uint64_t>& decode_errors) {
+    // Bound on accepted replay messages: comfortably above vLLM's default
+    // replay buffer (10k batches); a publisher streaming beyond this is
+    // misbehaving and the replay fails closed to the reset path.
+    constexpr uint32_t kMaxReplayBatches = 65536;
+    uint32_t accepted = 0;
+    void* sock = zmq_socket(ctx, ZMQ_DEALER);
+    if (sock == nullptr) return false;
+    int linger = 0;
+    zmq_setsockopt(sock, ZMQ_LINGER, &linger, sizeof(linger));
+    if (zmq_connect(sock, sub.replay_endpoint.c_str()) != 0) {
+        log_kv.warn("Replay connect('{}') failed for backend {}: {}",
+                    sub.replay_endpoint, backend, zmq_strerror(zmq_errno()));
+        zmq_close(sock);
+        return false;
+    }
+    uint8_t request[8];
+    encode_replay_request(from_seq, request);
+    if (zmq_send(sock, request, sizeof(request), 0) != static_cast<int>(sizeof(request))) {
+        zmq_close(sock);
+        return false;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    uint64_t next_expected = from_seq;
+    uint64_t dropped = 0;
+    bool first = true;
+    bool sentinel_seen = false;
+    bool ok = true;
+
+    while (ok && !sentinel_seen) {
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) { ok = false; break; }
+        zmq_pollitem_t item{sock, 0, ZMQ_POLLIN, 0};
+        if (zmq_poll(&item, 1, static_cast<long>(remaining)) <= 0) { ok = false; break; }
+
+        Message msg;
+        while (recv_message(sock, msg, dropped)) {
+            // Re-check bounds INSIDE the drain: a fast publisher can keep
+            // this socket readable indefinitely, and the outer poll deadline
+            // alone would never fire.
+            if (std::chrono::steady_clock::now() >= deadline ||
+                ++accepted > kMaxReplayBatches) {
+                ok = false;
+                break;
+            }
+            uint64_t raw_seq = 0;
+            const std::vector<uint8_t>* payload = nullptr;
+            if (!split_seq_payload(msg, raw_seq, &payload)) {
+                continue;  // unrecognized frame shape: skip, deadline bounds us
+            }
+            const int64_t seq = static_cast<int64_t>(raw_seq);
+            if (seq < 0) {
+                // Sentinel (canonically seq=-1 + empty payload); any negative
+                // sequence ends the stream.
+                sentinel_seen = true;
+                break;
+            }
+            const uint64_t s = raw_seq;
+            if (upto_exclusive != UINT64_MAX && s >= upto_exclusive) {
+                continue;  // past the gap: drain to the sentinel
+            }
+            if (first) {
+                if (upto_exclusive != UINT64_MAX && s != from_seq) {
+                    ok = false;  // buffer no longer covers the gap start
+                    break;
+                }
+                next_expected = s;
+                first = false;
+            }
+            if (s != next_expected) {
+                ok = false;  // hole inside the replay stream
+                break;
+            }
+            auto batch = decode_kv_event_batch(payload->data(), payload->size());
+            if (!batch.has_value()) {
+                decode_errors.fetch_add(1, std::memory_order_relaxed);
+                ok = false;
+                break;
+            }
+            if (!ledger.translate(backend, *batch, ops)) {
+                ok = false;
+                break;
+            }
+            replay_batches.fetch_add(1, std::memory_order_relaxed);
+            next_expected = s + 1;
+            if (s + 1 > sub.next_seq) {
+                sub.next_seq = s + 1;
+            }
+            sub.synced = true;
+
+            if (ops.size() >= flush_threshold) {
+                flush_ops(std::move(ops));
+                ops = {};
+            }
+        }
+    }
+    zmq_close(sock);
+    if (!ok || !sentinel_seen) return false;
+    if (upto_exclusive != UINT64_MAX && next_expected < upto_exclusive) {
+        return false;  // sentinel arrived before the gap was fully covered
+    }
+    return true;
+}
+
 }  // namespace
 
 KvEventSubscriberService::KvEventSubscriberService(const KvEventsConfig& cfg,
                                                    uint32_t block_alignment)
     : _cfg(cfg)
     , _ledger_limits{block_alignment, cfg.max_indexed_token_depth,
-                     cfg.max_tracked_blocks_per_backend}
+                     cfg.max_tracked_blocks_per_backend,
+                     cfg.materialize_routes ? cfg.max_materialize_tokens : 0}
     , _commands(64) {}
 
 KvEventSubscriberService::~KvEventSubscriberService() {
@@ -128,11 +264,13 @@ seastar::future<> KvEventSubscriberService::stop() {
     return _apply_gate.close();
 }
 
-bool KvEventSubscriberService::add_subscription(BackendId id, std::string endpoint) {
+bool KvEventSubscriberService::add_subscription(BackendId id, std::string endpoint,
+                                                std::string replay_endpoint) {
     Command cmd;
     cmd.kind = Command::Kind::ADD;
     cmd.backend = id;
     cmd.endpoint = std::move(endpoint);
+    cmd.replay_endpoint = std::move(replay_endpoint);
     if (!_commands.try_push(std::move(cmd))) {
         _commands_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -158,7 +296,10 @@ KvEventSubscriberService::StatsSnapshot KvEventSubscriberService::stats() const 
             _ops_shipped.load(std::memory_order_relaxed),
             _shipments.load(std::memory_order_relaxed),
             _shipments_throttled.load(std::memory_order_relaxed),
-            _commands_dropped.load(std::memory_order_relaxed)};
+            _commands_dropped.load(std::memory_order_relaxed),
+            _replay_requests.load(std::memory_order_relaxed),
+            _replay_batches.load(std::memory_order_relaxed),
+            _replay_failures.load(std::memory_order_relaxed)};
 }
 
 void KvEventSubscriberService::ship(seastar::alien::instance& alien,
@@ -166,10 +307,22 @@ void KvEventSubscriberService::ship(seastar::alien::instance& alien,
     // One translate() call can emit far more ops than the shipment cap (a
     // single BlockStored may carry thousands of hashes), so chunk here: the
     // cap is the Rule #17 bound on each synchronous per-shard application.
-    for (size_t off = 0; off < ops.size(); off += _cfg.max_ops_per_shipment) {
-        const size_t n = std::min<size_t>(_cfg.max_ops_per_shipment, ops.size() - off);
-        std::vector<NativeKvOp> chunk(ops.begin() + static_cast<ptrdiff_t>(off),
-                                      ops.begin() + static_cast<ptrdiff_t>(off + n));
+    // Chunks are cut by summed op WEIGHT (a MATERIALIZE counts one unit per
+    // route insertion it will perform), so token-heavy ops can't smuggle an
+    // oversized application past the cap.
+    for (size_t off = 0; off < ops.size();) {
+        size_t end = off;
+        uint64_t weight = 0;
+        while (end < ops.size()) {
+            const uint64_t w = ops[end].weight();
+            if (end > off && weight + w > _cfg.max_ops_per_shipment) break;
+            weight += w;
+            ++end;
+        }
+        const size_t n = end - off;
+        std::vector<NativeKvOp> chunk(
+            std::make_move_iterator(ops.begin() + static_cast<ptrdiff_t>(off)),
+            std::make_move_iterator(ops.begin() + static_cast<ptrdiff_t>(end)));
 
         // Bounded in-flight shipments: the worker waits (it's an OS thread —
         // sleeping is legal here) rather than flooding shard 0's task queue.
@@ -181,6 +334,7 @@ void KvEventSubscriberService::ship(seastar::alien::instance& alien,
         _inflight.fetch_add(1, std::memory_order_acq_rel);
         _ops_shipped.fetch_add(n, std::memory_order_relaxed);
         _shipments.fetch_add(1, std::memory_order_relaxed);
+        off = end;
 
         try {
             seastar::alien::run_on(alien, 0,
@@ -233,6 +387,8 @@ void KvEventSubscriberService::worker_loop(seastar::alien::instance& alien) {
     };
 
     while (!_shutdown.load(std::memory_order_acquire)) {
+        std::vector<NativeKvOp> ops;
+
         // Drain control commands (reallocate endpoint strings worker-side).
         Command cmd;
         while (_commands.try_pop(cmd)) {
@@ -276,9 +432,33 @@ void KvEventSubscriberService::worker_loop(seastar::alien::instance& alien) {
                 zmq_close(existing->second.socket);
                 ledger.drop_backend(cmd.backend);
             }
-            subs[cmd.backend] = Subscription{sock, std::move(endpoint), 0, false};
-            log_kv.info("KV-event subscription added: backend {} ← {}",
-                        cmd.backend, subs[cmd.backend].endpoint);
+            std::string replay_endpoint(cmd.replay_endpoint.data(),
+                                        cmd.replay_endpoint.size());
+            subs[cmd.backend] = Subscription{sock, std::move(endpoint),
+                                             std::move(replay_endpoint), 0, false};
+            auto& added = subs[cmd.backend];
+            log_kv.info("KV-event subscription added: backend {} ← {} (replay: {})",
+                        cmd.backend, added.endpoint,
+                        added.replay_endpoint.empty() ? "none" : added.replay_endpoint);
+
+            // Connect-backfill: pull the publisher's buffered history so a
+            // restarted Ranvier recovers warm backends' recent block state
+            // (bounded by the publisher's replay buffer — this is the
+            // cold-start story, PUB/SUB itself has no snapshot).
+            if (!added.replay_endpoint.empty() && _cfg.replay_on_connect) {
+                _replay_requests.fetch_add(1, std::memory_order_relaxed);
+                auto flush = [this, &alien](std::vector<NativeKvOp>&& v) {
+                    ship(alien, std::move(v));
+                };
+                if (!attempt_replay(ctx, added, cmd.backend, 0, UINT64_MAX,
+                                    _cfg.replay_timeout_ms, ledger, ops,
+                                    flush, _cfg.max_ops_per_shipment,
+                                    _replay_batches, _decode_errors)) {
+                    _replay_failures.fetch_add(1, std::memory_order_relaxed);
+                    log_kv.warn("Connect-backfill failed for backend {}; starting "
+                                "from live stream only", cmd.backend);
+                }
+            }
         }
         if (_shutdown.load(std::memory_order_acquire)) break;
 
@@ -300,7 +480,6 @@ void KvEventSubscriberService::worker_loop(seastar::alien::instance& alien) {
                      static_cast<long>(_cfg.poll_interval_ms));
         }
 
-        std::vector<NativeKvOp> ops;
         for (size_t i = 0; i < items.size(); ++i) {
             if (!(items[i].revents & ZMQ_POLLIN)) continue;
             BackendId backend = item_backends[i];
@@ -323,9 +502,32 @@ void KvEventSubscriberService::worker_loop(seastar::alien::instance& alien) {
 
                 if (sub.synced && seq != sub.next_seq) {
                     _sequence_gaps.fetch_add(1, std::memory_order_relaxed);
-                    log_kv.warn("KV-event sequence gap for backend {} (expected {}, got {}); "
-                                "resetting native state", backend, sub.next_seq, seq);
-                    ledger.reset_backend(backend, now_ms(), ops);
+                    bool repaired = false;
+                    // Replay can only fill a FORWARD gap; a rewind (publisher
+                    // restart resetting its sequence) always resets.
+                    if (!sub.replay_endpoint.empty() && seq > sub.next_seq) {
+                        _replay_requests.fetch_add(1, std::memory_order_relaxed);
+                        auto flush = [this, &alien](std::vector<NativeKvOp>&& v) {
+                            ship(alien, std::move(v));
+                        };
+                        repaired = attempt_replay(ctx, sub, backend, sub.next_seq,
+                                                  seq, _cfg.replay_timeout_ms,
+                                                  ledger, ops, flush,
+                                                  _cfg.max_ops_per_shipment,
+                                                  _replay_batches, _decode_errors);
+                        if (!repaired) {
+                            _replay_failures.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    if (repaired) {
+                        log_kv.info("KV-event gap for backend {} repaired via replay "
+                                    "(seq {}..{})", backend, sub.next_seq, seq);
+                    } else {
+                        log_kv.warn("KV-event sequence gap for backend {} (expected {}, "
+                                    "got {}); resetting native state",
+                                    backend, sub.next_seq, seq);
+                        ledger.reset_backend(backend, now_ms(), ops);
+                    }
                 }
                 sub.next_seq = seq + 1;
                 sub.synced = true;

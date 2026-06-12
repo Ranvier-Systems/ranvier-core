@@ -58,6 +58,9 @@ constexpr const char* K8S_ANNOTATION_POOL_ROLE = "ranvier.io/pool-role";
 // Annotation key for the native KV-event stream port (BACKLOG §20.1 P0.1).
 // The subscriber connects to tcp://<pod-ip>:<port>; absent/0 = no stream.
 constexpr const char* K8S_ANNOTATION_KV_EVENTS_PORT = "ranvier.io/kv-events-port";
+// Port of the publisher's optional replay ROUTER socket; absent/0 = gaps
+// reset instead of replaying. Requires kv-events-port.
+constexpr const char* K8S_ANNOTATION_KV_EVENTS_REPLAY_PORT = "ranvier.io/kv-events-replay-port";
 
 // Conventional Secret data-map field that holds the API key. Operators run
 //   kubectl create secret generic my-key --from-literal=api-key=sk-...
@@ -102,6 +105,8 @@ struct K8sEndpoint {
     PoolRole role = PoolRole::UNIFIED;
     // Native KV-event stream port (ranvier.io/kv-events-port). 0 = none.
     uint16_t kv_events_port = 0;
+    // Replay ROUTER port (ranvier.io/kv-events-replay-port). 0 = no replay.
+    uint16_t kv_events_replay_port = 0;
     // Name of a K8s Secret whose `api-key` field holds the credential.
     // Empty string means "no auth header" — correct for vLLM on a cluster-
     // internal network. The Secret value is resolved at endpoint-discovery
@@ -123,7 +128,8 @@ struct K8sEndpoint {
 // callers that don't care can pass VLLM/""/UNIFIED.
 using BackendRegisterCallback = std::function<seastar::future<>(
     BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority,
-    BackendType type, std::string api_key, PoolRole role, uint16_t kv_events_port)>;
+    BackendType type, std::string api_key, PoolRole role, uint16_t kv_events_port,
+    uint16_t kv_events_replay_port)>;
 using BackendDrainCallback = std::function<seastar::future<>(BackendId id)>;
 
 // K8sDiscoveryService: Watches Kubernetes for GPU backend endpoints

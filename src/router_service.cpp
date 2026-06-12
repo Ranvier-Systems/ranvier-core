@@ -221,6 +221,8 @@ struct ShardLocalState {
         uint64_t native_index_overflow = 0;         // Upserts dropped at the per-backend index cap
         uint64_t native_verified_hits = 0;          // ART hits confirmed resident by the native index
         uint64_t native_verified_downgrades = 0;    // ART hits downgraded because the native index lacked the prefix
+        uint64_t native_routes_materialized = 0;    // PUSH routes inserted from BlockStored token chains
+        uint64_t native_materialize_trust_skips = 0; // Materializations refused by a higher-trust route
 
         void reset() {
             cache_hits = 0;
@@ -262,6 +264,8 @@ struct ShardLocalState {
             native_index_overflow = 0;
             native_verified_hits = 0;
             native_verified_downgrades = 0;
+            native_routes_materialized = 0;
+            native_materialize_trust_skips = 0;
         }
     } stats;
 
@@ -271,6 +275,7 @@ struct ShardLocalState {
     struct Config {
         size_t max_routes = 100000;
         size_t max_route_tokens = 8192;  // Business-level limit on tokens per route
+        size_t min_token_length = 4;     // Minimum tokens before a route may exist
         std::chrono::seconds ttl_seconds{3600};
         std::chrono::seconds backend_drain_timeout{60};
         RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::PREFIX;
@@ -561,6 +566,7 @@ struct ShardLocalState {
         // Copy configuration for lock-free access
         config.max_routes = cfg.max_routes;
         config.max_route_tokens = cfg.max_route_tokens;
+        config.min_token_length = cfg.min_token_length;
         config.ttl_seconds = cfg.ttl_seconds;
         config.backend_drain_timeout = cfg.backend_drain_timeout;
         config.routing_mode = cfg.routing_mode;
@@ -615,6 +621,7 @@ struct ShardLocalState {
     void update_config(const RoutingConfig& cfg) {
         config.max_routes = cfg.max_routes;
         config.max_route_tokens = cfg.max_route_tokens;
+        config.min_token_length = cfg.min_token_length;
         config.ttl_seconds = cfg.ttl_seconds;
         config.backend_drain_timeout = cfg.backend_drain_timeout;
         config.routing_mode = cfg.routing_mode;
@@ -1214,7 +1221,7 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
         // LRU eviction: prefer evicting REMOTE routes first when at capacity
         if (state.config.max_routes > 0) {
             while (tree->route_count() >= state.config.max_routes) {
-                if (tree->evict_oldest_remote()) {
+                if (tree->evict_lowest_trust()) {
                     state.stats.routes_evicted++;
                 } else {
                     break;  // No more routes to evict
@@ -1838,7 +1845,15 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
                                          "decode failure (verified residency suspended)")),
         seastar::metrics::make_counter("router_native_index_overflow_total",
             [] { return g_shard_state ? g_shard_state->stats.native_index_overflow : 0UL; },
-            seastar::metrics::description("Native index upserts dropped at the per-backend cap"))
+            seastar::metrics::description("Native index upserts dropped at the per-backend cap")),
+        seastar::metrics::make_counter("router_native_routes_materialized_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_routes_materialized : 0UL; },
+            seastar::metrics::description("RouteOrigin::PUSH routes inserted from native "
+                                         "BlockStored token chains")),
+        seastar::metrics::make_counter("router_native_materialize_trust_skips_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_materialize_trust_skips : 0UL; },
+            seastar::metrics::description("Materializations refused because a higher-trust "
+                                         "route holds the prefix"))
 
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
@@ -4934,6 +4949,49 @@ void RouterService::apply_native_kv_ops_local(const NativeKvOp* ops, size_t coun
         case NativeKvOp::Kind::ALIVE:
             state.touch_native_fresh(op.backend);
             break;
+        case NativeKvOp::Kind::MATERIALIZE: {
+            if (op.boundary_step == 0 || op.tokens.empty() ||
+                op.first_new_token_count == 0 ||
+                op.first_new_token_count > op.tokens.size()) {
+                break;
+            }
+            RadixTree* tree = state.tree.get();
+            if (!tree) break;
+
+            // Rule #14: the tree's insert contract requires locally-allocated
+            // tokens; the op's vector may be a cross-shard read through the
+            // shipment's foreign_ptr. One local copy serves every boundary.
+            std::vector<int32_t> local_tokens(op.tokens.begin(), op.tokens.end());
+
+            for (size_t count = op.first_new_token_count;
+                 count <= local_tokens.size(); count += op.boundary_step) {
+                if (count < state.config.min_token_length) continue;
+                if (state.config.max_route_tokens > 0 &&
+                    count > state.config.max_route_tokens) {
+                    break;
+                }
+                if (state.config.max_routes > 0) {
+                    while (tree->route_count() >= state.config.max_routes) {
+                        if (tree->evict_lowest_trust()) {
+                            state.stats.routes_evicted++;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                auto inserted = tree->insert_if_trusted(
+                    std::span<const TokenId>(local_tokens.data(), count),
+                    op.backend, RouteOrigin::PUSH);
+                if (inserted == TrustInsertResult::INSERTED_NEW ||
+                    inserted == TrustInsertResult::OVERWROTE) {
+                    state.stats.native_routes_materialized++;
+                } else if (inserted == TrustInsertResult::REFUSED) {
+                    state.stats.native_materialize_trust_skips++;
+                }
+            }
+            state.touch_native_fresh(op.backend);
+            break;
+        }
         case NativeKvOp::Kind::CLEAR:
         case NativeKvOp::Kind::RESET:
             // Dispatched through native_purge_backend_local by the shard-0
@@ -5005,7 +5063,8 @@ seastar::future<> RouterService::apply_native_kv_ops(std::vector<NativeKvOp> ops
     // here are control-plane application, not a data-plane fan-out.
     //
     // Rule #14: shards READ the ops through the foreign_ptr (index ranges,
-    // no captures of raw data) and write only their own shard state.
+    // no captures of raw data) and write only their own shard state;
+    // MATERIALIZE token payloads are copied locally before tree insertion.
     // Rule #20: the coroutine frame keeps `shared` alive across co_awaits.
     auto shared = seastar::make_foreign(
         std::make_unique<std::vector<NativeKvOp>>(std::move(ops)));
@@ -5043,7 +5102,8 @@ RouterService::NativeKvStatsSnapshot RouterService::get_native_kv_stats() {
     auto& st = shard_state().stats;
     return {st.native_ops_applied, st.native_upserts, st.native_removes,
             st.native_clears, st.native_resets, st.native_index_overflow,
-            st.native_verified_hits, st.native_verified_downgrades};
+            st.native_verified_hits, st.native_verified_downgrades,
+            st.native_routes_materialized, st.native_materialize_trust_skips};
 }
 
 void RouterService::set_native_fresh_for_testing(BackendId id) {
