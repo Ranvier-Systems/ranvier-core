@@ -10,6 +10,7 @@
 #pragma once
 
 #include "config_infra.hpp"
+#include "parse_utils.hpp"  // extract_bearer_token (canonical helper)
 
 #include <chrono>
 #include <cstdint>
@@ -146,17 +147,6 @@ private:
     bool _ip_filter_enabled = false;
 };
 
-// Extracts the Bearer token from an Authorization header value.
-// Returns empty string_view if not in "Bearer <token>" format.
-inline std::string_view extract_bearer_token(std::string_view auth_header) {
-    constexpr std::string_view prefix = "Bearer ";
-    if (auth_header.size() > prefix.size() &&
-        std::string_view(auth_header.data(), prefix.size()) == prefix) {
-        return auth_header.substr(prefix.size());
-    }
-    return {};
-}
-
 // HTTP handler wrapper that checks Bearer token and IP allowlist before
 // delegating to the underlying Prometheus handler.
 //
@@ -195,8 +185,9 @@ public:
 
         // Bearer token check
         if (_config.auth_enabled()) {
-            auto token = extract_bearer_token(req->get_header("Authorization"));
-            if (token.empty() || !_config.is_token_valid(token)) {
+            auto token = extract_bearer_token(
+                std::string_view(req->get_header("Authorization")));
+            if (!token.has_value() || !_config.is_token_valid(*token)) {
                 log_rejected("auth_failed", source_ip);
                 rep->set_status(seastar::http::reply::status_type::unauthorized);
                 rep->_content = "Unauthorized\n";

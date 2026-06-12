@@ -667,6 +667,22 @@ seastar::future<> Application::register_static_backends() {
                               sb.id, sb.gpu_tier, sb.cost_per_hour);
             }
 
+#ifdef RANVIER_WITH_KV_EVENTS
+            if (_kv_subscriber && sb.kv_events_port > 0) {
+                // zmq_connect resolves hostnames itself, on the worker thread
+                // — blocking DNS is legal there (Rule #12: off-reactor).
+                std::string kv_endpoint =
+                    "tcp://" + sb.host + ":" + std::to_string(sb.kv_events_port);
+                if (_kv_subscriber->add_subscription(sb.id, std::move(kv_endpoint))) {
+                    log_main.info("Static backend {}: native KV events from port {}",
+                                  sb.id, sb.kv_events_port);
+                } else {
+                    log_main.warn("KV-event subscription queue full; static backend {} "
+                                  "stays on probabilistic residency", sb.id);
+                }
+            }
+#endif
+
             // Log without the key. api_key_env name is fine — it's not the secret.
             log_main.info("Static backend {} ({}) -> {} (weight={}, priority={}, api_key_env={})",
                           sb.id, backend_type_to_string(sb.type),
@@ -771,16 +787,41 @@ void Application::init_k8s_discovery() {
     // listening when K8s discovery fires events, so this window is real).
     _k8s_discovery->set_register_callback(
         [this](BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority,
-               BackendType type, std::string api_key, PoolRole role) -> seastar::future<> {
+               BackendType type, std::string api_key, PoolRole role,
+               uint16_t kv_events_port) -> seastar::future<> {
             if (!api_key.empty()) {
                 co_await _router->set_backend_api_key_global(id, std::move(api_key));
             }
             co_await _router->register_backend_global(id, addr, weight, priority,
                                                        /*supports_token_ids=*/true,
                                                        /*compression_ratio=*/1.0, type, role);
+#ifdef RANVIER_WITH_KV_EVENTS
+            if (_kv_subscriber) {
+                if (kv_events_port > 0) {
+                    std::ostringstream ep;
+                    ep << "tcp://" << addr.addr() << ":" << kv_events_port;
+                    if (!_kv_subscriber->add_subscription(id, ep.str())) {
+                        log_main.warn("KV-event subscription queue full; backend {} "
+                                      "stays on probabilistic residency until the "
+                                      "next discovery sync", id);
+                    }
+                } else {
+                    // Annotation removed on a re-register: drop the stream.
+                    _kv_subscriber->remove_subscription(id);
+                }
+            }
+#else
+            (void)kv_events_port;
+#endif
         });
     _k8s_discovery->set_drain_callback(
         [this](BackendId id) {
+#ifdef RANVIER_WITH_KV_EVENTS
+            // A draining backend's stream is no longer routing-relevant.
+            if (_kv_subscriber) {
+                _kv_subscriber->remove_subscription(id);
+            }
+#endif
             return _router->drain_backend_global(id);
         });
 
@@ -1037,6 +1078,26 @@ seastar::future<> Application::startup() {
                 return seastar::make_ready_future<>();
             }
             return load_persisted_state();
+        }).then([this] {
+            // 14a-bis. Native KV-event subscriber (vLLM block-granular
+            // stream). Started before static/K8s registration so their
+            // subscription commands land in a live (or at least constructed)
+            // service; commands queue in the MPSC buffer either way.
+#ifdef RANVIER_WITH_KV_EVENTS
+            if (_config.kv_events.enabled) {
+                _kv_subscriber = std::make_unique<KvEventSubscriberService>(
+                    _config.kv_events, _config.routing.block_alignment);
+                _kv_subscriber->start(*seastar::alien::internal::default_instance);
+                log_main.info("Native KV-event subscriber enabled");
+            }
+#else
+            if (_config.kv_events.enabled) {
+                log_main.warn("kv_events.enabled=true but this build lacks "
+                              "WITH_KV_EVENTS; native KV-event mode is inert "
+                              "(probabilistic residency remains in force)");
+            }
+#endif
+            return seastar::make_ready_future<>();
         }).then([this] {
             // 14b. Register static-config backends from YAML.
             // Runs after persistence replay so YAML wins on ID collision,
@@ -1524,6 +1585,20 @@ seastar::future<> Application::stop_services() {
             })
         );
     }
+
+#ifdef RANVIER_WITH_KV_EVENTS
+    if (_kv_subscriber) {
+        // Joins the worker (no further shipments), then drains in-flight
+        // applies — must complete before RouterService teardown below.
+        parallel_stops.push_back(
+            _kv_subscriber->stop().then([] {
+                log_main.debug("  KV-event subscriber stopped");
+            }).handle_exception([](auto ep) {
+                log_main.warn("  KV-event subscriber stop error (ignored)");
+            })
+        );
+    }
+#endif
 
     return seastar::when_all_succeed(parallel_stops.begin(), parallel_stops.end())
         .discard_result()

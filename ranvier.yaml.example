@@ -118,6 +118,38 @@ routing:
   #   # Reserved for a future latency/SLO term (parsed, not yet read)
   #   slo_weight: 0.0
 
+# Native KV-events (vLLM block-granular cache events; BACKLOG §20.1 P0.1)
+# Subscribes directly to each opted-in vLLM backend's native KV-event stream
+# (ZMQ PUB, msgpack), making cache residency EXACT per (backend, prefix) with
+# ~ms staleness: an ART hit is then VERIFIED against the live block state
+# (present = resident, absent = evicted) instead of gated by the
+# probabilistic scrape estimate. Backends without a stream keep today's
+# probabilistic behavior; the bespoke POST /v1/cache/events protocol remains
+# the engine-agnostic fallback. Compiled in by default (libzmq; disable with
+# -DWITH_KV_EVENTS=OFF); per-backend opt-in via `kv_events_port` (static
+# backends) or the ranvier.io/kv-events-port annotation (K8s).
+# Env: RANVIER_KV_EVENTS_ENABLED, RANVIER_KV_EVENTS_TOPIC,
+#      RANVIER_KV_EVENTS_POLL_INTERVAL_MS, RANVIER_KV_EVENTS_FRESHNESS_TTL,
+#      RANVIER_KV_EVENTS_MAX_TRACKED_BLOCKS,
+#      RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH
+# kv_events:
+#   enabled: false
+#   # ZMQ subscription topic; "" subscribes to everything the publisher emits
+#   topic: ""
+#   # Worker poll cadence and idle-stream heartbeat (freshness keep-alive)
+#   poll_interval_ms: 100
+#   heartbeat_interval_ms: 5000
+#   # One reactor application is bounded to this many translated ops
+#   max_ops_per_shipment: 512
+#   max_inflight_shipments: 4
+#   # Per-backend block ledger caps (Rule #4); chains are tracked only to the
+#   # depth routing can use
+#   max_tracked_blocks_per_backend: 65536
+#   max_indexed_token_depth: 2048
+#   # How long applied events/heartbeats keep verified-residency trust before
+#   # routing falls back to the probabilistic signal
+#   freshness_ttl_seconds: 300
+
 # Timeout configuration
 timeouts:
   # Timeout for establishing connection to backend in seconds (RANVIER_CONNECT_TIMEOUT)
@@ -645,6 +677,13 @@ attribution:
 #     hardware saving. Unpriced backends (0, the default) are never
 #     preferred and never diverted from, so pricing only part of the
 #     fleet only re-routes among the priced backends.
+#
+# Optional native KV-event stream field:
+#   `kv_events_port` — port of this backend's vLLM KV-event publisher
+#     (--kv-events-config with a zmq publisher). 0/absent = no stream (the
+#     default). Requires the kv_events: section below to be enabled. K8s
+#     fleets use the ranvier.io/kv-events-port EndpointSlice annotation
+#     instead.
 #
 # Optional disaggregated-serving field:
 #   `pool_role` — "unified" (default) / "prefill" / "decode". For fleets

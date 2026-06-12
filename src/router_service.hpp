@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend_registry.hpp"
+#include "kv_event_ledger.hpp"  // NativeKvOp (pure, no transport deps)
 #include "radix_tree.hpp"
 #include "config.hpp"
 #include "gossip_service.hpp"  // For NodeState
@@ -647,6 +648,52 @@ public:
 
     // Update prefix hash index entry for a specific backend (for testing).
     static void update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id);
+
+    // ==========================================================================
+    // Native KV-Event Support (vLLM block-granular stream → exact residency)
+    // ==========================================================================
+    // Entry point for the KV-event subscriber (dedicated OS thread →
+    // alien::run_on → shard 0). Applies translated ops to every shard:
+    // UPSERT/REMOVE maintain prefix_hash_index as an exact per-(hash, backend)
+    // residency mirror; CLEAR purges the backend's routes + index entries
+    // (AllBlocksCleared — the backend's cache is empty); RESET drops
+    // verified-residency trust after a stream fault (sequence gap / decode
+    // failure) so routing falls back to the probabilistic gossip signal;
+    // ALIVE refreshes per-backend stream freshness.
+    //
+    // Per-block native evictions deliberately do NOT touch the RadixTree:
+    // the existing remove path purges every route of a backend per event —
+    // built for the rare bespoke-protocol events, ruinous at native block
+    // rates. Stale routes are instead neutralized at decision time by the
+    // verified-residency check; TTL/LRU reclaim them as before.
+    //
+    // Rule #21/#22: coroutine takes ops by value.
+    static seastar::future<> apply_native_kv_ops(std::vector<NativeKvOp> ops);
+
+    // Shard-local synchronous batch apply (UPSERT/REMOVE/ALIVE only — CLEAR
+    // and RESET dispatch through their own per-backend sweep). Public so
+    // reactor-free unit tests can drive it directly. Each shipment from the
+    // subscriber is capped (kv_events.max_ops_per_shipment), keeping one
+    // synchronous application well under the reactor task quota (Rule #17
+    // by bounding, not yielding).
+    static void apply_native_kv_ops_local(const NativeKvOp* ops, size_t count);
+
+    // Native KV stats for metrics (shard-local read).
+    struct NativeKvStatsSnapshot {
+        uint64_t ops_applied = 0;
+        uint64_t upserts = 0;
+        uint64_t removes = 0;
+        uint64_t clears = 0;
+        uint64_t resets = 0;
+        uint64_t index_overflow = 0;
+        uint64_t verified_hits = 0;
+        uint64_t verified_downgrades = 0;
+    };
+    static NativeKvStatsSnapshot get_native_kv_stats();
+
+    // Mark a backend's native stream fresh in shard-local state (testing only;
+    // production freshness comes from applied ops / ALIVE heartbeats).
+    static void set_native_fresh_for_testing(BackendId id);
 
     // Get cache event stats for metrics (shard-local read).
     struct CacheEventStatsSnapshot {

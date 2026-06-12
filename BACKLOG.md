@@ -925,7 +925,10 @@ Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build
 
 ### 20.1 P0 — KV-aware routing parity (OSS)
 
-- [ ] **Precise, native KV-event mode** (P0.1)
+- [ ] **Precise, native KV-event mode** (P0.1) — _PR-1 of 2 in review (exactness: decoder,
+  hash-bridge ledger, ZMQ subscriber, verified residency). PR-2 pending: route
+  materialization from BlockStored token IDs (realizes the push-eviction design's Phase 3c
+  via the native wire format) + replay-socket gap recovery._
   _Justification:_ Today residency is probabilistic (`VLLMMetrics::estimated_prefix_retention`)
   and the eviction signal rides a bespoke `POST /v1/cache/events` protocol. The ecosystem
   standard is to feed routing from the engine's *native* KV-event stream (vLLM, block-hash

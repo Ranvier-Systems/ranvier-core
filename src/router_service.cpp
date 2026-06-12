@@ -212,6 +212,15 @@ struct ShardLocalState {
         uint64_t hardware_cost_diverts = 0;         // Cache misses diverted to cheaper cost_per_hour backend
         // Pool-role routing stats
         uint64_t pool_role_fallbacks = 0;           // Decisions where only DECODE pools were live and the role filter was waived
+        // Native KV-event routing stats
+        uint64_t native_ops_applied = 0;            // Translated native ops applied on this shard
+        uint64_t native_upserts = 0;                // Index entries added/refreshed from BlockStored
+        uint64_t native_removes = 0;                // Index entries removed from BlockRemoved
+        uint64_t native_clears = 0;                 // AllBlocksCleared purges
+        uint64_t native_resets = 0;                 // Stream faults (gap/decode) dropping verified trust
+        uint64_t native_index_overflow = 0;         // Upserts dropped at the per-backend index cap
+        uint64_t native_verified_hits = 0;          // ART hits confirmed resident by the native index
+        uint64_t native_verified_downgrades = 0;    // ART hits downgraded because the native index lacked the prefix
 
         void reset() {
             cache_hits = 0;
@@ -245,6 +254,14 @@ struct ShardLocalState {
             residency_downgrades = 0;
             hardware_cost_diverts = 0;
             pool_role_fallbacks = 0;
+            native_ops_applied = 0;
+            native_upserts = 0;
+            native_removes = 0;
+            native_clears = 0;
+            native_resets = 0;
+            native_index_overflow = 0;
+            native_verified_hits = 0;
+            native_verified_downgrades = 0;
         }
     } stats;
 
@@ -288,6 +305,10 @@ struct ShardLocalState {
         double cache_residency_threshold = 0.2;
         // Unified route scoring weights (neutral defaults = pre-scorer behavior)
         ScoringWeights scoring;
+        // Routing-side half of the kv_events feature: how long an applied
+        // native op / ALIVE heartbeat keeps a backend's verified-residency
+        // trust. Operator-facing key lives in the kv_events: YAML section.
+        std::chrono::seconds kv_residency_freshness_ttl{300};
     } config;
 
     // ========================================================================
@@ -401,6 +422,40 @@ struct ShardLocalState {
         }
         it->second.residency = residency_weight;
         it->second.updated_at = std::chrono::steady_clock::now();
+    }
+
+    // ========================================================================
+    // Native KV-Event State (per-shard; fed by the KV-event subscriber)
+    // ========================================================================
+    // `fresh` tracks per-backend stream liveness: a backend is trusted for
+    // VERIFIED residency only while ops/heartbeats arrived within the
+    // configured TTL — otherwise routing falls back to the probabilistic
+    // gossip signal. `index_entries` counts this shard's prefix_hash_index
+    // entries created per backend so native upserts stay bounded even if the
+    // worker-side ledger cap is ever bypassed (Rule #4 defense in depth;
+    // the ledger's caps are the authoritative bound).
+    struct NativeKvState {
+        absl::flat_hash_map<BackendId, std::chrono::steady_clock::time_point> fresh;
+        absl::flat_hash_map<BackendId, uint32_t> index_entries;
+        static constexpr size_t MAX_BACKENDS = 256;               // Hard Rule #4
+        static constexpr uint32_t MAX_ENTRIES_PER_BACKEND = 65536; // Hard Rule #4
+    } native_kv;
+
+    // True while the backend's native stream is fresh enough that absence
+    // from prefix_hash_index means "verified evicted" rather than "unknown".
+    bool native_residency_fresh(BackendId id) const {
+        auto it = native_kv.fresh.find(id);
+        if (it == native_kv.fresh.end()) return false;
+        return std::chrono::steady_clock::now() - it->second
+                   <= config.kv_residency_freshness_ttl;
+    }
+
+    void touch_native_fresh(BackendId id) {
+        if (!native_kv.fresh.contains(id) &&
+            native_kv.fresh.size() >= NativeKvState::MAX_BACKENDS) {
+            return;  // bounded; an untracked backend simply stays unverified
+        }
+        native_kv.fresh[id] = std::chrono::steady_clock::now();
     }
 
     // ========================================================================
@@ -539,6 +594,8 @@ struct ShardLocalState {
         config.cache_residency_threshold = cfg.cache_residency_threshold;
         // Unified route scoring weights
         config.scoring = cfg.scoring;
+        // Native KV-event verified-residency freshness
+        config.kv_residency_freshness_ttl = cfg.kv_residency_freshness_ttl;
 
         // Pre-allocate cross-shard load snapshot storage (one entry per shard)
         // Resized to smp::count so we can index by shard_id without bounds checks.
@@ -591,6 +648,8 @@ struct ShardLocalState {
         config.cache_residency_threshold = cfg.cache_residency_threshold;
         // Unified route scoring weights
         config.scoring = cfg.scoring;
+        // Native KV-event verified-residency freshness
+        config.kv_residency_freshness_ttl = cfg.kv_residency_freshness_ttl;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -618,6 +677,10 @@ struct ShardLocalState {
 
         // Clear cache residency cache
         residency_cache.entries.clear();
+
+        // Clear native KV-event state
+        native_kv.fresh.clear();
+        native_kv.index_entries.clear();
 
         // Clear cross-shard load sync state
         for (auto& snapshot : shard_load_snapshots) {
@@ -1755,7 +1818,27 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         seastar::metrics::make_counter("router_pool_role_fallbacks_total",
             [] { return g_shard_state ? g_shard_state->stats.pool_role_fallbacks : 0UL; },
             seastar::metrics::description("Routing decisions where the pool-role filter was "
-                                         "waived because only decode-role backends were live"))
+                                         "waived because only decode-role backends were live")),
+
+        // Native KV-event routing (vLLM block-granular stream)
+        seastar::metrics::make_counter("router_native_kv_ops_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_ops_applied : 0UL; },
+            seastar::metrics::description("Translated native KV-event operations applied on this shard")),
+        seastar::metrics::make_counter("router_native_verified_hits_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_verified_hits : 0UL; },
+            seastar::metrics::description("ART hits whose prefix was verified resident in the "
+                                         "backend's KV cache via the native event stream")),
+        seastar::metrics::make_counter("router_native_verified_evictions_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_verified_downgrades : 0UL; },
+            seastar::metrics::description("ART hits whose prefix was verified ABSENT from the "
+                                         "backend's KV cache via the native event stream")),
+        seastar::metrics::make_counter("router_native_stream_resets_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_resets : 0UL; },
+            seastar::metrics::description("Native KV streams reset after a sequence gap or "
+                                         "decode failure (verified residency suspended)")),
+        seastar::metrics::make_counter("router_native_index_overflow_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_index_overflow : 0UL; },
+            seastar::metrics::description("Native index upserts dropped at the per-backend cap"))
 
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
@@ -2468,12 +2551,37 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 // route would pay a cache miss while believing we hit. Treat it
                 // as a miss and fall through to load-based selection, skipping
                 // this cache-cold backend (only when an alternative exists).
-                if (state.config.cache_residency_threshold > 0.0 ||
-                    state.config.scoring.residency_weight > 0.0) {
-                    anchor_residency = get_cached_residency(art_backend);
+                // Residency: prefer the VERIFIED native signal when this
+                // backend's KV-event stream is fresh — presence of (request
+                // prefix hash, backend) in prefix_hash_index is then an exact
+                // mirror of the backend's cache at this routing depth, fed by
+                // vLLM BlockStored/BlockRemoved events. Without stream
+                // freshness, fall back to the probabilistic gossiped estimate
+                // and its threshold gate (the engine-agnostic path).
+                bool cache_cold = false;
+                if (state.config.kv_residency_freshness_ttl.count() > 0 &&
+                    state.native_residency_fresh(art_backend)) {
+                    uint64_t request_hash = hash_prefix(tokens.data(), prefix_len,
+                                                        state.config.block_alignment);
+                    auto idx_it = state.prefix_hash_index.find(request_hash);
+                    bool resident = idx_it != state.prefix_hash_index.end() &&
+                                    idx_it->second.contains(art_backend);
+                    if (resident) {
+                        anchor_residency = 1.0;
+                        state.stats.native_verified_hits++;
+                    } else {
+                        anchor_residency = 0.0;
+                        cache_cold = true;
+                        state.stats.native_verified_downgrades++;
+                    }
+                } else {
+                    if (state.config.cache_residency_threshold > 0.0 ||
+                        state.config.scoring.residency_weight > 0.0) {
+                        anchor_residency = get_cached_residency(art_backend);
+                    }
+                    cache_cold = (anchor_residency >= 0.0 &&
+                                  anchor_residency < state.config.cache_residency_threshold);
                 }
-                bool cache_cold = (anchor_residency >= 0.0 &&
-                                   anchor_residency < state.config.cache_residency_threshold);
 
                 if (cache_cold && live_backends.size() > 1) {
                     // Likely-stale route: downgrade to the hash/load fallback.
@@ -4747,6 +4855,200 @@ void RouterService::record_cache_event_auth_failure() {
 
 void RouterService::record_cache_event_parse_error() {
     if (g_shard_state) shard_state().cache_event_stats.parse_errors++;
+}
+
+// ============================================================================
+// Native KV-Event Application
+// ============================================================================
+// Translated ops arrive from the subscriber's OS thread via alien::run_on on
+// shard 0, already reallocated reactor-side. UPSERT/REMOVE maintain
+// prefix_hash_index as an exact residency mirror; the RadixTree is untouched
+// on per-block evictions (stale routes are neutralized by the
+// verified-residency check at decision time — see apply_native_kv_ops docs
+// in router_service.hpp).
+
+void RouterService::apply_native_kv_ops_local(const NativeKvOp* ops, size_t count) {
+    if (!g_shard_state || ops == nullptr) return;
+    auto& state = shard_state();
+
+    for (size_t i = 0; i < count; ++i) {
+        const NativeKvOp& op = ops[i];
+        switch (op.kind) {
+        case NativeKvOp::Kind::UPSERT: {
+            // Shares the bespoke-protocol timestamp map so a native store at
+            // t=2 blocks a stale HTTP evict at t=1 (and vice versa).
+            auto key = ShardLocalState::PrefixBackendKey{op.prefix_hash, op.backend};
+            auto ts_it = state.cache_event_timestamps.find(key);
+            if (ts_it != state.cache_event_timestamps.end() &&
+                op.ts_ms <= ts_it->second.timestamp_ms) {
+                break;  // stale (reorder / duplicate shipment)
+            }
+            if (ts_it != state.cache_event_timestamps.end() ||
+                state.cache_event_timestamps.size() < ShardLocalState::MAX_CACHE_TIMESTAMPS) {
+                state.cache_event_timestamps[key] = {op.ts_ms};
+            }
+
+            uint32_t& entries = state.native_kv.index_entries[op.backend];
+            auto idx_it = state.prefix_hash_index.find(op.prefix_hash);
+            bool present = idx_it != state.prefix_hash_index.end() &&
+                           idx_it->second.contains(op.backend);
+            if (!present) {
+                if (entries >= ShardLocalState::NativeKvState::MAX_ENTRIES_PER_BACKEND) {
+                    state.stats.native_index_overflow++;
+                    break;  // ledger caps make this unreachable in practice (Rule #4 backstop)
+                }
+                state.prefix_hash_index[op.prefix_hash].insert(op.backend);
+                entries++;
+            }
+            state.stats.native_upserts++;
+            state.touch_native_fresh(op.backend);
+            break;
+        }
+        case NativeKvOp::Kind::REMOVE: {
+            auto key = ShardLocalState::PrefixBackendKey{op.prefix_hash, op.backend};
+            auto ts_it = state.cache_event_timestamps.find(key);
+            if (ts_it != state.cache_event_timestamps.end() &&
+                op.ts_ms <= ts_it->second.timestamp_ms) {
+                break;
+            }
+            if (ts_it != state.cache_event_timestamps.end() ||
+                state.cache_event_timestamps.size() < ShardLocalState::MAX_CACHE_TIMESTAMPS) {
+                state.cache_event_timestamps[key] = {op.ts_ms};
+            }
+
+            auto idx_it = state.prefix_hash_index.find(op.prefix_hash);
+            if (idx_it != state.prefix_hash_index.end() &&
+                idx_it->second.erase(op.backend) > 0) {
+                if (idx_it->second.empty()) {
+                    state.prefix_hash_index.erase(idx_it);
+                }
+                auto cnt = state.native_kv.index_entries.find(op.backend);
+                if (cnt != state.native_kv.index_entries.end() && cnt->second > 0) {
+                    cnt->second--;
+                }
+                state.stats.native_removes++;
+            }
+            state.touch_native_fresh(op.backend);
+            break;
+        }
+        case NativeKvOp::Kind::ALIVE:
+            state.touch_native_fresh(op.backend);
+            break;
+        case NativeKvOp::Kind::CLEAR:
+        case NativeKvOp::Kind::RESET:
+            // Dispatched through native_purge_backend_local by the shard-0
+            // coroutine; ignored here so a misrouted op cannot bypass the
+            // sweep semantics.
+            break;
+        }
+        state.stats.native_ops_applied++;
+    }
+}
+
+// Per-shard purge for CLEAR (AllBlocksCleared: cache is empty — index AND
+// routes go) and RESET (stream fault: index entries go, routes stay, and
+// verified trust drops so routing falls back to the probabilistic signal).
+// Synchronous sweep over prefix_hash_index — restart-class rarity, same
+// posture as the existing remove_routes_for_backend sweep.
+static void native_purge_backend_local(BackendId backend, bool clear_routes,
+                                       bool drop_trust) {
+    if (!g_shard_state) return;
+    auto& state = shard_state();
+
+    // Two passes: collect, then erase — flat_hash_map iterators don't
+    // survive erasure during iteration. Bounded by index size (<= max_routes
+    // + native cap).
+    std::vector<uint64_t> to_erase;
+    for (auto& [hash, backends] : state.prefix_hash_index) {
+        if (backends.contains(backend)) {
+            to_erase.push_back(hash);
+        }
+    }
+    for (uint64_t hash : to_erase) {
+        auto it = state.prefix_hash_index.find(hash);
+        if (it == state.prefix_hash_index.end()) continue;
+        it->second.erase(backend);
+        if (it->second.empty()) {
+            state.prefix_hash_index.erase(it);
+        }
+    }
+    state.native_kv.index_entries.erase(backend);
+
+    if (clear_routes) {
+        if (RadixTree* tree = state.tree.get()) {
+            size_t removed = tree->remove_routes_by_backend(backend, RouteOrigin::LOCAL);
+            removed += tree->remove_routes_by_backend(backend, RouteOrigin::REMOTE);
+            if (removed > 0) {
+                log_router.debug("Shard {}: native AllBlocksCleared purged {} routes for backend {}",
+                                 seastar::this_shard_id(), removed, backend);
+            }
+        }
+        state.stats.native_clears++;
+        // Stream is alive and exact (it just told us the cache is empty).
+        state.touch_native_fresh(backend);
+    }
+    if (drop_trust) {
+        state.native_kv.fresh.erase(backend);
+        state.stats.native_resets++;
+    }
+}
+
+seastar::future<> RouterService::apply_native_kv_ops(std::vector<NativeKvOp> ops) {
+    // Wire order is semantically load-bearing: a shipment can interleave
+    // op batches with CLEAR/RESET (e.g. [UPSERT(t1), CLEAR(t2), UPSERT(t2)]
+    // when an engine restarts mid-cycle), and applying the purge out of
+    // order would let pre-clear upserts resurrect afterwards. So: walk the
+    // ops in order, broadcasting each contiguous UPSERT/REMOVE/ALIVE segment,
+    // and dispatch each CLEAR/RESET as its own per-backend sweep at its
+    // position. Segments and sweeps are both rare-multiplicity per shipment
+    // (one segment, zero sweeps in steady state); the sequential co_awaits
+    // here are control-plane application, not a data-plane fan-out.
+    //
+    // Rule #14: shards READ the ops through the foreign_ptr (index ranges,
+    // no captures of raw data) and write only their own shard state.
+    // Rule #20: the coroutine frame keeps `shared` alive across co_awaits.
+    auto shared = seastar::make_foreign(
+        std::make_unique<std::vector<NativeKvOp>>(std::move(ops)));
+
+    const size_t count = shared->size();
+    size_t segment_start = 0;
+    for (size_t i = 0; i <= count; ++i) {
+        const bool is_sweep = i < count &&
+            ((*shared)[i].kind == NativeKvOp::Kind::CLEAR ||
+             (*shared)[i].kind == NativeKvOp::Kind::RESET);
+        if (i < count && !is_sweep) continue;
+
+        if (i > segment_start) {
+            const size_t a = segment_start;
+            const size_t b = i;
+            co_await seastar::smp::invoke_on_all([&shared, a, b] {
+                if (!g_shard_state) return;
+                apply_native_kv_ops_local(shared->data() + a, b - a);
+            });
+        }
+        if (is_sweep) {
+            const BackendId backend = (*shared)[i].backend;
+            const bool clear_routes = (*shared)[i].kind == NativeKvOp::Kind::CLEAR;
+            const bool drop_trust = (*shared)[i].kind == NativeKvOp::Kind::RESET;
+            co_await seastar::smp::invoke_on_all([backend, clear_routes, drop_trust] {
+                native_purge_backend_local(backend, clear_routes, drop_trust);
+            });
+        }
+        segment_start = i + 1;
+    }
+}
+
+RouterService::NativeKvStatsSnapshot RouterService::get_native_kv_stats() {
+    if (!g_shard_state) return {};
+    auto& st = shard_state().stats;
+    return {st.native_ops_applied, st.native_upserts, st.native_removes,
+            st.native_clears, st.native_resets, st.native_index_overflow,
+            st.native_verified_hits, st.native_verified_downgrades};
+}
+
+void RouterService::set_native_fresh_for_testing(BackendId id) {
+    if (!g_shard_state) return;
+    g_shard_state->touch_native_fresh(id);
 }
 
 void RouterService::update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id) {
