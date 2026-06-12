@@ -773,6 +773,26 @@ void RanvierConfig::apply_env_overrides() {
         routing.cost_routing.cost_imbalance_factor = *v;
     }
 
+    // Unified route scoring overrides
+    if (auto v = get_env_as<double>("RANVIER_SCORING_PREFIX_WEIGHT")) {
+        routing.scoring.prefix_weight = *v;
+    }
+    if (auto v = get_env_as<double>("RANVIER_SCORING_LOAD_WEIGHT")) {
+        routing.scoring.load_weight = *v;
+    }
+    if (auto v = get_env_as<double>("RANVIER_SCORING_RESIDENCY_WEIGHT")) {
+        routing.scoring.residency_weight = *v;
+    }
+    if (auto v = get_env_as<double>("RANVIER_SCORING_COST_WEIGHT")) {
+        routing.scoring.cost_weight = *v;
+    }
+    if (auto v = get_env_as<double>("RANVIER_SCORING_PRICE_WEIGHT")) {
+        routing.scoring.price_weight = *v;
+    }
+    if (auto v = get_env_as<double>("RANVIER_SCORING_SLO_WEIGHT")) {
+        routing.scoring.slo_weight = *v;
+    }
+
     // Cache events overrides
     if (auto v = get_env("RANVIER_CACHE_EVENTS_ENABLED")) {
         cache_events.enabled = (*v == "1" || *v == "true" || *v == "yes");
@@ -1061,6 +1081,28 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 }
                 if (cr["cost_imbalance_factor"]) {
                     config.routing.cost_routing.cost_imbalance_factor = cr["cost_imbalance_factor"].as<double>();
+                }
+            }
+            // Unified route scoring sub-section (nested under routing)
+            if (r["scoring"]) {
+                YAML::Node sc = r["scoring"];
+                if (sc["prefix_weight"]) {
+                    config.routing.scoring.prefix_weight = sc["prefix_weight"].as<double>();
+                }
+                if (sc["load_weight"]) {
+                    config.routing.scoring.load_weight = sc["load_weight"].as<double>();
+                }
+                if (sc["residency_weight"]) {
+                    config.routing.scoring.residency_weight = sc["residency_weight"].as<double>();
+                }
+                if (sc["cost_weight"]) {
+                    config.routing.scoring.cost_weight = sc["cost_weight"].as<double>();
+                }
+                if (sc["price_weight"]) {
+                    config.routing.scoring.price_weight = sc["price_weight"].as<double>();
+                }
+                if (sc["slo_weight"]) {
+                    config.routing.scoring.slo_weight = sc["slo_weight"].as<double>();
                 }
             }
         }
@@ -1766,6 +1808,29 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.routing.max_ttl_multiplier < 1.0 || config.routing.max_ttl_multiplier > 10.0) {
         return "routing.max_ttl_multiplier must be between 1.0 and 10.0";
+    }
+
+    // Validate unified route scoring weights. Negative weights would invert
+    // term semantics (e.g. prefer overloaded backends); residency_weight is a
+    // discount fraction on the affinity bonus, so it is additionally capped
+    // at 1.0.
+    if (config.routing.scoring.prefix_weight < 0.0 || config.routing.scoring.prefix_weight > 1000.0) {
+        return "routing.scoring.prefix_weight must be between 0.0 and 1000.0";
+    }
+    if (config.routing.scoring.load_weight < 0.0 || config.routing.scoring.load_weight > 1000.0) {
+        return "routing.scoring.load_weight must be between 0.0 and 1000.0";
+    }
+    if (config.routing.scoring.residency_weight < 0.0 || config.routing.scoring.residency_weight > 1.0) {
+        return "routing.scoring.residency_weight must be between 0.0 and 1.0";
+    }
+    if (config.routing.scoring.cost_weight < 0.0 || config.routing.scoring.cost_weight > 1000.0) {
+        return "routing.scoring.cost_weight must be between 0.0 and 1000.0";
+    }
+    if (config.routing.scoring.price_weight < 0.0 || config.routing.scoring.price_weight > 1000.0) {
+        return "routing.scoring.price_weight must be between 0.0 and 1000.0";
+    }
+    if (config.routing.scoring.slo_weight < 0.0 || config.routing.scoring.slo_weight > 1000.0) {
+        return "routing.scoring.slo_weight must be between 0.0 and 1000.0";
     }
 
     // Validate timeout settings

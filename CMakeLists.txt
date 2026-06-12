@@ -792,6 +792,19 @@ target_link_libraries(gpu_load_routing_test
 )
 gtest_discover_tests(gpu_load_routing_test)
 
+# Unified Route Scorer Unit Tests (Pure C++, no Seastar dependency)
+# Default-weight parity matrix for the weighted routing decision core:
+# term hinges, placement/dispatch argmaxes, tie-break order, weight knobs.
+add_executable(route_scorer_test
+  tests/unit/route_scorer_test.cpp
+)
+target_include_directories(route_scorer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(route_scorer_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(route_scorer_test)
+
 # Quorum / Split-Brain Detection Unit Tests (Pure C++, no Seastar dependency)
 # Tests for quorum calculation, state transitions, and peer liveness with TestClock
 add_executable(quorum_test

@@ -74,38 +74,35 @@ Request arrives with tokens
         │
         ▼
 ┌─────────────────────────────────────────┐
-│  2b. Hardware-Cost Preference (Optional)│
-│     Cache miss + priced backends →      │
-│     prefer cheapest cost_per_hour.      │
-│     Replaces the miss-path selection,   │
-│     so it feeds route learning (unlike  │
-│     the transient overrides in 3/4).    │
+│  3. Unified Weighted Scoring            │
+│     One ranked pass over the live       │
+│     candidates (route_scorer.hpp):      │
+│                                         │
+│     PLACEMENT score (stable terms):     │
+│       prefix affinity + hardware price  │
+│       → original_selected (learned)     │
+│                                         │
+│     DISPATCH score (adds transients):   │
+│       − load hinge over the strategy    │
+│         allowance                       │
+│       − cost-budget hinge               │
+│       → final backend (this request)    │
+│                                         │
+│     Neutral default weights reproduce   │
+│     the strategy/threshold rules        │
+│     exactly (routing.scoring.* tunes).  │
 └─────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────┐
-│  3. Load-Aware Override (Optional)      │
-│     Divert to less-loaded backend if    │
-│     preferred is overloaded             │
-└─────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────┐
-│  4. Cost-Aware Override (Optional)      │
-│     Fast lane / budget redirect when    │
-│     cost-based routing is enabled       │
-└─────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────┐
-│  5. Learn Prefix (After Success)        │
-│     Store the originally-selected ART/  │
-│     hash backend (not the load/cost-    │
-│     budget diversion target) so cache   │
-│     affinity survives transient load    │
-│     spikes. The 2b hardware-cost choice │
-│     IS the original selection, so it is │
-│     learned. Future requests get ART hit│
+│  4. Learn Prefix (After Success)        │
+│     Store the PLACEMENT winner (not the │
+│     load/cost-budget dispatch target)   │
+│     so cache affinity survives          │
+│     transient load spikes. A hardware-  │
+│     price divert moves placement, so it │
+│     IS learned. Future requests get an  │
+│     ART hit on the learned backend.     │
 └─────────────────────────────────────────┘
 ```
 
@@ -128,13 +125,13 @@ Clusters often mix GPU types with very different hourly cost (e.g. H100 next to 
 - `gpu_tier` — coarse informational hardware label (`"h100"`, `"a10g"`, …), surfaced in routing logs.
 - `cost_per_hour` — the operator's hourly price for the backend. `0` (the default) means *unpriced*.
 
-When a request **misses** the ART (step 2 above), the prefix must be recomputed wherever it lands — the hash choice has no cache advantage. If both the hash-selected backend and a cheaper live backend are priced, the selection is diverted to the cheapest priced candidate (`apply_hardware_cost_preference()` in `router_service.cpp`). When a request **hits** the ART, cost is ignored entirely: recomputing a warm prefix on a cold cheaper box costs more GPU-seconds than the hardware saving, so cache-warm traffic always stays on the warm backend.
+When a request **misses** the ART (step 2 above), the prefix must be recomputed wherever it lands — the hash choice has no cache advantage. If both the hash-selected backend and a cheaper live backend are priced, the selection is diverted to the cheapest priced candidate (the hardware-price term of the unified route score; `price_weight` in `routing.scoring`, default `1.0`, `0.0` disables). When a request **hits** the ART, price is ignored entirely: recomputing a warm prefix on a cold cheaper box costs more GPU-seconds than the hardware saving, so cache-warm traffic always stays on the warm backend.
 
 Three properties bound the behavior:
 
 - **Unpriced = untouched.** Backends with `cost_per_hour` unset are never preferred and never diverted from. A fleet with no priced backends routes exactly as before; a partially priced fleet only re-routes among priced backends. Equal prices never divert (the deterministic hash spread is preserved within a tier).
-- **Overload guard.** A cheaper backend is skipped when its composite load exceeds `median · load_imbalance_factor + load_imbalance_floor` — the same "overloaded" definition the median-threshold override uses — so the preference cannot pile unbounded load onto the cheapest box. Cost ties break toward lower load.
-- **The divert feeds route learning.** Unlike the transient load/cost-budget overrides (steps 3/4, excluded from learning), the hardware-cost preference replaces the miss-path selection *before* `original_selected` is captured. The learned route therefore pins the prefix to the backend that actually computed it, and follow-up requests ART-hit warm on the cheap hardware. Since `cost_per_hour` is static operator config, this is a stable placement policy rather than a flapping redirect.
+- **Overload guard.** A cheaper backend is skipped when its composite load exceeds `median · load_imbalance_factor + load_imbalance_floor` — the same "overloaded" definition the legacy median load threshold uses — so the preference cannot pile unbounded load onto the cheapest box. Cost ties break toward lower load.
+- **The divert feeds route learning.** Unlike the transient load/cost-budget terms (which move only the dispatch target, never the learn target), the hardware-price term is part of the PLACEMENT score: `original_selected` follows it. The learned route therefore pins the prefix to the backend that actually computed it, and follow-up requests ART-hit warm on the cheap hardware. Since `cost_per_hour` is static operator config, this is a stable placement policy rather than a flapping redirect.
 
 Observability: `router_hardware_cost_diverts_total` counts misses diverted to cheaper hardware; the per-divert debug log includes both backends' `gpu_tier` and price.
 
@@ -336,7 +333,8 @@ routing:
 
 ### Key Files
 
-- `src/router_service.cpp` - `route_request()` (top-level dispatch), `get_backend_for_prefix()` (hybrid ART+hash), `bounded_load_select()`, `p2c_select()`, `jump_consistent_hash()`, `apply_load_aware_selection()`
+- `src/router_service.cpp` - `route_request()` (top-level dispatch), `get_backend_for_prefix()` (hybrid ART+hash + scoring pass), `bounded_load_select()`, `p2c_select()`, `jump_consistent_hash()`, `compute_load_allowance()`
+- `src/route_scorer.hpp` - Pure unified-score decision core: term definitions, placement/dispatch argmaxes, tie-break order (reactor-free unit-testable)
 - `src/router_service.cpp` - `learn_route_global()` (single boundary) and `learn_route_global_multi()` (multi-depth)
 - `src/radix_tree.hpp` - Adaptive Radix Tree with longest prefix match
 - `src/parse_utils.hpp` - `hash_prefix()` (FNV-1a + block alignment) shared by router, header injection, and cache-event eviction
@@ -370,10 +368,10 @@ The 64-bit FNV-1a hash is fed into one of four bucket-selection strategies, conf
 
 | Strategy | Behavior | Built-in load awareness |
 |----------|----------|-------------------------|
-| `bounded_load` (default) | Jump consistent hash + per-backend cap of `ceil(avg_load · (1 + ε))`. On overflow, sequentially probes adjacent buckets, then falls back to least-loaded. | Yes — supersedes the median-threshold override. |
-| `p2c` | Power-of-two-choices: hashes to a primary and a secondary (XORed with a per-request salt). Sticks to primary unless secondary's load is lower by at least `p2c_load_bias`. | Yes — supersedes the median-threshold override. |
-| `jump` | Plain Lamping/Veach jump consistent hash. Topology changes remap only ~1/n keys. | No — relies on the median-threshold override (Step 3). |
-| `modular` | `hash % num_backends`. **Benchmark only**: any topology change reshuffles all keys. | No — relies on the median-threshold override (Step 3). |
+| `bounded_load` (default) | Jump consistent hash + per-backend cap of `ceil(avg_load · (1 + ε))`. On overflow, sequentially probes adjacent buckets, then falls back to least-loaded. | Yes — the scorer's load term skips bounded-load hash anchors (load already vetted). |
+| `p2c` | Power-of-two-choices: hashes to a primary and a secondary (XORed with a per-request salt). Sticks to primary unless secondary's load is lower by at least `p2c_load_bias`. | Yes — the scorer's load term skips P2C hash anchors (load already vetted). |
+| `jump` | Plain Lamping/Veach jump consistent hash. Topology changes remap only ~1/n keys. | No — the scorer's load term applies the median allowance to both ART and hash anchors. |
+| `modular` | `hash % num_backends`. **Benchmark only**: any topology change reshuffles all keys. | No — the scorer's load term applies the median allowance to both ART and hash anchors. |
 
 `bounded_load_epsilon` (default `0.25`) and `p2c_load_bias` (default `2`) tune the corresponding strategies. All strategies honor the `load_aware_routing` toggle: when set to `false`, every strategy degrades to plain jump consistent hash with no diversion, giving operators a uniform escape hatch.
 
@@ -414,10 +412,10 @@ When enabled (`load_aware_routing: true`, the default), the router considers bac
 
 How load awareness is applied depends on the active `hash_strategy`:
 
-- **`bounded_load`** and **`p2c`** bake load awareness into selection itself (cap probing for bounded-load, secondary comparison for P2C). For ART hits, an additional check re-runs the strategy if the ART-selected backend exceeds the strategy's cap/bias.
-- **`jump`** and **`modular`** rely on a separate **median-threshold override** described below (`apply_load_aware_selection()`). It is also the only path that runs when `hash_strategy` is unset and the implicit default were `jump`.
+- **`bounded_load`** and **`p2c`** bake load awareness into hash selection itself (cap probing for bounded-load, secondary comparison for P2C). For ART hits, the unified score's **load term** hinges the anchor against the strategy's allowance (the cap for bounded-load, `least + bias` for P2C) and diverts when the anchor exceeds it.
+- **`jump`** and **`modular`** are load-blind at selection, so the load term applies its **median allowance** (`median · load_imbalance_factor + load_imbalance_floor`) to both ART and hash anchors.
 
-When `load_aware_routing: false`, all strategies skip diversion entirely.
+When `load_aware_routing: false`, the load term is disabled and all strategies skip diversion entirely.
 
 ### Problem
 
@@ -435,26 +433,27 @@ Request with prefix P1 → Backend 1 (prefix affinity)
 
 Load-aware routing checks the preferred backend's in-flight request count before routing. If the backend is overloaded and a significantly less-loaded alternative exists, the request is diverted to reduce tail latency.
 
-### Algorithm (median-threshold override)
+### Algorithm (load term of the unified score)
 
-This is the algorithm used by the `jump` and `modular` strategies. It uses a **relative threshold** based on the median load across all backends, which auto-adapts to any workload, model size, or cluster size — no per-model tuning needed.
+The load term hinges every candidate's load against the active strategy's **allowance** — the load level a candidate may carry penalty-free:
 
 ```
-1. Determine preferred backend (ART lookup or hash fallback)
-2. If load_aware_routing is disabled or fewer than 2 live backends, return preferred
-3. If preferred load is 0, route to preferred (fast path)
-4. Compute median composite load across all live backends (via nth_element, O(n))
-   composite = local_active_requests + gpu_load_score * gpu_load_weight
-5. Compute threshold = median * load_imbalance_factor + load_imbalance_floor
-6. If preferred load > threshold:
-   - Find least-loaded backend among candidates
-   - Route to least-loaded (accepting cache miss)
-7. Otherwise, route to preferred
+allowance:
+  bounded_load:   cap - 1, cap = max(1, ceil(avg_load * (1 + epsilon)))
+  p2c:            least_load + p2c_load_bias
+  jump / modular: median * load_imbalance_factor + load_imbalance_floor
+
+dispatch score(b) = prefix_weight * affinity(b)
+                  - load_weight   * max(0, load(b) - allowance)
+                  - cost_weight   * cost_hinge(b)
+                  [+ price terms on the miss path]
 ```
 
-See `apply_load_aware_selection()` in `router_service.cpp` for the implementation. The bounded-load and P2C strategies have their own integrated overrides — see `bounded_load_select()` and `p2c_select()` respectively.
+At the neutral defaults (`prefix_weight 0`, `load_weight 1`) the anchor keeps its seat exactly while at or under the allowance, and forfeits past it — the same keep/divert frontier as the per-strategy rules. Divert targets are encoded in the deterministic tie-break order: first-under-cap in jump-probe order for bounded-load, least-loaded (then lowest id) for the others. The median allowance auto-adapts to any workload, model size, or cluster size — no per-model tuning needed; `bounded_load`/`p2c` use capacity-adjusted load, `jump`/`modular` use composite load (`local_active_requests + gpu_load_score * gpu_load_weight`).
 
-Regardless of which path produces the final backend, route learning (Step 5 of the high-level flow) uses the **originally selected** ART/hash backend, not the load-diversion target. This preserves long-term cache affinity across transient load spikes.
+See `route_scorer.hpp` for the scorer and `compute_load_allowance()` in `router_service.cpp` for the allowance math; the miss-path hash strategies keep their own integrated load logic — see `bounded_load_select()` and `p2c_select()`.
+
+Regardless of which candidate wins dispatch, route learning (Step 4 of the high-level flow) uses the **placement winner**, not the load-diversion target. This preserves long-term cache affinity across transient load spikes.
 
 ### Configuration
 
@@ -521,6 +520,30 @@ Under heavy load (30 concurrent users, 300 total requests):
 | Cache Hit Rate | 82% | 78% | -5% |
 
 The small reduction in cache hit rate is offset by significantly improved tail latency.
+
+## Unified Route Scoring (`routing.scoring.*`)
+
+Everything after the anchor — the residency-gated affinity, the load divert, the cost-budget divert, and the hardware-price preference — is a single weighted ranking over the live candidates (`src/route_scorer.hpp`), computed in one pass per request:
+
+```
+placement(b) = prefix_weight * affinity(b) + price_weight * price_advantage(b)
+dispatch(b)  = placement(b)
+             - load_weight * max(0, load(b) - allowance)
+             - cost_weight * cost_hinge(b)
+```
+
+`placement` argmax → `original_selected` (the learn target, stable inputs only); `dispatch` argmax → the backend serving this request. Tie-breaks are deterministic: placement prefers the anchor then lower composite load then lower id; dispatch prefers a clean placement winner (no forfeited term), then jump-probe order, then lower cost pressure, then lower load, then lower id.
+
+| Weight | Default | Env | Meaning |
+|--------|---------|-----|---------|
+| `prefix_weight` | `0.0` | `RANVIER_SCORING_PREFIX_WEIGHT` | Extra load units a cache-warm anchor may carry beyond the strategy allowance. `0` = stickiness governed entirely by the strategy parameters (legacy behavior). |
+| `load_weight` | `1.0` | `RANVIER_SCORING_LOAD_WEIGHT` | Scale of the over-allowance penalty. `0` disables load diverts. |
+| `residency_weight` | `0.0` | `RANVIER_SCORING_RESIDENCY_WEIGHT` | Discounts the affinity bonus by reported cache-cooling: `affinity *= 1 - w*(1-residency)`. `0` = hard gate at `cache_residency_threshold` only. |
+| `cost_weight` | `1.0` | `RANVIER_SCORING_COST_WEIGHT` | Scale of the cost-budget hinge (inert unless `cost_routing.enabled`). |
+| `price_weight` | `1.0` | `RANVIER_SCORING_PRICE_WEIGHT` | Hardware-price preference strength; `0` disables the cache-miss cheaper-hardware divert. |
+| `slo_weight` | `0.0` | `RANVIER_SCORING_SLO_WEIGHT` | Reserved seam for a future latency/SLO term; parsed but not read. |
+
+**Default-weight parity:** at the defaults above, every term reduces to its legacy rule — the per-step keys (`bounded_load_epsilon`, `p2c_load_bias`, `load_imbalance_factor/floor`, `cache_residency_threshold`, `cost_routing.*`, per-backend `cost_per_hour`) keep their authority and an un-tuned config routes exactly as the former sequential override pipeline did. The weights are the seam for BACKLOG §20.1: precise KV-event residency (P0.1) grades `affinity(b)` per backend instead of gating it, pool-role awareness (P0.3) adds a dimension to the same pass, and an SLO term plugs into the reserved weight.
 
 ## References
 

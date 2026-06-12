@@ -93,6 +93,31 @@ routing:
   # GPT-2 has 50257 tokens, but we use a higher default for safety.
   max_token_id: 100000
 
+  # Unified route scoring weights (RANVIER_SCORING_*)
+  # The post-anchor routing decision is one weighted ranking blending prefix
+  # affinity, backend load, cache residency, cost budget, and hardware price.
+  # The defaults below are NEUTRAL: each term reduces to its legacy rule and
+  # the per-step keys (bounded_load_epsilon, p2c_load_bias,
+  # load_imbalance_factor/floor, cache_residency_threshold, cost_routing.*,
+  # per-backend cost_per_hour) keep their authority — an un-tuned config
+  # routes exactly as before. Tune only with benchmark evidence.
+  # scoring:
+  #   # Extra load units a cache-warm backend may carry beyond its strategy
+  #   # allowance before the route is abandoned (0.0 = strategy-managed)
+  #   prefix_weight: 0.0
+  #   # Scale of the over-allowance load penalty (0.0 disables load diverts)
+  #   load_weight: 1.0
+  #   # Discounts the affinity bonus by reported cache-cooling (0.0 = hard
+  #   # gate at cache_residency_threshold only; range 0.0-1.0)
+  #   residency_weight: 0.0
+  #   # Scale of the cost-budget penalty (inert unless cost_routing.enabled)
+  #   cost_weight: 1.0
+  #   # Hardware-price preference strength (0.0 disables the cache-miss
+  #   # cheaper-hardware divert)
+  #   price_weight: 1.0
+  #   # Reserved for a future latency/SLO term (parsed, not yet read)
+  #   slo_weight: 0.0
+
 # Timeout configuration
 timeouts:
   # Timeout for establishing connection to backend in seconds (RANVIER_CONNECT_TIMEOUT)

@@ -122,6 +122,14 @@ biases toward *keeping* cache affinity (the feature's whole value) and only
 abandons a route when eviction is very likely. Setting the threshold to `0.0`
 disables downgrades entirely (pre-feature behavior).
 
+Beyond the hard gate, the unified route score can blend residency continuously:
+`routing.scoring.residency_weight > 0` discounts the ART anchor's affinity bonus
+by reported cache-cooling (`affinity *= 1 - w*(1-residency)`), so a cooling-but-
+above-threshold backend gradually loses stickiness instead of holding it in full
+until the gate trips. Default `0.0` keeps the gate as the only residency effect.
+See [prefix-affinity-routing.md](prefix-affinity-routing.md) § Unified Route
+Scoring.
+
 ## Payload / reactor budget
 
 - **Wire:** with `B` locally-scraped backends, one node adds `B` × 10-byte

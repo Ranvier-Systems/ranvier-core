@@ -2468,6 +2468,87 @@ TEST_F(ConfigTest, MaxTtlMultiplierAboveMaxFails) {
 }
 
 // =============================================================================
+// Unified Route Scoring weights (routing.scoring.*)
+// =============================================================================
+
+TEST_F(ConfigTest, ScoringDefaultsAreNeutral) {
+    // Neutral defaults = pre-scorer routing behavior; pinned so a default
+    // change is a deliberate decision, not an accident.
+    RanvierConfig config;
+    EXPECT_DOUBLE_EQ(config.routing.scoring.prefix_weight, 0.0);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.load_weight, 1.0);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.residency_weight, 0.0);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.cost_weight, 1.0);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.price_weight, 1.0);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.slo_weight, 0.0);
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, ScoringParsesFromYaml) {
+    auto config = RanvierConfig::load_from_string(R"(
+routing:
+  scoring:
+    prefix_weight: 3.5
+    load_weight: 0.5
+    residency_weight: 0.8
+    cost_weight: 2.0
+    price_weight: 0.0
+    slo_weight: 1.5
+)");
+    EXPECT_DOUBLE_EQ(config.routing.scoring.prefix_weight, 3.5);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.load_weight, 0.5);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.residency_weight, 0.8);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.cost_weight, 2.0);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.price_weight, 0.0);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.slo_weight, 1.5);
+}
+
+TEST_F(ConfigTest, ScoringPartialYamlKeepsOtherDefaults) {
+    auto config = RanvierConfig::load_from_string(R"(
+routing:
+  scoring:
+    prefix_weight: 2.0
+)");
+    EXPECT_DOUBLE_EQ(config.routing.scoring.prefix_weight, 2.0);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.load_weight, 1.0);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.price_weight, 1.0);
+}
+
+TEST_F(ConfigTest, ScoringEnvOverrides) {
+    setenv("RANVIER_SCORING_PREFIX_WEIGHT", "4.0", 1);
+    setenv("RANVIER_SCORING_RESIDENCY_WEIGHT", "0.5", 1);
+    setenv("RANVIER_SCORING_PRICE_WEIGHT", "0.0", 1);
+
+    auto config = RanvierConfig::defaults();
+    EXPECT_DOUBLE_EQ(config.routing.scoring.prefix_weight, 4.0);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.residency_weight, 0.5);
+    EXPECT_DOUBLE_EQ(config.routing.scoring.price_weight, 0.0);
+    // Untouched weights keep defaults
+    EXPECT_DOUBLE_EQ(config.routing.scoring.load_weight, 1.0);
+
+    unsetenv("RANVIER_SCORING_PREFIX_WEIGHT");
+    unsetenv("RANVIER_SCORING_RESIDENCY_WEIGHT");
+    unsetenv("RANVIER_SCORING_PRICE_WEIGHT");
+}
+
+TEST_F(ConfigTest, ScoringRejectsNegativeWeights) {
+    RanvierConfig config;
+    config.routing.scoring.load_weight = -0.1;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("scoring.load_weight"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ScoringRejectsResidencyWeightAboveOne) {
+    RanvierConfig config;
+    config.routing.scoring.residency_weight = 1.5;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("scoring.residency_weight"), std::string::npos);
+}
+
+// =============================================================================
 // Static-config backends YAML schema
 // =============================================================================
 

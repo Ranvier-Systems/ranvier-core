@@ -4,6 +4,29 @@ All notable changes to Ranvier Core will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **Unified weighted route scorer** (BACKLOG §20.1 P0.2) — The post-anchor
+  routing decision is now one weighted ranking over the live candidates
+  (`src/route_scorer.hpp`) instead of the former sequential override chain
+  (residency downgrade → load redirect → cost redirect → hardware-cost
+  preference). Stable terms (prefix affinity, hardware price) pick the
+  placement / learn target; transient terms (load hinge over the strategy
+  allowance, cost-budget hinge) pick the dispatch target. Per-signal weights
+  in `routing.scoring.*` (env `RANVIER_SCORING_*`): `prefix_weight`,
+  `load_weight`, `residency_weight`, `cost_weight`, `price_weight`, plus a
+  reserved `slo_weight` seam. **Neutral defaults reproduce the previous
+  pipeline's decisions exactly** — the existing strategy/threshold keys keep
+  their authority until weights are tuned. Counter-semantics note:
+  `router_load_aware_fallbacks_total` now counts every load-driven ART-hit
+  divert under `bounded_load` (the former re-probe skipped diverts landing on
+  the primary hash bucket); with cost routing enabled, the budget/fast-lane
+  triggers blend continuously instead of overriding sequentially, and the 4b
+  divert target is deterministic (least budget pressure) rather than
+  random-two-choices.
+
 ## [2.1.0] - 2026-04-11
 
 Performance release. Introduces partial tokenization for routing — truncates
