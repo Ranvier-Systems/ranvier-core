@@ -243,6 +243,7 @@ struct K8sEndpoint {
     uint32_t weight = K8S_DEFAULT_WEIGHT;
     uint32_t priority = K8S_DEFAULT_PRIORITY;
     BackendType type = BackendType::VLLM;
+    PoolRole role = PoolRole::UNIFIED;
     std::string api_key_secret_ref;
 
     // FNV-1a 64-bit hash, truncated to 31 bits for positive BackendId.
