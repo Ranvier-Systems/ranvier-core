@@ -135,6 +135,7 @@ The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle o
 - **HealthService**: Periodic health checks on backends
 - **ConnectionPool**: Reusable connections with LRU eviction
 - **TelemetryService** (optional): Per-shard outcome counters bucketed by `(model_family, backend_type, hardware_label, workload_pattern)`, plus a shard-0 periodic emitter that gathers across shards and hands a window report to a pluggable sink. Off by default; stock build wires `NoopSink`. See `src/telemetry_sink.hpp`.
+- **Usage-ledger sink** (optional): A per-shard, per-request sink for external metering / attribution / billing backends — one `UsageEvent` (per-key identifiers + estimated usage, no content) handed to the installed sink on the shard that served the request. Distinct from the telemetry sink (aggregate, content-free, shard-0). Off by default; stock build wires `NoopUsageLedgerSink`. See `src/usage_ledger_sink.hpp`.
 
 ### Persistence Layer
 - **AsyncPersistenceManager**: Fire-and-forget queue that decouples SQLite writes from the reactor thread. See [Async Persistence Internals](../internals/async-persistence.md).

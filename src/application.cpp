@@ -9,6 +9,7 @@
 #include "metrics_service.hpp"
 #include "shard_load_metrics.hpp"
 #include "tracing_service.hpp"
+#include "usage_ledger_sink.hpp"
 #include "worker_affinity.hpp"
 
 #include <cstdio>
@@ -373,6 +374,12 @@ void Application::log_non_reloadable_changes(const RanvierConfig& new_config) co
     }
     if (new_config.telemetry_sink.max_buckets != _config.telemetry_sink.max_buckets) {
         log_main.warn("Config reload: telemetry_sink.max_buckets changes require restart to take effect");
+    }
+
+    // Usage-ledger sink is installed once per shard at startup; toggling it
+    // requires a restart (same posture as telemetry_sink).
+    if (new_config.usage_ledger.enabled != _config.usage_ledger.enabled) {
+        log_main.warn("Config reload: usage_ledger.enabled changes require restart to take effect");
     }
 }
 
@@ -775,6 +782,27 @@ seastar::future<> Application::init_telemetry_service() {
                   _config.telemetry_sink.max_buckets);
 }
 
+seastar::future<> Application::init_usage_ledger() {
+    if (!_config.usage_ledger.enabled) {
+        // Disabled: leave every shard's sink null. The completion path is a
+        // single null check; stock build behaves exactly as today.
+        log_main.info("Usage-ledger sink disabled");
+        co_return;
+    }
+
+    // Each shard installs its OWN sink instance (usage events occur on every
+    // shard; a shard-0-only sink would force a cross-shard hop per request).
+    // The factory is the process-wide seam: OSS yields NoopUsageLedgerSink, a
+    // downstream build installs a real exporter via set_usage_ledger_sink_factory()
+    // before this runs. Capture the factory by value so each shard copies it.
+    auto factory = get_usage_ledger_sink_factory();
+    co_await _controller.invoke_on_all([factory](HttpController& c) {
+        c.set_usage_ledger_sink(factory());
+    });
+
+    log_main.info("Usage-ledger sink initialised (enabled=true, per-shard sink installed)");
+}
+
 void Application::init_k8s_discovery() {
     if (!_config.k8s_discovery.enabled) {
         return;
@@ -1069,6 +1097,12 @@ seastar::future<> Application::startup() {
             // the periodic window emitter. Off by default — the recording
             // path is a single null-check branch when the sink is disabled.
             return init_telemetry_service();
+        }).then([this] {
+            // Install the per-shard usage-ledger sink (BACKLOG §20.2 P1.5).
+            // Off by default — leaves each shard's sink null. Runs after the
+            // controller is started so set_usage_ledger_sink lands on a live
+            // per-shard instance.
+            return init_usage_ledger();
         }).then([this] {
             // Initialise per-API-key attribution on every shard. This
             // pre-registers the three sentinel labels and any pre-configured

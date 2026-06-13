@@ -571,6 +571,25 @@ target_link_libraries(telemetry_sink_test
 )
 gtest_discover_tests(telemetry_sink_test)
 
+# Usage-ledger sink unit tests: UsageEvent defaults + forward-compat
+# readability (wire contract — see src/usage_ledger_schema.hpp), the
+# NoopUsageLedgerSink default, the process-wide factory seam, and that a sink
+# double receives the event verbatim through record().
+# Reactor-free by construction: never calls .then()/.finally()/.get() on the
+# stubbed futures (only flush()'s return is held, never driven).
+add_executable(usage_ledger_test
+  tests/unit/usage_ledger_test.cpp
+)
+target_include_directories(usage_ledger_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/stubs
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(usage_ledger_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(usage_ledger_test)
+
 # NodeSlab Unit Tests (Pure C++, no Seastar dependency)
 # Tests slab allocator: allocate/free round-trips, free-list integrity,
 # peak tracking, auto-growth, and make_node factory methods.

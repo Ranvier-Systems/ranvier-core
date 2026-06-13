@@ -477,6 +477,28 @@ struct TelemetrySinkConfig {
 };
 
 // =============================================================================
+// Usage-Ledger Configuration (per-API-key usage event sink)
+// =============================================================================
+
+// Pluggable per-request usage-event sink for external metering / attribution /
+// billing backends. DISTINCT from `TelemetrySinkConfig` above (aggregate
+// routing/cache metrics) and from `TelemetryConfig` (OpenTelemetry tracing):
+// this hands one UsageEvent per completed request to the installed sink on the
+// shard that served it.
+//
+// Off by default. With `enabled=false`, no sink is created and the completion
+// path is a single null check — behaviour is exactly as today. The seam itself
+// has only the master switch; a concrete sink reads its own configuration
+// out-of-band (endpoint, credentials, buffer bounds), exactly like the
+// telemetry-sink factory. See `src/usage_ledger_sink.hpp` for the sink contract
+// and `src/usage_ledger_schema.hpp` for the event schema + forward-compat
+// discipline that bind concrete implementations.
+struct UsageLedgerConfig {
+    // Master switch. Off by default — stock build behaves exactly as today.
+    bool enabled = false;
+};
+
+// =============================================================================
 // Load Balancing Configuration
 // =============================================================================
 

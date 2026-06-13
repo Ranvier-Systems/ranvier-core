@@ -614,6 +614,34 @@ telemetry_sink:
   max_buckets: 512
 
 # =============================================================================
+# Usage-Ledger Sink Configuration (per-request usage events)
+# =============================================================================
+# Pluggable per-request usage-event sink for external metering / attribution /
+# billing backends. DISTINCT from `telemetry_sink:` above (aggregate, content-
+# free, periodic) and from `telemetry:` (OpenTelemetry tracing): this hands ONE
+# event per completed request to the installed sink, on the shard that served
+# it. Unlike the telemetry sink, a usage event carries the attribution
+# identifiers (api_key_id, request_id) — that is the point of a usage ledger —
+# but still NO prompt/response content and NO token IDs.
+#
+# Off by default. With enabled=false, no sink is created and the completion path
+# is a single null check — behaviour is exactly as today.
+#
+# This stock build wires the NoopUsageLedgerSink (discards every event).
+# Operators plug in their own exporter without recompiling consumers; the event
+# schema is forward-compatible (consumers tolerate unknown trailing fields — see
+# src/usage_ledger_sink.hpp and src/usage_ledger_schema.hpp). A concrete sink
+# reads its own endpoint/credentials/buffer config out-of-band, so the only knob
+# here is the master switch.
+#
+# Token/cost figures on each event are the same pre-flight ESTIMATES the
+# per-API-key attribution rows record (Ranvier does not parse the upstream
+# response `usage`); see the HONESTY NOTE in src/usage_ledger_schema.hpp.
+usage_ledger:
+  # Master switch (RANVIER_USAGE_LEDGER_ENABLED). Toggling requires a restart.
+  enabled: false
+
+# =============================================================================
 # =============================================================================
 # Per-API-Key Attribution Configuration
 # =============================================================================

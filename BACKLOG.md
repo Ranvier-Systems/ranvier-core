@@ -998,13 +998,30 @@ Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build
   _Location:_ new ext_proc gRPC server surface; reuse `router_service` decision core
   _Complexity:_ High
 
-- [ ] **Usage-ledger sink seam** (P1.5, OSS)
+- [x] **Usage-ledger sink seam** (P1.5, OSS) — _Done 2026-06-13._
   _Justification:_ Ship a pluggable usage-ledger *sink* interface (no-op default + registration
   point, mirroring `TelemetrySinkConfig`) on top of the existing per-API-key attribution +
   SQLite, so external metering / attribution / billing backends can consume per-key usage events
   without core hard-depending on any concrete implementation.
   _Location:_ OSS sink interface in `src/`
   _Complexity:_ Medium
+  _Completion note:_ Shipped as `src/usage_ledger_sink.hpp` (`UsageLedgerSink` interface +
+  `NoopUsageLedgerSink` default + process-wide factory seam) and `src/usage_ledger_schema.hpp`
+  (`UsageEvent` + forward-compat contract), mirroring the telemetry-sink pair. Emission model
+  differs deliberately from the telemetry sink: usage is **per-request, per-shard**, not a
+  shard-0 windowed aggregate — so each shard owns its own sink instance (the factory is invoked
+  once per shard) and `HttpController` calls a synchronous, non-blocking `record(UsageEvent)` at
+  the terminal phase next to the existing `request_attribution` enqueue (the two share one
+  computed set of outcome values and are independently gated; the whole block is skipped when
+  neither is active). The event carries the attribution identifiers (`api_key_id`,
+  `request_id`) — the point of a ledger — plus `model` (reused from the P1.6 extraction) and the
+  estimated token/cost figures; **no** prompt/response content, **no** token IDs. Token/cost are
+  the same pre-flight *estimates* the attribution rows record (the response `usage` is not
+  parsed) — wiring engine-reported actuals is a flagged follow-up. Independent of SQLite
+  persistence (a billing backend can be the only consumer). Gated by `usage_ledger.enabled`
+  (default false; `RANVIER_USAGE_LEDGER_ENABLED`); toggling requires a restart (same posture as
+  `telemetry_sink`). Stock build wires the Noop sink; the completion path is one null check when
+  disabled.
 
 - [x] **OpenTelemetry GenAI semantic conventions** (P1.6, OSS) — _Done 2026-06-13._
   _Justification:_ Emit `gen_ai.*` span attributes from the existing tracing path so Ranvier
