@@ -608,6 +608,12 @@ void RanvierConfig::apply_env_overrides() {
         if (*v > 0) telemetry_sink.max_buckets = *v;
     }
 
+    // Usage-ledger sink (per-request usage events; distinct from both telemetry
+    // blocks above)
+    if (auto v = get_env("RANVIER_USAGE_LEDGER_ENABLED")) {
+        usage_ledger.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+
     // Cost estimation overrides
     if (auto v = get_env("RANVIER_COST_ESTIMATION_ENABLED")) {
         cost_estimation.enabled = (*v == "1" || *v == "true" || *v == "yes");
@@ -1497,6 +1503,12 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 size_t mb = ts["max_buckets"].as<size_t>();
                 if (mb > 0) config.telemetry_sink.max_buckets = mb;
             }
+        }
+        // Usage-ledger sink section (per-request usage events; distinct from
+        // both telemetry blocks above)
+        if (yaml["usage_ledger"]) {
+            YAML::Node ul = yaml["usage_ledger"];
+            if (ul["enabled"]) config.usage_ledger.enabled = ul["enabled"].as<bool>();
         }
         // Cost estimation section
         if (yaml["cost_estimation"]) {

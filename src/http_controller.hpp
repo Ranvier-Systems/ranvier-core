@@ -18,6 +18,7 @@
 #include "shard_load_metrics.hpp"
 #include "telemetry_service.hpp"
 #include "tokenizer_service.hpp"
+#include "usage_ledger_sink.hpp"
 
 #include <array>
 #include <functional>
@@ -89,6 +90,11 @@ struct ProxyContext {
     std::string backend_traceparent;
     std::string routing_mode;
     std::string endpoint;  // API endpoint path (e.g., "/v1/chat/completions" or "/v1/completions")
+    // Client-requested "model" string, extracted during the single request-body
+    // parse. Empty if absent. Carried only for the usage-ledger sink's
+    // UsageEvent (gen_ai.request.model uses the same source on the trace span);
+    // routing never reads it.
+    std::string model;
 
     // Request body and tokens
     std::string forwarded_body;
@@ -400,6 +406,16 @@ public:
     // See src/telemetry_sink.hpp for the sink contract.
     void set_telemetry_service(TelemetryService* ts) { _telemetry_service = ts; }
 
+    // Install this shard's usage-ledger sink (owned). When set, the proxy
+    // completion path hands one UsageEvent per request to record(). When unset
+    // (the default, and whenever usage_ledger.enabled is false), the completion
+    // path skips the build entirely — one null check. Called once per shard at
+    // startup (Application::init_usage_ledger) via the process-wide factory.
+    // See src/usage_ledger_sink.hpp for the sink contract.
+    void set_usage_ledger_sink(std::unique_ptr<UsageLedgerSink> sink) {
+        _usage_sink = std::move(sink);
+    }
+
     // Set config reload callback (for /admin/keys/reload endpoint)
     // Callback returns true on success, false on failure
     // The callback is synchronous as it should just trigger the reload process
@@ -481,6 +497,11 @@ private:
     // (Application::init_telemetry_service). When null, the proxy
     // completion path's record_outcome call is skipped — zero cost.
     TelemetryService* _telemetry_service = nullptr;
+
+    // Per-shard usage-ledger sink (owned, nullable). Null unless
+    // usage_ledger.enabled installed one at startup. Drained in stop().
+    // See src/usage_ledger_sink.hpp.
+    std::unique_ptr<UsageLedgerSink> _usage_sink;
 
     // Graceful shutdown state
     // Plain bool: set/read only from this shard's reactor via invoke_on_all/local handler

@@ -341,6 +341,20 @@ After streaming completes:
    Shard-local, off the request future; when disabled, a single null-check
    branch. See [`src/telemetry_sink.hpp`](../../src/telemetry_sink.hpp) for the
    sink contract.
+2a. **Request attribution + usage ledger** (optional, independent) — the same
+   terminal block computes one set of per-request outcome values (status code,
+   latency, backend, estimated tokens/cost) and feeds two independent opt-in
+   consumers: the `request_attribution` SQLite row (when `_persistence` and
+   `attribution.persistence_enabled`) and the **usage-ledger sink** (when
+   `usage_ledger.enabled`). The sink's `record()` is shard-local, synchronous,
+   and non-blocking — one `UsageEvent` per request to a per-shard sink instance;
+   the stock build wires `NoopUsageLedgerSink`. Unlike the telemetry sink the
+   event carries the attribution identifiers (`api_key_id`, `request_id`), but
+   still no content. Token/cost are pre-flight estimates (the response `usage`
+   is not parsed). When neither consumer is active the whole block is skipped
+   (one null check). See [`src/usage_ledger_sink.hpp`](../../src/usage_ledger_sink.hpp)
+   for the contract and [`src/usage_ledger_schema.hpp`](../../src/usage_ledger_schema.hpp)
+   for the event schema.
 3. **Connection** — if `bundle.is_valid`, return to pool via
    `ConnectionPool::put()`. Otherwise close.
 4. **RAII destructors** release (in reverse capture order):

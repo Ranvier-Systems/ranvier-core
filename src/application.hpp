@@ -247,6 +247,13 @@ private:
     // simply doesn't arm.
     seastar::future<> init_telemetry_service();
 
+    // Install the per-shard usage-ledger sink when usage_ledger.enabled. Each
+    // shard builds its own instance via the process-wide factory
+    // (get_usage_ledger_sink_factory). No-op when disabled — the controller
+    // keeps a null sink and the completion path stays a single null check.
+    // Must run after the controller is started. See src/usage_ledger_sink.hpp.
+    seastar::future<> init_usage_ledger();
+
     // Build a snapshot of the routing-strategy parameters currently in effect.
     // Used by the telemetry emitter to attach a strategy view to each window
     // report (so operators correlating outcome shifts with config changes

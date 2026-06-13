@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Usage-ledger sink seam** (BACKLOG §20.2 P1.5) — A pluggable, per-request
+  usage-event sink for external metering / attribution / billing backends,
+  layered on the existing per-API-key attribution without core depending on any
+  concrete implementation. `src/usage_ledger_sink.hpp` defines the
+  `UsageLedgerSink` interface, the `NoopUsageLedgerSink` default, and a
+  process-wide factory seam (`set_/get_usage_ledger_sink_factory`);
+  `src/usage_ledger_schema.hpp` defines the `UsageEvent` with the same
+  forward-compatibility contract as the telemetry schema. Unlike the telemetry
+  sink (aggregate, content-free, shard-0 windowed), the usage sink is
+  per-request and per-shard: each shard installs its own instance and the
+  completion path calls a synchronous, non-blocking `record(UsageEvent)` next to
+  the existing `request_attribution` enqueue (both fed from one computed set of
+  outcome values, independently gated; skipped entirely when neither is active).
+  The event carries the attribution identifiers (`api_key_id`, `request_id`),
+  `model`, and estimated token/cost figures — **no** prompt/response content and
+  **no** token IDs. Token/cost are the same pre-flight estimates the attribution
+  rows record (the upstream response `usage` is not parsed). Independent of
+  SQLite persistence. Gated by `usage_ledger.enabled` (default false;
+  `RANVIER_USAGE_LEDGER_ENABLED`); toggling requires a restart. The stock build
+  wires the Noop sink, so the completion path is a single null check when
+  disabled.
+
 - **OpenTelemetry GenAI semantic conventions** (BACKLOG §20.2 P1.6) — The
   `ranvier.request` root span now carries the OpenTelemetry GenAI semconv
   (`gen_ai.*`) attributes, so Ranvier slots into the standard

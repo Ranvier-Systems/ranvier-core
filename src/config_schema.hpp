@@ -709,6 +709,11 @@ struct RanvierConfig {
     // by default. See config_infra.hpp for the struct and src/telemetry_sink.hpp
     // for the sink contract.
     TelemetrySinkConfig telemetry_sink;
+    // Pluggable per-request usage-event sink for external metering / billing /
+    // attribution backends. DISTINCT from `telemetry_sink` (aggregate metrics)
+    // and `telemetry` (tracing). Off by default. See config_infra.hpp for the
+    // struct and src/usage_ledger_sink.hpp for the sink contract.
+    UsageLedgerConfig usage_ledger;
     LoadBalancingConfig load_balancing;
     CostEstimationConfig cost_estimation;
     PriorityTierConfig priority_tier;

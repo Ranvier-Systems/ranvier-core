@@ -2130,6 +2130,13 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->backend_traceparent = backend_traceparent;
     ctx->routing_mode = routing_mode_str;
     ctx->endpoint = endpoint;
+    // Client-requested model, from the single body parse (P1.6 extraction).
+    // Empty when absent or when the body wasn't parsed (e.g. client tokens).
+    // Carried for the usage-ledger UsageEvent; the lambda can't see
+    // text_extraction (a handle_proxy local), so stash it on ctx here.
+    if (text_extraction.has_value()) {
+        ctx->model = text_extraction->model;
+    }
     ctx->forwarded_body = std::move(forwarded_body);
     ctx->tokens = std::move(tokens);
     ctx->prefix_boundary = prefix_boundary;
@@ -2455,20 +2462,24 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             _telemetry_service->record_outcome(bucket, outcome);
         }
 
-        // Per-API-key attribution: enqueue one request_attribution row from
-        // the terminal phase. Single enqueue per request, regardless of which
-        // outcome branch above fired. Memo §7.4. Silently dropped when
-        // _persistence is null or attribution_persistence_enabled is false.
-        if (_persistence != nullptr) {
-            LogRequestOp op;
-            op.request_id   = ctx->request_id;
-            op.api_key_id   = ctx->api_key_id;
-            op.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        // Terminal per-request attribution + usage. Two independent opt-in
+        // consumers fed from one set of computed outcome values:
+        //   1. request_attribution SQLite row (Memo §7.4), via _persistence.
+        //   2. usage-ledger sink (BACKLOG §20.2 P1.5), via _usage_sink — a
+        //      per-shard external metering/billing seam, default Noop.
+        // Single attribution per request regardless of which outcome branch
+        // above fired. Skipped entirely when neither consumer is active (one
+        // null check), preserving the stock-build hot path.
+        if (_persistence != nullptr || _usage_sink) {
+            const int64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
-            op.endpoint     = ctx->endpoint;
+            const int32_t latency_ms = static_cast<int32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    backend_end - ctx->request_start).count());
             // Backend may not have been chosen on early failures.
+            std::optional<BackendId> backend_id;
             if (ctx->current_backend != 0) {
-                op.backend_id = ctx->current_backend;
+                backend_id = ctx->current_backend;
             }
             // Status code: prefer the backend's real HTTP status (parsed from
             // the upstream status line) so backend errors (429/500/etc.) are
@@ -2478,27 +2489,71 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             // synthesized proxy-outcome code. Client disconnect is checked
             // first because it can occur after a successful backend response
             // began streaming, and operators want to distinguish it.
+            int32_t status_code;
             if (ctx->client_disconnected) {
-                op.status_code = 499;  // Nginx convention
+                status_code = 499;  // Nginx convention
             } else if (ctx->timed_out) {
-                op.status_code = 504;
+                status_code = 504;
             } else if (ctx->connection_error || ctx->connection_failed) {
-                op.status_code = 502;
+                status_code = 502;
             } else if (ctx->backend_status_code != 0) {
-                op.status_code = ctx->backend_status_code;
+                status_code = ctx->backend_status_code;
             } else {
                 // No backend status and no proxy-level failure flag — e.g. an
                 // empty response that didn't trip stale-retry. Default to 200
                 // (consistent with the success branch in phase 4).
-                op.status_code = 200;
+                status_code = 200;
             }
-            op.latency_ms = static_cast<int32_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    backend_end - ctx->request_start).count());
-            op.input_tokens  = static_cast<int64_t>(ctx->estimated_input_tokens);
-            op.output_tokens = static_cast<int64_t>(ctx->estimated_output_tokens);
-            op.cost_units    = ctx->estimated_cost_units;
-            _persistence->queue_log_request(std::move(op));
+            // Token/cost figures are the pre-flight ESTIMATES (the codebase does
+            // not parse the upstream response `usage`) — see
+            // usage_ledger_schema.hpp HONESTY NOTE.
+            const int64_t input_tokens  = static_cast<int64_t>(ctx->estimated_input_tokens);
+            const int64_t output_tokens = static_cast<int64_t>(ctx->estimated_output_tokens);
+            const double  cost_units    = ctx->estimated_cost_units;
+
+            // Silently dropped when attribution_persistence_enabled is false.
+            if (_persistence != nullptr) {
+                LogRequestOp op;
+                op.request_id    = ctx->request_id;
+                op.api_key_id    = ctx->api_key_id;
+                op.timestamp_ms  = timestamp_ms;
+                op.endpoint      = ctx->endpoint;
+                op.backend_id    = backend_id;
+                op.status_code   = status_code;
+                op.latency_ms    = latency_ms;
+                op.input_tokens  = input_tokens;
+                op.output_tokens = output_tokens;
+                op.cost_units    = cost_units;
+                _persistence->queue_log_request(std::move(op));
+            }
+
+            // Usage-ledger sink: one event per completed request, on this shard.
+            if (_usage_sink) {
+                UsageEvent ev;
+                ev.api_key_id    = ctx->api_key_id;
+                ev.request_id    = ctx->request_id;
+                ev.endpoint      = ctx->endpoint;
+                ev.model         = ctx->model;
+                ev.backend_id    = backend_id;
+                ev.timestamp_ms  = timestamp_ms;
+                ev.status_code   = status_code;
+                ev.latency_ms    = latency_ms;
+                ev.input_tokens  = input_tokens;
+                ev.output_tokens = output_tokens;
+                ev.cost_units    = cost_units;
+                // Contract: record() must not throw. Guard defensively and log
+                // at warn (Rule #9) so a misbehaving sink can never corrupt
+                // request completion.
+                try {
+                    _usage_sink->record(std::move(ev));
+                } catch (const std::exception& e) {
+                    log_proxy.warn("[{}] usage-ledger sink record() threw: {}",
+                                   ctx->request_id, e.what());
+                } catch (...) {
+                    log_proxy.warn("[{}] usage-ledger sink record() threw: unknown error",
+                                   ctx->request_id);
+                }
+            }
         }
 
         // Cost budget release is handled by CostBudgetGuard destructor (RAII).
@@ -3015,6 +3070,21 @@ future<> HttpController::stop() {
     // Close gate if not already closed by wait_for_drain()
     if (!_request_gate.is_closed()) {
         co_await _request_gate.close();
+    }
+
+    // Drain the usage-ledger sink: the request gate is now closed, so no further
+    // record() calls can arrive. flush() lets a buffering sink export its
+    // backlog and join its worker before member destruction.
+    if (_usage_sink) {
+        try {
+            co_await _usage_sink->flush();
+        } catch (const std::exception& e) {
+            log_proxy.warn("usage-ledger sink flush() failed on shard {}: {}",
+                           seastar::this_shard_id(), e.what());
+        } catch (...) {
+            log_proxy.warn("usage-ledger sink flush() failed on shard {}: unknown error",
+                           seastar::this_shard_id());
+        }
     }
 
     log_proxy.debug("HttpController::stop() completed on shard {}", seastar::this_shard_id());
