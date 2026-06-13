@@ -1472,10 +1472,10 @@ TEST_F(RadixTreeRouteOriginTest, OverwritePreservesNewOrigin) {
 }
 
 // -----------------------------------------------------------------------------
-// evict_oldest_remote() Tests
+// evict_lowest_trust() origin-preference Tests
 // -----------------------------------------------------------------------------
 
-TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteEvictsRemoteFirst) {
+TEST_F(RadixTreeRouteOriginTest, EvictLowestTrustEvictsRemoteFirst) {
     // Insert LOCAL first (oldest)
     tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::LOCAL);
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1489,8 +1489,8 @@ TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteEvictsRemoteFirst) {
 
     EXPECT_EQ(tree.route_count(), 3u);
 
-    // evict_oldest_remote should evict the REMOTE route, not the oldest LOCAL
-    bool evicted = tree.evict_oldest_remote();
+    // evict_lowest_trust should evict the REMOTE route, not the oldest LOCAL
+    bool evicted = tree.evict_lowest_trust();
 
     EXPECT_TRUE(evicted);
     EXPECT_EQ(tree.route_count(), 2u);
@@ -1503,7 +1503,7 @@ TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteEvictsRemoteFirst) {
     EXPECT_TRUE(tree.lookup(tokens({7, 8, 9})).has_value());
 }
 
-TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteFallsBackToLocal) {
+TEST_F(RadixTreeRouteOriginTest, EvictLowestTrustFallsBackToLocal) {
     // Insert only LOCAL routes
     tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::LOCAL);
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1511,8 +1511,8 @@ TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteFallsBackToLocal) {
 
     EXPECT_EQ(tree.route_count(), 2u);
 
-    // No REMOTE routes, should fall back to evicting oldest LOCAL
-    bool evicted = tree.evict_oldest_remote();
+    // No REMOTE (or PUSH) routes: falls through the ladder to oldest LOCAL
+    bool evicted = tree.evict_lowest_trust();
 
     EXPECT_TRUE(evicted);
     EXPECT_EQ(tree.route_count(), 1u);
@@ -1522,7 +1522,7 @@ TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteFallsBackToLocal) {
     EXPECT_TRUE(tree.lookup(tokens({4, 5, 6})).has_value());
 }
 
-TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteMultipleRemotes) {
+TEST_F(RadixTreeRouteOriginTest, EvictLowestTrustMultipleRemotes) {
     // Insert multiple REMOTE routes at different times
     tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::REMOTE);  // Oldest REMOTE
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1533,22 +1533,22 @@ TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteMultipleRemotes) {
     EXPECT_EQ(tree.route_count(), 3u);
 
     // Should evict the oldest REMOTE (backend 1)
-    tree.evict_oldest_remote();
+    tree.evict_lowest_trust();
     EXPECT_EQ(tree.route_count(), 2u);
     EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
 
     // Should evict the remaining REMOTE (backend 2)
-    tree.evict_oldest_remote();
+    tree.evict_lowest_trust();
     EXPECT_EQ(tree.route_count(), 1u);
     EXPECT_FALSE(tree.lookup(tokens({4, 5, 6})).has_value());
 
     // Now should fall back to LOCAL
-    tree.evict_oldest_remote();
+    tree.evict_lowest_trust();
     EXPECT_EQ(tree.route_count(), 0u);
 }
 
-TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteEmptyTree) {
-    bool evicted = tree.evict_oldest_remote();
+TEST_F(RadixTreeRouteOriginTest, EvictLowestTrustEmptyTree) {
+    bool evicted = tree.evict_lowest_trust();
     EXPECT_FALSE(evicted);
 }
 
