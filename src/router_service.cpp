@@ -4989,7 +4989,14 @@ void RouterService::apply_native_kv_ops_local(const NativeKvOp* ops, size_t coun
                     state.stats.native_materialize_trust_skips++;
                 }
             }
-            state.touch_native_fresh(op.backend);
+            // Deliberately NO touch_native_fresh here: freshness is earned by
+            // the ops that maintain the prefix_hash_index mirror (UPSERT /
+            // REMOVE / ALIVE / CLEAR). A MATERIALIZE alone marking the stream
+            // fresh would flip the anchor into verified mode with no index
+            // entry behind it — and the next lookup would verdict the
+            // just-created route "verified evicted" and divert off it. The
+            // ledger always ships the boundary UPSERTs in the same shipment,
+            // so production freshness is unaffected.
             break;
         }
         case NativeKvOp::Kind::CLEAR:
