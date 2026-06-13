@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **OpenTelemetry GenAI semantic conventions** (BACKLOG §20.2 P1.6) — The
+  `ranvier.request` root span now carries the OpenTelemetry GenAI semconv
+  (`gen_ai.*`) attributes, so Ranvier slots into the standard
+  LLM-observability stack (Datadog/GCP/Azure map the semconv natively):
+  `gen_ai.operation.name` (`chat`/`text_completion`), `gen_ai.provider.name`
+  (backend engine class — `vllm`/`sglang`/…; semconv sanctions custom values,
+  more honest than labeling a self-hosted backend `openai`),
+  `gen_ai.request.model`, `gen_ai.request.max_tokens`,
+  `gen_ai.usage.input_tokens` (the exact tokenized count — omitted under
+  partial or skipped tokenization rather than reporting a fraction),
+  `server.address`/`server.port` (the upstream behind the proxy), and
+  `error.type` plus span-status Error on the routing-failure paths. The span
+  name stays `ranvier.request` (dashboards key on attributes). Response-side
+  usage (output tokens, response model) is intentionally not emitted — the
+  request span ends at dispatch handoff, before the response streams back.
+  Gated by `telemetry.genai_semconv` (default true;
+  `RANVIER_TELEMETRY_GENAI_SEMCONV`); with the flag off behavior is
+  byte-identical to before. The `model` field is read during the existing
+  single request-body parse, adding no JSON work to the hot path.
+
 - **Native KV-event mode, part 1: verified residency** (BACKLOG §20.1 P0.1) —
   Opt-in subscriber for vLLM's native KV-cache event stream (ZMQ PUB,
   msgpack `KVEventBatch`): `BlockStored`/`BlockRemoved` events maintain

@@ -592,6 +592,9 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<size_t>("RANVIER_TELEMETRY_MAX_EXPORT_BATCH_SIZE")) {
         telemetry.max_export_batch_size = *v;
     }
+    if (auto v = get_env("RANVIER_TELEMETRY_GENAI_SEMCONV")) {
+        telemetry.genai_semconv = (*v == "1" || *v == "true" || *v == "yes");
+    }
 
     // Telemetry-sink overrides (aggregate metrics export — distinct from
     // OpenTelemetry tracing above)
@@ -1476,6 +1479,9 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             }
             if (t["max_export_batch_size"]) {
                 config.telemetry.max_export_batch_size = t["max_export_batch_size"].as<size_t>();
+            }
+            if (t["genai_semconv"]) {
+                config.telemetry.genai_semconv = t["genai_semconv"].as<bool>();
             }
         }
         // Telemetry-sink section (aggregate metrics export — distinct from

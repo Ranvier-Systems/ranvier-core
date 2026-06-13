@@ -1006,12 +1006,28 @@ Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build
   _Location:_ OSS sink interface in `src/`
   _Complexity:_ Medium
 
-- [ ] **OpenTelemetry GenAI semantic conventions** (P1.6, OSS)
+- [x] **OpenTelemetry GenAI semantic conventions** (P1.6, OSS) — _Done 2026-06-13._
   _Justification:_ Emit `gen_ai.*` span attributes from the existing tracing path so Ranvier
   slots into the standard LLM-observability stack (Datadog/GCP/Azure map the semconv natively).
   Low effort, high ecosystem-citizenship value.
   _Location:_ `src/tracing_service.{hpp,cpp}`
   _Complexity:_ Low
+  _Completion note:_ Implemented on the existing `ranvier.request` root span (kept the span
+  name; dashboards key on attributes, and Datadog/GCP/Azure map the semconv that way) rather
+  than `tracing_service.{hpp,cpp}` — the ScopedSpan API was already sufficient, so the change
+  is entirely at the call sites in `http_controller.cpp`. Attributes: `gen_ai.operation.name`
+  (`chat`/`text_completion`, set at entry), `gen_ai.provider.name` (backend engine class —
+  `vllm`/`sglang`/… via `backend_type_to_string`; semconv sanctions custom values, more
+  honest than labeling self-hosted backends `openai`), `gen_ai.request.model`,
+  `gen_ai.request.max_tokens`, `gen_ai.usage.input_tokens` (exact tokenized count; omitted
+  under partial/skipped tokenization so we never report a fraction as the whole),
+  `server.address`/`server.port` (the upstream behind the proxy), and `error.type` +
+  span-status on the three routing-failure paths. Request-span lifetime ends at dispatch
+  handoff, so response-side usage (output tokens, response model) is intentionally out of
+  scope — it pairs naturally with the P1.5 usage ledger. The `model` field rides the existing
+  single-parse `extract_text_with_boundary_info` (no extra JSON pass). Gated by
+  `telemetry.genai_semconv` (default true; `RANVIER_TELEMETRY_GENAI_SEMCONV`); with the flag
+  off, behavior is byte-identical to before.
 
 ### 20.3 P2 — selective / out of scope
 

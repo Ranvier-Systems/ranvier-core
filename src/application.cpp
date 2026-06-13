@@ -225,6 +225,8 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.intent_classifier.rebuild_quoted_fields();
     // Local mode settings
     cfg.local_mode = config.local_mode;
+    // OpenTelemetry GenAI semantic-convention attribute emission
+    cfg.genai_semconv = config.telemetry.genai_semconv;
     // Dashboard settings (CORS gating)
     cfg.dashboard = config.dashboard;
     // Agent registry settings

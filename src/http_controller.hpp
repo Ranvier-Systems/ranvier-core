@@ -264,6 +264,10 @@ struct HttpControllerConfig {
     // Local mode settings (copied from LocalModeConfig at init)
     LocalModeConfig local_mode;
 
+    // Emit OpenTelemetry GenAI semantic-convention attributes (gen_ai.*) on the
+    // request span. Copied from TelemetryConfig::genai_semconv at init.
+    bool genai_semconv = true;
+
     // Dashboard settings (CORS gating)
     DashboardConfig dashboard;
 

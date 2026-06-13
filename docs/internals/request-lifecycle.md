@@ -351,6 +351,39 @@ After streaming completes:
 
 ---
 
+## Distributed tracing spans
+
+When `telemetry.enabled`, each request emits a `ranvier.request` root span with
+two children: `ranvier.tokenize` and `ranvier.route_lookup`. W3C trace context
+is parsed from the inbound `traceparent` and propagated to the backend (Phase
+7), so a Ranvier trace stitches into the caller's and the engine's.
+
+With `telemetry.genai_semconv` (default on), the root span also carries the
+[OpenTelemetry GenAI semantic-convention](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
+attributes, so the trace is legible to Datadog / GCP / Azure without a custom
+mapping:
+
+| Attribute | Source | Notes |
+|-----------|--------|-------|
+| `gen_ai.operation.name` | endpoint | `chat` (`/v1/chat/completions`) or `text_completion` (`/v1/completions`); set at entry |
+| `gen_ai.provider.name` | `backend_type(target)` | engine class — `vllm`, `sglang`, … (custom value, not `openai`) |
+| `gen_ai.request.model` | request `model` field | read in the single body parse; omitted if absent |
+| `gen_ai.request.max_tokens` | request `max_tokens` | omitted if absent / non-positive |
+| `gen_ai.usage.input_tokens` | `tokens.size()` | exact; **omitted** under partial or skipped tokenization (never a fraction) |
+| `server.address` / `server.port` | chosen backend | the upstream behind the proxy, per semconv |
+| `error.type` | failure path | `no_backend_available` / `circuit_open` / `backend_address_missing`, with span status Error |
+
+Response-side usage (`gen_ai.usage.output_tokens`, `gen_ai.response.model`) is
+intentionally **not** emitted: the root span ends at dispatch handoff (the
+streaming body lambda outlives it), before any response token is parsed.
+Emitting the chars/4 cost *estimate* as usage would be dishonest; precise
+output accounting belongs to the usage-ledger path (BACKLOG §20.2 P1.5). The
+span name stays `ranvier.request` rather than the semconv-suggested
+`{operation} {model}` so existing dashboards keyed on the span name keep
+working — backends map on the attributes regardless.
+
+---
+
 ## Error Response Summary
 
 | Condition | HTTP Status | Body |
