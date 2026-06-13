@@ -642,6 +642,36 @@ usage_ledger:
   enabled: false
 
 # =============================================================================
+# GIE Endpoint-Picker (EPP) ext_proc gRPC Compatibility Mode
+# =============================================================================
+# Exposes the routing core as a Gateway API Inference Extension (GIE)
+# Endpoint-Picker: a gRPC envoy.service.ext_proc.v3.ExternalProcessor server
+# that a GIE-conformant gateway delegates endpoint selection to. The picker
+# returns the chosen backend via the x-gateway-destination-endpoint response
+# header (or ImmediateResponse 503 when no backend is ready). This is a
+# COMPATIBILITY mode alongside the standalone inline data plane, not a
+# replacement for it.
+#
+# BUILD-GATED: only present when the binary was built with -DWITH_GIE_EPP=ON
+# (default OFF — gRPC + protobuf are heavy and most deployments use the inline
+# path). If enabled: true on a build that lacks WITH_GIE_EPP, a warning is
+# logged and the server stays inert. Toggling enabled / port / listen_address
+# requires a restart.
+#
+# (PR-1 routes with header-level selection; prefix-aware routing over the
+# tokenized request body lands in a follow-up.)
+gie_epp:
+  # Master switch (RANVIER_GIE_EPP_ENABLED).
+  enabled: false
+
+  # gRPC listen port for the ext_proc ExternalProcessor service.
+  # (RANVIER_GIE_EPP_PORT)
+  port: 9002
+
+  # Listen address for the gRPC server. (RANVIER_GIE_EPP_LISTEN_ADDRESS)
+  listen_address: "0.0.0.0"
+
+# =============================================================================
 # =============================================================================
 # Per-API-Key Attribution Configuration
 # =============================================================================

@@ -714,6 +714,10 @@ struct RanvierConfig {
     // and `telemetry` (tracing). Off by default. See config_infra.hpp for the
     // struct and src/usage_ledger_sink.hpp for the sink contract.
     UsageLedgerConfig usage_ledger;
+    // GIE Endpoint-Picker (EPP) ext_proc gRPC compatibility mode. Off by
+    // default; compiled only when WITH_GIE_EPP=ON. See config_infra.hpp for the
+    // struct and src/gie_epp_server.hpp for the server.
+    GieEppConfig gie_epp;
     LoadBalancingConfig load_balancing;
     CostEstimationConfig cost_estimation;
     PriorityTierConfig priority_tier;

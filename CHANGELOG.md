@@ -8,6 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **GIE Endpoint-Picker (EPP) ext_proc mode — part 1: bridge + server**
+  (BACKLOG §20.2 P1.4) — Optional gRPC `envoy.service.ext_proc.v3.ExternalProcessor`
+  server that exposes Ranvier's routing core as a Gateway API Inference Extension
+  Endpoint-Picker, so a GIE-conformant gateway can delegate endpoint selection to
+  it (returning the chosen backend via the `x-gateway-destination-endpoint`
+  header, or `ImmediateResponse` 503 when none is ready). A compatibility mode
+  alongside — not a replacement for — the standalone inline data plane.
+  Build-gated behind `WITH_GIE_EPP` (**default OFF**: gRPC + protobuf are heavy
+  and the inline path is primary); when ON, the ext_proc stubs are generated at
+  build time from `proto/ext_proc_min.proto` — a minimal, wire-compatible subset
+  of the Envoy proto (field numbers verified against upstream) rather than the
+  full proto tree. Runtime opt-in via `gie_epp.enabled` / `RANVIER_GIE_EPP_*`.
+  gRPC runs on its own threads; handlers bridge into the reactor with
+  `seastar::alien::submit_to` (the request/response inverse of the KV
+  subscriber's fire-and-forget bridge) and reuse `route_request` +
+  `get_backend_address`, with the decision crossing back as a trivially-copyable
+  POD so no shard heap is freed off-reactor. This part routes at the header level
+  (empty-token load/hash selection); prefix-aware routing over the tokenized
+  request body, `dynamic_metadata`, 429 shedding, and the inline-vs-sidecar
+  benchmark are the follow-up. Stock builds (`WITH_GIE_EPP=OFF`) are unaffected.
+
 - **Usage-ledger sink seam** (BACKLOG §20.2 P1.5) — A pluggable, per-request
   usage-event sink for external metering / attribution / billing backends,
   layered on the existing per-API-key attribution without core depending on any

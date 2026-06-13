@@ -381,6 +381,16 @@ void Application::log_non_reloadable_changes(const RanvierConfig& new_config) co
     if (new_config.usage_ledger.enabled != _config.usage_ledger.enabled) {
         log_main.warn("Config reload: usage_ledger.enabled changes require restart to take effect");
     }
+
+    // GIE EPP gRPC server binds its port once at startup; toggling it or its
+    // listen address/port requires a restart.
+    if (new_config.gie_epp.enabled != _config.gie_epp.enabled) {
+        log_main.warn("Config reload: gie_epp.enabled changes require restart to take effect");
+    }
+    if (new_config.gie_epp.port != _config.gie_epp.port ||
+        new_config.gie_epp.listen_address != _config.gie_epp.listen_address) {
+        log_main.warn("Config reload: gie_epp.port/listen_address changes require restart to take effect");
+    }
 }
 
 seastar::future<> Application::apply_vocab_size_config() {
@@ -1147,6 +1157,26 @@ seastar::future<> Application::startup() {
                               "(probabilistic residency remains in force)");
             }
 #endif
+
+            // 14a-ter. GIE Endpoint-Picker (EPP) ext_proc gRPC server. Started
+            // after RouterService is up; handlers route via the alien bridge.
+            // Before any backends register it answers 503 (no ready endpoint),
+            // which is the correct GIE behaviour.
+#ifdef RANVIER_WITH_GIE_EPP
+            if (_config.gie_epp.enabled) {
+                _gie_epp_server = std::make_unique<GieEppServer>(
+                    _config.gie_epp, _router.get());
+                _gie_epp_server->start(*seastar::alien::internal::default_instance);
+                log_main.info("GIE Endpoint-Picker (EPP) enabled on port {}",
+                              _config.gie_epp.port);
+            }
+#else
+            if (_config.gie_epp.enabled) {
+                log_main.warn("gie_epp.enabled=true but this build lacks "
+                              "WITH_GIE_EPP; the EPP ext_proc server is inert "
+                              "(rebuild with -DWITH_GIE_EPP=ON)");
+            }
+#endif
             return seastar::make_ready_future<>();
         }).then([this] {
             // 14b. Register static-config backends from YAML.
@@ -1645,6 +1675,20 @@ seastar::future<> Application::stop_services() {
                 log_main.debug("  KV-event subscriber stopped");
             }).handle_exception([](auto ep) {
                 log_main.warn("  KV-event subscriber stop error (ignored)");
+            })
+        );
+    }
+#endif
+
+#ifdef RANVIER_WITH_GIE_EPP
+    if (_gie_epp_server) {
+        // Stops accepting and drains in-flight Process RPCs (they call into the
+        // router via alien) — must complete before RouterService teardown below.
+        parallel_stops.push_back(
+            _gie_epp_server->stop().then([] {
+                log_main.debug("  GIE EPP server stopped");
+            }).handle_exception([](auto ep) {
+                log_main.warn("  GIE EPP server stop error (ignored)");
             })
         );
     }

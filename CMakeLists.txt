@@ -89,6 +89,14 @@ option(RANVIER_DEBUG_METRICS "Enable gossip debug metrics (crypto offload stats,
 # it. Pass -DWITH_KV_EVENTS=OFF for a zmq-free server build.
 option(WITH_KV_EVENTS "Enable native vLLM KV-event subscription (requires libzmq)" ON)
 
+# GIE Endpoint-Picker (EPP) ext_proc gRPC compatibility mode (BACKLOG §20.2
+# P1.4). OFF by default: gRPC + protobuf are a heavy dependency and the EPP is a
+# compatibility mode alongside the standalone inline data plane, not the primary
+# path. When ON, the ext_proc stubs are generated at build time from
+# proto/ext_proc_min.proto (protoc + grpc_cpp_plugin). Pass -DWITH_GIE_EPP=ON to
+# build it; runtime stays opt-in via gie_epp.enabled.
+option(WITH_GIE_EPP "Enable GIE Endpoint-Picker ext_proc gRPC server (requires gRPC + protobuf)" OFF)
+
 if(WITH_TELEMETRY)
     # OpenTelemetry C++ SDK Configuration
     # Provides distributed tracing with Zipkin HTTP export support
@@ -341,6 +349,55 @@ static GLOBAL: Jemalloc = Jemalloc;
         message(STATUS "Native KV events disabled (WITH_KV_EVENTS=OFF)")
     endif()
 
+    # GIE Endpoint-Picker (EPP) ext_proc gRPC server (gRPC confined to
+    # gie_epp_server.cpp + the generated stubs). The minimal ext_proc proto is
+    # compiled at build time so we do not vendor generated code.
+    if(WITH_GIE_EPP)
+        find_package(Protobuf CONFIG QUIET)
+        if(NOT Protobuf_FOUND)
+            find_package(Protobuf QUIET)  # module-mode fallback
+        endif()
+        find_package(gRPC CONFIG QUIET)
+        if(NOT Protobuf_FOUND OR NOT gRPC_FOUND)
+            message(FATAL_ERROR "WITH_GIE_EPP=ON but gRPC/Protobuf were not found. "
+                                "Install grpc + protobuf dev packages (e.g. "
+                                "grpc-devel/protobuf-devel on Fedora, libgrpc++-dev/"
+                                "libprotobuf-dev/protobuf-compiler-grpc on Debian), "
+                                "or pass -DWITH_GIE_EPP=OFF.")
+        endif()
+
+        set(EPP_PROTO ${CMAKE_CURRENT_SOURCE_DIR}/proto/ext_proc_min.proto)
+        set(EPP_GEN_DIR ${CMAKE_BINARY_DIR}/generated/gie_epp)
+        file(MAKE_DIRECTORY ${EPP_GEN_DIR})
+        set(EPP_PB_CC   ${EPP_GEN_DIR}/ext_proc_min.pb.cc)
+        set(EPP_PB_H    ${EPP_GEN_DIR}/ext_proc_min.pb.h)
+        set(EPP_GRPC_CC ${EPP_GEN_DIR}/ext_proc_min.grpc.pb.cc)
+        set(EPP_GRPC_H  ${EPP_GEN_DIR}/ext_proc_min.grpc.pb.h)
+
+        add_custom_command(
+            OUTPUT ${EPP_PB_CC} ${EPP_PB_H} ${EPP_GRPC_CC} ${EPP_GRPC_H}
+            COMMAND $<TARGET_FILE:protobuf::protoc>
+            ARGS --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+                 --cpp_out=${EPP_GEN_DIR}
+                 --grpc_out=${EPP_GEN_DIR}
+                 --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+                 ${EPP_PROTO}
+            DEPENDS ${EPP_PROTO}
+            COMMENT "Generating GIE ext_proc gRPC stubs from ext_proc_min.proto"
+            VERBATIM)
+
+        message(STATUS "GIE EPP enabled: gRPC ext_proc server (port via gie_epp.port)")
+        target_sources(ranvier_core PRIVATE
+            src/gie_epp_server.cpp
+            ${EPP_PB_CC}
+            ${EPP_GRPC_CC})
+        target_include_directories(ranvier_core PRIVATE ${EPP_GEN_DIR})
+        target_compile_definitions(ranvier_core PUBLIC RANVIER_WITH_GIE_EPP)
+        target_link_libraries(ranvier_core PUBLIC gRPC::grpc++ protobuf::libprotobuf)
+    else()
+        message(STATUS "GIE EPP disabled (WITH_GIE_EPP=OFF)")
+    endif()
+
     # OpenTelemetry configuration (optional)
     # Note: We always use the Zipkin exporter because the OTLP exporter (which uses
     # protobuf) has static initialization that blocks before main() runs.
@@ -589,6 +646,22 @@ target_link_libraries(usage_ledger_test
   GTest::gtest_main
 )
 gtest_discover_tests(usage_ledger_test)
+
+# GIE Endpoint-Picker plan unit tests: the pure endpoint-formatting + the
+# set-endpoint-vs-503 decision (src/gie_epp_plan.hpp). No gRPC / Seastar deps —
+# the gRPC server itself is integration-verified. Always built (independent of
+# WITH_GIE_EPP) since the helper is dependency-free.
+add_executable(gie_epp_test
+  tests/unit/gie_epp_test.cpp
+)
+target_include_directories(gie_epp_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(gie_epp_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(gie_epp_test)
 
 # NodeSlab Unit Tests (Pure C++, no Seastar dependency)
 # Tests slab allocator: allocate/free round-trips, free-list integrity,
