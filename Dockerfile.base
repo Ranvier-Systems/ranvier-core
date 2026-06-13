@@ -39,6 +39,9 @@ RUN dnf install -y \
         gmock-devel \
         sqlite-devel \
         zeromq-devel \
+        grpc-devel \
+        grpc-plugins \
+        protobuf-compiler \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 

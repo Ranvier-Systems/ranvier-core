@@ -85,6 +85,39 @@ generates the ext_proc stubs from `proto/ext_proc_min.proto` at build time).
 `enabled: true` on a binary without `WITH_GIE_EPP` logs a warning and stays
 inert.
 
+## Building & testing
+
+The EPP is **off by default** (`WITH_GIE_EPP=OFF`), so the production image and
+the standard unit-test lane never compile the gRPC server. Two layers of
+coverage close the gap without flipping the default:
+
+- **Decision logic — always covered.** `tests/unit/gie_epp_test.cpp` is pure
+  (no gRPC/Seastar deps) and is part of the `unit_tests` aggregate, so it runs
+  in the normal **Unit Tests** CI lane and any local `make test-unit` — the
+  endpoint formatting and the set-endpoint-vs-503 branch are guarded on every
+  push regardless of the flag.
+- **gRPC path — dedicated lane.** `Dockerfile.gie-epp` builds
+  `WITH_GIE_EPP=ON` (compiling + linking `gie_epp_server.cpp` and running the
+  ext_proc proto codegen), and `.github/workflows/gie-epp-tests.yml` runs
+  `ctest` over that build after each Docker Publish. This is the compile/link
+  regression guard for the gRPC server, mirroring the sanitizer/fuzz lanes.
+
+The build toolchain (`grpc-devel`, `grpc-plugins`, `protobuf-compiler`) lives in
+`Dockerfile.base`, so it is *available* for an EPP build without being linked
+into the default/production binaries.
+
+**Local one-liner** (inside the `ranvier-base` / `ranvier-gie-epp` dev
+container, which carries the gRPC toolchain and the pre-built `/deps`):
+
+```sh
+make gie-epp-test     # configure WITH_GIE_EPP=ON, build ranvier_server + tests, run ctest
+```
+
+Or by hand: `cmake -B build -DWITH_GIE_EPP=ON && cmake --build build && (cd build && ctest)`
+— note `WITH_GIE_EPP` is a CMake configure option, so it must be set at the
+`cmake` step, not passed to `ninja`/`make`. If the gRPC packages are missing,
+the configure step fails fast with a `FATAL_ERROR` naming what to install.
+
 ## Deferred to PR-2
 
 - Capture the request body (`request_body` phase) and tokenize it for full

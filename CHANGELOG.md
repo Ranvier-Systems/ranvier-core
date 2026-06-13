@@ -28,6 +28,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (empty-token load/hash selection); prefix-aware routing over the tokenized
   request body, `dynamic_metadata`, 429 shedding, and the inline-vs-sidecar
   benchmark are the follow-up. Stock builds (`WITH_GIE_EPP=OFF`) are unaffected.
+  CI coverage without changing the default: the pure decision-helper test runs
+  in the default unit-test lane (always built), and a dedicated `WITH_GIE_EPP=ON`
+  lane (`Dockerfile.gie-epp` + `.github/workflows/gie-epp-tests.yml`) compiles +
+  links the gRPC server and runs ctest. The gRPC toolchain is in
+  `Dockerfile.base`; `make gie-epp-test` is the local one-liner.
 
 - **Usage-ledger sink seam** (BACKLOG §20.2 P1.5) — A pluggable, per-request
   usage-event sink for external metering / attribution / billing backends,
