@@ -532,9 +532,25 @@ telemetry:
   # Maximum spans per export batch (RANVIER_TELEMETRY_MAX_EXPORT_BATCH_SIZE)
   max_export_batch_size: 512
 
+  # Emit OpenTelemetry GenAI semantic-convention attributes (gen_ai.*) on the
+  # request span (RANVIER_TELEMETRY_GENAI_SEMCONV). Default true. These let
+  # Ranvier slot into the standard LLM-observability stack — Datadog, GCP, and
+  # Azure map the semconv natively. Costless when tracing is disabled. Set
+  # false to suppress only the gen_ai.* attributes (the ranvier.* attributes
+  # below are unaffected).
+  genai_semconv: true
+
   # Spans created by Ranvier:
   # - ranvier.request: Root span for each incoming request
   #     Attributes: http.method, http.url, ranvier.request_id, ranvier.backend_id, ranvier.routing_mode
+  #     GenAI semconv (when genai_semconv: true): gen_ai.operation.name
+  #       (chat|text_completion), gen_ai.provider.name (engine class, e.g. vllm),
+  #       gen_ai.request.model, gen_ai.request.max_tokens,
+  #       gen_ai.usage.input_tokens (exact; omitted under partial/skipped
+  #       tokenization), server.address, server.port, and error.type on failure.
+  #     Response-side usage (output tokens, response model) is intentionally not
+  #     emitted: the request span ends at dispatch handoff, before the response
+  #     streams back.
   # - ranvier.tokenize: Tokenization time
   #     Attributes: ranvier.token_source (client|local), ranvier.token_count
   # - ranvier.route_lookup: Radix tree or prefix hash lookup time

@@ -28,6 +28,8 @@
 #include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
 
+#include <fmt/format.h>
+
 using namespace seastar;
 
 namespace ranvier {
@@ -1201,6 +1203,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     request_span.set_attribute("http.url", std::string(endpoint));
     request_span.set_attribute("ranvier.request_id", request_id);
 
+    // OpenTelemetry GenAI semantic conventions: gen_ai.operation.name is the
+    // one Required attribute knowable at request entry. The proxy endpoints map
+    // 1:1 to the semconv operation values. Provider, model, token usage, and
+    // server address are added after routing (see the post-route block below).
+    if (_config.genai_semconv) {
+        request_span.set_attribute(
+            "gen_ai.operation.name",
+            std::string(endpoint == "/v1/completions" ? "text_completion" : "chat"));
+    }
+
     // Check if we're draining - reject new requests with 503
     if (_draining) {
         log_proxy.info("[{}] Request rejected - server is draining", request_id);
@@ -1905,6 +1917,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         if (!route_result.backend_id.has_value()) {
             log_proxy.warn("[{}] {}", request_id, route_result.error_message);
             route_span.set_error(route_result.error_message);
+            // GenAI semconv error.type + span status on the root (GenAI
+            // operation) span. Gated so behavior is unchanged when off.
+            if (_config.genai_semconv) {
+                request_span.set_attribute("error.type", std::string("no_backend_available"));
+                request_span.set_error(route_result.error_message);
+            }
             metrics().record_failure();
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"" + escape_json_string(route_result.error_message) + "!\"}");
@@ -1973,6 +1991,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             }
         } else {
             log_proxy.warn("[{}] All backends unavailable (circuit breaker open)", request_id);
+            if (_config.genai_semconv) {
+                request_span.set_attribute("error.type", std::string("circuit_open"));
+                request_span.set_error("All backends unavailable (circuit breaker open)");
+            }
             metrics().record_failure();
             // backend_guard + active_request_guard destructors handle cleanup
             rep->add_header("X-Request-ID", request_id);
@@ -1984,6 +2006,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     auto target_addr_opt = _router.get_backend_address(target_id);
     if (!target_addr_opt.has_value()) {
         log_proxy.warn("[{}] Backend {} IP not found", request_id, target_id);
+        if (_config.genai_semconv) {
+            request_span.set_attribute("error.type", std::string("backend_address_missing"));
+            request_span.set_error("Backend IP not found");
+        }
         metrics().record_failure();
         // backend_guard + active_request_guard destructors handle cleanup
         rep->add_header("X-Request-ID", request_id);
@@ -2021,6 +2047,43 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // Set final attributes on request span before entering streaming lambda
     request_span.set_attribute("ranvier.backend_id", static_cast<int64_t>(target_id));
     request_span.set_attribute("ranvier.routing_mode", routing_mode_str);
+
+    // OpenTelemetry GenAI semantic conventions (post-route): everything that
+    // becomes known once a backend is chosen. Response-side attributes
+    // (gen_ai.usage.output_tokens, gen_ai.response.model) are intentionally
+    // omitted — the request span ends at dispatch handoff, before the response
+    // streams back, and emitting our chars/4 estimate as usage would be
+    // dishonest. gen_ai.usage.input_tokens is the exact tokenized count, so it
+    // is reported only when we actually tokenized the full prompt.
+    if (_config.genai_semconv) {
+        // Provider = the engine class of the chosen backend. The semconv
+        // sanctions custom values; "vllm"/"sglang"/... is strictly more
+        // informative than mislabeling a self-hosted backend as "openai".
+        request_span.set_attribute(
+            "gen_ai.provider.name",
+            std::string(backend_type_to_string(_router.backend_type(target_id))));
+        // server.{address,port} = the upstream behind this proxy (semconv
+        // explicitly wants the address behind intermediaries when available).
+        request_span.set_attribute("server.address", fmt::format("{}", target_addr.addr()));
+        request_span.set_attribute("server.port", static_cast<int64_t>(target_addr.port()));
+        if (text_extraction.has_value()) {
+            if (!text_extraction->model.empty()) {
+                request_span.set_attribute("gen_ai.request.model", text_extraction->model);
+            }
+            if (text_extraction->max_tokens > 0) {
+                request_span.set_attribute(
+                    "gen_ai.request.max_tokens",
+                    static_cast<int64_t>(text_extraction->max_tokens));
+            }
+        }
+        // Exact input token count — only when we tokenized the full prompt.
+        // Partial tokenization (a truncated prefix) and random-mode skips would
+        // make tokens.size() a fraction of the real input, so we omit it there.
+        if (!tokenization_skipped && !was_truncated && !tokens.empty()) {
+            request_span.set_attribute(
+                "gen_ai.usage.input_tokens", static_cast<int64_t>(tokens.size()));
+        }
+    }
 
     // Generate traceparent header for propagation to backend
     // Format: "00-{trace_id}-{span_id}-{flags}"

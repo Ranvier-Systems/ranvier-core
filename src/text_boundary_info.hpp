@@ -66,6 +66,12 @@ struct TextWithBoundaryInfo {
     // max_tokens (or max_completion_tokens) extracted from the request body
     // during the same JSON parse.  Zero if the field was absent or non-numeric.
     uint64_t max_tokens = 0;
+
+    // "model" field extracted from the request body during the same JSON
+    // parse.  Empty if the field was absent or non-string.  Used only to
+    // populate the OpenTelemetry GenAI `gen_ai.request.model` span attribute;
+    // routing never reads it.
+    std::string model;
 };
 
 } // namespace ranvier

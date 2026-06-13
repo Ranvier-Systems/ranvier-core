@@ -1463,6 +1463,60 @@ TEST_F(RequestRewriterTest, BoundaryInfoMaxTokensLargeValue) {
 }
 
 // =============================================================================
+// model extraction via extract_text_with_boundary_info
+// Feeds the OpenTelemetry GenAI `gen_ai.request.model` span attribute (P1.6).
+// Routing never reads this field; it rides the existing single body parse.
+// =============================================================================
+
+TEST_F(RequestRewriterTest, BoundaryInfoExtractsModelFromPrompt) {
+    std::string body = R"({"prompt": "Hello", "model": "gpt-4o-mini"})";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->model, "gpt-4o-mini");
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoExtractsModelFromMessages) {
+    std::string body = R"({
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "messages": [{"role": "user", "content": "Hi"}]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->model, "meta-llama/Llama-3.1-8B-Instruct");
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoModelEmptyWhenAbsent) {
+    std::string body = R"({
+        "messages": [{"role": "user", "content": "Hi"}]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->model.empty());
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoModelIgnoresNonStringValues) {
+    std::string body = R"({
+        "model": 12345,
+        "messages": [{"role": "user", "content": "Hi"}]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->model.empty());
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoModelAndMaxTokensCoexist) {
+    std::string body = R"({
+        "model": "gpt-4",
+        "prompt": "Hello",
+        "max_tokens": 256
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->model, "gpt-4");
+    EXPECT_EQ(result->max_tokens, 256u);
+}
+
+// =============================================================================
 // Token injection + strip round-trip tests
 // =============================================================================
 // These tests verify the strip_prompt_token_ids path used when forwarding to

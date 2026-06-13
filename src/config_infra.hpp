@@ -432,6 +432,13 @@ struct TelemetryConfig {
     std::chrono::milliseconds export_interval{5000};       // Batch export interval
     size_t max_queue_size = 2048;                          // Max pending spans in queue
     size_t max_export_batch_size = 512;                    // Max spans per export batch
+
+    // Emit OpenTelemetry GenAI semantic-convention attributes (gen_ai.*) on the
+    // request span so Ranvier slots into the standard LLM-observability stack
+    // (Datadog/GCP/Azure map the semconv natively).  Default on — costless when
+    // tracing is disabled, and set_attribute() is a no-op on non-recording
+    // spans.  Set false to suppress the gen_ai.* attributes specifically.
+    bool genai_semconv = true;
 };
 
 // =============================================================================

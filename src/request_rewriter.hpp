@@ -357,12 +357,22 @@ RequestRewriter::extract_text_with_boundary_info(
         return 0;
     };
 
+    // Extract the "model" field while the doc is in scope (same single parse).
+    // Used only for the OpenTelemetry GenAI `gen_ai.request.model` attribute.
+    auto extract_model = [&doc]() -> std::string {
+        if (doc.HasMember("model") && doc["model"].IsString()) {
+            return std::string(doc["model"].GetString(), doc["model"].GetStringLength());
+        }
+        return {};
+    };
+
     // Check for "prompt" field first (completion API style)
     if (doc.HasMember("prompt") && doc["prompt"].IsString()) {
         TextWithBoundaryInfo result;
         result.text = std::string(doc["prompt"].GetString(), doc["prompt"].GetStringLength());
         result.from_prompt = true;
         result.max_tokens = extract_max_tokens();
+        result.model = extract_model();
         // No system message concept for prompt-style requests
         return result;
     }
@@ -490,6 +500,7 @@ RequestRewriter::extract_text_with_boundary_info(
     }
 
     result.max_tokens = extract_max_tokens();
+    result.model = extract_model();
     return result;
 }
 
