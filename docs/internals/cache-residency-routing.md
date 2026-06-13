@@ -138,6 +138,20 @@ the probabilistic path above with no operator action needed. See
 `src/kv_event_ledger.hpp` for how vLLM block hashes are bridged to Ranvier
 prefix hashes without sharing a hash function.
 
+Two extensions complete the native mode. **Route materialization**
+(`kv_events.materialize_routes`, default on): `BlockStored` token chains
+insert `RouteOrigin::PUSH` routes at every covered block boundary, so
+prefixes computed without Ranvier's involvement — engine warm-up, other
+frontends, replay backfill — become routable without waiting for traffic to
+learn them. The trust order is enforced at insertion (locally-learned routes
+are never overwritten; PUSH outranks gossip) and at eviction
+(`evict_lowest_trust()`: REMOTE, then PUSH, then LOCAL). **Replay**
+(per-backend `kv_events_replay_port`): forward sequence gaps recover the
+missed batches from the publisher's buffered window instead of resetting,
+and `replay_on_connect` backfills that window on subscribe — which is what
+lets a restarted Ranvier recover warm backends' recent block state (PUB/SUB
+itself has no snapshot; coverage is bounded by the publisher's buffer).
+
 Beyond the hard gate, the unified route score can blend residency continuously:
 `routing.scoring.residency_weight > 0` discounts the ART anchor's affinity bonus
 by reported cache-cooling (`affinity *= 1 - w*(1-residency)`), so a cooling-but-

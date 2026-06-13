@@ -99,8 +99,9 @@ std::vector<uint8_t> removed_batch(double ts, const std::vector<uint64_t>& hashe
 }
 
 KvBlockLedger::Limits limits(uint32_t alignment = 16, uint32_t depth = 2048,
-                             uint32_t max_blocks = 65536) {
-    return {alignment, depth, max_blocks};
+                             uint32_t max_blocks = 65536,
+                             uint32_t materialize = 0) {
+    return {alignment, depth, max_blocks, materialize};
 }
 
 }  // namespace
@@ -443,4 +444,117 @@ TEST(KvLedger, WireOrderPreservedAcrossEventTypes) {
     EXPECT_EQ(ops[0].kind, NativeKvOp::Kind::REMOVE);
     EXPECT_EQ(ops[1].kind, NativeKvOp::Kind::UPSERT);
     EXPECT_EQ(ops[0].prefix_hash, ops[1].prefix_hash);
+}
+
+// =============================================================================
+// Ledger: route materialization
+// =============================================================================
+
+TEST(KvLedgerMaterialize, EmitsCumulativeTokensAndNewBoundaries) {
+    auto all = make_tokens(48);
+    KvBlockLedger ledger(limits(16, 2048, 65536, /*materialize=*/128));
+    std::vector<NativeKvOp> ops;
+
+    // Event 1: blocks A,B (tokens 0..31). New boundaries: 16 and 32.
+    auto p1 = stored_batch(1.0, {0xA, 0xB}, std::nullopt,
+                           {all.begin(), all.begin() + 32}, 16);
+    auto b1 = decode_kv_event_batch(p1.data(), p1.size());
+    ASSERT_TRUE(ledger.translate(7, *b1, ops));
+
+    ASSERT_EQ(ops.size(), 3u);  // 2 UPSERTs + 1 MATERIALIZE
+    const auto& m1 = ops.back();
+    EXPECT_EQ(m1.kind, NativeKvOp::Kind::MATERIALIZE);
+    EXPECT_EQ(m1.backend, 7);
+    EXPECT_EQ(m1.first_new_token_count, 16u);
+    EXPECT_EQ(m1.boundary_step, 16u);
+    EXPECT_EQ(m1.tokens, std::vector<int32_t>(all.begin(), all.begin() + 32));
+    EXPECT_EQ(m1.weight(), 1u + 2u);  // two boundary insertions
+
+    // Event 2: block C chains off B (tokens 32..47). Cumulative tokens must
+    // be rebuilt through the parent walk; only boundary 48 is new.
+    ops.clear();
+    auto p2 = stored_batch(2.0, {0xC}, uint64_t{0xB},
+                           {all.begin() + 32, all.end()}, 16);
+    auto b2 = decode_kv_event_batch(p2.data(), p2.size());
+    ASSERT_TRUE(ledger.translate(7, *b2, ops));
+    ASSERT_EQ(ops.size(), 2u);  // 1 UPSERT + 1 MATERIALIZE
+    const auto& m2 = ops.back();
+    EXPECT_EQ(m2.kind, NativeKvOp::Kind::MATERIALIZE);
+    EXPECT_EQ(m2.first_new_token_count, 48u);
+    EXPECT_EQ(m2.tokens, all);
+    EXPECT_EQ(ledger.stats().materialize_ops, 2u);
+}
+
+TEST(KvLedgerMaterialize, CapBoundsTokensAndSkipsBeyond) {
+    auto all = make_tokens(64);
+    KvBlockLedger ledger(limits(16, 2048, 65536, /*materialize=*/32));
+    std::vector<NativeKvOp> ops;
+
+    // Blocks at depths 16,32,48,64: materialization covers only up to 32.
+    auto p = stored_batch(1.0, {0xA, 0xB, 0xC, 0xD}, std::nullopt, all, 16);
+    auto b = decode_kv_event_batch(p.data(), p.size());
+    ASSERT_TRUE(ledger.translate(7, *b, ops));
+
+    size_t mat = 0;
+    for (const auto& op : ops) {
+        if (op.kind == NativeKvOp::Kind::MATERIALIZE) {
+            mat++;
+            EXPECT_EQ(op.tokens.size(), 32u);
+            EXPECT_EQ(op.first_new_token_count, 16u);
+        }
+    }
+    EXPECT_EQ(mat, 1u);
+
+    // A follow-up event entirely beyond the cap emits no MATERIALIZE.
+    ops.clear();
+    auto deeper = make_tokens(16, 5000);
+    auto p2 = stored_batch(2.0, {0xE}, uint64_t{0xD}, deeper, 16);
+    auto b2 = decode_kv_event_batch(p2.data(), p2.size());
+    ASSERT_TRUE(ledger.translate(7, *b2, ops));
+    for (const auto& op : ops) {
+        EXPECT_NE(op.kind, NativeKvOp::Kind::MATERIALIZE);
+    }
+}
+
+TEST(KvLedgerMaterialize, DisabledEmitsNothing) {
+    auto all = make_tokens(32);
+    KvBlockLedger ledger(limits());  // materialize = 0
+    std::vector<NativeKvOp> ops;
+    auto p = stored_batch(1.0, {0xA, 0xB}, std::nullopt, all, 16);
+    auto b = decode_kv_event_batch(p.data(), p.size());
+    ASSERT_TRUE(ledger.translate(7, *b, ops));
+    for (const auto& op : ops) {
+        EXPECT_NE(op.kind, NativeKvOp::Kind::MATERIALIZE);
+    }
+    EXPECT_EQ(ledger.stats().materialize_ops, 0u);
+}
+
+// =============================================================================
+// Replay frame helpers
+// =============================================================================
+
+TEST(ReplayFrames, RequestEncodingRoundTrips) {
+    uint8_t buf[8];
+    encode_replay_request(0x0102030405060708ULL, buf);
+    int64_t seq = 0;
+    ASSERT_TRUE(decode_replay_seq(buf, sizeof(buf), seq));
+    EXPECT_EQ(static_cast<uint64_t>(seq), 0x0102030405060708ULL);
+}
+
+TEST(ReplayFrames, SentinelDetection) {
+    uint8_t buf[8];
+    encode_replay_request(static_cast<uint64_t>(int64_t{-1}), buf);
+    int64_t seq = 0;
+    ASSERT_TRUE(decode_replay_seq(buf, sizeof(buf), seq));
+    EXPECT_EQ(seq, -1);
+    EXPECT_TRUE(is_replay_sentinel(seq, 0));
+    EXPECT_FALSE(is_replay_sentinel(seq, 10));   // payload present: not the sentinel
+    EXPECT_FALSE(is_replay_sentinel(42, 0));     // positive seq: not the sentinel
+}
+
+TEST(ReplayFrames, RejectsWrongLength) {
+    uint8_t buf[8] = {0};
+    int64_t seq = 0;
+    EXPECT_FALSE(decode_replay_seq(buf, 7, seq));
+    EXPECT_FALSE(decode_replay_seq(nullptr, 8, seq));
 }

@@ -327,4 +327,32 @@ inline std::optional<KvEventBatch> decode_kv_event_batch(const uint8_t* data, si
     return out;
 }
 
+// =============================================================================
+// Replay-frame helpers (pure)
+// =============================================================================
+// vLLM's publisher pairs the PUB stream with an optional ROUTER socket: a
+// consumer sends the missed start sequence as an 8-byte big-endian integer
+// and receives buffered batches as (seq, payload) messages, terminated by a
+// sentinel (seq = -1, empty payload). Byte-level helpers live here so the
+// protocol is unit-testable without ZMQ.
+
+inline void encode_replay_request(uint64_t start_seq, uint8_t out[8]) {
+    for (int i = 0; i < 8; ++i) {
+        out[i] = static_cast<uint8_t>((start_seq >> (8 * (7 - i))) & 0xff);
+    }
+}
+
+// Decodes an 8-byte big-endian SIGNED sequence (the sentinel is -1).
+inline bool decode_replay_seq(const uint8_t* data, size_t len, int64_t& seq) {
+    if (data == nullptr || len != 8) return false;
+    uint64_t v = 0;
+    for (size_t i = 0; i < 8; ++i) v = (v << 8) | data[i];
+    seq = static_cast<int64_t>(v);
+    return true;
+}
+
+inline bool is_replay_sentinel(int64_t seq, size_t payload_len) {
+    return seq < 0 && payload_len == 0;
+}
+
 }  // namespace ranvier

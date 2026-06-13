@@ -554,6 +554,26 @@ struct KvEventsConfig {
     uint32_t max_tracked_blocks_per_backend = 65536;  // Ledger entry cap (Rule #4)
     uint32_t max_indexed_token_depth = 2048;    // Chains tracked only to routable depth
     uint32_t freshness_ttl_seconds = 300;       // Mirrored into routing.kv_residency_freshness_ttl
+
+    // Route materialization (the push-eviction design's Phase 3c, realized
+    // via the native wire format): BlockStored token chains insert
+    // RouteOrigin::PUSH routes at every covered block boundary, so prefixes
+    // computed without Ranvier's involvement (engine restarts, other
+    // frontends, replay backfill) become routable. Higher-trust LOCAL routes
+    // are never overwritten. max_materialize_tokens bounds per-chain token
+    // retention on the subscriber's worker thread; must be
+    // <= max_indexed_token_depth.
+    bool materialize_routes = true;
+    uint32_t max_materialize_tokens = 128;
+
+    // Sequence-gap replay (vLLM's optional ROUTER replay socket; per-backend
+    // opt-in via kv_events_replay_port / the replay-port annotation). On a
+    // forward gap the subscriber recovers the missed batches instead of
+    // resetting; replay_on_connect additionally backfills the publisher's
+    // buffered history on subscribe — the cold-start path for a restarted
+    // Ranvier in front of warm backends.
+    bool replay_on_connect = true;
+    uint32_t replay_timeout_ms = 2000;
 };
 
 // Static-config backend declaration.
@@ -611,6 +631,11 @@ struct StaticBackendConfig {
     // the backend keeps probabilistic residency). Only meaningful when
     // kv_events.enabled and the build has WITH_KV_EVENTS=ON.
     uint16_t kv_events_port = 0;
+
+    // Port of the publisher's optional replay ROUTER socket (vLLM
+    // replay_endpoint). 0 = no replay: sequence gaps reset native state.
+    // Requires kv_events_port to be set (validated).
+    uint16_t kv_events_replay_port = 0;
 };
 
 struct StaticBackendsConfig {

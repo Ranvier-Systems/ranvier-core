@@ -2622,6 +2622,64 @@ TEST_F(ConfigTest, KvEventsValidationBounds) {
     EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
 }
 
+TEST_F(ConfigTest, KvEventsMaterializeAndReplayParseAndValidate) {
+    auto config = RanvierConfig::load_from_string(R"(
+kv_events:
+  enabled: true
+  materialize_routes: false
+  max_materialize_tokens: 64
+  replay_on_connect: false
+  replay_timeout_ms: 500
+)");
+    EXPECT_FALSE(config.kv_events.materialize_routes);
+    EXPECT_EQ(config.kv_events.max_materialize_tokens, 64u);
+    EXPECT_FALSE(config.kv_events.replay_on_connect);
+    EXPECT_EQ(config.kv_events.replay_timeout_ms, 500u);
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+
+    // Materialize cap must not exceed the indexed depth cap.
+    RanvierConfig bad;
+    bad.kv_events.enabled = true;
+    bad.kv_events.max_materialize_tokens = 4096;  // > max_indexed_token_depth (2048)
+    error = RanvierConfig::validate(bad);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("max_materialize_tokens"), std::string::npos);
+
+    RanvierConfig bad2;
+    bad2.kv_events.enabled = true;
+    bad2.kv_events.replay_timeout_ms = 50;  // below floor
+    error = RanvierConfig::validate(bad2);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("replay_timeout_ms"), std::string::npos);
+}
+
+TEST_F(ConfigTest, StaticBackendsReplayPortRequiresEventsPort) {
+    auto config = RanvierConfig::load_from_string(R"(
+backends:
+  - id: 31
+    host: 10.0.0.31
+    port: 8000
+    type: vllm
+    kv_events_port: 5557
+    kv_events_replay_port: 5558
+)");
+    ASSERT_EQ(config.backends.entries.size(), 1u);
+    EXPECT_EQ(config.backends.entries[0].kv_events_replay_port, 5558);
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+
+    RanvierConfig bad;
+    StaticBackendConfig sb;
+    sb.id = 1;
+    sb.host = "10.0.0.1";
+    sb.kv_events_replay_port = 5558;  // without kv_events_port
+    bad.backends.entries.push_back(sb);
+    error = RanvierConfig::validate(bad);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("kv_events_replay_port"), std::string::npos);
+}
+
 TEST_F(ConfigTest, StaticBackendsParseKvEventsPort) {
     auto config = RanvierConfig::load_from_string(R"(
 backends:

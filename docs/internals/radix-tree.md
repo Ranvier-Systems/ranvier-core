@@ -349,13 +349,13 @@ An external LRU structure (e.g., `std::list` + hash map) would add per-node heap
 | `lru_remove(node)` | O(1) | Unlink node from list (on eviction or deletion) |
 | `lru_touch(node)` | O(1) | Move node to head (called on every lookup hit) |
 | `evict_oldest()` | O(1) | Pop tail node, clear its `leaf_value` (tombstone) |
-| `evict_oldest_remote()` | O(n) worst | Scan from tail for a `REMOTE` route; falls back to `evict_oldest()` if none found |
+| `evict_lowest_trust()` | O(n) worst | Scan from tail for `REMOTE`, then `PUSH`; falls back to `evict_oldest()` if neither found |
 
 ### Eviction Flow
 
 `evict_oldest()` pops the tail of the intrusive list, clears the node's `leaf_value` (tombstoning it), and decrements the route count. The node structure remains in the tree until [compaction](#tree-compaction-memory-reclamation) removes it.
 
-`evict_oldest_remote()` prefers evicting gossip-learned routes first. It scans backward from the tail looking for a node with `origin == RouteOrigin::REMOTE`. If none exists, it falls back to `evict_oldest()`. The scan makes this O(n) in the worst case, but in practice REMOTE routes cluster near the tail (they're accessed less frequently).
+`evict_lowest_trust()` evicts by the origin trust ladder: it scans backward from the tail for `RouteOrigin::REMOTE`, then for `RouteOrigin::PUSH` (backend-materialized routes), and only then falls back to `evict_oldest()` — making the enum's documented eviction precedence (REMOTE > PUSH > LOCAL) literal. The scans make this O(n) in the worst case, but in practice lower-trust routes cluster near the tail (they're accessed less frequently).
 
 ### LRU Touch on Lookup
 
@@ -501,7 +501,7 @@ sequenceDiagram
 | `lookup()` | O(k) | O(1) | k = tokens in prefix |
 | `insert()` | O(k) | O(k) amortized | May trigger node growth or prefix split |
 | `evict_oldest()` | O(1) | O(1) | Pops intrusive LRU tail |
-| `evict_oldest_remote()` | O(n) worst | O(1) | Scans for REMOTE; falls back to `evict_oldest()` |
+| `evict_lowest_trust()` | O(n) worst | O(1) | Scans for REMOTE, then PUSH; falls back to `evict_oldest()` |
 | `remove_expired()` | O(n) | O(1) | Scans all routes for TTL expiration |
 | `compact()` | O(n) | O(d) | Post-order traversal; d = tree depth |
 

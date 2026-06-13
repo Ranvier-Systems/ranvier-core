@@ -858,7 +858,8 @@ seastar::future<> K8sDiscoveryService::reconcile(std::vector<K8sEndpoint> discov
                 it->second.weight != ep.weight ||
                 it->second.priority != ep.priority ||
                 it->second.role != ep.role ||
-                it->second.kv_events_port != ep.kv_events_port) {
+                it->second.kv_events_port != ep.kv_events_port ||
+                it->second.kv_events_replay_port != ep.kv_events_replay_port) {
                 operations.emplace_back(ep, false);
             }
         }
@@ -954,7 +955,8 @@ seastar::future<> K8sDiscoveryService::register_with_secret(
         co_await _register_callback(backend_id, addr,
                                      endpoint.weight, endpoint.priority,
                                      endpoint.type, std::move(api_key),
-                                     endpoint.role, endpoint.kv_events_port);
+                                     endpoint.role, endpoint.kv_events_port,
+                                     endpoint.kv_events_replay_port);
     } catch (const std::exception& e) {
         log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
     }
@@ -1206,6 +1208,7 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
     BackendType base_type = BackendType::VLLM;
     PoolRole base_role = PoolRole::UNIFIED;
     uint16_t base_kv_events_port = 0;
+    uint16_t base_kv_events_replay_port = 0;
     std::string base_secret_ref;
 
     // 1. Extract Annotations (Weight/Priority/Type/SecretRef)
@@ -1282,6 +1285,17 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
                                  "for this slice", K8S_ANNOTATION_KV_EVENTS_PORT, port_str);
                 }
             }
+            if (ann.HasMember(K8S_ANNOTATION_KV_EVENTS_REPLAY_PORT)
+                    && ann[K8S_ANNOTATION_KV_EVENTS_REPLAY_PORT].IsString()) {
+                const char* port_str = ann[K8S_ANNOTATION_KV_EVENTS_REPLAY_PORT].GetString();
+                auto port_opt = parse_uint32(std::string_view(port_str));
+                if (port_opt && *port_opt <= 65535) {
+                    base_kv_events_replay_port = static_cast<uint16_t>(*port_opt);
+                } else {
+                    log_k8s.warn("Invalid '{}' annotation value '{}' - replay disabled "
+                                 "for this slice", K8S_ANNOTATION_KV_EVENTS_REPLAY_PORT, port_str);
+                }
+            }
             if (ann.HasMember(K8S_ANNOTATION_API_KEY_SECRET_REF)
                     && ann[K8S_ANNOTATION_API_KEY_SECRET_REF].IsString()) {
                 base_secret_ref = ann[K8S_ANNOTATION_API_KEY_SECRET_REF].GetString();
@@ -1331,6 +1345,7 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
                         endpoint.type = base_type;
                         endpoint.role = base_role;
                         endpoint.kv_events_port = base_kv_events_port;
+                        endpoint.kv_events_replay_port = base_kv_events_replay_port;
                         endpoint.api_key_secret_ref = base_secret_ref;
                         endpoints.push_back(std::move(endpoint));
                     }

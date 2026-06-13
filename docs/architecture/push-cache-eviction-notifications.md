@@ -19,7 +19,7 @@ fallback for backends without a native stream. See
 | **2** | ✅ merged | `CACHE_EVICTION` gossip packet `0x05`, cluster propagation, reliable delivery |
 | **3a** | ✅ merged | `loaded` events, `RouteOrigin::PUSH`, conflict-resolution timestamp tracking |
 | **3b** | ⏭ separate repo | vLLM/SGLang sidecars (Python, polls engine metrics, POSTs events) |
-| **3c** | 🟡 conditional | Hash-only routes for true cold-start (RadixTree side index or schema change) |
+| **3c** | ✅ realized via native stream | True cold-start route creation ships as native-KV route materialization (BACKLOG §20.1 P0.1 part 2) — `BlockStored` token chains insert `RouteOrigin::PUSH` routes, applying this document's conflict table. This protocol's hash-only schema remains tokenless; 3c stays unbuilt HERE by design. |
 | **4** | ⏭ future | Benchmarks, RFC, upstream PRs to vLLM/SGLang for native push support |
 
 3c is gated on operational telemetry: see "Loaded Events and Route Bootstrapping" below.

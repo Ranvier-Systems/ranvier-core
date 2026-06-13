@@ -68,8 +68,10 @@ public:
 
     // Reactor-side, lock-free (MPSC enqueue). Returns false when the command
     // queue is full (Rule #4 backpressure) — callers log and may retry on
-    // their next discovery cycle.
-    bool add_subscription(BackendId id, std::string endpoint);
+    // their next discovery cycle. replay_endpoint may be empty: sequence
+    // gaps then reset native state instead of recovering via replay.
+    bool add_subscription(BackendId id, std::string endpoint,
+                          std::string replay_endpoint = "");
     bool remove_subscription(BackendId id);
 
     struct StatsSnapshot {
@@ -80,6 +82,9 @@ public:
         uint64_t shipments = 0;
         uint64_t shipments_throttled = 0;  // worker waited on the in-flight cap
         uint64_t commands_dropped = 0;
+        uint64_t replay_requests = 0;
+        uint64_t replay_batches_recovered = 0;
+        uint64_t replay_failures = 0;      // timeout / fault: fell back to reset
     };
     StatsSnapshot stats() const;
 
@@ -88,6 +93,7 @@ private:
         enum class Kind : uint8_t { ADD, REMOVE, STOP } kind = Kind::STOP;
         BackendId backend = 0;
         std::string endpoint;
+        std::string replay_endpoint;
     };
 
     void worker_loop(seastar::alien::instance& alien);
@@ -116,6 +122,9 @@ private:
     std::atomic<uint64_t> _shipments{0};
     std::atomic<uint64_t> _shipments_throttled{0};
     std::atomic<uint64_t> _commands_dropped{0};
+    std::atomic<uint64_t> _replay_requests{0};
+    std::atomic<uint64_t> _replay_batches{0};
+    std::atomic<uint64_t> _replay_failures{0};
 };
 
 }  // namespace ranvier

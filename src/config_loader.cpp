@@ -812,6 +812,18 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint32_t>("RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH")) {
         kv_events.max_indexed_token_depth = *v;
     }
+    if (auto v = get_env("RANVIER_KV_EVENTS_MATERIALIZE")) {
+        kv_events.materialize_routes = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_KV_EVENTS_MAX_MATERIALIZE_TOKENS")) {
+        kv_events.max_materialize_tokens = *v;
+    }
+    if (auto v = get_env("RANVIER_KV_EVENTS_REPLAY_ON_CONNECT")) {
+        kv_events.replay_on_connect = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_KV_EVENTS_REPLAY_TIMEOUT_MS")) {
+        kv_events.replay_timeout_ms = *v;
+    }
 
     // Cache events overrides
     if (auto v = get_env("RANVIER_CACHE_EVENTS_ENABLED")) {
@@ -1704,6 +1716,18 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             if (kv["freshness_ttl_seconds"]) {
                 config.kv_events.freshness_ttl_seconds = kv["freshness_ttl_seconds"].as<uint32_t>();
             }
+            if (kv["materialize_routes"]) {
+                config.kv_events.materialize_routes = kv["materialize_routes"].as<bool>();
+            }
+            if (kv["max_materialize_tokens"]) {
+                config.kv_events.max_materialize_tokens = kv["max_materialize_tokens"].as<uint32_t>();
+            }
+            if (kv["replay_on_connect"]) {
+                config.kv_events.replay_on_connect = kv["replay_on_connect"].as<bool>();
+            }
+            if (kv["replay_timeout_ms"]) {
+                config.kv_events.replay_timeout_ms = kv["replay_timeout_ms"].as<uint32_t>();
+            }
         }
 
         // Dashboard section
@@ -1801,6 +1825,9 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 }
                 if (entry["kv_events_port"]) {
                     sb.kv_events_port = entry["kv_events_port"].as<uint16_t>();
+                }
+                if (entry["kv_events_replay_port"]) {
+                    sb.kv_events_replay_port = entry["kv_events_replay_port"].as<uint16_t>();
                 }
                 config.backends.entries.push_back(std::move(sb));
             }
@@ -1913,6 +1940,16 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
         }
         if (config.kv_events.max_indexed_token_depth < config.routing.block_alignment) {
             return "kv_events.max_indexed_token_depth must be >= routing.block_alignment";
+        }
+        if (config.kv_events.materialize_routes &&
+            (config.kv_events.max_materialize_tokens < config.routing.block_alignment ||
+             config.kv_events.max_materialize_tokens > config.kv_events.max_indexed_token_depth)) {
+            return "kv_events.max_materialize_tokens must be between routing.block_alignment "
+                   "and kv_events.max_indexed_token_depth";
+        }
+        if (config.kv_events.replay_timeout_ms < 100 ||
+            config.kv_events.replay_timeout_ms > 60000) {
+            return "kv_events.replay_timeout_ms must be between 100 and 60000";
         }
     }
 
@@ -2170,6 +2207,10 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
             if (!std::isfinite(sb.cost_per_hour) || !(sb.cost_per_hour >= 0.0)) {
                 return "backends entry id=" + std::to_string(sb.id)
                     + " has invalid cost_per_hour (must be a finite value >= 0; 0 = unset)";
+            }
+            if (sb.kv_events_replay_port != 0 && sb.kv_events_port == 0) {
+                return "backends entry id=" + std::to_string(sb.id)
+                    + " sets kv_events_replay_port without kv_events_port";
             }
             if (!parse_pool_role(sb.pool_role)) {
                 return "backends entry id=" + std::to_string(sb.id)

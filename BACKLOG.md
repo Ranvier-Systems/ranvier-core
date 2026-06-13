@@ -925,10 +925,17 @@ Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build
 
 ### 20.1 P0 — KV-aware routing parity (OSS)
 
-- [ ] **Precise, native KV-event mode** (P0.1) — _PR-1 of 2 in review (exactness: decoder,
-  hash-bridge ledger, ZMQ subscriber, verified residency). PR-2 pending: route
-  materialization from BlockStored token IDs (realizes the push-eviction design's Phase 3c
-  via the native wire format) + replay-socket gap recovery._
+- [x] **Precise, native KV-event mode** (P0.1) — _Done 2026-06-12 (two PRs)._
+  _PR-1 (exactness):_ pure msgpack decoder + FNV hash-bridge ledger + dedicated-thread ZMQ
+  subscriber feeding `prefix_hash_index` as a block-exact residency mirror; ART hits on
+  stream-fresh backends are VERIFIED (present = resident, absent = evicted), with the
+  probabilistic gossip path as the engine-agnostic fallback.
+  _PR-2 (materialization + replay):_ `BlockStored` token chains insert `RouteOrigin::PUSH`
+  routes at covered block boundaries under the conflict-table trust order
+  (`insert_if_trusted`, `evict_lowest_trust`), realizing the push-eviction design's Phase 3c
+  via the native wire format; forward sequence gaps recover through vLLM's replay ROUTER
+  socket, and connect-backfill replays the buffered window for restart cold-start
+  (bounded by the publisher's buffer).
   _Justification:_ Today residency is probabilistic (`VLLMMetrics::estimated_prefix_retention`)
   and the eviction signal rides a bespoke `POST /v1/cache/events` protocol. The ecosystem
   standard is to feed routing from the engine's *native* KV-event stream (vLLM, block-hash

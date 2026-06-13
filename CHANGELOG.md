@@ -27,8 +27,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the `ranvier.io/kv-events-port` annotation. Metrics:
   `router_native_kv_ops_total`, `router_native_verified_hits_total`,
   `router_native_verified_evictions_total`, `router_native_stream_resets_total`,
-  `router_native_index_overflow_total`. Route materialization from stored
-  token IDs and replay-socket gap recovery follow in part 2.
+  `router_native_index_overflow_total`.
+
+- **Native KV-event mode, part 2: route materialization + replay**
+  (BACKLOG §20.1 P0.1, completing the item) — `BlockStored` token chains now
+  insert `RouteOrigin::PUSH` routes at every covered block boundary
+  (`kv_events.materialize_routes`, default on; `max_materialize_tokens`
+  bounds per-chain retention), so prefixes computed without Ranvier's
+  involvement become routable. Trust order enforced at insertion
+  (`RadixTree::insert_if_trusted`: locally-learned routes are never
+  overwritten, PUSH outranks gossip; same-backend confirmations LRU-refresh)
+  and at eviction (`evict_lowest_trust()`: REMOTE → PUSH → LOCAL, replacing
+  `evict_oldest_remote()` and making the documented precedence literal).
+  Forward sequence gaps recover via vLLM's replay ROUTER socket (per-backend
+  `kv_events_replay_port` / `ranvier.io/kv-events-replay-port`; DEALER
+  client, 8-byte big-endian start seq, sentinel-terminated, contiguity
+  verified) instead of resetting; `replay_on_connect` backfills the
+  publisher's buffered window on subscribe — restart cold-start, bounded by
+  that buffer. Shipments are chunked by op weight so token-carrying ops
+  can't oversize a reactor application. Metrics:
+  `router_native_routes_materialized_total`,
+  `router_native_materialize_trust_skips_total`.
 
 - **Disaggregated prefill/decode pool roles** (BACKLOG §20.1 P0.3) — Backends
   carry a `pool_role` (`unified` default / `prefill` / `decode`) through

@@ -673,9 +673,16 @@ seastar::future<> Application::register_static_backends() {
                 // — blocking DNS is legal there (Rule #12: off-reactor).
                 std::string kv_endpoint =
                     "tcp://" + sb.host + ":" + std::to_string(sb.kv_events_port);
-                if (_kv_subscriber->add_subscription(sb.id, std::move(kv_endpoint))) {
-                    log_main.info("Static backend {}: native KV events from port {}",
-                                  sb.id, sb.kv_events_port);
+                std::string replay_endpoint;
+                if (sb.kv_events_replay_port > 0) {
+                    replay_endpoint =
+                        "tcp://" + sb.host + ":" + std::to_string(sb.kv_events_replay_port);
+                }
+                if (_kv_subscriber->add_subscription(sb.id, std::move(kv_endpoint),
+                                                     std::move(replay_endpoint))) {
+                    log_main.info("Static backend {}: native KV events from port {} "
+                                  "(replay port {})",
+                                  sb.id, sb.kv_events_port, sb.kv_events_replay_port);
                 } else {
                     log_main.warn("KV-event subscription queue full; static backend {} "
                                   "stays on probabilistic residency", sb.id);
@@ -788,7 +795,7 @@ void Application::init_k8s_discovery() {
     _k8s_discovery->set_register_callback(
         [this](BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority,
                BackendType type, std::string api_key, PoolRole role,
-               uint16_t kv_events_port) -> seastar::future<> {
+               uint16_t kv_events_port, uint16_t kv_events_replay_port) -> seastar::future<> {
             if (!api_key.empty()) {
                 co_await _router->set_backend_api_key_global(id, std::move(api_key));
             }
@@ -800,7 +807,13 @@ void Application::init_k8s_discovery() {
                 if (kv_events_port > 0) {
                     std::ostringstream ep;
                     ep << "tcp://" << addr.addr() << ":" << kv_events_port;
-                    if (!_kv_subscriber->add_subscription(id, ep.str())) {
+                    std::string replay_ep;
+                    if (kv_events_replay_port > 0) {
+                        std::ostringstream rep_ep;
+                        rep_ep << "tcp://" << addr.addr() << ":" << kv_events_replay_port;
+                        replay_ep = rep_ep.str();
+                    }
+                    if (!_kv_subscriber->add_subscription(id, ep.str(), std::move(replay_ep))) {
                         log_main.warn("KV-event subscription queue full; backend {} "
                                       "stays on probabilistic residency until the "
                                       "next discovery sync", id);
@@ -812,6 +825,7 @@ void Application::init_k8s_discovery() {
             }
 #else
             (void)kv_events_port;
+            (void)kv_events_replay_port;
 #endif
         });
     _k8s_discovery->set_drain_callback(

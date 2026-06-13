@@ -149,6 +149,18 @@ routing:
 #   # How long applied events/heartbeats keep verified-residency trust before
 #   # routing falls back to the probabilistic signal
 #   freshness_ttl_seconds: 300
+#   # Route materialization: BlockStored token chains insert PUSH-origin
+#   # routes (never overwriting locally-learned ones), so prefixes computed
+#   # without Ranvier's involvement become routable. The token cap bounds
+#   # per-chain retention on the subscriber thread.
+#   materialize_routes: true
+#   max_materialize_tokens: 128
+#   # Sequence-gap replay via the publisher's ROUTER socket (per-backend
+#   # kv_events_replay_port / ranvier.io/kv-events-replay-port). On connect,
+#   # the buffered history is backfilled — the cold-start path for a
+#   # restarted Ranvier in front of warm backends.
+#   replay_on_connect: true
+#   replay_timeout_ms: 2000
 
 # Timeout configuration
 timeouts:
@@ -684,6 +696,10 @@ attribution:
 #     default). Requires the kv_events: section below to be enabled. K8s
 #     fleets use the ranvier.io/kv-events-port EndpointSlice annotation
 #     instead.
+#   `kv_events_replay_port` — port of the publisher's optional replay ROUTER
+#     socket (vLLM replay_endpoint). 0/absent = sequence gaps reset native
+#     state instead of replaying. Requires kv_events_port. K8s annotation:
+#     ranvier.io/kv-events-replay-port.
 #
 # Optional disaggregated-serving field:
 #   `pool_role` — "unified" (default) / "prefill" / "decode". For fleets
