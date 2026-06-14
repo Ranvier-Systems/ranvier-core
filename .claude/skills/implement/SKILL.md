@@ -31,6 +31,10 @@ For this specific task, which of the Hard Rules apply?
 
 ## STAGED EXECUTION
 
+Each pass ends at a **Verification Gate**: a static, failable artifact an outside reader could reproduce — a `grep` result, a header/impl signature diff, the async diagram checked against the actual lines, or a cited Seastar API. "Looks correct" is not a gate. If you cannot produce the artifact, the pass is not done — say so and stop.
+
+Some checks need a real compile or run, which this sandbox forbids (static analysis only). Do not fake them: record a **Deferred Gate** — the exact `make`/test command for the developer's Docker build, plus the output that would pass or fail.
+
 ### Pass 0: Visualize the Async Flow (REQUIRED)
 Before any code, provide a Mermaid diagram showing:
 - Entry point -> async boundaries -> shard crossings -> completion
@@ -45,20 +49,25 @@ sequenceDiagram
     ...
 ```
 
+- **Gate:** every async boundary and shard crossing in the diagram names the Seastar primitive that implements it (`co_await`, `smp::submit_to`, `parallel_for_each`), each checked against Seastar docs.
+
 ### Pass 1: Logic & Correctness
 - Handle all edge cases and error paths
 - Ensure robustness (null checks, bounds checks, error handling)
 - Every `catch` block logs at warn level with context
+- **Gate:** `grep` the changed files and cite lines proving Rule #9 (every `catch` logs at warn+), Rule #3 (C-string returns null-guarded), and Rule #4 (every new container has a MAX_SIZE). Zero unguarded cases = pass.
 
 ### Pass 2: Refactor for Clarity & Modularity
 - Extract helper methods where appropriate
 - Ensure single responsibility
 - Add minimal necessary comments (only where logic isn't self-evident)
+- **Gate:** diff each changed `.hpp` signature against its `.cpp` definition and the Step 1 file list — they match, and the refactor changes structure only (no behavioral delta).
 
 ### Pass 3: Optimize for Async Performance
 - Replace any sequential `co_await` loops with `parallel_for_each`
 - Verify no blocking calls on reactor thread
 - Confirm gate guards for any timer/callback capturing `this`
+- **Gate:** `grep` proves no sequential `co_await` remains inside a loop body (Rule #2) and any `this`-capturing timer/callback is gate-guarded (Rule #5). Cite the lines.
 
 ---
 
