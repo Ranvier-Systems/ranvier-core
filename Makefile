@@ -244,7 +244,10 @@ gie-epp-build:
 	    exit 1; \
 	}
 	@command -v grpc_cpp_plugin >/dev/null 2>&1 || { \
-	    echo "error: grpc_cpp_plugin not found on PATH (Fedora: dnf install grpc-plugins)."; \
+	    echo "error: grpc_cpp_plugin not found on PATH."; \
+	    echo "       Install the full gRPC toolchain in one go (grpc-devel provides the"; \
+	    echo "       libs + CMake config, grpc-plugins the code generator):"; \
+	    echo "         Fedora: dnf install -y grpc-devel grpc-plugins protobuf-compiler"; \
 	    exit 1; \
 	}
 	@# Stale-cache guard (same rationale as sanitize-build): wipe if the cached
