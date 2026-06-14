@@ -56,6 +56,31 @@ milliseconds, plus how many requests resolved to an endpoint.
   Ranvier's decision overhead, not production network or gateway costs. Treat it
   as the floor, and see `interpreting-benchmark-numbers.md` for general caveats.
 
+## Example run (dev baseline — illustrative, not canonical)
+
+First end-to-end run, recorded as a sanity-check reference. **This is a floor,
+not a published figure:** a single-shard Ranvier (`--smp 1`) plus the mock
+backend in Docker on a macOS dev laptop, client over loopback
+(`localhost:9002`). It isolates Ranvier's routing-decision + bridge overhead
+with no production network, real backend, or gateway in the path — reproduce on
+representative hardware before quoting numbers.
+
+| mode | requests | mean | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|---|
+| prefix-aware (tokenized body) | 5000 | 0.475 | 0.523 | 0.578 | 0.711 | 2.897 |
+| headers-only (load/hash)      | 2000 | 0.440 | 0.490 | 0.527 | 0.610 | 0.768 |
+
+All times in milliseconds; `endpoint set` == request count with 0 errors in both
+modes. A 2000-request prefix-aware run matched the 5000-request one (mean 0.474,
+p99 0.755 ms), so the figures are stable across run sizes.
+
+**Takeaway:** per-request EPP overhead is **sub-millisecond** (p50 ~0.5 ms, p99
+~0.7 ms), and prefix-aware routing adds only **~35 µs at the median** (~0.1 ms at
+p99) over bare load/hash — the tokenize + ART/residency lookup is cheap relative
+to the ext_proc gRPC round-trip + reactor bridge, which dominate. For the
+inline-vs-sidecar decision, the overhead to weigh is the indirection itself, not
+Ranvier's routing intelligence.
+
 ## Scope / follow-ups
 
 The full inline-vs-sidecar A/B (Envoy ext_proc gateway, real vLLM backends,
