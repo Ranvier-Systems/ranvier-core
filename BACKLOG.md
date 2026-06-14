@@ -915,160 +915,18 @@ The section heading and anchor (`#19-heterogeneous-backend-support-2026-05-16`) 
 
 ## 20. Routing Parity & Ecosystem Alignment (2026-06-07)
 
-Routing-quality and ecosystem-alignment work derived from the mid-2026 routing scan in
-[`docs/architecture/routing-direction-2026.md`](docs/architecture/routing-direction-2026.md)
-(routing direction, ecosystem context, and rationale for each item below). The ecosystem
-converged on live block-level KV-event routing + a single weighted prefix/load/KV score +
-prefill/decode disaggregation, and standardized on the Kubernetes Gateway API Inference
-Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build half
-(eviction events, residency weighting, load/cost routing); these items close the remaining gaps.
+**Status: CLOSED (2026-06-14).** All actionable items (§20.1 P0.x, §20.2 P1.x) shipped and merged. §20.3 was P2 / out of scope.
 
-### 20.1 P0 — KV-aware routing parity (OSS)
+Closure narrative — the per-item completion notes for the unified weighted scorer (P0.2), disaggregated prefill/decode pool roles (P0.3), native vLLM KV-event mode (P0.1, two PRs), OpenTelemetry GenAI semantic conventions (P1.6), the usage-ledger sink seam (P1.5), and the GIE Endpoint-Picker ext_proc mode (P1.4, two PRs) — plus the cross-cutting engineering decisions, lessons, and deferred follow-ups — were extracted on 2026-06-14 to a dedicated audit doc to keep this backlog focused on active work.
 
-- [x] **Precise, native KV-event mode** (P0.1) — _Done 2026-06-12 (two PRs)._
-  _PR-1 (exactness):_ pure msgpack decoder + FNV hash-bridge ledger + dedicated-thread ZMQ
-  subscriber feeding `prefix_hash_index` as a block-exact residency mirror; ART hits on
-  stream-fresh backends are VERIFIED (present = resident, absent = evicted), with the
-  probabilistic gossip path as the engine-agnostic fallback.
-  _PR-2 (materialization + replay):_ `BlockStored` token chains insert `RouteOrigin::PUSH`
-  routes at covered block boundaries under the conflict-table trust order
-  (`insert_if_trusted`, `evict_lowest_trust`), realizing the push-eviction design's Phase 3c
-  via the native wire format; forward sequence gaps recover through vLLM's replay ROUTER
-  socket, and connect-backfill replays the buffered window for restart cold-start
-  (bounded by the publisher's buffer).
-  _Justification:_ Today residency is probabilistic (`VLLMMetrics::estimated_prefix_retention`)
-  and the eviction signal rides a bespoke `POST /v1/cache/events` protocol. The ecosystem
-  standard is to feed routing from the engine's *native* KV-event stream (vLLM, block-hash
-  granularity), giving exact residency and letting "loaded" events create routes (ours can't —
-  the wire format carries no tokens; see `load_route_global`). Feed the existing
-  `prefix_hash_index` from the native stream. Realizes Phase 3 of the push-eviction design,
-  aligned to the ecosystem wire format. Keep the ART history path as the engine-agnostic
-  fallback (SGLang/Ollama/TRT).
-  _Design:_ [`docs/architecture/push-cache-eviction-notifications.md`](docs/architecture/push-cache-eviction-notifications.md)
-  _Location:_ `src/router_service.hpp` (cache-event API), `src/vllm_metrics.hpp`, `src/health_service.cpp`
-  _Complexity:_ High
+- [`docs/audits/routing-parity-ecosystem-alignment-2026-06-14.md`](docs/audits/routing-parity-ecosystem-alignment-2026-06-14.md)
+  — per-item end state, cross-cutting decisions/lessons, and deferred follow-ups (this section's closeout record).
+- [`docs/architecture/routing-direction-2026.md`](docs/architecture/routing-direction-2026.md)
+  — the planning rationale and ecosystem context the work derived from.
 
-- [x] **Unified weighted scorer** (P0.2) — _Done 2026-06-11._
-  _Justification:_ Routing currently layers ART → load redirect → cost redirect as sequential
-  *overrides* (`PrefixRouteResult.was_load_redirect`, `was_cost_redirect`). The state of the art
-  uses one tunable weighted score blending prefix overlap + queue depth + KV utilization
-  (published heuristics use a `prefix:queue:kv`-style weighting; disaggregated scorers add a
-  `w·prefill_blocks + decode_blocks` term). All inputs already exist (`get_composite_backend_load`,
-  residency weight, cost budget); fuse them into a single composable scorer with configurable
-  weights, leaving room for a future SLO term.
-  _Location:_ `src/router_service.cpp` (`get_backend_for_prefix`, `route_request`), `src/config_schema.hpp` (`RoutingConfig`)
-  _Complexity:_ Medium
-  _Completion note:_ Shipped as `src/route_scorer.hpp` (pure, reactor-free decision core) +
-  one scoring pass in `get_backend_for_prefix`. Placement score (affinity + hardware price)
-  → `original_selected`/learning; dispatch score (+ load hinge over the strategy allowance,
-  + cost-budget hinge) → final backend. Weights in `RoutingConfig::scoring`
-  (`routing.scoring.*`, `RANVIER_SCORING_*`), incl. the reserved `slo_weight` seam. Neutral
-  defaults reproduce the pre-scorer decisions exactly; P0.1 plugs in by grading
-  `affinity(b)` per backend from native KV events, P0.3 by adding a pool-role gate to the
-  same pass. See `docs/internals/prefix-affinity-routing.md` § Unified Route Scoring.
+Deferred follow-ups (recorded in the retrospective; would be promoted to new backlog sections if prioritised): GIE EPP 429 request-shedding, the inline-vs-sidecar ext_proc overhead benchmark, and per-model chat-template selection. The §20.3 P2 candidates (semantic/embedding cache, KV-offload awareness, guardrails hook, multi-provider/model routing) remain out of scope.
 
-- [x] **Disaggregated prefill/decode awareness** (P0.3) — _Done 2026-06-12._
-  _Justification:_ `BackendType` is engine class, not pool role. Disaggregated (P/D) serving is
-  now table-stakes for frontier-model serving (cf. Mooncake). A topology-blind router silently
-  misroutes and forfeits the gains. Add a `pool_role` (`prefill`/`decode`/`unified`) dimension
-  to backend registration + routing; route new turns to prefill, preserve decode affinity. We
-  need not own KV transfer (NIXL/LMCache do that).
-  _Location:_ `src/backend_registry.hpp`, `src/router_service.cpp` (`register_backend_global`), `src/types.hpp`, `src/config_schema.hpp`
-  _Complexity:_ Medium–High
-  _Completion note:_ `PoolRole` rides registration proper (8th `register_backend_global`
-  param, default `UNIFIED` = unlabeled fleets route bit-identically). Role acts as a hard
-  candidate FILTER on the P0.2 scoring pass, not a weight: misses and all dispatch diverts
-  target prefill/unified only; an ART anchor is honored regardless of role (decode
-  affinity); an availability valve waives the filter when only decode pools are live
-  (`router_pool_role_fallbacks_total`). Labeling via `ranvier.io/pool-role` annotation,
-  static-YAML `pool_role:`, admin API; persisted in SQLite next to `backend_type`.
-  See `docs/internals/prefix-affinity-routing.md` § Pool-Role Routing. P0.1 upgrade path:
-  measured per-backend residency replaces learned-route-driven decode affinity.
-
-### 20.2 P1 — strategic parity / ecosystem
-
-- [x] **GIE Endpoint-Picker (EPP) compatibility mode** (P1.4, OSS) — _Done 2026-06-14 (two PRs)._
-  _Justification:_ The Kubernetes Gateway API Inference Extension (GA 2026) standardized
-  endpoint selection on an ext_proc EPP protocol that GIE-conformant gateways implement.
-  Exposing the routing core as a GIE-conformant ext_proc endpoint picker lets any conformant
-  gateway delegate to Ranvier — riding the standard's distribution without giving up the
-  standalone inline data plane. Pair with a published benchmark of inline routing vs. a sidecar
-  ext_proc EPP hop, measuring the absolute per-request routing-overhead delta — a number not
-  currently published anywhere.
-  _Location:_ new ext_proc gRPC server surface; reuse `router_service` decision core
-  _Complexity:_ High
-  _Completion note:_ Shipped as `src/gie_epp_server.{hpp,cpp}` (gRPC
-  `envoy.service.ext_proc.v3.ExternalProcessor`) behind `WITH_GIE_EPP` (default OFF; gRPC is a
-  heavy dep and the EPP is a compatibility mode, not the primary inline path). PR-1: the
-  gRPC↔Seastar bridge (gRPC on its own threads; `alien::submit_to` into `route_request`; decision
-  returned as a trivially-copyable POD) + a minimal wire-compatible vendored ext_proc proto
-  (`proto/ext_proc_min.proto`, field numbers verified vs upstream) + frictionless build/CI
-  (`Dockerfile.gie-epp`, `gie-epp-tests.yml`, `make gie-epp-test`). PR-2: prefix-aware routing —
-  capture the `request_body` phase and tokenize the prompt with the inline path's chat template
-  (so tokens align with the KV-event residency index, P0.1) before routing; endpoint returned via
-  the `x-gateway-destination-endpoint` header + `dynamic_metadata`. Remaining follow-ups (own
-  tickets): 429 request-shedding (needs an overload signal), the inline-vs-sidecar overhead
-  benchmark, and per-model chat-template selection for heterogeneous fleets. This completes the
-  actionable items in §20.2; §20.3 is P2/out-of-scope.
-
-- [x] **Usage-ledger sink seam** (P1.5, OSS) — _Done 2026-06-13._
-  _Justification:_ Ship a pluggable usage-ledger *sink* interface (no-op default + registration
-  point, mirroring `TelemetrySinkConfig`) on top of the existing per-API-key attribution +
-  SQLite, so external metering / attribution / billing backends can consume per-key usage events
-  without core hard-depending on any concrete implementation.
-  _Location:_ OSS sink interface in `src/`
-  _Complexity:_ Medium
-  _Completion note:_ Shipped as `src/usage_ledger_sink.hpp` (`UsageLedgerSink` interface +
-  `NoopUsageLedgerSink` default + process-wide factory seam) and `src/usage_ledger_schema.hpp`
-  (`UsageEvent` + forward-compat contract), mirroring the telemetry-sink pair. Emission model
-  differs deliberately from the telemetry sink: usage is **per-request, per-shard**, not a
-  shard-0 windowed aggregate — so each shard owns its own sink instance (the factory is invoked
-  once per shard) and `HttpController` calls a synchronous, non-blocking `record(UsageEvent)` at
-  the terminal phase next to the existing `request_attribution` enqueue (the two share one
-  computed set of outcome values and are independently gated; the whole block is skipped when
-  neither is active). The event carries the attribution identifiers (`api_key_id`,
-  `request_id`) — the point of a ledger — plus `model` (reused from the P1.6 extraction) and the
-  estimated token/cost figures; **no** prompt/response content, **no** token IDs. Token/cost are
-  the same pre-flight *estimates* the attribution rows record (the response `usage` is not
-  parsed) — wiring engine-reported actuals is a flagged follow-up. Independent of SQLite
-  persistence (a billing backend can be the only consumer). Gated by `usage_ledger.enabled`
-  (default false; `RANVIER_USAGE_LEDGER_ENABLED`); toggling requires a restart (same posture as
-  `telemetry_sink`). Stock build wires the Noop sink; the completion path is one null check when
-  disabled.
-
-- [x] **OpenTelemetry GenAI semantic conventions** (P1.6, OSS) — _Done 2026-06-13._
-  _Justification:_ Emit `gen_ai.*` span attributes from the existing tracing path so Ranvier
-  slots into the standard LLM-observability stack (Datadog/GCP/Azure map the semconv natively).
-  Low effort, high ecosystem-citizenship value.
-  _Location:_ `src/tracing_service.{hpp,cpp}`
-  _Complexity:_ Low
-  _Completion note:_ Implemented on the existing `ranvier.request` root span (kept the span
-  name; dashboards key on attributes, and Datadog/GCP/Azure map the semconv that way) rather
-  than `tracing_service.{hpp,cpp}` — the ScopedSpan API was already sufficient, so the change
-  is entirely at the call sites in `http_controller.cpp`. Attributes: `gen_ai.operation.name`
-  (`chat`/`text_completion`, set at entry), `gen_ai.provider.name` (backend engine class —
-  `vllm`/`sglang`/… via `backend_type_to_string`; semconv sanctions custom values, more
-  honest than labeling self-hosted backends `openai`), `gen_ai.request.model`,
-  `gen_ai.request.max_tokens`, `gen_ai.usage.input_tokens` (exact tokenized count; omitted
-  under partial/skipped tokenization so we never report a fraction as the whole),
-  `server.address`/`server.port` (the upstream behind the proxy), and `error.type` +
-  span-status on the three routing-failure paths. Request-span lifetime ends at dispatch
-  handoff, so response-side usage (output tokens, response model) is intentionally out of
-  scope — it pairs naturally with the P1.5 usage ledger. The `model` field rides the existing
-  single-parse `extract_text_with_boundary_info` (no extra JSON pass). Gated by
-  `telemetry.genai_semconv` (default true; `RANVIER_TELEMETRY_GENAI_SEMCONV`); with the flag
-  off, behavior is byte-identical to before.
-
-### 20.3 P2 — selective / out of scope
-
-- [ ] **Semantic (embedding) cache** — optional OSS add; app-layer dedup orthogonal to KV
-  awareness; drags in an embedding dependency. Useful for RAG/support bots. _Complexity:_ Medium
-- [ ] **KV-offload awareness (LMCache/Mooncake)** — be compatible now; later factor shared-store
-  hits into the P0.2 score. _Complexity:_ Medium
-- [ ] **Guardrails (PII/prompt-injection)** — core exposes a filter hook; connectors live outside
-  core. Never build classifiers in core. _Complexity:_ Medium (hook only)
-- [ ] _Out of scope:_ multi-provider shims and cost/quality model routing (RouteLLM-style) —
-  general-purpose gateways own provider breadth; no model-router dominates all domains.
+The section heading and anchor (`#20-routing-parity--ecosystem-alignment-2026-06-07`) are preserved here as a stable pointer for the in-source cross-references in `src/route_scorer.hpp`, `src/router_service.cpp`, `src/types.hpp`, `src/k8s_discovery_service.hpp`, `src/sqlite_persistence.cpp`, `src/gie_epp_server.hpp`, `src/http_controller.cpp`, and `src/application.cpp` (and the §20-referencing internals docs).
 
 ---
 
