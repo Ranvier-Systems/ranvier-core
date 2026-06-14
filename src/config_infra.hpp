@@ -499,6 +499,31 @@ struct UsageLedgerConfig {
 };
 
 // =============================================================================
+// GIE Endpoint-Picker (EPP) Configuration
+// =============================================================================
+
+// Exposes the routing core as a Gateway API Inference Extension (GIE)
+// Endpoint-Picker: a gRPC `envoy.service.ext_proc.v3.ExternalProcessor` server
+// that a GIE-conformant gateway delegates endpoint selection to (it returns the
+// chosen backend via the x-gateway-destination-endpoint header). This is a
+// COMPATIBILITY mode alongside the standalone inline data plane, not a
+// replacement for it.
+//
+// Compiled only when the build sets WITH_GIE_EPP=ON (default OFF — gRPC is a
+// heavy dependency and most deployments use the inline path; see
+// CMakeLists.txt and src/gie_epp_server.hpp). When the binary lacks
+// WITH_GIE_EPP, `enabled=true` logs a warning and the server stays inert.
+// Off by default; toggling `enabled` requires a restart.
+struct GieEppConfig {
+    // Master switch. Off by default.
+    bool enabled = false;
+    // gRPC listen port for the ext_proc ExternalProcessor service.
+    uint16_t port = 9002;
+    // Listen address for the gRPC server.
+    std::string listen_address = "0.0.0.0";
+};
+
+// =============================================================================
 // Load Balancing Configuration
 // =============================================================================
 

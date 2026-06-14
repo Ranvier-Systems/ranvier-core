@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean gie-epp-build gie-epp-test gie-epp-clean
 
 # Default target
 all: build
@@ -219,6 +219,68 @@ sanitize-test: sanitize-build
 
 sanitize-clean:
 	@rm -rf $(SANITIZE_BUILD_DIR)
+
+# -----------------------------------------------------------------------------
+# GIE Endpoint-Picker (EPP) build/test (requires gRPC + protobuf-compiler — see
+# Dockerfile.gie-epp; the production builder does not install them). The EPP is
+# OFF by default, so this is the developer / CI loop that exercises the gRPC
+# ext_proc path (src/gie_epp_server.cpp + the build-time proto codegen).
+# -----------------------------------------------------------------------------
+# Typical workflow (inside the ranvier-base or ranvier-gie-epp container, which
+# carry the gRPC toolchain and pre-built deps under /deps):
+#   make gie-epp-build              # configure + build WITH_GIE_EPP=ON
+#   make gie-epp-test               # build + run ctest (incl. the EPP path)
+#
+# NOTE: gie-epp-test builds ranvier_server (compiling + linking the gRPC TU) —
+# a full build. For a quick check of just the EPP decision logic without gRPC,
+# `make test-unit` already runs the pure gie_epp_test (always built).
+GIE_EPP_BUILD_DIR := build-gie-epp
+# WITH_KV_EVENTS for the EPP loop. Default OFF so the EPP target needs only the
+# gRPC toolchain (not libzmq). Set GIE_EPP_KV_EVENTS=ON to build both features.
+GIE_EPP_KV_EVENTS ?= OFF
+
+gie-epp-build:
+	@command -v protoc >/dev/null 2>&1 || { \
+	    echo "error: protoc not found on PATH."; \
+	    echo "       Use the ranvier-gie-epp image (Dockerfile.gie-epp) or install"; \
+	    echo "       gRPC locally (Fedora: dnf install grpc-devel grpc-plugins protobuf-compiler)."; \
+	    exit 1; \
+	}
+	@command -v grpc_cpp_plugin >/dev/null 2>&1 || { \
+	    echo "error: grpc_cpp_plugin not found on PATH."; \
+	    echo "       Install the full gRPC toolchain in one go (grpc-devel provides the"; \
+	    echo "       libs + CMake config, grpc-plugins the code generator):"; \
+	    echo "         Fedora: dnf install -y grpc-devel grpc-plugins protobuf-compiler"; \
+	    exit 1; \
+	}
+	@# Stale-cache guard (same rationale as sanitize-build): wipe if the cached
+	@# source dir differs from this checkout (bind-mount path mismatch).
+	@if [ -f $(GIE_EPP_BUILD_DIR)/CMakeCache.txt ]; then \
+	    cached_src=$$(grep -E '^CMAKE_HOME_DIRECTORY:' $(GIE_EPP_BUILD_DIR)/CMakeCache.txt | cut -d= -f2); \
+	    if [ "$$cached_src" != "$$(pwd)" ]; then \
+	        echo "Stale gie-epp build cache (cached source $$cached_src != $$(pwd)); wiping $(GIE_EPP_BUILD_DIR)."; \
+	        rm -rf $(GIE_EPP_BUILD_DIR); \
+	    fi; \
+	fi
+	@echo "Configuring WITH_GIE_EPP=ON..."
+	@# Reuse pre-built deps from the base image's /deps when present (fast path
+	@# in-container); fall back to FetchContent clones outside it.
+	@# WITH_KV_EVENTS=OFF keeps this EPP-focused loop from requiring libzmq — KV
+	@# events is an orthogonal optional feature with its own coverage, and the CI
+	@# lane (Dockerfile.gie-epp) builds the full EPP+KV combination. Override with
+	@# `make gie-epp-test GIE_EPP_KV_EVENTS=ON` if you have zeromq-devel and want both.
+	@cmake -B $(GIE_EPP_BUILD_DIR) -DWITH_GIE_EPP=ON -DWITH_KV_EVENTS=$(GIE_EPP_KV_EVENTS) -DCMAKE_BUILD_TYPE=Release \
+	    $(if $(wildcard /deps/tokenizers-cpp),-DFETCHCONTENT_SOURCE_DIR_TOKENIZERS_CPP=/deps/tokenizers-cpp,) \
+	    $(if $(wildcard /deps/opentelemetry-cpp),-DFETCHCONTENT_SOURCE_DIR_OPENTELEMETRY-CPP=/deps/opentelemetry-cpp,) \
+	    $(if $(wildcard /deps/rapidjson),-DFETCHCONTENT_SOURCE_DIR_RAPIDJSON=/deps/rapidjson,)
+	@cmake --build $(GIE_EPP_BUILD_DIR) --target ranvier_server unit_tests -j$$(nproc)
+
+gie-epp-test: gie-epp-build
+	@echo "Running unit tests (WITH_GIE_EPP=ON)..."
+	@cd $(GIE_EPP_BUILD_DIR) && ctest --output-on-failure
+
+gie-epp-clean:
+	@rm -rf $(GIE_EPP_BUILD_DIR)
 
 # Run all tests
 test: test-unit
@@ -965,6 +1027,11 @@ help:
 	@echo "  make fuzz-ci                       - Short post-merge run (60s × 2 harnesses, no stream-parser)"
 	@echo "  make fuzz-clean                    - Remove the fuzz build directory"
 	@echo "  FUZZ_TIME=600 make fuzz-run-radix-tree  (override default 1800s run)"
+	@echo ""
+	@echo "GIE Endpoint-Picker (EPP gRPC server; OFF by default — see Dockerfile.gie-epp):"
+	@echo "  make gie-epp-build  - Configure + build WITH_GIE_EPP=ON (needs gRPC + protoc)"
+	@echo "  make gie-epp-test   - Build + run ctest with the EPP gRPC path compiled"
+	@echo "  make gie-epp-clean  - Remove the gie-epp build directory"
 	@echo ""
 	@echo "Production Readiness Validation:"
 	@echo "  make validate       - Run full validation suite (all 4 tests)"

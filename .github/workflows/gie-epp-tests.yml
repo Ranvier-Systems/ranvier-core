@@ -1,0 +1,110 @@
+# GIE Endpoint-Picker (EPP) build + tests for Ranvier Core
+#
+# The EPP gRPC server is OFF by default (WITH_GIE_EPP=OFF), so the production
+# image and the standard unit-tests lane never compile src/gie_epp_server.cpp
+# or run the proto codegen. This lane is the automated regression guard for the
+# EPP path: it builds WITH_GIE_EPP=ON (compiling + linking the gRPC server and
+# generating the ext_proc stubs) and runs ctest. The pure decision-helper test
+# (gie_epp_test) runs in BOTH this lane and the default unit-tests lane (it is
+# always built); this lane additionally proves the gRPC TU compiles and links.
+#
+# Triggers (mirrors unit-tests.yml / sanitizer-tests.yml): after Docker Publish
+# completes (shares the pre-built base from GHCR) and on manual dispatch. The
+# EPP image (Dockerfile.gie-epp) layers the gRPC toolchain on that base.
+name: GIE EPP Tests
+
+on:
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types:
+      - completed
+  workflow_dispatch:
+
+# A burst of merges produces one Docker Publish per merge; the latest commit's
+# build subsumes prior ones, so cancel superseded in-progress runs on the same
+# ref (standard shared-branch CI posture; see sanitizer-tests.yml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  BASE_IMAGE: ghcr.io/ranvier-systems/ranvier-base:latest
+
+jobs:
+  gie-epp-tests:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      checks: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the WITH_GIE_EPP=ON test image. cache-from reuses the builder
+      # layer from the publish job (scope app-amd64) for the Seastar/Rust deps;
+      # cache-to writes a dedicated scope so the gRPC layer + EPP build don't
+      # pollute the publish cache.
+      - name: Build GIE EPP test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.gie-epp
+          target: test
+          load: true
+          tags: ranvier-gie-epp:latest
+          cache-from: |
+            type=gha,scope=app-amd64
+            type=gha,scope=gie-epp-tests
+          cache-to: type=gha,mode=max,scope=gie-epp-tests
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+
+      - name: Run ctest (WITH_GIE_EPP=ON)
+        id: tests
+        run: |
+          mkdir -p gie-epp-test-results
+          docker run --rm \
+            -v "$(pwd)/gie-epp-test-results:/results" \
+            ranvier-gie-epp:latest \
+            ctest --output-on-failure --output-junit /results/gie-epp-results.xml \
+            2>&1 | tee gie-epp-test-results/gie-epp-test.log
+
+          TEST_EXIT=${PIPESTATUS[0]}
+          echo "test_exit_code=$TEST_EXIT" >> $GITHUB_OUTPUT
+          exit $TEST_EXIT
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gie-epp-test-results
+          path: |
+            gie-epp-test-results/gie-epp-results.xml
+            gie-epp-test-results/gie-epp-test.log
+          retention-days: 30
+
+      - name: Publish test summary
+        uses: dorny/test-reporter@v3
+        if: always() && hashFiles('gie-epp-test-results/gie-epp-results.xml') != ''
+        with:
+          name: GIE EPP Test Results
+          path: gie-epp-test-results/gie-epp-results.xml
+          reporter: java-junit
+          fail-on-error: false

@@ -1,0 +1,75 @@
+# ---------------------------------------------------------
+# Ranvier GIE Endpoint-Picker (EPP) build + test image
+# ---------------------------------------------------------
+# Builds Ranvier with -DWITH_GIE_EPP=ON so CI compiles + links the gRPC
+# ext_proc server (src/gie_epp_server.cpp) and the build-time proto codegen
+# (proto/ext_proc_min.proto), then runs the unit-test suite. This is the
+# automated regression guard for the EPP path, which the default build
+# (WITH_GIE_EPP=OFF) and the production image never compile.
+#
+# Why a SEPARATE image (mirrors Dockerfile.sanitize / Dockerfile.fuzz):
+#   - gRPC + protobuf-compiler are a heavy dependency the EPP is the only
+#     consumer of; baking them into every production builder would inflate
+#     releases for a compatibility mode most deployments do not run.
+#   - The EPP is OFF by default, so the production publish path stays gRPC-free.
+#     This developer / post-merge CI loop is where the EPP build is exercised.
+#
+# Build:
+#   # 1. Build (or pull) the base image first.
+#   docker build -f Dockerfile.base -t ranvier-base:latest .
+#   # 2. Build the EPP test image on top and run ctest.
+#   docker build -f Dockerfile.gie-epp --target test -t ranvier-gie-epp:latest .
+#   docker run --rm ranvier-gie-epp:latest ctest --output-on-failure
+#
+# Override the base image (e.g. CI cache tag):
+#   docker build --build-arg BASE_IMAGE=ghcr.io/ranvier-systems/ranvier-base:latest \
+#                -f Dockerfile.gie-epp --target test -t ranvier-gie-epp:latest .
+# ---------------------------------------------------------
+ARG BASE_IMAGE=ghcr.io/ranvier-systems/ranvier-base:latest
+FROM ${BASE_IMAGE} AS builder
+
+LABEL org.opencontainers.image.title="Ranvier GIE EPP Builder"
+LABEL org.opencontainers.image.description="ranvier-base + gRPC toolchain for the WITH_GIE_EPP build/test lane"
+
+# gRPC toolchain. These are in Dockerfile.base as of the WITH_GIE_EPP feature,
+# but base images rebuild only on manual trigger — install explicitly so this
+# build works against ANY published base (mirrors the zeromq-devel handling in
+# Dockerfile.production.fast). No-op once the base image catches up; do not
+# remove on that basis.
+#   grpc-devel        — gRPC::grpc++ + the CMake config (find_package(gRPC))
+#   grpc-plugins      — grpc_cpp_plugin (the protoc gRPC code generator)
+#   protobuf-compiler — protoc (protobuf-devel/libs are already in the base)
+RUN dnf install -y grpc-devel grpc-plugins protobuf-compiler zeromq-devel \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+WORKDIR /src
+
+# Copy CMakeLists.txt, cmake modules, and the ext_proc proto (codegen input)
+COPY CMakeLists.txt ./
+COPY cmake/ ./cmake/
+COPY proto/ ./proto/
+
+# Copy source, tests, assets
+COPY src/ ./src/
+COPY tests/ ./tests/
+COPY assets/ ./assets/
+
+# Build WITH_GIE_EPP=ON. Building ranvier_server compiles ranvier_core (which
+# includes gie_epp_server.cpp) and links gRPC — the compile + link regression
+# guard; the proto codegen runs as a build dependency. unit_tests builds the
+# gtest binaries (incl. the always-present gie_epp_test) for ctest.
+ENV CARGO_TARGET_DIR=/deps/tokenizers-cpp/rust/target
+RUN mkdir -p build && cd build && \
+    cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DWITH_GIE_EPP=ON \
+        -DFETCHCONTENT_SOURCE_DIR_TOKENIZERS_CPP=/deps/tokenizers-cpp \
+        -DFETCHCONTENT_SOURCE_DIR_OPENTELEMETRY-CPP=/deps/opentelemetry-cpp \
+        -DFETCHCONTENT_SOURCE_DIR_RAPIDJSON=/deps/rapidjson && \
+    ninja ranvier_server unit_tests
+
+# ---------------------------------------------------------
+# STAGE 2: Test (runs ctest over the WITH_GIE_EPP=ON build)
+# ---------------------------------------------------------
+FROM builder AS test
+WORKDIR /src/build
+CMD ["ctest", "--output-on-failure"]

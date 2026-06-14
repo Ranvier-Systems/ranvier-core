@@ -22,6 +22,9 @@
 #ifdef RANVIER_WITH_KV_EVENTS
 #include "kv_event_subscriber.hpp"
 #endif
+#ifdef RANVIER_WITH_GIE_EPP
+#include "gie_epp_server.hpp"
+#endif
 #include "router_service.hpp"
 #include "shard_load_balancer.hpp"
 #include "sharded_config.hpp"
@@ -213,6 +216,13 @@ private:
     // RouterService teardown (its in-flight shipments broadcast into router
     // shard state).
     std::unique_ptr<KvEventSubscriberService> _kv_subscriber;
+#endif
+
+#ifdef RANVIER_WITH_GIE_EPP
+    // GIE Endpoint-Picker (EPP) ext_proc gRPC server. Created on shard 0 when
+    // gie_epp.enabled; stopped in stop_services() Step 1, before RouterService
+    // teardown (its in-flight handlers call route_request via the alien bridge).
+    std::unique_ptr<GieEppServer> _gie_epp_server;
 #endif
 
     // Local backend discovery (local mode only)

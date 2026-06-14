@@ -614,6 +614,17 @@ void RanvierConfig::apply_env_overrides() {
         usage_ledger.enabled = (*v == "1" || *v == "true" || *v == "yes");
     }
 
+    // GIE Endpoint-Picker (EPP) ext_proc gRPC compatibility mode
+    if (auto v = get_env("RANVIER_GIE_EPP_ENABLED")) {
+        gie_epp.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<int>("RANVIER_GIE_EPP_PORT")) {
+        if (*v > 0 && *v <= 65535) gie_epp.port = static_cast<uint16_t>(*v);
+    }
+    if (auto v = get_env("RANVIER_GIE_EPP_LISTEN_ADDRESS")) {
+        gie_epp.listen_address = *v;
+    }
+
     // Cost estimation overrides
     if (auto v = get_env("RANVIER_COST_ESTIMATION_ENABLED")) {
         cost_estimation.enabled = (*v == "1" || *v == "true" || *v == "yes");
@@ -1509,6 +1520,18 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
         if (yaml["usage_ledger"]) {
             YAML::Node ul = yaml["usage_ledger"];
             if (ul["enabled"]) config.usage_ledger.enabled = ul["enabled"].as<bool>();
+        }
+        // GIE Endpoint-Picker (EPP) ext_proc gRPC compatibility mode section
+        if (yaml["gie_epp"]) {
+            YAML::Node ge = yaml["gie_epp"];
+            if (ge["enabled"]) config.gie_epp.enabled = ge["enabled"].as<bool>();
+            if (ge["port"]) {
+                int p = ge["port"].as<int>();
+                if (p > 0 && p <= 65535) config.gie_epp.port = static_cast<uint16_t>(p);
+            }
+            if (ge["listen_address"]) {
+                config.gie_epp.listen_address = ge["listen_address"].as<std::string>();
+            }
         }
         // Cost estimation section
         if (yaml["cost_estimation"]) {
