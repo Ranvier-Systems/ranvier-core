@@ -66,6 +66,15 @@ Run through each of the Hard Rules. For each rule, provide one of:
 
 ---
 
+## SKEPTICAL PASS (before sign-off)
+
+The Hard Rules table catches known anti-patterns; this pass catches what the table doesn't. Re-read the diff as a hostile reviewer who assumes it is wrong:
+
+- **Weakest change:** name the single change (file:line) most likely to break, and the realistic way it fails — under load, across shards, on restart, or on malformed input. Justify why it holds, or fix it.
+- **Not verified statically:** state what you could not confirm by reading or `grep`. Anything needing a real build or run is a **Deferred Gate** — give the developer the exact command and the pass/fail output to look for.
+
+---
+
 ## OUTPUT FORMAT
 
 ### Compliance Summary
@@ -87,5 +96,5 @@ Rule #2 - src/services/router.cc:156
 - `[YES]` - All rules pass, ready for commit
 - `[NO]` - Fixes required (list above)
 
-If violations found, fix and re-run this review. Only commit when all checks pass.
+If violations found, fix and re-run this review. Only commit when all checks pass and the skeptical pass is clean.
 Then run `/doc` for tests and documentation.
