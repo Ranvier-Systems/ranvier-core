@@ -14,9 +14,12 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace ranvier {
 
@@ -24,6 +27,19 @@ namespace ranvier {
 // Spec: gateway-api-inference-extension docs/proposals/004-endpoint-picker-protocol.
 inline constexpr const char* kGieDestinationEndpointHeader =
     "x-gateway-destination-endpoint";
+
+// Append `chunk` to `buf` without ever growing `buf` past `cap` bytes (Rule #4 —
+// bound the request body we buffer for a routing decision). Returns the number
+// of bytes actually appended (0 once `buf` is at/over the cap). Routing needs
+// only the prompt prefix, so truncating beyond the cap is benign.
+inline size_t epp_append_bounded(std::string& buf, std::string_view chunk, size_t cap) {
+    if (buf.size() >= cap) {
+        return 0;
+    }
+    const size_t n = std::min(cap - buf.size(), chunk.size());
+    buf.append(chunk.data(), n);
+    return n;
+}
 
 // What the ext_proc handler should emit for one request-headers phase.
 struct EppResponsePlan {

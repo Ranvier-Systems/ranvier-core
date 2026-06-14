@@ -1,16 +1,18 @@
 // Ranvier Core - GIE Endpoint-Picker plan unit tests
 //
-// Reactor-free, dependency-free tests over the pure EPP decision helper
-// (src/gie_epp_plan.hpp): the endpoint-header formatting and the
-// set-endpoint-vs-503 branch. The gRPC server itself (gie_epp_server.cpp) is
-// integration-verified — these cover the content-free decision core.
+// Reactor-free, dependency-free tests over the pure EPP helpers
+// (src/gie_epp_plan.hpp): endpoint-header formatting, the set-endpoint-vs-503
+// branch, and the Rule #4 bounded body-append cap. The gRPC server itself
+// (gie_epp_server.cpp) is integration-verified — these cover the pure logic.
 
 #include "gie_epp_plan.hpp"
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <optional>
 #include <string>
+#include <string_view>
 
 using namespace ranvier;
 
@@ -68,4 +70,62 @@ TEST(EppPlan, BackendWithEmptyEndpointIs503) {
 TEST(EppPlan, DestinationHeaderNameMatchesGieSpec) {
     // The data plane keys on this exact header; a typo silently breaks routing.
     EXPECT_STREQ(kGieDestinationEndpointHeader, "x-gateway-destination-endpoint");
+}
+
+// =============================================================================
+// epp_append_bounded: Rule #4 cap on the buffered request body
+// =============================================================================
+
+TEST(EppAppendBounded, UnderCapAppendsFully) {
+    std::string buf = "ab";
+    size_t n = epp_append_bounded(buf, "cde", /*cap=*/10);
+    EXPECT_EQ(n, 3u);
+    EXPECT_EQ(buf, "abcde");
+}
+
+TEST(EppAppendBounded, CrossingCapTruncatesToRoom) {
+    std::string buf = "abcd";          // 4 bytes, cap 6 -> room 2
+    size_t n = epp_append_bounded(buf, "xyz", /*cap=*/6);
+    EXPECT_EQ(n, 2u);
+    EXPECT_EQ(buf, "abcdxy");
+    EXPECT_EQ(buf.size(), 6u);
+}
+
+TEST(EppAppendBounded, ExactlyAtCapAppendsNothing) {
+    std::string buf = "abcdef";        // already at cap
+    size_t n = epp_append_bounded(buf, "more", /*cap=*/6);
+    EXPECT_EQ(n, 0u);
+    EXPECT_EQ(buf, "abcdef");
+}
+
+TEST(EppAppendBounded, FillsExactlyToCap) {
+    std::string buf = "abcd";
+    size_t n = epp_append_bounded(buf, "ef", /*cap=*/6);  // room 2, chunk 2
+    EXPECT_EQ(n, 2u);
+    EXPECT_EQ(buf, "abcdef");
+}
+
+TEST(EppAppendBounded, MultipleChunksRespectCapAcrossCalls) {
+    std::string buf;
+    const size_t cap = 5;
+    EXPECT_EQ(epp_append_bounded(buf, "abc", cap), 3u);   // buf=abc
+    EXPECT_EQ(epp_append_bounded(buf, "defg", cap), 2u);  // buf=abcde (room 2)
+    EXPECT_EQ(epp_append_bounded(buf, "hij", cap), 0u);   // already full
+    EXPECT_EQ(buf, "abcde");
+    EXPECT_EQ(buf.size(), cap);
+}
+
+TEST(EppAppendBounded, EmptyChunkIsNoOp) {
+    std::string buf = "abc";
+    EXPECT_EQ(epp_append_bounded(buf, "", /*cap=*/10), 0u);
+    EXPECT_EQ(buf, "abc");
+}
+
+TEST(EppAppendBounded, BinarySafeWithEmbeddedNuls) {
+    std::string buf;
+    std::string chunk("a\0b", 3);  // contains an embedded NUL
+    size_t n = epp_append_bounded(buf, std::string_view(chunk.data(), chunk.size()), 10);
+    EXPECT_EQ(n, 3u);
+    EXPECT_EQ(buf.size(), 3u);
+    EXPECT_EQ(buf, chunk);
 }

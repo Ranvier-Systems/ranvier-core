@@ -21,7 +21,6 @@
 
 #include <fmt/format.h>
 
-#include <algorithm>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -95,11 +94,7 @@ public:
                 const auto& hb = request.request_body();
                 // Rule #4: accumulate only up to the routing-prefix cap; extra
                 // body bytes beyond it don't change the prefix decision.
-                if (body_buf.size() < kMaxRoutingBodyBytes) {
-                    const size_t room = kMaxRoutingBodyBytes - body_buf.size();
-                    body_buf.append(hb.body().data(),
-                                    std::min(room, hb.body().size()));
-                }
+                epp_append_bounded(body_buf, hb.body(), kMaxRoutingBodyBytes);
                 if (hb.end_of_stream()) {
                     // Full body in hand: prefix-aware decision on the body phase.
                     fill_decision(response, /*on_body=*/true, decide(body_buf));
