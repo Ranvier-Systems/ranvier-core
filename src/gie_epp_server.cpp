@@ -8,7 +8,9 @@
 
 #include "gie_epp_plan.hpp"
 #include "logging.hpp"
+#include "request_rewriter.hpp"
 #include "router_service.hpp"
+#include "tokenizer_service.hpp"
 
 // Generated from proto/ext_proc_min.proto (build-time protoc + grpc_cpp_plugin;
 // include dir wired in CMakeLists.txt under WITH_GIE_EPP).
@@ -21,9 +23,11 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/util/log.hh>
 
 namespace ranvier {
@@ -33,6 +37,12 @@ namespace epp = envoy::service::ext_proc::v3;
 static seastar::logger log_epp("gie_epp");
 
 namespace {
+
+// Rule #4: bound the request body we buffer for a routing decision. Routing
+// needs only the prompt prefix, so truncating a very large or streamed body is
+// harmless — the inline path likewise tokenizes only a bounded prefix. Caps the
+// per-request accumulation regardless of how much the gateway streams.
+constexpr size_t kMaxRoutingBodyBytes = 256 * 1024;
 
 // Routing decision crossed back from the reactor to a gRPC handler thread.
 // Trivially copyable on purpose: a socket_address is a sockaddr_storage union
@@ -48,30 +58,59 @@ struct EppDecision {
 // the gateway sends request phases and we return the chosen endpoint (or 503).
 class ExtProcServiceImpl final : public epp::ExternalProcessor::Service {
 public:
-    ExtProcServiceImpl(RouterService* router, seastar::alien::instance* alien)
-        : _router(router), _alien(alien) {}
+    ExtProcServiceImpl(RouterService* router,
+                       seastar::sharded<TokenizerService>* tokenizer,
+                       ChatTemplate chat_template,
+                       seastar::alien::instance* alien)
+        : _router(router),
+          _tokenizer(tokenizer),
+          _chat_template(std::move(chat_template)),
+          _alien(alien) {}
 
     grpc::Status Process(
         grpc::ServerContext* /*context*/,
         grpc::ServerReaderWriter<epp::ProcessingResponse, epp::ProcessingRequest>* stream)
         override {
+        // Per-request body accumulation (this RPC, this gRPC thread). BUFFERED
+        // delivery is one frame with end_of_stream; STREAMED is several.
+        std::string body_buf;
         epp::ProcessingRequest request;
         while (stream->Read(&request)) {
             epp::ProcessingResponse response;
+            bool write = true;
+
             if (request.has_request_headers()) {
-                build_headers_response(response);
+                if (request.request_headers().end_of_stream()) {
+                    // No body will follow (e.g. GET / empty body): nothing to
+                    // tokenize, so decide now on the headers phase (load/hash).
+                    fill_decision(response, /*on_body=*/false, decide(std::string()));
+                } else {
+                    // A body follows; defer the decision to the body phase so we
+                    // can tokenize the prompt for prefix-aware routing.
+                    response.mutable_request_headers()->mutable_response()->set_status(
+                        epp::CommonResponse::CONTINUE);
+                }
             } else if (request.has_request_body()) {
-                // PR-1 routes at the header phase; just CONTINUE the body so a
-                // gateway configured to stream the body to the picker is not
-                // stalled. PR-2 will tokenize the body here for prefix routing.
-                response.mutable_request_body()->mutable_response()->set_status(
-                    epp::CommonResponse::CONTINUE);
+                const auto& hb = request.request_body();
+                // Rule #4: accumulate only up to the routing-prefix cap; extra
+                // body bytes beyond it don't change the prefix decision.
+                epp_append_bounded(body_buf, hb.body(), kMaxRoutingBodyBytes);
+                if (hb.end_of_stream()) {
+                    // Full body in hand: prefix-aware decision on the body phase.
+                    fill_decision(response, /*on_body=*/true, decide(body_buf));
+                } else {
+                    // More body frames coming: keep accumulating, CONTINUE.
+                    response.mutable_request_body()->mutable_response()->set_status(
+                        epp::CommonResponse::CONTINUE);
+                }
             } else {
-                // A phase we don't act on in PR-1 (response_* should not reach a
-                // request-path picker). Close the stream cleanly.
+                // A phase we don't act on for a request-path picker
+                // (response_* / trailers). Close the stream cleanly.
+                write = false;
                 break;
             }
-            if (!stream->Write(response)) {
+
+            if (write && !stream->Write(response)) {
                 break;  // gateway hung up
             }
             request.Clear();
@@ -80,10 +119,12 @@ public:
     }
 
 private:
-    // Build the request_headers response: either set the destination-endpoint
-    // header or emit an ImmediateResponse 503 when no backend is ready.
-    void build_headers_response(epp::ProcessingResponse& response) {
-        const EppDecision decision = decide();
+    // Fill `response` for a completed decision: set the destination-endpoint
+    // header (+ dynamic_metadata) on the matching phase, or an ImmediateResponse
+    // 503 when no backend is ready. `on_body` selects which oneof phase carries
+    // the CommonResponse (request_body vs request_headers).
+    void fill_decision(epp::ProcessingResponse& response, bool on_body,
+                       const EppDecision& decision) {
         std::optional<std::string> endpoint;
         if (decision.ok) {
             endpoint = epp_format_endpoint(
@@ -92,7 +133,9 @@ private:
         const EppResponsePlan plan = epp_plan(decision.ok, endpoint);
 
         if (plan.kind == EppResponsePlan::Kind::SetEndpoint) {
-            auto* common = response.mutable_request_headers()->mutable_response();
+            auto* common = on_body
+                ? response.mutable_request_body()->mutable_response()
+                : response.mutable_request_headers()->mutable_response();
             common->set_status(epp::CommonResponse::CONTINUE);
             // Force the data plane to re-run endpoint selection against the
             // header we just set (otherwise the original route stands).
@@ -102,6 +145,10 @@ private:
             auto* hv = opt->mutable_header();
             hv->set_key(kGieDestinationEndpointHeader);
             hv->set_value(plan.endpoint);
+            // Also surface the same endpoint via dynamic_metadata for gateways
+            // that read it from there. The GIE spec requires the header and
+            // metadata values not disagree — both come from `plan.endpoint`.
+            set_dynamic_metadata(response, plan.endpoint);
         } else {
             auto* imm = response.mutable_immediate_response();
             imm->mutable_status()->set_code(epp::ServiceUnavailable);
@@ -109,26 +156,31 @@ private:
         }
     }
 
+    // dynamic_metadata = { "envoy.lb": { "x-gateway-destination-endpoint": ep } }
+    static void set_dynamic_metadata(epp::ProcessingResponse& response,
+                                     const std::string& endpoint) {
+        auto* md = response.mutable_dynamic_metadata();                 // Struct
+        auto* inner = (*md->mutable_fields())["envoy.lb"]              // Value
+                          .mutable_struct_value();                      // Struct
+        (*inner->mutable_fields())[kGieDestinationEndpointHeader]       // Value
+            .set_string_value(endpoint);
+    }
+
     // Run the routing decision on the reactor (shard 0) and block this gRPC
-    // handler thread for the result. PR-1 routes with empty tokens — live
-    // load/hash selection over registered backends; PR-2 adds body tokenization
-    // for prefix-aware routing. Reuses the entire reactor-side pipeline rather
-    // than reimplementing routing off-reactor.
-    EppDecision decide() {
+    // handler thread for the result. `body` is the raw request body (empty for
+    // bodyless requests). Reuses the entire reactor-side tokenize+route pipeline
+    // rather than reimplementing routing off-reactor.
+    EppDecision decide(const std::string& body) {
         try {
+            // The submit_to callable is a PLAIN lambda (not a coroutine): it
+            // copies the body reactor-side from a view into `body` (alive across
+            // fut.get() below) and hands it to the named coroutine by value. This
+            // avoids both a cross-thread free of the body and the Rule #16
+            // coroutine-lambda lifetime trap.
             std::future<EppDecision> fut = seastar::alien::submit_to(
-                *_alien, 0u, [router = _router]() -> seastar::future<EppDecision> {
-                    EppDecision d;
-                    const std::vector<int32_t> no_tokens;
-                    RouteResult rr = router->route_request(no_tokens, std::string(), 0, 0.0);
-                    if (rr.backend_id.has_value()) {
-                        auto addr = router->get_backend_address(*rr.backend_id);
-                        if (addr.has_value()) {
-                            d.ok = true;
-                            d.addr = *addr;
-                        }
-                    }
-                    return seastar::make_ready_future<EppDecision>(d);
+                *_alien, 0u,
+                [this, bv = std::string_view(body)]() -> seastar::future<EppDecision> {
+                    return route_on_reactor(std::string(bv));
                 });
             return fut.get();
         } catch (const std::exception& e) {
@@ -140,7 +192,37 @@ private:
         }
     }
 
+    // Reactor-side (shard 0) routing coroutine. Named (not a lambda) and takes
+    // `body` by value (Rule #21) so its frame owns the body across the tokenize
+    // suspension. Extracts the prompt with the SAME chat template the inline path
+    // uses, so the EPP's tokens align with the backend's (and thus with the
+    // KV-event-fed residency index); tokenizes; routes.
+    seastar::future<EppDecision> route_on_reactor(std::string body) {
+        std::vector<int32_t> tokens;
+        auto extracted = RequestRewriter::extract_text_with_boundary_info(
+            body, /*need_formatted_messages=*/false, _chat_template);
+        std::string text = extracted.has_value() ? std::move(extracted->text) : std::move(body);
+        if (!text.empty() && _tokenizer->local().is_loaded()) {
+            auto tok = co_await _tokenizer->local().encode_threaded_async(text);
+            tokens = std::move(tok.tokens);
+        }
+        // Empty tokens (bodyless / unloaded tokenizer) -> load/hash fallback,
+        // exactly as the headerless path; non-empty -> ART/residency-aware.
+        RouteResult rr = _router->route_request(tokens, std::string(), 0, 0.0);
+        EppDecision d;
+        if (rr.backend_id.has_value()) {
+            auto addr = _router->get_backend_address(*rr.backend_id);
+            if (addr.has_value()) {
+                d.ok = true;
+                d.addr = *addr;
+            }
+        }
+        co_return d;
+    }
+
     RouterService* _router;
+    seastar::sharded<TokenizerService>* _tokenizer;
+    const ChatTemplate _chat_template;
     seastar::alien::instance* _alien;
 };
 
@@ -153,6 +235,8 @@ private:
 struct GieEppServer::Impl {
     GieEppConfig cfg;
     RouterService* router = nullptr;
+    seastar::sharded<TokenizerService>* tokenizer = nullptr;
+    ChatTemplate chat_template;
     seastar::alien::instance* alien = nullptr;
     std::unique_ptr<ExtProcServiceImpl> service;
     std::unique_ptr<grpc::Server> server;
@@ -171,10 +255,14 @@ struct GieEppServer::Impl {
     }
 };
 
-GieEppServer::GieEppServer(const GieEppConfig& cfg, RouterService* router)
+GieEppServer::GieEppServer(const GieEppConfig& cfg, RouterService* router,
+                           seastar::sharded<TokenizerService>* tokenizer,
+                           ChatTemplate chat_template)
     : _impl(std::make_unique<Impl>()) {
     _impl->cfg = cfg;
     _impl->router = router;
+    _impl->tokenizer = tokenizer;
+    _impl->chat_template = std::move(chat_template);
 }
 
 GieEppServer::~GieEppServer() = default;
@@ -184,7 +272,8 @@ void GieEppServer::start(seastar::alien::instance& alien) {
         return;  // already started
     }
     _impl->alien = &alien;
-    _impl->service = std::make_unique<ExtProcServiceImpl>(_impl->router, _impl->alien);
+    _impl->service = std::make_unique<ExtProcServiceImpl>(
+        _impl->router, _impl->tokenizer, _impl->chat_template, _impl->alien);
 
     const std::string addr =
         fmt::format("{}:{}", _impl->cfg.listen_address, _impl->cfg.port);

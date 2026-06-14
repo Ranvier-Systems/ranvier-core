@@ -57,6 +57,10 @@ message ProcessingResponse {
     BodyResponse response_body = 4;
     ImmediateResponse immediate_response = 7;
   }
+  // GIE allows the chosen endpoint to be carried in dynamic_metadata under the
+  // "envoy.lb" namespace in addition to the header. Typed google.protobuf.Struct
+  // upstream; inlined below (wire-compatible) to avoid importing struct.proto.
+  Struct dynamic_metadata = 8;
 }
 
 message HttpHeaders {
@@ -134,4 +138,23 @@ enum StatusCode {
   OK = 200;
   TooManyRequests = 429;
   ServiceUnavailable = 503;
+}
+
+// ---- Inlined subset of google.protobuf.Struct/Value (wire-compatible) ----
+//
+// dynamic_metadata is google.protobuf.Struct upstream. Inlining a minimal,
+// field-number-exact subset (only the Value kinds we emit: string_value=3,
+// struct_value=5) keeps the build free of a struct.proto import + the protobuf
+// well-known-types include path, while remaining wire-identical: a message
+// field is length-delimited bytes, a proto3 map is repeated key=1/value=2
+// entries, and the gateway decodes our bytes back into google.protobuf.Struct.
+message Struct {
+  map<string, Value> fields = 1;
+}
+
+message Value {
+  oneof kind {
+    string string_value = 3;
+    Struct struct_value = 5;
+  }
 }

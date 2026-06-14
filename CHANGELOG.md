@@ -8,6 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **GIE Endpoint-Picker (EPP) ext_proc mode — part 2: prefix-aware routing**
+  (BACKLOG §20.2 P1.4, completing the item) — The picker now routes on the
+  actual prompt instead of part 1's header-level load/hash. It captures the
+  ext_proc `request_body` phase, and on a dedicated reactor coroutine
+  (`route_on_reactor`, bridged via `alien::submit_to`) extracts the prompt and
+  tokenizes it with **the same chat template the inline path uses**
+  (`assets.chat_template_format`) before calling `route_request` — so the EPP's
+  tokens align with the backend's and with the KV-event-fed residency index
+  (P0.1), which is what makes prefix-/residency-aware selection actually hit.
+  Bodyless requests (headers `end_of_stream`) and an unloaded/empty prompt fall
+  back to load/hash — no regression. The chosen endpoint is also surfaced in
+  `dynamic_metadata` (`envoy.lb` namespace) alongside the header, via a minimal
+  inlined `google.protobuf.Struct` (wire-compatible, no `struct.proto` import).
+  The body is copied reactor-side from a `string_view` (no cross-thread free)
+  and the named-coroutine bridge avoids the Rule #16 lambda-lifetime trap.
+  429 request-shedding and the inline-vs-sidecar benchmark remain follow-ups.
+  Still build-gated `WITH_GIE_EPP=OFF`; stock builds unaffected.
+
 - **GIE Endpoint-Picker (EPP) ext_proc mode — part 1: bridge + server**
   (BACKLOG §20.2 P1.4) — Optional gRPC `envoy.service.ext_proc.v3.ExternalProcessor`
   server that exposes Ranvier's routing core as a Gateway API Inference Extension
