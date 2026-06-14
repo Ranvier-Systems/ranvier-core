@@ -34,8 +34,9 @@ EPP_TARGET="localhost:9002"
 BACKEND_IP="172.29.1.10"
 BACKEND_PORT="8000"
 
-# Forward extra flags (e.g. --requests, --warmup, --no-body) to the driver.
-DRIVER_ARGS=("$@")
+# Extra flags (e.g. --requests, --warmup, --no-body) are forwarded to the
+# driver below via "$@" (safe under `set -u` even when empty, unlike an
+# expanded empty array on macOS's bash 3.2).
 
 # Detect docker compose invocation.
 if docker compose version >/dev/null 2>&1; then
@@ -77,4 +78,4 @@ sleep 3
 
 echo "Running microbenchmark against ${EPP_TARGET}..."
 python3 "${REPO_ROOT}/tests/integration/epp_microbench.py" \
-    --target "${EPP_TARGET}" "${DRIVER_ARGS[@]}"
+    --target "${EPP_TARGET}" "$@"

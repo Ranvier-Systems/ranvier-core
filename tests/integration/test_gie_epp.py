@@ -52,7 +52,7 @@ EPP_METRICS = f"http://{DOCKER_HOST}:9191"       # Prometheus
 BACKEND_ID = 1
 BACKEND_ENDPOINT = "172.29.1.10:8000"
 
-STARTUP_TIMEOUT = 90
+STARTUP_TIMEOUT = 120
 REGISTER_POLL_SECONDS = 20
 
 
@@ -76,12 +76,11 @@ def epp_node():
     _epp_compose(["down", "-v", "--remove-orphans"], check=False)
     _epp_compose(["up", "-d", "--build"], check=True)
     try:
-        if not wait_for_healthy(
-            f"{EPP_METRICS}/metrics",
-            timeout=STARTUP_TIMEOUT,
-            container_name="ranvier-epp",
-            project_name=EPP_PROJECT,
-        ):
+        # Poll the metrics URL only. (Don't pass container_name to
+        # wait_for_healthy: its container-running fast-fail runs `compose ps`
+        # against conftest's COMPOSE_FILE — the main cluster compose — which has
+        # no ranvier-epp service, so it would always report "exited".)
+        if not wait_for_healthy(f"{EPP_METRICS}/metrics", timeout=STARTUP_TIMEOUT):
             _epp_compose(["logs", "--tail=80"], check=False)
             raise RuntimeError("EPP node did not become healthy")
         yield
