@@ -47,22 +47,44 @@ registers a backend, runs `tests/integration/http_ab_load.py` against all three
 arms (single-stream by default), prints per-arm p50/p90/p99 and the deltas, then
 tears down. Requires Docker + a `WITH_GIE_EPP=ON` build + Python `requests`.
 
-## Results (fill from your run)
+## Results
 
-> Single-stream, mock backend, single-shard Ranvier. Record the host so the
-> numbers are interpretable; a dev laptop gives a directional floor (see
-> [interpreting-benchmark-numbers.md](interpreting-benchmark-numbers.md)).
+### Dev baseline (2026-06-14 — illustrative, not canonical)
+
+Single-stream, 2000 reqs/arm, single-shard Ranvier + mock backend, Docker on a
+macOS dev laptop. A floor — reproduce on a representative host before quoting.
+The ~54 ms baseline is the **mock backend's response time**, identical across
+arms, so it cancels in the deltas; the deltas are the signal.
 
 | arm | p50 (ms) | p90 (ms) | p99 (ms) |
 |---|---|---|---|
-| A — inline | _tbd_ | _tbd_ | _tbd_ |
-| B — plain Envoy | _tbd_ | _tbd_ | _tbd_ |
-| C — Envoy + EPP | _tbd_ | _tbd_ | _tbd_ |
+| A — inline | 54.8 | 59.1 | 68.9 |
+| B — plain Envoy | 53.9 | 57.3 | 60.2 |
+| C — Envoy + EPP | 55.4 | 59.0 | 61.9 |
 
-| delta | p50 (ms) | p99 (ms) |
-|---|---|---|
-| ext_proc overhead (C − B) | _tbd_ | _tbd_ |
-| inline-vs-sidecar (C − A) | _tbd_ | _tbd_ |
+| delta | p50 (ms) | p99 (ms) | mean (ms) |
+|---|---|---|---|
+| **ext_proc overhead (C − B)** | **+1.5** | **+1.7** | **+1.4** |
+| inline-vs-sidecar (C − A) | +0.6 | −7.0 | +0.1 |
+
+**Reading it:**
+
+- **The ext_proc sidecar hop costs ~1.5 ms/request** (C − B, both Envoy-fronted
+  with tight tails, so this is the clean signal). That cross-checks with the
+  [microbenchmark](epp-overhead-microbenchmark.md): the EPP's own decision is
+  ~0.5 ms, and the remaining ~1 ms is Envoy's ext_proc machinery (buffering the
+  body, the gRPC call from Envoy's side, the extra filter pass).
+- **Inline vs. sidecar is within ~0.6 ms at p50 / ~flat at the mean.** The
+  C − A p99 came out *negative* here only because the single inline run had a
+  180 ms outlier inflating arm A's tail; with Envoy fronting B/C their tails are
+  tighter. Treat the C − A p99 as noise from one run, not a real "sidecar is
+  faster" result — re-run for a stable tail.
+- Bottom line: the EPP sidecar adds **single-digit-millisecond** per-request
+  overhead, dominated by the ext_proc indirection, not Ranvier's routing.
+
+> Reproduce on a representative, isolated host (and ideally several runs for
+> stable tails) before publishing; see
+> [interpreting-benchmark-numbers.md](interpreting-benchmark-numbers.md).
 
 ## Caveats
 
