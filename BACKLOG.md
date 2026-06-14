@@ -923,6 +923,10 @@ prefill/decode disaggregation, and standardized on the Kubernetes Gateway API In
 Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build half
 (eviction events, residency weighting, load/cost routing); these items close the remaining gaps.
 
+**Status: CLOSED (2026-06-14).** All actionable items below shipped. Closeout retrospective
+(end-state summary + cross-cutting decisions and lessons):
+[`docs/audits/routing-parity-ecosystem-alignment-2026-06-14.md`](docs/audits/routing-parity-ecosystem-alignment-2026-06-14.md).
+
 ### 20.1 P0 — KV-aware routing parity (OSS)
 
 - [x] **Precise, native KV-event mode** (P0.1) — _Done 2026-06-12 (two PRs)._
