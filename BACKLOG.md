@@ -987,7 +987,7 @@ Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build
 
 ### 20.2 P1 — strategic parity / ecosystem
 
-- [ ] **GIE Endpoint-Picker (EPP) compatibility mode** (P1.4, OSS)
+- [x] **GIE Endpoint-Picker (EPP) compatibility mode** (P1.4, OSS) — _Done 2026-06-14 (two PRs)._
   _Justification:_ The Kubernetes Gateway API Inference Extension (GA 2026) standardized
   endpoint selection on an ext_proc EPP protocol that GIE-conformant gateways implement.
   Exposing the routing core as a GIE-conformant ext_proc endpoint picker lets any conformant
@@ -997,6 +997,19 @@ Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build
   currently published anywhere.
   _Location:_ new ext_proc gRPC server surface; reuse `router_service` decision core
   _Complexity:_ High
+  _Completion note:_ Shipped as `src/gie_epp_server.{hpp,cpp}` (gRPC
+  `envoy.service.ext_proc.v3.ExternalProcessor`) behind `WITH_GIE_EPP` (default OFF; gRPC is a
+  heavy dep and the EPP is a compatibility mode, not the primary inline path). PR-1: the
+  gRPC↔Seastar bridge (gRPC on its own threads; `alien::submit_to` into `route_request`; decision
+  returned as a trivially-copyable POD) + a minimal wire-compatible vendored ext_proc proto
+  (`proto/ext_proc_min.proto`, field numbers verified vs upstream) + frictionless build/CI
+  (`Dockerfile.gie-epp`, `gie-epp-tests.yml`, `make gie-epp-test`). PR-2: prefix-aware routing —
+  capture the `request_body` phase and tokenize the prompt with the inline path's chat template
+  (so tokens align with the KV-event residency index, P0.1) before routing; endpoint returned via
+  the `x-gateway-destination-endpoint` header + `dynamic_metadata`. Remaining follow-ups (own
+  tickets): 429 request-shedding (needs an overload signal), the inline-vs-sidecar overhead
+  benchmark, and per-model chat-template selection for heterogeneous fleets. This completes the
+  actionable items in §20.2; §20.3 is P2/out-of-scope.
 
 - [x] **Usage-ledger sink seam** (P1.5, OSS) — _Done 2026-06-13._
   _Justification:_ Ship a pluggable usage-ledger *sink* interface (no-op default + registration

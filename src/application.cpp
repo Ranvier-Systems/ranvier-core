@@ -1164,8 +1164,14 @@ seastar::future<> Application::startup() {
             // which is the correct GIE behaviour.
 #ifdef RANVIER_WITH_GIE_EPP
             if (_config.gie_epp.enabled) {
+                // The EPP tokenizes prompts with the same chat template the
+                // inline path uses (assets.chat_template_format) so its tokens
+                // align with the backend's — and thus with the KV-event-fed
+                // residency index — for prefix-aware routing.
                 _gie_epp_server = std::make_unique<GieEppServer>(
-                    _config.gie_epp, _router.get());
+                    _config.gie_epp, _router.get(), &_tokenizer,
+                    ChatTemplate(parse_chat_template_format(
+                        _config.assets.chat_template_format)));
                 _gie_epp_server->start(*seastar::alien::internal::default_instance);
                 log_main.info("GIE Endpoint-Picker (EPP) enabled on port {}",
                               _config.gie_epp.port);

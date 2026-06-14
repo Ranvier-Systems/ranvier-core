@@ -35,22 +35,30 @@
 
 #pragma once
 
-#include "config.hpp"  // GieEppConfig
+#include "config.hpp"        // GieEppConfig
+#include "chat_template.hpp"  // ChatTemplate (value member; needs the full type)
 
 #include <memory>
 
 #include <seastar/core/alien.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
 
 namespace ranvier {
 
 class RouterService;
+class TokenizerService;
 
 class GieEppServer {
 public:
-    // `router` is borrowed (not owned); it must outlive the server (the
-    // Application stops this service before tearing the router down).
-    GieEppServer(const GieEppConfig& cfg, RouterService* router);
+    // `router` and `tokenizer` are borrowed (not owned); both must outlive the
+    // server (the Application stops this service before tearing them down).
+    // `chat_template` is copied — the EPP tokenizes prompts with the same
+    // template the inline path uses so token sequences align with the backend
+    // (and thus with the KV-event-fed residency index). PR-2 (BACKLOG §20.2 P1.4).
+    GieEppServer(const GieEppConfig& cfg, RouterService* router,
+                 seastar::sharded<TokenizerService>* tokenizer,
+                 ChatTemplate chat_template);
     ~GieEppServer();
 
     GieEppServer(const GieEppServer&) = delete;

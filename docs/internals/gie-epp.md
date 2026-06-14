@@ -1,8 +1,9 @@
 # GIE Endpoint-Picker (EPP) ext_proc Compatibility Mode
 
-**Status:** PR-1 (bridge + header-level routing) implemented; prefix-aware
-routing, `dynamic_metadata`, and 429 shedding are PR-2. **Build-gated:**
-`WITH_GIE_EPP` (default OFF). **Runtime:** `gie_epp.enabled` (default false).
+**Status:** implemented (bridge + prefix-aware routing + `dynamic_metadata`).
+429 request-shedding and the inline-vs-sidecar benchmark remain as follow-ups.
+**Build-gated:** `WITH_GIE_EPP` (default OFF). **Runtime:** `gie_epp.enabled`
+(default false).
 
 ## What this is
 
@@ -45,31 +46,66 @@ same dedicated-OS-thread discipline as `tokenizer_thread_pool` /
 (shard 0) and blocks the gRPC thread on the returned `std::future` for the
 routing decision — the request/response inverse of the KV subscriber's
 fire-and-forget `alien::run_on`. The handler thus reuses the entire reactor-side
-pipeline (`RouterService::route_request` → `get_backend_address`) instead of
-reimplementing routing off-reactor.
+pipeline (extract → tokenize → `route_request` → `get_backend_address`) instead
+of reimplementing it off-reactor.
 
-The decision crosses the boundary as a trivially-copyable POD (a
-`socket_address` + an "ok" flag), so no Seastar-shard heap is ever freed on a
-gRPC thread (Rules #14/#15). The `<ip:port>` string is formatted on the gRPC
-thread from that POD.
+The reactor-side work is a **named coroutine** (`route_on_reactor`, taking the
+body by value — Rules #16/#21) invoked by a *plain* `submit_to` lambda that
+copies the body reactor-side from a `string_view` into the gRPC thread's buffer
+(alive across `fut.get()`). That sidesteps both a cross-thread free of the body
+and the coroutine-lambda lifetime trap. The decision crosses back as a
+trivially-copyable POD (a `socket_address` + an "ok" flag), so no Seastar-shard
+heap is ever freed on a gRPC thread (Rules #14/#15); the `<ip:port>` string is
+formatted on the gRPC thread from that POD.
 
 ```
 GIE gateway ──gRPC──► ExternalProcessor::Process       (gRPC sync thread pool)
-                        read request_headers
-                        alien::submit_to(shard 0) ─► route_request()   (reactor)
-                                                     get_backend_address()
+                        request_headers → CONTINUE (defer; body follows)
+                        request_body  → accumulate, then on end_of_stream:
+                        alien::submit_to(shard 0) ─► route_on_reactor()  (reactor)
+                                                       extract_text + chat template
+                                                       encode_threaded_async()
+                                                       route_request(tokens)
+                                                       get_backend_address()
                         ◄──── EppDecision (POD) ──────────────────────────┘
-                        set x-gateway-destination-endpoint   (or 503)
+                        set x-gateway-destination-endpoint (+ dynamic_metadata),
+                        or ImmediateResponse 503
 ```
+
+## Prefix-aware routing & tokenization alignment
+
+The picker routes on the actual prompt: it captures the request body (the
+gateway must send it — `request_body: BUFFERED` in the GIE picker config; a
+bodyless request, headers `end_of_stream`, routes on load/hash instead),
+extracts the prompt, and tokenizes it with **the same chat template the inline
+path uses** (`assets.chat_template_format`). That alignment is load-bearing:
+vLLM tokenizes the chat-template-formatted prompt, the native KV-event stream
+(P0.1) keys the residency index on *those* token hashes, so the EPP's tokens
+must match for an ART/residency hit. With a misaligned (e.g. template-less)
+tokenization the prefix hashes diverge and routing silently falls back to
+load/hash. In a **pure-EPP deployment** (no inline proxy learning routes), the
+prefix/residency state that makes this meaningful is populated by the KV-event
+stream and gossip — so prefix-aware EPP routing composes with, and depends on,
+P0.1. Without any residency source it degrades to load/hash, the same as the
+bodyless path — no regression. Caveat (shared with the inline path): one
+configured template won't byte-match a heterogeneous fleet of model families;
+per-model template selection is a future refinement.
+
+The chosen endpoint is returned both as the `x-gateway-destination-endpoint`
+header mutation and in `dynamic_metadata` under the `envoy.lb` namespace (same
+value, per the GIE spec). `clear_route_cache` forces the data plane to re-run
+selection against it.
 
 ## Lifecycle
 
 The server is created and started on shard 0 after `RouterService` is up (it
 answers 503 until backends register — the correct GIE behaviour), and stopped in
 `stop_services()` **before** `RouterService` teardown, since in-flight handlers
-call into the router. Shutdown is a bounded `grpc::Server::Shutdown(deadline)` +
-`Wait()` (a brief teardown-time reactor stall, matching the kv-subscriber join
-precedent).
+call into the router. Shutdown drains gRPC on a **dedicated OS thread**
+(`Shutdown()` + `Wait()` off the reactor) and resolves the returned future back
+on shard 0 via `alien::run_on`, so the reactor stays free to service in-flight
+handlers' bridge calls while they finish (freezing it in `Wait()` would deadlock
+them); the thread is joined in `~Impl` (Rule #13).
 
 ## Configuration
 
@@ -124,12 +160,15 @@ Or by hand: `cmake -B build -DWITH_GIE_EPP=ON && cmake --build build && (cd buil
 `cmake` step, not passed to `ninja`/`make`. If the gRPC packages are missing,
 the configure step fails fast with a `FATAL_ERROR` naming what to install.
 
-## Deferred to PR-2
+## Remaining follow-ups
 
-- Capture the request body (`request_body` phase) and tokenize it for full
-  prefix-aware routing via the existing pipeline, instead of header-level
-  selection with empty tokens.
-- Mirror the endpoint into `dynamic_metadata` (`envoy.lb` namespace) alongside
-  the header.
-- 429 request-shedding and multi-endpoint fallback lists.
-- The published inline-vs-sidecar ext_proc overhead benchmark.
+- **429 request-shedding.** GIE allows an `ImmediateResponse` 429 under load.
+  Deferred pending a real overload signal — there is no global "shed now" today
+  (only per-backend `get_composite_backend_load`); a meaningful policy is its
+  own design rather than a blunt all-backends-over-threshold heuristic.
+- **Inline-vs-sidecar overhead benchmark.** The published proof point comparing
+  inline routing to a sidecar ext_proc EPP hop (needs real cluster/hardware).
+- **Per-model chat-template selection** for heterogeneous fleets (see the
+  tokenization-alignment caveat above), and `mode_override` to request the
+  request body from gateways not pre-configured to send it.
+- **Multi-endpoint fallback lists** in the destination header.
