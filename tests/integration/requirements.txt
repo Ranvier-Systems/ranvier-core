@@ -1,0 +1,10 @@
+# Python dependencies for the Ranvier integration tests (run on the host that
+# drives docker-compose; install with: pip install -r requirements.txt).
+#
+# requests is used by the whole suite (conftest.py). grpcio + grpcio-tools are
+# only needed by the GIE EPP test / microbenchmark (test_gie_epp.py,
+# epp_client.py) — those skip automatically if grpc is absent, so the rest of
+# the suite runs without them.
+requests>=2.28
+grpcio>=1.48
+grpcio-tools>=1.48

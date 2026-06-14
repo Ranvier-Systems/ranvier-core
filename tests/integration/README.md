@@ -58,8 +58,22 @@ The integration tests use Docker Compose to spin up a 3-node Ranvier cluster wit
 - Docker and Docker Compose
 - Python 3.8+
 - `requests` library (`pip install requests`)
+- For the GIE EPP test/benchmark only: `grpcio` + `grpcio-tools`
+  (`pip install -r tests/integration/requirements.txt`). The EPP test
+  (`test_gie_epp.py`) skips automatically when these are absent.
 
 ## Running Tests
+
+### GIE Endpoint-Picker (EPP)
+
+`test_gie_epp.py` is standalone (its own `docker-compose.epp-test.yml`, a
+`WITH_GIE_EPP=ON` node + mock backend) and is **not** part of the default
+multi-node suite. Run it and its overhead microbenchmark with:
+
+```bash
+make test-epp     # drive the running ext_proc server via gRPC, assert behaviour
+make bench-epp    # per-request EPP routing-overhead microbenchmark
+```
 
 ### Quick Start
 
