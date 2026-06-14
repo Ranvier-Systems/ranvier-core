@@ -1,6 +1,8 @@
 # Inline vs. Sidecar (GIE EPP) Routing-Overhead A/B — Scope
 
-**Status:** scoping memo — gates the implementation PR. Not started.
+**Status:** scoping memo. **Phase 1 implemented** (mock-backend 3-arm A/B) — see
+[inline-vs-sidecar-ab-benchmark.md](inline-vs-sidecar-ab-benchmark.md) and
+`make bench-inline-vs-sidecar`. Phase 2 (vLLM realism) not started.
 **Date:** 2026-06-14
 **Context:** BACKLOG §20.2 P1.4 ("pair with a published benchmark of inline
 routing vs. a sidecar ext_proc EPP hop, measuring the absolute per-request

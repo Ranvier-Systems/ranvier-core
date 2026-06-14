@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean gie-epp-build gie-epp-test gie-epp-clean test-epp bench-epp
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean gie-epp-build gie-epp-test gie-epp-clean test-epp bench-epp bench-inline-vs-sidecar
 
 # Default target
 all: build
@@ -298,6 +298,12 @@ test-epp:
 # Pass driver flags via BENCH_EPP_ARGS, e.g. BENCH_EPP_ARGS="--requests 5000".
 bench-epp:
 	@./scripts/bench-epp-overhead.sh $(BENCH_EPP_ARGS)
+
+# Inline vs. sidecar (GIE EPP) routing-overhead A/B: 3 arms (inline / plain
+# Envoy / Envoy+ext_proc) over one mock backend; reports the per-request
+# latency deltas. Pass driver flags via BENCH_AB_ARGS.
+bench-inline-vs-sidecar:
+	@./scripts/bench-inline-vs-sidecar.sh $(BENCH_AB_ARGS)
 
 # Run all tests
 test: test-unit
@@ -1051,6 +1057,7 @@ help:
 	@echo "  make gie-epp-clean  - Remove the gie-epp build directory"
 	@echo "  make test-epp       - Integration test: drive the running EPP via gRPC (Docker)"
 	@echo "  make bench-epp      - EPP overhead microbenchmark (BENCH_EPP_ARGS=...)"
+	@echo "  make bench-inline-vs-sidecar - Inline vs Envoy+EPP A/B (BENCH_AB_ARGS=...)"
 	@echo ""
 	@echo "Production Readiness Validation:"
 	@echo "  make validate       - Run full validation suite (all 4 tests)"

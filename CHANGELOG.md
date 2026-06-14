@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Inline-vs-sidecar EPP overhead A/B — scope + Phase 1** (BACKLOG §20.2 P1.4
+  follow-up) — The headline benchmark: per-request latency of serving through a
+  GIE gateway that delegates to Ranvier's EPP vs. Ranvier's inline data plane. A
+  scope memo (`docs/benchmarks/inline-vs-sidecar-ab-scope.md`) gates it; Phase 1
+  ships a 3-arm, single-backend, single-stream harness — **inline** (Ranvier
+  `:8080`), **plain Envoy**, and **Envoy + ext_proc(EPP)** — so the ext_proc
+  overhead (`C − B`) is isolated from "Envoy proxies vs Ranvier proxies"
+  (`B − A`). New `docker-compose.epp-ab.yml` (one EPP-enabled Ranvier serving
+  both planes + Envoy with two listeners from `tests/integration/envoy/bench-bootstrap.yaml`
+  + the mock backend), `tests/integration/http_ab_load.py`,
+  `scripts/bench-inline-vs-sidecar.sh` (prints per-arm percentiles + deltas),
+  and `docs/benchmarks/inline-vs-sidecar-ab-benchmark.md`. `make
+  bench-inline-vs-sidecar`. Mock backend by design (isolates the µs–ms hop from
+  100s-of-ms inference); the vLLM realism pass is the GPU-gated Phase 2. No
+  core/runtime change.
+
 - **GIE EPP integration test + overhead microbenchmark** (BACKLOG §20.2 P1.4
   follow-up) — A gRPC `ext_proc` client (`tests/integration/epp_client.py`,
   stubs generated at runtime from `proto/ext_proc_min.proto`) that drives a real

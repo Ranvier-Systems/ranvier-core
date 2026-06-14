@@ -1,0 +1,86 @@
+# Compose for the inline-vs-sidecar EPP overhead A/B (BACKLOG §20.2 P1.4).
+# Three ingresses over ONE backend + ONE Ranvier:
+#   arm A (inline)      -> ranvier :8080            (host 8101)
+#   arm B (plain Envoy) -> envoy   :10000           (host 8102)
+#   arm C (Envoy+EPP)   -> envoy   :10001 -> ext_proc -> ranvier :9002 (host 8103)
+# The single EPP-enabled Ranvier serves BOTH the inline data plane (arm A) and
+# the ext_proc picker (arm C); Envoy reaches the backend + EPP by service DNS.
+#
+# Distinct subnet (172.30/16) + host ports so it can run alongside the other
+# test composes. Not runnable in the sandbox — run on a Docker host.
+
+networks:
+  ranvier-epp-ab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+
+services:
+  mock-backend:
+    image: ranvier-mock-backend:latest
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.mock-backend
+    container_name: epp-ab-backend
+    networks:
+      ranvier-epp-ab:
+        ipv4_address: 172.30.1.10
+    ports:
+      - "21438:8000"
+    environment:
+      - BACKEND_ID=1
+
+  # EPP-enabled Ranvier (also serves the inline data plane), from the
+  # Dockerfile.gie-epp builder stage (ranvier_server built WITH_GIE_EPP=ON).
+  ranvier:
+    image: ranvier-gie-epp:builder
+    build:
+      context: .
+      dockerfile: Dockerfile.gie-epp
+      target: builder
+    container_name: epp-ab-ranvier
+    working_dir: /src/build
+    cap_add:
+      - IPC_LOCK
+    networks:
+      ranvier-epp-ab:
+        ipv4_address: 172.30.2.1
+    ports:
+      - "8101:8080"     # arm A: inline data-plane ingress
+      - "9192:9180"     # metrics (healthcheck + registration readiness)
+                        # :9002 (EPP) stays internal — Envoy reaches it by DNS
+    environment:
+      - LD_LIBRARY_PATH=/src/build
+      - RANVIER_GIE_EPP_ENABLED=true
+      - RANVIER_GIE_EPP_PORT=9002
+      - RANVIER_GIE_EPP_LISTEN_ADDRESS=0.0.0.0
+      - RANVIER_TOKENIZER_PATH=/src/assets/gpt2.json
+      - RANVIER_MIN_TOKEN_LENGTH=2
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M", "--config", "/tmp/ranvier.yaml"]
+    depends_on:
+      - mock-backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    container_name: epp-ab-envoy
+    networks:
+      ranvier-epp-ab:
+        ipv4_address: 172.30.3.1
+    ports:
+      - "8102:10000"    # arm B: plain Envoy ingress
+      - "8103:10001"    # arm C: Envoy + ext_proc ingress
+      - "9901:9901"     # Envoy admin
+    volumes:
+      - ./tests/integration/envoy/bench-bootstrap.yaml:/etc/envoy/envoy.yaml:ro
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "warn"]
+    depends_on:
+      - ranvier
+      - mock-backend
