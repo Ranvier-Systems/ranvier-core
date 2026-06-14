@@ -124,19 +124,25 @@ inert.
 ## Building & testing
 
 The EPP is **off by default** (`WITH_GIE_EPP=OFF`), so the production image and
-the standard unit-test lane never compile the gRPC server. Two layers of
+the standard unit-test lane never compile the gRPC server. Three layers of
 coverage close the gap without flipping the default:
 
 - **Decision logic — always covered.** `tests/unit/gie_epp_test.cpp` is pure
   (no gRPC/Seastar deps) and is part of the `unit_tests` aggregate, so it runs
   in the normal **Unit Tests** CI lane and any local `make test-unit` — the
-  endpoint formatting and the set-endpoint-vs-503 branch are guarded on every
-  push regardless of the flag.
+  endpoint formatting, the set-endpoint-vs-503 branch, and the Rule #4 body cap
+  are guarded on every push regardless of the flag.
 - **gRPC path — dedicated lane.** `Dockerfile.gie-epp` builds
   `WITH_GIE_EPP=ON` (compiling + linking `gie_epp_server.cpp` and running the
   ext_proc proto codegen), and `.github/workflows/gie-epp-tests.yml` runs
   `ctest` over that build after each Docker Publish. This is the compile/link
   regression guard for the gRPC server, mirroring the sanitizer/fuzz lanes.
+- **End-to-end behaviour.** `make test-epp`
+  (`tests/integration/test_gie_epp.py` + `docker-compose.epp-test.yml`) drives a
+  real running EPP via a gRPC `ext_proc` client (`epp_client.py`) and asserts the
+  503 / header / `dynamic_metadata` / bodyless paths. The same client backs the
+  overhead microbenchmark (`make bench-epp`, see
+  [`../benchmarks/epp-overhead-microbenchmark.md`](../benchmarks/epp-overhead-microbenchmark.md)).
 
 The build toolchain (`grpc-devel`, `grpc-plugins`, `protobuf-compiler`) lives in
 `Dockerfile.base`, so it is *available* for an EPP build without being linked

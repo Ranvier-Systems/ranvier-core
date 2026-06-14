@@ -1,0 +1,80 @@
+# Standalone compose for the GIE Endpoint-Picker (EPP) integration test +
+# overhead microbenchmark. Separate from docker-compose.test.yml because the
+# EPP needs a Ranvier built WITH_GIE_EPP=ON (the production image is OFF) and a
+# gRPC port; kept isolated so the main cluster harness stays gRPC-free.
+#
+# The Ranvier service runs straight from the Dockerfile.gie-epp *builder* stage
+# (it already has ranvier_server built WITH_GIE_EPP=ON plus its libs on the
+# build-tree RPATH), so no separate runtime image / lib-collection is needed.
+#
+# Distinct subnet (172.29/16) and host ports (8091/9191/9002/21437) so it can
+# run alongside docker-compose.test.yml (172.28/16) without collisions.
+#
+# Build constraint: requires Docker + a WITH_GIE_EPP=ON build. Not runnable in
+# the sandbox — the developer runs it in their Docker environment.
+
+networks:
+  ranvier-epp-test:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+
+services:
+  # Mock OpenAI-compatible backend the EPP will hand requests to. Sets
+  # X-Backend-ID on every response (see tests/integration/mock_backend.py).
+  epp-backend:
+    image: ranvier-mock-backend:latest
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.mock-backend
+    container_name: epp-backend
+    networks:
+      ranvier-epp-test:
+        ipv4_address: 172.29.1.10
+    ports:
+      - "21437:8000"
+    environment:
+      - BACKEND_ID=1
+
+  # EPP-enabled Ranvier, run from the gie-epp builder image.
+  ranvier-epp:
+    image: ranvier-gie-epp:builder
+    build:
+      context: .
+      dockerfile: Dockerfile.gie-epp
+      target: builder
+    container_name: ranvier-epp
+    working_dir: /src/build
+    cap_add:
+      - IPC_LOCK          # Seastar memory locking (mlock/mlockall)
+    networks:
+      ranvier-epp-test:
+        ipv4_address: 172.29.2.1
+    ports:
+      - "8091:8080"       # admin/data HTTP API (register backends here)
+      - "9191:9180"       # Prometheus metrics (healthcheck)
+      - "9002:9002"       # GIE EPP ext_proc gRPC
+    environment:
+      # Build-tree libs (Seastar at /usr/local/lib; ranvier/OTel built libs in
+      # the build dir) — RPATH should cover these, LD_LIBRARY_PATH is insurance.
+      - LD_LIBRARY_PATH=/src/build
+      # EPP on, listening on 9002.
+      - RANVIER_GIE_EPP_ENABLED=true
+      - RANVIER_GIE_EPP_PORT=9002
+      - RANVIER_GIE_EPP_LISTEN_ADDRESS=0.0.0.0
+      # Tokenizer model ships under /src/assets in the builder image; with it
+      # loaded the EPP routes prefix-aware, without it it falls back to
+      # load/hash (the test asserts an endpoint is returned either way).
+      - RANVIER_TOKENIZER_PATH=/src/assets/gpt2.json
+      - RANVIER_MIN_TOKEN_LENGTH=2
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M", "--config", "/tmp/ranvier.yaml"]
+    depends_on:
+      - epp-backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s

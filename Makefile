@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean gie-epp-build gie-epp-test gie-epp-clean
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean gie-epp-build gie-epp-test gie-epp-clean test-epp bench-epp
 
 # Default target
 all: build
@@ -281,6 +281,23 @@ gie-epp-test: gie-epp-build
 
 gie-epp-clean:
 	@rm -rf $(GIE_EPP_BUILD_DIR)
+
+# GIE EPP integration test: drives the running ext_proc gRPC server end-to-end
+# (docker-compose.epp-test.yml builds a WITH_GIE_EPP=ON node + mock backend).
+# Needs Docker + Python grpcio/grpcio-tools (installed on demand).
+test-epp:
+	@echo "Running GIE EPP integration test..."
+	@if ! python3 -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    echo "Installing Python gRPC tooling (tests/integration/requirements.txt)..."; \
+	    pip3 install --user -r tests/integration/requirements.txt || \
+	    pip install --user -r tests/integration/requirements.txt; \
+	fi
+	@python3 -m pytest tests/integration/test_gie_epp.py -v -s
+
+# GIE EPP overhead microbenchmark (per-request ext_proc routing-decision cost).
+# Pass driver flags via BENCH_EPP_ARGS, e.g. BENCH_EPP_ARGS="--requests 5000".
+bench-epp:
+	@./scripts/bench-epp-overhead.sh $(BENCH_EPP_ARGS)
 
 # Run all tests
 test: test-unit
@@ -1032,6 +1049,8 @@ help:
 	@echo "  make gie-epp-build  - Configure + build WITH_GIE_EPP=ON (needs gRPC + protoc)"
 	@echo "  make gie-epp-test   - Build + run ctest with the EPP gRPC path compiled"
 	@echo "  make gie-epp-clean  - Remove the gie-epp build directory"
+	@echo "  make test-epp       - Integration test: drive the running EPP via gRPC (Docker)"
+	@echo "  make bench-epp      - EPP overhead microbenchmark (BENCH_EPP_ARGS=...)"
 	@echo ""
 	@echo "Production Readiness Validation:"
 	@echo "  make validate       - Run full validation suite (all 4 tests)"

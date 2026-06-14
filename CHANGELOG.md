@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **GIE EPP integration test + overhead microbenchmark** (BACKLOG §20.2 P1.4
+  follow-up) — A gRPC `ext_proc` client (`tests/integration/epp_client.py`,
+  stubs generated at runtime from `proto/ext_proc_min.proto`) that drives a real
+  running EPP and is shared by both a new integration test and a microbenchmark.
+  `tests/integration/test_gie_epp.py` (+ `docker-compose.epp-test.yml`, a
+  standalone `WITH_GIE_EPP=ON` node from the `Dockerfile.gie-epp` builder stage +
+  a mock backend) asserts the end-to-end picker behaviour the unit/CI coverage
+  couldn't: `ImmediateResponse` 503 with no backend, the
+  `x-gateway-destination-endpoint` header (+ matching `dynamic_metadata`) once a
+  backend is registered, and bodyless (headers-EOS) routing. The
+  `epp-overhead` microbenchmark (`scripts/bench-epp-overhead.sh` →
+  `tests/integration/epp_microbench.py`, methodology in
+  `docs/benchmarks/epp-overhead-microbenchmark.md`) reports the per-request
+  ext_proc routing-decision + bridge latency. New `make test-epp` / `make
+  bench-epp`; Python gRPC deps in `tests/integration/requirements.txt` (the
+  suite skips the EPP test when they're absent). No core/runtime change.
+
 - **GIE Endpoint-Picker (EPP) ext_proc mode — part 2: prefix-aware routing**
   (BACKLOG §20.2 P1.4, completing the item) — The picker now routes on the
   actual prompt instead of part 1's header-level load/hash. It captures the
