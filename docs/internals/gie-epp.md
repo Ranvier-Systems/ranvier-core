@@ -113,6 +113,12 @@ container, which carries the gRPC toolchain and the pre-built `/deps`):
 make gie-epp-test     # configure WITH_GIE_EPP=ON, build ranvier_server + tests, run ctest
 ```
 
+The local target builds `WITH_KV_EVENTS=OFF` so it needs only the gRPC
+toolchain, not libzmq — KV events is orthogonal and has its own coverage. The
+CI lane (`Dockerfile.gie-epp`) builds the full EPP + KV combination. Pass
+`make gie-epp-test GIE_EPP_KV_EVENTS=ON` to build both locally (needs
+`zeromq-devel`).
+
 Or by hand: `cmake -B build -DWITH_GIE_EPP=ON && cmake --build build && (cd build && ctest)`
 — note `WITH_GIE_EPP` is a CMake configure option, so it must be set at the
 `cmake` step, not passed to `ninja`/`make`. If the gRPC packages are missing,

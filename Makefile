@@ -235,6 +235,9 @@ sanitize-clean:
 # a full build. For a quick check of just the EPP decision logic without gRPC,
 # `make test-unit` already runs the pure gie_epp_test (always built).
 GIE_EPP_BUILD_DIR := build-gie-epp
+# WITH_KV_EVENTS for the EPP loop. Default OFF so the EPP target needs only the
+# gRPC toolchain (not libzmq). Set GIE_EPP_KV_EVENTS=ON to build both features.
+GIE_EPP_KV_EVENTS ?= OFF
 
 gie-epp-build:
 	@command -v protoc >/dev/null 2>&1 || { \
@@ -262,7 +265,11 @@ gie-epp-build:
 	@echo "Configuring WITH_GIE_EPP=ON..."
 	@# Reuse pre-built deps from the base image's /deps when present (fast path
 	@# in-container); fall back to FetchContent clones outside it.
-	@cmake -B $(GIE_EPP_BUILD_DIR) -DWITH_GIE_EPP=ON -DCMAKE_BUILD_TYPE=Release \
+	@# WITH_KV_EVENTS=OFF keeps this EPP-focused loop from requiring libzmq — KV
+	@# events is an orthogonal optional feature with its own coverage, and the CI
+	@# lane (Dockerfile.gie-epp) builds the full EPP+KV combination. Override with
+	@# `make gie-epp-test GIE_EPP_KV_EVENTS=ON` if you have zeromq-devel and want both.
+	@cmake -B $(GIE_EPP_BUILD_DIR) -DWITH_GIE_EPP=ON -DWITH_KV_EVENTS=$(GIE_EPP_KV_EVENTS) -DCMAKE_BUILD_TYPE=Release \
 	    $(if $(wildcard /deps/tokenizers-cpp),-DFETCHCONTENT_SOURCE_DIR_TOKENIZERS_CPP=/deps/tokenizers-cpp,) \
 	    $(if $(wildcard /deps/opentelemetry-cpp),-DFETCHCONTENT_SOURCE_DIR_OPENTELEMETRY-CPP=/deps/opentelemetry-cpp,) \
 	    $(if $(wildcard /deps/rapidjson),-DFETCHCONTENT_SOURCE_DIR_RAPIDJSON=/deps/rapidjson,)
