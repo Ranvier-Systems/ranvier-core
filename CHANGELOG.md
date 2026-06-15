@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Response-side usage accounting — Phase 1: capture actuals** (§20.2
+  P1.5/P1.6 follow-up) — The usage-ledger sink and the `request_attribution`
+  SQLite row now record the engine's **authoritative** token counts when the
+  response carries them, instead of always using pre-flight estimates. A pure
+  scanner (`src/response_usage_parser.hpp`) snoops the response `usage` object
+  from the proxied stream (non-streaming body, or the final SSE event when
+  `stream_options.include_usage` is set) at the existing `StreamParser` hook;
+  the terminal attribution/ledger path prefers actuals, **recomputes cost** from
+  them, and falls back to estimates otherwise. A new `tokens_estimated` flag on
+  `UsageEvent` + `LogRequestOp` + the `request_attribution` row (additive SQLite
+  migration, defaults to `1`/estimated for existing rows) tells billing
+  consumers which they got. Streaming responses without `include_usage` still
+  fall back to estimates — injecting `include_usage` to force actuals, and the
+  GenAI span's `gen_ai.usage.output_tokens` (needs a span-lifecycle change), are
+  the documented follow-ups (`docs/architecture/response-usage-accounting.md`).
+  No behaviour change when the response has no usage.
+
 - **Inline-vs-sidecar EPP overhead A/B — scope + Phase 1** (BACKLOG §20.2 P1.4
   follow-up) — The headline benchmark: per-request latency of serving through a
   GIE gateway that delegates to Ranvier's EPP vs. Ranvier's inline data plane. A

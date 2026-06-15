@@ -11,14 +11,15 @@
 // structural usage figures (token counts, cost, status, latency) needed to
 // meter, bill, or attribute. Anything richer belongs outside core.
 //
-// HONESTY NOTE ON TOKEN COUNTS: input_tokens / output_tokens / cost_units are
-// the same ESTIMATES the existing per-API-key attribution path records
-// (CostEstimate: input from tokenized/char heuristics, output from the
-// request's max_tokens or a multiplier). Ranvier does not parse the upstream
-// response `usage` object today, so these are pre-flight estimates, not
-// engine-reported actuals. A sink that needs billing-grade actuals must source
-// them from the engine; wiring response-side usage into core is a separate,
-// larger change (the same response-side data deferred from the P1.6 trace span).
+// NOTE ON TOKEN COUNTS: input_tokens / output_tokens / cost_units are the
+// engine's authoritative response `usage` when it was available (snooped from
+// the response during streaming), and otherwise the pre-flight estimates the
+// per-API-key attribution path computes (CostEstimate: input from
+// tokenized/char heuristics, output from the request's max_tokens or a
+// multiplier). The `tokens_estimated` flag below says which — a streaming
+// response without stream_options.include_usage carries no usage, so those fall
+// back to estimates. Billing consumers should branch on `tokens_estimated`
+// rather than assume. See docs/architecture/response-usage-accounting.md.
 //
 // =============================================================================
 // FORWARD-COMPATIBILITY CONTRACT
@@ -88,10 +89,17 @@ struct UsageEvent {
     int32_t status_code  = 0;   // backend HTTP status, or synthesized proxy code
     int32_t latency_ms   = 0;   // end-to-end request latency
 
-    // ---- Usage figures (ESTIMATES — see HONESTY NOTE at top) ----
+    // ---- Usage figures ----
     int64_t input_tokens  = 0;
     int64_t output_tokens = 0;
     double  cost_units    = 0.0;
+
+    // True when the figures above are pre-flight ESTIMATES, false when they are
+    // the engine's authoritative response `usage` (forward-compat append; see
+    // the HONESTY NOTE at the top of this file). A billing consumer should check
+    // this rather than assume — estimates and actuals can both appear depending
+    // on whether the response carried usage.
+    bool tokens_estimated = true;
 };
 
 }  // namespace ranvier

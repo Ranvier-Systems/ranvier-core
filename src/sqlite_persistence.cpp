@@ -112,7 +112,8 @@ bool SqlitePersistence::create_tables() {
             latency_ms    INTEGER NOT NULL,
             input_tokens  INTEGER NOT NULL,
             output_tokens INTEGER NOT NULL,
-            cost_units    REAL    NOT NULL
+            cost_units    REAL    NOT NULL,
+            tokens_estimated INTEGER NOT NULL DEFAULT 1
         )
     )";
     const char* idx_key_ts_sql = R"(
@@ -126,6 +127,12 @@ bool SqlitePersistence::create_tables() {
     if (!exec_sql(request_attribution_sql) || !exec_sql(idx_key_ts_sql) || !exec_sql(idx_ts_sql)) {
         return false;
     }
+    // tokens_estimated column added 2026-06-15 (response-usage accounting,
+    // §20.2 P1.5/P1.6 follow-up). The CREATE above carries it for fresh DBs;
+    // this ALTER adds it to request_attribution tables created since P1.5.
+    // Existing rows default to 1 (estimated) — which is what they were. ALTER
+    // ADD COLUMN is idempotent-safe (the re-run fails harmlessly).
+    exec_sql("ALTER TABLE request_attribution ADD COLUMN tokens_estimated INTEGER NOT NULL DEFAULT 1");
 
     return true;
 }
@@ -562,8 +569,9 @@ bool SqlitePersistence::log_request(const RequestAttributionRecord& rec) {
     const char* sql =
         "INSERT INTO request_attribution "
         "(request_id, api_key_id, timestamp_ms, endpoint, backend_id, "
-        " status_code, latency_ms, input_tokens, output_tokens, cost_units) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        " status_code, latency_ms, input_tokens, output_tokens, cost_units, "
+        " tokens_estimated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) return false;
@@ -582,6 +590,7 @@ bool SqlitePersistence::log_request(const RequestAttributionRecord& rec) {
     sqlite3_bind_int64 (stmt, 8, rec.input_tokens);
     sqlite3_bind_int64 (stmt, 9, rec.output_tokens);
     sqlite3_bind_double(stmt,10, rec.cost_units);
+    sqlite3_bind_int   (stmt,11, rec.tokens_estimated ? 1 : 0);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);

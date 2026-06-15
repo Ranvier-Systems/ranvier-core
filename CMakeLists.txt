@@ -663,6 +663,21 @@ target_link_libraries(gie_epp_test
 )
 gtest_discover_tests(gie_epp_test)
 
+# Response-usage parser unit tests: extracting the engine's authoritative
+# `usage` from non-streaming bodies + streaming SSE blobs (src/response_usage_parser.hpp).
+# Pure / dependency-free.
+add_executable(response_usage_parser_test
+  tests/unit/response_usage_parser_test.cpp
+)
+target_include_directories(response_usage_parser_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(response_usage_parser_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(response_usage_parser_test)
+
 # NodeSlab Unit Tests (Pure C++, no Seastar dependency)
 # Tests slab allocator: allocate/free round-trips, free-list integrity,
 # peak tracking, auto-growth, and make_node factory methods.

@@ -162,6 +162,16 @@ struct ProxyContext {
     uint64_t estimated_output_tokens = 0;  // max_tokens from request, or input * output_multiplier
     double estimated_cost_units = 0.0;     // input + (output * output_multiplier)
 
+    // Engine-reported actual usage, snooped from the response `usage` object
+    // during streaming (§20.2 P1.5/P1.6 follow-up). When present, the terminal
+    // attribution/ledger path prefers these over the estimates above and
+    // recomputes cost. actual_usage_present stays false for streaming responses
+    // that don't carry usage (no stream_options.include_usage), falling back to
+    // estimates. See src/response_usage_parser.hpp.
+    int64_t actual_input_tokens = 0;
+    int64_t actual_output_tokens = 0;
+    bool    actual_usage_present = false;
+
     // Priority tier (populated by extract_priority before routing)
     PriorityLevel priority = PriorityLevel::NORMAL;
 
