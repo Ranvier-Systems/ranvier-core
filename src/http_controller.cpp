@@ -6,6 +6,7 @@
 #include "parse_utils.hpp"
 #include "request_rewriter.hpp"
 #include "request_timeout.hpp"
+#include "response_usage_parser.hpp"
 #include "shard_load_metrics.hpp"
 #include "text_validator.hpp"
 #include "tracing_service.hpp"
@@ -1060,6 +1061,18 @@ future<> HttpController::stream_backend_response(
         // errors (429/500/etc.) are recorded accurately.
         if (res.backend_status_code != 0 && ctx->backend_status_code == 0) {
             ctx->backend_status_code = res.backend_status_code;
+        }
+
+        // Snoop the engine's authoritative token usage from the response (§20.2
+        // P1.5/P1.6 follow-up): the `usage` object rides the non-streaming body
+        // or the final SSE event (present when stream_options.include_usage was
+        // set). Last-seen wins; when never present we fall back to estimates at
+        // the terminal block. Pure scan, off the TTFT-critical path.
+        if (auto usage = parse_response_usage(
+                std::string_view(res.data.data(), res.data.size()))) {
+            ctx->actual_input_tokens  = usage->prompt_tokens;
+            ctx->actual_output_tokens = usage->completion_tokens;
+            ctx->actual_usage_present = true;
         }
 
         // Snooping Logic - record success and learn route
@@ -2504,12 +2517,29 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                 // (consistent with the success branch in phase 4).
                 status_code = 200;
             }
-            // Token/cost figures are the pre-flight ESTIMATES (the codebase does
-            // not parse the upstream response `usage`) — see
-            // usage_ledger_schema.hpp HONESTY NOTE.
-            const int64_t input_tokens  = static_cast<int64_t>(ctx->estimated_input_tokens);
-            const int64_t output_tokens = static_cast<int64_t>(ctx->estimated_output_tokens);
-            const double  cost_units    = ctx->estimated_cost_units;
+            // Prefer the engine's authoritative usage (snooped from the response
+            // `usage` object during streaming) over the pre-flight estimates;
+            // recompute cost from actual tokens with the same model as
+            // estimate_request_cost(). tokens_estimated records which figures
+            // these are so a billing consumer can tell actual from estimated.
+            // Streaming responses without stream_options.include_usage carry no
+            // usage, so we fall back to estimates. (§20.2 P1.5/P1.6 follow-up.)
+            int64_t input_tokens;
+            int64_t output_tokens;
+            double  cost_units;
+            bool    tokens_estimated;
+            if (ctx->actual_usage_present) {
+                input_tokens  = ctx->actual_input_tokens;
+                output_tokens = ctx->actual_output_tokens;
+                cost_units    = static_cast<double>(input_tokens)
+                    + static_cast<double>(output_tokens) * _config.cost_estimation_output_multiplier;
+                tokens_estimated = false;
+            } else {
+                input_tokens  = static_cast<int64_t>(ctx->estimated_input_tokens);
+                output_tokens = static_cast<int64_t>(ctx->estimated_output_tokens);
+                cost_units    = ctx->estimated_cost_units;
+                tokens_estimated = true;
+            }
 
             // Silently dropped when attribution_persistence_enabled is false.
             if (_persistence != nullptr) {
@@ -2524,6 +2554,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                 op.input_tokens  = input_tokens;
                 op.output_tokens = output_tokens;
                 op.cost_units    = cost_units;
+                op.tokens_estimated = tokens_estimated;
                 _persistence->queue_log_request(std::move(op));
             }
 
@@ -2541,6 +2572,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                 ev.input_tokens  = input_tokens;
                 ev.output_tokens = output_tokens;
                 ev.cost_units    = cost_units;
+                ev.tokens_estimated = tokens_estimated;
                 // Contract: record() must not throw. Guard defensively and log
                 // at warn (Rule #9) so a misbehaving sink can never corrupt
                 // request completion.

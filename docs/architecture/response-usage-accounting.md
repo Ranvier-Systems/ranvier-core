@@ -1,6 +1,9 @@
 # Response-Side Usage Accounting (actuals, not estimates) — Scope
 
-**Status:** scoping memo — gates the implementation PR. Not started.
+**Status:** scoping memo. **Phase 1 implemented** (ledger/attribution actuals +
+`tokens_estimated` flag + cost recompute; capture-when-present). The
+`stream_options.include_usage` injection and the Phase-2 span output-tokens are
+not yet done — see §4.
 **Date:** 2026-06-15
 **Context:** follow-up to the usage-ledger sink (§20.2 P1.5) and the GenAI
 trace span (§20.2 P1.6), both of which currently record **pre-flight

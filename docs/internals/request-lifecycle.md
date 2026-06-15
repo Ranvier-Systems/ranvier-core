@@ -343,15 +343,18 @@ After streaming completes:
    sink contract.
 2a. **Request attribution + usage ledger** (optional, independent) — the same
    terminal block computes one set of per-request outcome values (status code,
-   latency, backend, estimated tokens/cost) and feeds two independent opt-in
+   latency, backend, tokens/cost) and feeds two independent opt-in
    consumers: the `request_attribution` SQLite row (when `_persistence` and
    `attribution.persistence_enabled`) and the **usage-ledger sink** (when
    `usage_ledger.enabled`). The sink's `record()` is shard-local, synchronous,
    and non-blocking — one `UsageEvent` per request to a per-shard sink instance;
    the stock build wires `NoopUsageLedgerSink`. Unlike the telemetry sink the
    event carries the attribution identifiers (`api_key_id`, `request_id`), but
-   still no content. Token/cost are pre-flight estimates (the response `usage`
-   is not parsed). When neither consumer is active the whole block is skipped
+   still no content. Token/cost are the engine's **actual** response `usage` when
+   it was captured (snooped during streaming), else pre-flight estimates — the
+   `tokens_estimated` flag says which (see
+   [response-usage-accounting.md](../architecture/response-usage-accounting.md)).
+   When neither consumer is active the whole block is skipped
    (one null check). See [`src/usage_ledger_sink.hpp`](../../src/usage_ledger_sink.hpp)
    for the contract and [`src/usage_ledger_schema.hpp`](../../src/usage_ledger_schema.hpp)
    for the event schema.

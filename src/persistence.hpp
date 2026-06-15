@@ -60,6 +60,7 @@ struct RequestAttributionRecord {
     int64_t     input_tokens = 0;
     int64_t     output_tokens = 0;
     double      cost_units = 0.0;
+    bool        tokens_estimated = true;  // false = engine-reported response usage
 };
 
 // Aggregated row for /admin/keys/usage responses. Computed in C++ from a

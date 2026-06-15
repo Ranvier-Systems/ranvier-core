@@ -506,6 +506,7 @@ void AsyncPersistenceManager::execute(LogRequestOp& op, RouteAccumulator& routes
     rec.input_tokens  = op.input_tokens;
     rec.output_tokens = op.output_tokens;
     rec.cost_units    = op.cost_units;
+    rec.tokens_estimated = op.tokens_estimated;
 
     if (_store->log_request(rec)) {
         _ops_processed++;
