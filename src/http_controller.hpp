@@ -259,6 +259,7 @@ struct HttpControllerConfig {
     bool cost_estimation_enabled = true;               // Enable cost estimation
     double cost_estimation_output_multiplier = 2.0;    // Default output token multiplier
     uint64_t cost_estimation_max_tokens = 1000000;     // Sanity cap on estimated tokens
+    bool inject_stream_usage = false;                  // Inject stream_options.include_usage to capture actual usage
 
     // Priority tier settings (copied from PriorityTierConfig at init)
     bool priority_tier_enabled = true;

@@ -1517,6 +1517,49 @@ TEST_F(RequestRewriterTest, BoundaryInfoModelAndMaxTokensCoexist) {
 }
 
 // =============================================================================
+// ensure_stream_include_usage — inject stream_options.include_usage for actual
+// response-usage accounting (§20.2 P1.5/P1.6 follow-up)
+// =============================================================================
+
+TEST_F(RequestRewriterTest, IncludeUsageAddedWhenAbsent) {
+    std::string body = R"({"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true})";
+    std::string out = RequestRewriter::ensure_stream_include_usage(body);
+    EXPECT_NE(out.find("\"stream_options\""), std::string::npos);
+    EXPECT_NE(out.find("\"include_usage\":true"), std::string::npos);
+}
+
+TEST_F(RequestRewriterTest, IncludeUsageAddedIntoExistingStreamOptions) {
+    std::string body = R"({"model":"m","stream_options":{"continuous_usage_stats":true}})";
+    std::string out = RequestRewriter::ensure_stream_include_usage(body);
+    EXPECT_NE(out.find("\"include_usage\":true"), std::string::npos);
+    // The pre-existing stream_options field is preserved.
+    EXPECT_NE(out.find("\"continuous_usage_stats\""), std::string::npos);
+}
+
+TEST_F(RequestRewriterTest, IncludeUsageRespectsClientTrue) {
+    // Client already opted in — return unchanged (no duplicate / re-serialize).
+    std::string body = R"({"stream_options":{"include_usage":true}})";
+    EXPECT_EQ(RequestRewriter::ensure_stream_include_usage(body), body);
+}
+
+TEST_F(RequestRewriterTest, IncludeUsageRespectsClientFalse) {
+    // Client explicitly opted out — must NOT override to true.
+    std::string body = R"({"stream_options":{"include_usage":false}})";
+    EXPECT_EQ(RequestRewriter::ensure_stream_include_usage(body), body);
+}
+
+TEST_F(RequestRewriterTest, IncludeUsageParseFailureReturnsInput) {
+    std::string body = "this is not json";
+    EXPECT_EQ(RequestRewriter::ensure_stream_include_usage(body), body);
+}
+
+TEST_F(RequestRewriterTest, IncludeUsageMalformedStreamOptionsUnchanged) {
+    // stream_options present but not an object — leave the (already weird) body.
+    std::string body = R"({"stream_options":42})";
+    EXPECT_EQ(RequestRewriter::ensure_stream_include_usage(body), body);
+}
+
+// =============================================================================
 // Token injection + strip round-trip tests
 // =============================================================================
 // These tests verify the strip_prompt_token_ids path used when forwarding to

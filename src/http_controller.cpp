@@ -1888,6 +1888,22 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
     }
 
+    // Response-usage accounting (§20.2 P1.5/P1.6 follow-up): for STREAMING
+    // requests, optionally inject stream_options.include_usage so the backend
+    // emits a final usage event, letting attribution/the usage ledger record
+    // ACTUAL tokens instead of estimates. Off by default (the client then sees
+    // an extra usage SSE chunk). Streaming is the default unless the client set
+    // stream:false; ensure_stream_include_usage() no-ops if the client already
+    // chose include_usage.
+    if (_config.inject_stream_usage) {
+        const bool client_stream_false =
+            body_view.find("\"stream\":false") != std::string_view::npos ||
+            body_view.find("\"stream\": false") != std::string_view::npos;
+        if (!client_stream_false) {
+            forwarded_body = RequestRewriter::ensure_stream_include_usage(forwarded_body);
+        }
+    }
+
     // Cost estimation: compute before routing so cost-based routing can use it.
     // estimate_request_cost() only needs text length and max_tokens — both available now.
     auto cost = _config.cost_estimation_enabled

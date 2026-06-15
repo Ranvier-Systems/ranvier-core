@@ -229,6 +229,14 @@ public:
     //   Modified body with prompt_token_ids removed, or original if not present
     static std::string strip_prompt_token_ids(std::string_view body);
 
+    // Ensure the forwarded request asks the backend for streaming usage:
+    // set stream_options.include_usage=true so the response carries a final
+    // usage event (which the proxy snoops for ACTUAL token accounting). Returns
+    // the body unchanged if the client already set include_usage (either value —
+    // respect their choice), if stream_options is present but not an object, or
+    // on parse failure. See docs/architecture/response-usage-accounting.md.
+    static std::string ensure_stream_include_usage(std::string_view body);
+
 private:
     // Internal helper to write token array to JSON
     static void write_token_array(rapidjson::Writer<rapidjson::StringBuffer>& writer,
@@ -829,6 +837,38 @@ inline std::string RequestRewriter::strip_prompt_token_ids(std::string_view body
     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
     doc.Accept(writer);
 
+    return std::string(buffer.GetString(), buffer.GetSize());
+}
+
+inline std::string RequestRewriter::ensure_stream_include_usage(std::string_view body) {
+    rapidjson::Document doc;
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return std::string(body);
+    }
+
+    auto& alloc = doc.GetAllocator();
+    auto it = doc.FindMember("stream_options");
+    if (it != doc.MemberEnd()) {
+        if (!it->value.IsObject()) {
+            // Malformed stream_options — don't risk rewriting it.
+            return std::string(body);
+        }
+        if (it->value.HasMember("include_usage")) {
+            // Client already chose (true or false) — respect it.
+            return std::string(body);
+        }
+        it->value.AddMember("include_usage", true, alloc);
+    } else {
+        rapidjson::Value opts(rapidjson::kObjectType);
+        opts.AddMember("include_usage", true, alloc);
+        doc.AddMember("stream_options", opts, alloc);
+    }
+
+    rapidjson::StringBuffer buffer;
+    buffer.Reserve(body.size() + 32);
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    doc.Accept(writer);
     return std::string(buffer.GetString(), buffer.GetSize());
 }
 
