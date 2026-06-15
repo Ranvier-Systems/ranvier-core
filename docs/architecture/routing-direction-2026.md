@@ -4,6 +4,9 @@
 > [BACKLOG.md](../../BACKLOG.md) (actionable items). VISION described the path from a prefix
 > router to an "intelligence layer"; this document records where ranvier-core's routing core
 > stands against the state of the art and the near-term engineering direction.
+>
+> Living document — last reviewed 2026-06-15. See §6 for how it is kept current and the
+> developments that warrant a closer look.
 
 ---
 
@@ -139,7 +142,66 @@ providers, don't build).
 - **Multi-provider shims + cost/quality model routing** — out of scope; general-purpose gateways
   own provider breadth, and research shows no model-router dominates all domains.
 
-## 6. Sources & prior art (dated; confidence noted)
+## 6. Review cadence & keeping this current
+
+This is a living document. A full landscape study is worth doing occasionally but not often:
+the ecosystem's architectural direction shifts over many months, so re-deriving it frequently
+surfaces little new signal while inviting roadmap churn and drawing attention away from our own
+work. We keep it current cheaply instead — a light periodic review, a short list of developments
+that warrant a closer look, and a small set of sources to follow.
+
+### Cadence
+
+- **Living doc.** Update the "last reviewed" date in the header and add a one-line changelog
+  entry below whenever this document is touched.
+- **Light review — quarterly, or alongside a release.** ~1–2 hours re-reading §2–§4 and updating
+  only "where we stand" and the gap list. This is a delta, not a fresh study; most cycles the
+  expected outcome is "direction unchanged."
+- **Full landscape study — roughly annually, or when a development below warrants it.**
+
+### Developments worth a closer look
+
+Observations that justify pulling the light review forward or opening a focused study — not
+alarms, just signs that an assumption recorded here may have moved:
+
+- A widely-adopted stack gains a capability that overlaps one of ranvier-core's distinguishing
+  characteristics — e.g., a mainstream router becomes deployable as a single binary without
+  Kubernetes, or a published measurement quantifies inline vs. sidecar endpoint-picker overhead
+  (a figure §4 notes as not currently published).
+- The interop standard evolves — the Gateway API Inference Extension adds conformance
+  expectations, CRDs, or versions worth tracking.
+- The underlying substrate changes — vLLM's native KV-event format changes, or a KV-offload
+  layer (LMCache, Mooncake, NIXL) becomes a common assumption for routing.
+- A newer approach reaches production maturity — e.g., cross-region / cross-datacenter KV routing
+  moving from research into shipping systems.
+
+### What the review asks
+
+The framing question is not "what have other projects added?" but "do the characteristics that
+make ranvier-core's approach distinct — inline routing latency, single-binary / no-Kubernetes
+operation, engine-agnostic support — still hold, and are they still useful to the people we
+serve?" Adding scope in response to any single development should clear a high bar; the roadmap
+exists to serve our users, and alignment with the ecosystem (e.g., the GIE compatibility mode in
+§4) is a means to that, not an end in itself.
+
+### Sources to follow
+
+The cheapest continuous signal is the release notes / changelogs of the projects listed in §7 —
+currently llm-d, the Gateway API Inference Extension, NVIDIA Dynamo, vLLM (including
+production-stack), SGLang, and AIBrix — together with the Kubernetes and OpenTelemetry GenAI
+release notes. Following those feeds tends to surface the developments above earlier than a
+calendar review would. A scheduled session could run just this delta — re-read this document,
+scan the watch-list release notes, and flag anything matching the list above — while leaving the
+judgment, and any roadmap changes, to a human review.
+
+### Changelog
+
+- 2026-06-15 — Added review cadence & signals (§6). Routing-parity work (BACKLOG §20) shipped and
+  closed; "where we stand" reflects native KV-event mode, the weighted scorer, prefill/decode
+  pool roles, the GIE EPP mode, and OTel GenAI attributes now in `main`.
+- 2026-06-07 — Initial direction & ecosystem-alignment write-up.
+
+## 7. Sources & prior art (dated; confidence noted)
 
 High confidence (multi-source + primary):
 - Kubernetes blog, *Introducing Gateway API Inference Extension*, 2025-06-05; GIE reached GA
