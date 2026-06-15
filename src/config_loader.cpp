@@ -635,6 +635,9 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint64_t>("RANVIER_COST_ESTIMATION_MAX_TOKENS")) {
         cost_estimation.max_estimated_tokens = *v;
     }
+    if (auto v = get_env("RANVIER_COST_ESTIMATION_INJECT_STREAM_USAGE")) {
+        cost_estimation.inject_stream_usage = (*v == "1" || *v == "true" || *v == "yes");
+    }
 
     // Priority tier overrides
     if (auto v = get_env("RANVIER_PRIORITY_TIER_ENABLED")) {
@@ -1542,6 +1545,9 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             }
             if (ce["max_estimated_tokens"]) {
                 config.cost_estimation.max_estimated_tokens = ce["max_estimated_tokens"].as<uint64_t>();
+            }
+            if (ce["inject_stream_usage"]) {
+                config.cost_estimation.inject_stream_usage = ce["inject_stream_usage"].as<bool>();
             }
         }
 

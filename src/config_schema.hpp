@@ -372,6 +372,12 @@ struct CostEstimationConfig {
     bool enabled = true;                        // Enable cost estimation on proxy requests
     double default_output_multiplier = 2.0;     // Multiplier for estimated output tokens when max_tokens absent
     uint64_t max_estimated_tokens = 1000000;    // Sanity cap on estimated tokens (Rule #4: bounded)
+    // Inject stream_options.include_usage into forwarded STREAMING requests so
+    // the backend emits a final usage event, letting attribution/the usage
+    // ledger record ACTUAL tokens instead of estimates. Off by default: when on,
+    // the client sees an extra usage SSE chunk. Skipped if the client already
+    // set include_usage. See docs/architecture/response-usage-accounting.md.
+    bool inject_stream_usage = false;
 };
 
 // =============================================================================

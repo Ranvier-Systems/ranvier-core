@@ -19,11 +19,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   them, and falls back to estimates otherwise. A new `tokens_estimated` flag on
   `UsageEvent` + `LogRequestOp` + the `request_attribution` row (additive SQLite
   migration, defaults to `1`/estimated for existing rows) tells billing
-  consumers which they got. Streaming responses without `include_usage` still
-  fall back to estimates — injecting `include_usage` to force actuals, and the
-  GenAI span's `gen_ai.usage.output_tokens` (needs a span-lifecycle change), are
-  the documented follow-ups (`docs/architecture/response-usage-accounting.md`).
-  No behaviour change when the response has no usage.
+  consumers which they got. To get actuals for streaming requests that didn't
+  ask for usage, `cost_estimation.inject_stream_usage` (env
+  `RANVIER_COST_ESTIMATION_INJECT_STREAM_USAGE`, **default off**) injects
+  `stream_options.include_usage` into forwarded streaming requests (respecting a
+  client that already chose); when off, such requests fall back to estimates.
+  The GenAI span's `gen_ai.usage.output_tokens` (needs a span-lifecycle change)
+  remains a documented follow-up (`docs/architecture/response-usage-accounting.md`).
+  No behaviour change when the response has no usage and injection is off.
 
 - **Inline-vs-sidecar EPP overhead A/B — scope + Phase 1** (BACKLOG §20.2 P1.4
   follow-up) — The headline benchmark: per-request latency of serving through a

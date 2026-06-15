@@ -211,6 +211,7 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.cost_estimation_enabled = config.cost_estimation.enabled;
     cfg.cost_estimation_output_multiplier = config.cost_estimation.default_output_multiplier;
     cfg.cost_estimation_max_tokens = config.cost_estimation.max_estimated_tokens;
+    cfg.inject_stream_usage = config.cost_estimation.inject_stream_usage;
     // Priority tier settings
     cfg.priority_tier_enabled = config.priority_tier.enabled;
     cfg.priority_tier_default = config.priority_tier.default_priority;
