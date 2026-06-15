@@ -39,6 +39,7 @@
 
 #include "intent_classifier.hpp"   // RequestIntent
 #include "metrics_helpers.hpp"     // MetricHistogram, latency bucket helpers
+#include "route_scorer.hpp"        // ScoringWeights
 #include "types.hpp"               // BackendId, BackendType, HardwareLabel
 
 #include <absl/container/flat_hash_map.h>
@@ -60,11 +61,16 @@ namespace ranvier {
 // Current wire format version of WindowReport. See the FORWARD-COMPATIBILITY
 // CONTRACT comment at the top of this file before bumping.
 //
+//   v3: added the unified route-scorer weights (RoutingStrategyParams::scoring,
+//       a ScoringWeights) to the per-window strategy snapshot. The body widened;
+//       a v2 reader simply doesn't see the weights — older payloads still parse
+//       (format_version is recorded, not a rejection boundary). Mirrors the v2
+//       bump made when the bucket key was widened.
 //   v2: added `backend_type` (engine class) to the bucket key. A v1 reader
 //       collapses engine classes into the other dimensions; the bump signals
 //       the wider key.
 //   v1: initial telemetry window-report schema.
-inline constexpr uint16_t kTelemetryReportFormatVersion = 2;
+inline constexpr uint16_t kTelemetryReportFormatVersion = 3;
 
 // =============================================================================
 // WorkloadPattern (stable wire-mirror of RequestIntent)
@@ -255,6 +261,7 @@ struct RoutingStrategyParams {
     uint64_t    load_imbalance_floor  = 0;
     bool        cost_routing_enabled  = false;
     double      cache_residency_threshold = 0.0;
+    ScoringWeights scoring;   // config.routing.scoring — per-signal route-score weights
 };
 
 // =============================================================================
