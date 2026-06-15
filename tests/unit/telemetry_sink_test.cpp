@@ -14,6 +14,7 @@
 //
 // Those live in the integration build and on the operator's Docker test loop.
 
+#include "route_scorer.hpp"
 #include "telemetry_schema.hpp"
 #include "telemetry_sink.hpp"
 #include "types.hpp"
@@ -264,7 +265,7 @@ TEST(AggregateRecord, MergeFromPrefixReuseDepthAccumulates) {
 TEST(WindowReport, DefaultsCarryCurrentFormatVersion) {
     WindowReport report;
     EXPECT_EQ(report.format_version, kTelemetryReportFormatVersion);
-    EXPECT_EQ(report.format_version, 2u);  // v2: backend_type added to the bucket key
+    EXPECT_EQ(report.format_version, 3u);  // v3: route-scorer weights added to the strategy snapshot
     EXPECT_TRUE(report.records.empty());
     EXPECT_EQ(report.shard_count, 0u);
     EXPECT_EQ(report.window_eviction_churn, 0u);
@@ -294,6 +295,58 @@ TEST(WindowReport, FieldsRemainReadableWhenVersionBumped) {
     EXPECT_EQ(report.records[0].request_count, 42u);
     EXPECT_EQ(report.records[0].key.backend_type, BackendType::VLLM);
     EXPECT_EQ(report.records[0].key.hardware_label, HardwareLabel::GPU_LARGE);
+}
+
+// =============================================================================
+// RoutingStrategyParams: route-scorer weights ride along in the snapshot
+// =============================================================================
+//
+// The per-window strategy snapshot must fully describe the active routing
+// config. After routing was consolidated into the unified weighted scorer
+// (route_scorer.hpp), the six per-signal weights (config.routing.scoring) are
+// part of that config, so they belong in the snapshot. These assert the schema
+// carries them and that non-neutral weights survive into WindowReport.strategy
+// (the in-process struct the emitter hands to the sink; the snapshot itself is
+// built in Application::make_strategy_snapshot, which needs a reactor).
+
+TEST(RoutingStrategyParams, DefaultScoringWeightsMatchScorerParityBaseline) {
+    // The snapshot's default weights mirror the shipped ScoringWeights defaults
+    // (route_scorer.hpp) — the parity baseline where every term reduces to the
+    // pre-scorer rule. If these drift, an operator running stock config would
+    // see a "tuned" snapshot that never matches their config.
+    RoutingStrategyParams p;
+    EXPECT_DOUBLE_EQ(p.scoring.prefix_weight,    0.0);
+    EXPECT_DOUBLE_EQ(p.scoring.load_weight,      1.0);
+    EXPECT_DOUBLE_EQ(p.scoring.residency_weight, 0.0);
+    EXPECT_DOUBLE_EQ(p.scoring.cost_weight,      1.0);
+    EXPECT_DOUBLE_EQ(p.scoring.price_weight,     1.0);
+    EXPECT_DOUBLE_EQ(p.scoring.slo_weight,       0.0);
+}
+
+TEST(RoutingStrategyParams, NonNeutralScoringWeightsRideAlongInWindowReport) {
+    // Operator tunes routing.scoring.* away from neutral; make_strategy_snapshot
+    // copies RoutingConfig::scoring verbatim (p.scoring = r.scoring). Model that
+    // copy here and confirm all six weights survive into WindowReport.strategy.
+    ScoringWeights tuned;
+    tuned.prefix_weight    = 2.5;
+    tuned.load_weight      = 0.25;
+    tuned.residency_weight = 0.75;
+    tuned.cost_weight      = 3.0;
+    tuned.price_weight     = 0.5;
+    tuned.slo_weight       = 1.5;
+
+    RoutingStrategyParams snapshot;
+    snapshot.scoring = tuned;   // mirrors `p.scoring = r.scoring;`
+
+    WindowReport report;
+    report.strategy = snapshot;
+
+    EXPECT_DOUBLE_EQ(report.strategy.scoring.prefix_weight,    2.5);
+    EXPECT_DOUBLE_EQ(report.strategy.scoring.load_weight,      0.25);
+    EXPECT_DOUBLE_EQ(report.strategy.scoring.residency_weight, 0.75);
+    EXPECT_DOUBLE_EQ(report.strategy.scoring.cost_weight,      3.0);
+    EXPECT_DOUBLE_EQ(report.strategy.scoring.price_weight,     0.5);
+    EXPECT_DOUBLE_EQ(report.strategy.scoring.slo_weight,       1.5);
 }
 
 // =============================================================================

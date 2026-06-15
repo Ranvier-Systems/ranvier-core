@@ -758,6 +758,7 @@ RoutingStrategyParams Application::make_strategy_snapshot() const {
     p.load_imbalance_floor       = r.load_imbalance_floor;
     p.cost_routing_enabled       = r.cost_routing.enabled;
     p.cache_residency_threshold  = r.cache_residency_threshold;
+    p.scoring                    = r.scoring;
     return p;
 }
 
