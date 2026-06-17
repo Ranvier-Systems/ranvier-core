@@ -14,7 +14,7 @@
 | Per-replica resident working set | ⏭ proposed | per-backend resident-route gauge in RouterService (§6.C) |
 | Hot-prefix top-K + concentration | ⏭ proposed | bounded `StreamSummary` + shard-0 merge (§6.D/E/F) |
 | `GET /v1/cache/topology` snapshot | ⏭ proposed | bounded JSON on `:9180`, auth-gated (§6.G) |
-| Cluster-wide sole-holder index | ❗ open risk | requires prefix→node aggregation that does not exist (§5) |
+| Cluster-wide sole-holder index | ❗ scoped (see "Sole-holder index — scoping") | new gossip digest + shard-0 reverse index; automated reap-gating waits for residency verification |
 
 ## Problem Statement
 
@@ -180,7 +180,8 @@ makes **sole-holder itself approximate**: a prefix hot on node A but
 cold-and-resident on node B is reported `sole_held` if B didn't rank it in its
 top-K. **Open question: is an approximate, top-K-bounded sole-holder signal safe
 enough to gate replica reaping on, or does drain-safety demand an exact (and far
-more expensive) residency exchange?** That trade-off is the core design decision.
+more expensive) residency exchange?** That trade-off is the core design
+decision — resolved in "Sole-holder index — scoping" below.
 
 **Secondary, concrete trap:** the existing `backend_vllm_*` gauge lambdas call
 `_health_service->get_vllm_metrics(backend_id)`, reading HealthService's
@@ -188,6 +189,120 @@ more expensive) residency exchange?** That trade-off is the core design decision
 MetricsService runs on shard 0." Any new per-backend or merged gauge added here
 inherits that constraint — register/read the cached snapshot on the owning shard
 only, or it becomes a Rule #14 cross-shard read race.
+
+## Sole-holder index — scoping
+
+Scoping the open question above changes its risk assessment. The key insight is
+that **the error is asymmetric**, which is what makes an approximate, bounded
+index acceptable to build.
+
+### The asymmetry
+
+`sole_held = true` means "unsafe to reap this node." The two error directions are
+not equally bad:
+
+- **False positive** (report sole-held when ≥2 nodes hold P warm): scaler is
+  *over*-conservative → keeps a replica it could have reaped → costs scaling
+  efficiency, **not** correctness or latency.
+- **False negative** (report *not* sole-held when exactly one node holds P warm):
+  scaler reaps the last warm copy → cold-start prefill penalty (the 5–15s the
+  system exists to avoid).
+
+Top-K truncation and dropped unreliable broadcasts both tend to *omit* holders,
+which inflates apparent sole-ownership → false positives → the safe direction.
+**Design rule: the index must err toward omitting holders, never inventing
+them.** The one construction that violates this is stale route-membership (below).
+
+### Holder semantics — the Phase-0 decision
+
+| Definition | Cost | Accuracy |
+|---|---|---|
+| (a) Announced/route membership — N has a `P→N` route | cheap; data already gossiped | routes are LRU-sticky; a node can be a "holder" of a prefix it already evicted (the staleness `push-cache-eviction-notifications.md` fights) |
+| (b) Residency-verified — N has P warm *now* via `residency_weight` / native `BlockStored` | more moving parts | accurate |
+
+(a) alone breaks the asymmetry: a stale route makes a truly-sole prefix look
+*multiply*-held (the evicted node still appears) → **false negative → unsafe**.
+Therefore: **(a) is fine for operator-facing observability; gating *automated*
+reaping must wait for (b).** That gate is the load-bearing conclusion of this
+scoping.
+
+### Phased plan
+
+| Phase | Deliverable | Files | Hard-Rule traps | Size |
+|---|---|---|---|---|
+| **0** | Decide holder semantics + freshness SLA (recommendation above) | — | — | design |
+| **1** | Per-node digest source = `_topk_snapshot` hash set | reuse §E (this doc) | none new | S |
+| **2** | `HOT_PREFIX_DIGEST = 0x07` packet: serialize/deserialize, `is_known_packet_type`, broadcast + handler callback | `gossip_protocol.{hpp,cpp}`, `byte_order.hpp` | #4 (bound payload to K), big-endian + append-only enum + forward-compat tail, #9 (log deserialize failures) | M |
+| **3** | Shard-0 cluster index `hash → NodeSet`: per-node replacement, TTL, peer-death eviction, bounded + overflow counter | new `cache_topology_index.hpp` + wire into `gossip_service`/consensus | #4 (cap + overflow metric), #17 (yield merging K·N), #14 (shard-0-only; foreign_ptr if distributed), #5 (broadcast timer gate) | M |
+| **4** | Expose: `sole_held`/`holders` in `/v1/cache/topology` JSON + `ranvier_sole_held_hot_prefixes` gauge (stubbed in §F) | aggregator service | #6 (deregister gauge first), shard-0 read trap | S |
+| **5** | **Residency-verified holders** — intersect digest membership with `residency_weight` / native KV events; required before automated reap-gating | `cache_topology_index`, consume CACHE_STATE | accuracy, not new Rule traps | M–L |
+
+MVP for **observability** = Phases 1–4. MVP for **gating a scaler's reaping** = +Phase 5.
+
+### New wire format — `HOT_PREFIX_DIGEST` (0x07)
+
+Periodic, idempotent, latest-value-wins → **unreliable broadcast, no ACK/seq_num**,
+like CACHE_STATE (`gossip_protocol.hpp:164`). Append at enum ordinal `0x07`; add
+to `is_known_packet_type()` (`gossip_protocol.hpp:59`).
+
+```
+[type:1=0x07][version:1][backend_id:4][count:2][ hash:8 × count ]   big-endian
+```
+
+- `count <= K`, enforced on serialize *and* deserialize (Rule #4 at the wire
+  boundary, like `RouteAnnouncementPacket::MAX_TOKENS`).
+- Per-node **set replacement**: a node's latest digest wholly replaces its prior
+  contribution (no append → no unbounded growth).
+- **MTU ceiling:** K=128 × 8B = 1024B + header ≈ 1032B. Under a 1500B MTU before
+  DTLS/IP/UDP overhead — this caps gossiped K at ~128 independent of a larger
+  local top-K. Beyond that: truncate hashes to 6B (collision risk — quantify) or
+  chunk across packets using a chunk index in the version-reserved tail.
+- **Forward-compat tail:** copy CACHE_STATE's `len >= PACKET_SIZE` contract
+  (`gossip_protocol.hpp:156`) so a later version can append a per-hash weight byte
+  (the Phase-5 residency signal) without a breaking change.
+
+### Cluster index (shard 0)
+
+```cpp
+// Lives on shard 0 only (gossip home). Bounded — Rule #4.
+class CacheTopologyIndex {
+    absl::flat_hash_map<uint64_t, absl::flat_hash_set<BackendId>> _holders;  // hash -> nodes
+    absl::flat_hash_map<BackendId, std::vector<uint64_t>> _by_node;          // O(1) per-node replace
+    static constexpr size_t MAX_HOT_PREFIXES = 16384;   // ~ K · max_nodes ceiling
+    uint64_t _overflow = 0;                             // ranvier_cache_topology_overflow_total
+};
+```
+
+- **On digest receipt:** replace `_by_node[backend]`; diff old vs new set to
+  update `_holders`. Yield every `kYieldInterval` (Rule #17) — diff is O(K).
+- **On peer death:** hook the existing `RoutePruneCallback`
+  (`gossip_consensus.hpp:82`) to drop the dead node's contribution. This is the
+  freshness backbone; without it dead nodes inflate holder counts → the
+  dangerous false-negative.
+- **TTL:** age out a node whose digest hasn't refreshed within N intervals
+  (belt-and-suspenders for the silent-peer case).
+- **Bound:** at `MAX_HOT_PREFIXES`, reject new keys + bump overflow counter.
+  Never evict a *live* holder to make room — that manufactures false sole-ownership.
+
+### Failure-mode / accuracy budget
+
+| Scenario | Index says | Reality | Direction | Mitigation |
+|---|---|---|---|---|
+| Hot only on A, in A's top-K | sole_held | sole | ✅ correct | — |
+| Held by A+B, both report | not sole | not sole | ✅ correct | — |
+| Held by A+B, B's digest dropped | sole_held | not sole | conservative (FP) | next broadcast corrects |
+| Held by A+B, B evicted but route stale | not sole | sole | **dangerous (FN)** | **Phase 5 residency verification** |
+| Held only by A, not in A's top-K | absent | sole but cold-ish | low stakes (not hot) | larger K; watch `hot_prefix_topk_request_share` |
+| DEGRADED quorum | unreliable | unknown | both | don't assert `sole_held=false` while `QuorumState::DEGRADED` |
+
+The one row that breaks safety (stale-route FN) is exactly what Phase 5 closes.
+
+### Open decisions for the implementer
+
+1. **Gossiped K vs MTU** — cap at ~128 with 8-byte hashes, or chunk for larger? (Recommend cap.)
+2. **Reap-gating semantics** — is `sole_held` a hard veto or a weighted cost? Hard veto + conservative-FP bias can pin capacity (hot-but-singly-held replicas become un-reapable); weighted cost degrades gracefully. (Lean weighted.)
+3. **DEGRADED-quorum behavior** — fail safe (freeze reaping) vs fail stale (serve last-known + staleness flag)? (Lean fail-safe.)
+4. **Phase-5 residency threshold** — what `residency_weight` counts as "warm enough"? Same calibration as cache-headroom routing.
 
 ## Registration sketch (illustrative — not shipped)
 
