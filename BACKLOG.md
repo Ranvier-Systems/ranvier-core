@@ -959,7 +959,8 @@ and the sole-holder index scoping (asymmetry insight + 5-phase plan).
 | P2 | Shard-0 `CacheTopologyIndex` (prefix→nodes), peer-death eviction, bounded + overflow counter (Phase 3) | Medium | 0x07 packet |
 | P2 | `sole_held`/`holders` in topology JSON + `sole_held_hot_prefixes` gauge (Phase 4) | Low | CacheTopologyIndex |
 | P3 | Residency-verified holders — intersect digest with `residency_weight`/native KV (Phase 5) | Medium-High | CacheTopologyIndex |
-| P3 | Routing-overhead micro-benchmark (telemetry off vs on) — see "Verification & benchmark gate" | Low | P0/P1 |
+| ✅ | Routing-overhead micro-benchmark (`make bench-hot-prefix`) — DONE: touch 2.3ns warm / 72ns evict; hash_prefix ~0.4µs @128 tok, ~2µs @512 | Low | done |
+| P3 | Bound the hot-prefix fingerprint hash (cap to ~64 tokens) — constant-time hit path for long-context; see benchmark doc | Low | P1 |
 
 ### Spike findings (2026-06-18)
 
@@ -1034,9 +1035,10 @@ Touch points: `telemetry_service.{hpp,cpp}`, `telemetry_schema.hpp`,
 - **Residency threshold (P3):** what `residency_weight` counts as "warm enough" to
   be a holder — same calibration as cache-headroom routing.
 - **StreamSummary eviction (deferred, P0 decision):** `src/stream_summary.hpp` uses
-  an O(capacity) min-scan on eviction — sub-µs at K=128, far under the task quota
-  (Rule #17). Upgrade to the O(1) bucket-list Space-Saving variant only if K is
-  raised by orders of magnitude.
+  an O(capacity) min-scan on eviction — **measured 72 ns at K=128** (vs 2.3 ns
+  warm; `make bench-hot-prefix`), far under the task quota (Rule #17). Upgrade to
+  the O(1) bucket-list Space-Saving variant only if K is raised by orders of
+  magnitude — not warranted at K=128.
 
 ### Verification & benchmark gate
 
@@ -1048,6 +1050,10 @@ O(1) hit / O(K=128) evict). Two ways to confirm it:
   `StreamSummary::touch()` + `hash_prefix()` ns/op, reactor-free, no Docker. The
   direct measurement of the tax (an end-to-end A/B can't resolve a sub-µs delta
   under ms-scale latency). See `docs/benchmarks/cache-topology-telemetry-overhead.md`.
+  **First run:** touch 2.3 ns warm / 72 ns evict; `hash_prefix` ~0.4 µs at the
+  default 128-token prefix, ~2 µs at 512. Conclusion: `touch()` is free; the
+  hit-path hash is byte-bound and grows with `prefix_token_length` → the
+  "bound the fingerprint hash" follow-up (table above) addresses long-context.
 - **End-to-end A/B (release gate, below):** confirms the tax is invisible under
   load. Modelled on `docs/benchmarks/epp-overhead-microbenchmark.md`; not runnable
   in the sandbox.
