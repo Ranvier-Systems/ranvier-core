@@ -4,6 +4,7 @@
 
 #include "telemetry_service.hpp"
 
+#include "stream_summary.hpp"  // StreamSummary::kDefaultCapacity (report top-K cap)
 #include "types.hpp"
 
 #include <boost/range/irange.hpp>
@@ -41,11 +42,13 @@ int64_t now_ms() {
 
 seastar::future<> TelemetryService::start_shard(
     TelemetrySinkConfig config,
-    std::function<uint64_t()> eviction_counter_getter) {
+    std::function<uint64_t()> eviction_counter_getter,
+    std::function<HotPrefixWindow()> hot_prefix_getter) {
     _enabled                 = config.enabled;
     _max_buckets             = config.max_buckets;
     _window                  = config.window;
     _eviction_counter_getter = std::move(eviction_counter_getter);
+    _hot_prefix_getter       = std::move(hot_prefix_getter);
 
     // Baseline so the first window's eviction delta is from start-time,
     // not from process start.
@@ -209,6 +212,12 @@ ShardSnapshot TelemetryService::snapshot_and_reset() {
         _eviction_last_seen = current;
     }
 
+    // BACKLOG §21 P1: pull + reset this shard's hot-prefix top-K. The getter
+    // resets the router's summary, so window boundaries align with this snapshot.
+    if (_hot_prefix_getter) {
+        snap.hot_prefixes = _hot_prefix_getter();
+    }
+
     return snap;
 }
 
@@ -284,12 +293,17 @@ seastar::future<> TelemetryService::emit_async() {
     uint64_t window_overflowed    = 0;
     uint32_t contributing_shards  = 0;
     size_t   merged_steps         = 0;
+    std::vector<HotPrefixWindow> shard_hot;  // BACKLOG §21 P1; shard-0-local copies
+    shard_hot.reserve(per_shard.size());
 
     for (auto& fp : per_shard) {
         if (!fp) continue;
         ++contributing_shards;
         window_eviction   += fp->eviction_delta;
         window_overflowed += fp->buckets_overflowed;
+        // Rule #14: COPY (not move) out of the foreign_ptr — the entries' heap
+        // is owned by the home shard. merge below produces shard-0-local storage.
+        shard_hot.push_back(fp->hot_prefixes);
         for (const auto& rec : fp->records) {
             auto it = merged.find(rec.key);
             if (it == merged.end()) {
@@ -322,6 +336,12 @@ seastar::future<> TelemetryService::emit_async() {
         v.key = k;
         report.records.push_back(std::move(v));
     }
+
+    // BACKLOG §21 P1: cluster-merge the per-shard hot-prefix top-K. Bounded to K
+    // entries (= per-shard summary capacity); merge input is <= K * shards.
+    auto merged_hot = merge_hot_prefixes(shard_hot, StreamSummary::kDefaultCapacity);
+    report.hot_prefixes       = std::move(merged_hot.top);
+    report.hot_prefix_touches = merged_hot.total_touches;
 
     _window_start_ms = report.window_end_ms;
 

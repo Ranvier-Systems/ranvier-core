@@ -771,7 +771,13 @@ seastar::future<> Application::init_telemetry_service() {
     // entry point stays a single branch.
     auto cfg = _config.telemetry_sink;
     co_await _telemetry.invoke_on_all([cfg](TelemetryService& s) {
-        return s.start_shard(cfg, [] { return RouterService::get_local_routes_evicted(); });
+        // BACKLOG §21 P1: arm the router's gated hot-prefix touch() for this shard
+        // (no-op cost when disabled) and hand the snapshot+reset getter to the sink.
+        RouterService::set_hot_prefix_tracking(cfg.enabled);
+        return s.start_shard(
+            cfg,
+            [] { return RouterService::get_local_routes_evicted(); },
+            [] { return RouterService::snapshot_hot_prefixes(); });
     });
 
     co_await _telemetry.invoke_on(0,

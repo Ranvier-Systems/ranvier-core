@@ -5,6 +5,8 @@
 #include "node_slab.hpp"
 #include "parse_utils.hpp"
 #include "route_scorer.hpp"
+#include "stream_summary.hpp"
+#include "telemetry_schema.hpp"  // HotPrefixWindow / HotPrefixEntry
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/smp.hh>
@@ -152,6 +154,16 @@ struct ShardLocalState {
     // ========================================================================
     std::unique_ptr<NodeSlab> node_slab;  // Destroyed last
     std::unique_ptr<RadixTree> tree;       // Destroyed first
+
+    // ========================================================================
+    // Hot-prefix telemetry (BACKLOG §21 P1)
+    // ========================================================================
+    // Bounded top-K of the most-requested routing prefixes this window, keyed by
+    // prefix_hash. Touched on the prefix-routing path only when track_hot_prefixes
+    // is set (telemetry sink enabled), so the default path pays a single branch
+    // and no hashing. Read + reset each window via snapshot_hot_prefixes().
+    bool track_hot_prefixes = false;
+    StreamSummary hot_prefixes;  // default capacity (StreamSummary::kDefaultCapacity)
 
     // ========================================================================
     // Backend Tracking (SIMD-accelerated containers for lock-free lookups)
@@ -2752,6 +2764,17 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         }
     }
 
+    // BACKLOG §21 P1: record this prefix in the hot-prefix top-K. Gated so the
+    // default (telemetry off) path is a single branch. The miss path computed
+    // prefix_hash above; the ART-hit path skipped it for speed, so hash once here
+    // when tracking is on. touch() is O(1)/O(K) shard-local (Rule #1/#17).
+    if (state.track_hot_prefixes) {
+        uint64_t hot_hash = art_hit
+            ? hash_prefix(tokens.data(), prefix_len, state.config.block_alignment)
+            : prefix_hash;
+        state.hot_prefixes.touch(hot_hash);
+    }
+
     // ========================================================================
     // Unified weighted scoring: placement + dispatch over the live candidates
     // ========================================================================
@@ -4394,6 +4417,26 @@ RouterService::telemetry_labels(BackendId id) const {
 uint64_t RouterService::get_local_routes_evicted() {
     if (!g_shard_state) return 0;
     return g_shard_state->stats.routes_evicted;
+}
+
+void RouterService::set_hot_prefix_tracking(bool enabled) {
+    if (!g_shard_state) return;
+    g_shard_state->track_hot_prefixes = enabled;
+}
+
+HotPrefixWindow RouterService::snapshot_hot_prefixes() {
+    HotPrefixWindow window;
+    if (!g_shard_state) return window;
+
+    auto& summary = g_shard_state->hot_prefixes;
+    window.total_touches = summary.total();
+    auto entries = summary.snapshot();  // sorted desc, size <= K
+    window.entries.reserve(entries.size());
+    for (const auto& e : entries) {
+        window.entries.push_back(HotPrefixEntry{e.key, e.count});
+    }
+    summary.clear();  // window boundary: reset for the next interval
+    return window;
 }
 
 std::vector<RouterService::BackendState> RouterService::get_all_backend_states() const {
