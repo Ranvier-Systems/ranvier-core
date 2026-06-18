@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean gie-epp-build gie-epp-test gie-epp-clean test-epp bench-epp bench-inline-vs-sidecar
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean gie-epp-build gie-epp-test gie-epp-clean test-epp bench-epp bench-inline-vs-sidecar bench-hot-prefix
 
 # Default target
 all: build
@@ -304,6 +304,13 @@ bench-epp:
 # latency deltas. Pass driver flags via BENCH_AB_ARGS.
 bench-inline-vs-sidecar:
 	@./scripts/bench-inline-vs-sidecar.sh $(BENCH_AB_ARGS)
+
+# Hot-prefix telemetry hot-path microbenchmark (BACKLOG §21): StreamSummary::touch
+# + hash_prefix ns/op. Reactor-free, no Docker. Release-built for real numbers.
+bench-hot-prefix:
+	@mkdir -p build
+	@cd build && cmake .. -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build . --target hot_prefix_bench -j$$(nproc)
+	@./build/hot_prefix_bench
 
 # Run all tests
 test: test-unit

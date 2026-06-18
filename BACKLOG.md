@@ -1042,9 +1042,15 @@ Touch points: `telemetry_service.{hpp,cpp}`, `telemetry_schema.hpp`,
 
 Static analysis predicts the per-request tax is sub-100ns (P0: a `routing_mode`
 compare + one `absl` lookup + 2 increments; P1: one `StreamSummary::touch()`,
-O(1) hit / O(K=128) evict). This gate turns that prediction into a failable
-measurement. Modelled on `docs/benchmarks/epp-overhead-microbenchmark.md` (the
-existing per-request-overhead A/B); not runnable in the sandbox.
+O(1) hit / O(K=128) evict). Two ways to confirm it:
+
+- **Targeted microbench (implemented):** `make bench-hot-prefix` →
+  `StreamSummary::touch()` + `hash_prefix()` ns/op, reactor-free, no Docker. The
+  direct measurement of the tax (an end-to-end A/B can't resolve a sub-µs delta
+  under ms-scale latency). See `docs/benchmarks/cache-topology-telemetry-overhead.md`.
+- **End-to-end A/B (release gate, below):** confirms the tax is invisible under
+  load. Modelled on `docs/benchmarks/epp-overhead-microbenchmark.md`; not runnable
+  in the sandbox.
 
 **A/B method (single-stream, the cleanest overhead signal).** Two otherwise
 identical runs through one ingress, telemetry **off** (baseline) then **on**,

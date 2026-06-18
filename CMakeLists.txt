@@ -623,7 +623,19 @@ target_link_libraries(stream_summary_test
 )
 gtest_discover_tests(stream_summary_test)
 
-# Telemetry Sink Unit Tests (Pure C++, uses stubs for Seastar future + metrics)
+# Hot-prefix telemetry hot-path microbenchmark (BACKLOG §21). Reactor-free, no
+# gtest — a plain main() printing ns/op. Built with the tree but NOT a ctest;
+# run via `make bench-hot-prefix` (Release).
+add_executable(hot_prefix_bench
+  tests/bench/hot_prefix_bench.cpp
+)
+target_include_directories(hot_prefix_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(hot_prefix_bench
+  PRIVATE
+  absl::flat_hash_map
+)
+
+
 # Tests the wire-stable BackendType / HardwareLabel / WorkloadPattern ordinals
 # (forward-compat contract — see src/telemetry_schema.hpp), TelemetryBucketKey
 # hash/equality, AggregateRecord merge semantics, WindowReport defaults, and
