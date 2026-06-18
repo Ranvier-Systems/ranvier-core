@@ -852,6 +852,18 @@ target_link_libraries(gossip_cache_state_test
 )
 gtest_discover_tests(gossip_cache_state_test)
 
+# Gossip Hot-Prefix-Digest Packet Unit Tests (BACKLOG §21 P2; wire-format only,
+# packet replicated in-test, no Seastar — mirrors gossip_cache_state_test).
+add_executable(gossip_hot_prefix_digest_test
+  tests/unit/gossip_hot_prefix_digest_test.cpp
+)
+target_include_directories(gossip_hot_prefix_digest_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(gossip_hot_prefix_digest_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(gossip_hot_prefix_digest_test)
+
 # Gossip Transport Ownership Pattern Tests (Pure C++, no Seastar dependency)
 # Tests verifying shard-local ownership patterns (Rule #0: no std::shared_ptr)
 add_executable(gossip_transport_ownership_test

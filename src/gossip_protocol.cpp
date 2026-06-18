@@ -234,6 +234,61 @@ std::optional<CacheStatePacket> CacheStatePacket::deserialize(const uint8_t* dat
     return pkt;
 }
 
+std::vector<uint8_t> HotPrefixDigestPacket::serialize() const {
+    uint16_t count = static_cast<uint16_t>(
+        std::min(prefix_hashes.size(), static_cast<size_t>(MAX_HASHES)));  // Rule #4
+
+    std::vector<uint8_t> buffer;
+    buffer.reserve(HEADER_SIZE + static_cast<size_t>(count) * sizeof(uint64_t));
+
+    buffer.push_back(static_cast<uint8_t>(type));
+    buffer.push_back(version);
+    be_write_u32(buffer, static_cast<uint32_t>(backend_id));
+    be_write_u16(buffer, count);
+
+    for (size_t i = 0; i < count; ++i) {
+        be_write_u64(buffer, prefix_hashes[i]);
+    }
+    return buffer;
+}
+
+std::optional<HotPrefixDigestPacket> HotPrefixDigestPacket::deserialize(const uint8_t* data, size_t len) {
+    // Forward compatibility: accept >= the declared length (not ==) so a future
+    // version that appends fields stays readable — parse what we know, ignore the
+    // trailing bytes.
+    if (len < HEADER_SIZE) {
+        return std::nullopt;
+    }
+
+    HotPrefixDigestPacket pkt;
+    pkt.type = static_cast<GossipPacketType>(data[0]);
+    pkt.version = data[1];
+
+    if (pkt.type != GossipPacketType::HOT_PREFIX_DIGEST) {
+        return std::nullopt;
+    }
+    // version intentionally not range-checked: a newer minor version only appends
+    // (guarded by the len>= checks). Type — not version — is the rejection boundary.
+
+    pkt.backend_id = static_cast<BackendId>(be_read_u32(data + 2));
+    uint16_t count = be_read_u16(data + 6);
+
+    // Rule #4: reject an over-cap count from the wire rather than allocate for it.
+    if (count > MAX_HASHES) {
+        return std::nullopt;
+    }
+    size_t need = HEADER_SIZE + static_cast<size_t>(count) * sizeof(uint64_t);
+    if (len < need) {
+        return std::nullopt;  // truncated
+    }
+
+    pkt.prefix_hashes.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        pkt.prefix_hashes.push_back(be_read_u64(data + HEADER_SIZE + i * sizeof(uint64_t)));
+    }
+    return pkt;
+}
+
 //------------------------------------------------------------------------------
 // GossipProtocol Implementation
 //------------------------------------------------------------------------------
@@ -574,6 +629,30 @@ seastar::future<> GossipProtocol::broadcast_cache_state(BackendId backend_id, do
     ++_cache_states_sent;
 }
 
+seastar::future<> GossipProtocol::broadcast_hot_prefix_digest(BackendId backend_id,
+                                                              std::vector<uint64_t> prefix_hashes) {
+    // Rule #22: coroutine converts any pre-future throw into a failed future.
+    if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
+        co_return;
+    }
+    if (_consensus && !_consensus->is_accepting_tasks()) {
+        co_return;
+    }
+
+    HotPrefixDigestPacket pkt;
+    pkt.backend_id = backend_id;
+    pkt.prefix_hashes = std::move(prefix_hashes);  // serialize() caps at MAX_HASHES (Rule #4)
+    auto serialized = pkt.serialize();
+
+    log_gossip_protocol().trace("Broadcasting hot-prefix digest: backend={}, hashes={} to {} peers",
+                                backend_id, pkt.prefix_hashes.size(), _peer_addresses->size());
+
+    // Unreliable broadcast (no ACK): periodic, idempotent, latest-value-wins per
+    // node — a dropped digest self-heals on the next window.
+    co_await _transport->broadcast(*_peer_addresses, serialized);
+    ++_hot_prefix_digests_sent;
+}
+
 seastar::future<> GossipProtocol::broadcast_heartbeat() {
     // Rule 22: coroutine converts any pre-future throw into a failed future
     // RAII Timer Safety: Holder must outlive the work — coroutine frame keeps it alive
@@ -680,6 +759,25 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
 
         if (_cache_state_callback) {
             return _cache_state_callback(cs_pkt->backend_id, cs_pkt->cache_usage, cs_pkt->residency_weight);
+        }
+        return seastar::make_ready_future<>();
+    }
+
+    // Handle hot-prefix digest packets (BACKLOG §21 P2; unreliable, latest-value-wins)
+    if (type == GossipPacketType::HOT_PREFIX_DIGEST) {
+        auto hp_pkt = HotPrefixDigestPacket::deserialize(ptr, len);
+        if (!hp_pkt) {
+            ++_packets_invalid;
+            return seastar::make_ready_future<>();
+        }
+
+        ++_hot_prefix_digests_received;
+        log_gossip_protocol().trace("Received HOT_PREFIX_DIGEST from {}: backend={}, hashes={}",
+                                    src_addr, hp_pkt->backend_id, hp_pkt->prefix_hashes.size());
+
+        // Rule #16: return the callback's future directly (no lambda-coroutine).
+        if (_hot_prefix_digest_callback) {
+            return _hot_prefix_digest_callback(hp_pkt->backend_id, std::move(hp_pkt->prefix_hashes));
         }
         return seastar::make_ready_future<>();
     }
