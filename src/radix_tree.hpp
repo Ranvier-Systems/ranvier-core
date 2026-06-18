@@ -12,6 +12,7 @@
 #include <cassert>
 
 #include <absl/container/inlined_vector.h>
+#include <absl/container/flat_hash_map.h>
 
 #include "byte_order.hpp"
 #include "types.hpp"
@@ -442,6 +443,15 @@ public:
 
     size_t route_count() const { return route_count_; }
 
+    // Live routes grouped by backend (BACKLOG §21 P1). Read-only; per-shard.
+    // Maintained in lockstep with route_count_ at every leaf add/remove/overwrite
+    // so it cannot drift. Holds only backends with >= 1 live route (self-cleaning),
+    // so Prometheus summing across shards yields cluster-total resident routes per
+    // backend. Backend a scaler would drain coldest = the one with the fewest here.
+    const absl::flat_hash_map<BackendId, size_t>& routes_by_backend() const {
+        return routes_by_backend_;
+    }
+
     // Calculate tree statistics for monitoring path compression effectiveness
     TreeStats get_tree_stats() const {
         TreeStats stats;
@@ -659,6 +669,7 @@ public:
         if (!lru_tail_) return false;
         Node* oldest = lru_tail_;
         lru_remove(oldest);
+        note_route_removed(oldest->leaf_value);  // BACKLOG §21 P1
         oldest->leaf_value = std::nullopt;
         if (route_count_ > 0) route_count_--;
         return true;
@@ -671,6 +682,7 @@ public:
             for (Node* n = lru_tail_; n != nullptr; n = n->lru_prev) {
                 if (n->origin == target) {
                     lru_remove(n);
+                    note_route_removed(n->leaf_value);  // BACKLOG §21 P1
                     n->leaf_value = std::nullopt;
                     if (route_count_ > 0) route_count_--;
                     return true;
@@ -735,6 +747,14 @@ private:
     NodePtr root_;
     uint32_t block_alignment_;
     size_t route_count_ = 0;
+
+    // Per-backend live-route tally for cache-aware-autoscaler telemetry
+    // (BACKLOG §21 P1). Updated alongside route_count_ at every leaf mutation;
+    // entries erased at count 0, so size is bounded by the number of backends
+    // with live routes — operationally bounded by the registry (backend_ids are
+    // not untrusted input). kMaxTrackedBackends is a defense-in-depth cap.
+    static constexpr size_t kMaxTrackedBackends = 10000;
+    absl::flat_hash_map<BackendId, size_t> routes_by_backend_;
 
     // Intrusive LRU doubly-linked list of leaf nodes.
     // lru_head_ = most recently accessed, lru_tail_ = oldest (eviction target).
@@ -1575,6 +1595,14 @@ private:
                 }
                 return {std::move(node), false};
             }
+            // BACKLOG §21 P1 tally, before leaf_value is reassigned: a new leaf,
+            // or an overwrite that moves this route to a different backend.
+            if (is_new) {
+                note_route_added(backend);
+            } else if (node->leaf_value != backend) {
+                note_route_removed(node->leaf_value);
+                note_route_added(backend);
+            }
             node->leaf_value = backend;
             node->origin = origin;
             node->last_accessed = std::chrono::steady_clock::now();
@@ -1607,6 +1635,7 @@ private:
             }
             new_child->leaf_value = backend;
             new_child->origin = origin;
+            note_route_added(backend);  // BACKLOG §21 P1: new leaf
             lru_push_front(new_child.get());
             // Rule #4: bound prefix length to prevent pathological memory usage
             if (new_child->prefix.size() > MAX_PREFIX_LENGTH) {
@@ -1731,11 +1760,33 @@ private:
     // Eviction Implementation
     // -------------------------------------------------------------------------
 
+    // Per-backend live-route tally maintenance (BACKLOG §21 P1). Called at every
+    // leaf add/remove so routes_by_backend_ tracks route_count_ exactly.
+    void note_route_added(BackendId backend) {
+        auto it = routes_by_backend_.find(backend);
+        if (it != routes_by_backend_.end()) {
+            ++it->second;
+        } else if (routes_by_backend_.size() < kMaxTrackedBackends) {
+            routes_by_backend_.emplace(backend, 1);
+        }
+        // At cap (unreachable for registry-bound ids): leave untracked. Balance
+        // holds because the matching note_route_removed() also finds no entry.
+    }
+    void note_route_removed(const std::optional<BackendId>& backend) {
+        if (!backend.has_value()) return;
+        auto it = routes_by_backend_.find(*backend);
+        if (it == routes_by_backend_.end()) return;
+        if (--it->second == 0) {
+            routes_by_backend_.erase(it);  // self-cleaning -> bounded by live backends
+        }
+    }
+
     void remove_expired_recursive(Node* node, std::chrono::steady_clock::time_point cutoff, size_t& removed) {
         if (!node) return;
 
         if (node->leaf_value.has_value() && node->last_accessed < cutoff) {
             lru_remove(node);
+            note_route_removed(node->leaf_value);  // BACKLOG §21 P1
             node->leaf_value = std::nullopt;
             removed++;
         }
@@ -1754,6 +1805,7 @@ private:
             auto cutoff = cutoff_fn(node->leaf_value.value());
             if (node->last_accessed < cutoff) {
                 lru_remove(node);
+                note_route_removed(node->leaf_value);  // BACKLOG §21 P1
                 node->leaf_value = std::nullopt;
                 removed++;
             }
@@ -1771,6 +1823,7 @@ private:
             node->leaf_value.value() == backend &&
             node->origin == origin) {
             lru_remove(node);
+            note_route_removed(node->leaf_value);  // BACKLOG §21 P1
             node->leaf_value = std::nullopt;
             removed++;
         }

@@ -911,6 +911,19 @@ CostBudgetGuard& CostBudgetGuard::operator=(CostBudgetGuard&& other) noexcept {
 // Load Tracking Helper Functions
 // ============================================================================
 
+// Live routes resident in this shard's ART pinned to backend `id` (BACKLOG §21
+// P1). Shard-local, lock-free read; Prometheus sums across shards = cluster
+// total. Defined here (not metrics_service) because the ART is shard-local
+// router state; mirrors get_backend_load's shard-local accessor pattern.
+uint64_t get_resident_routes(BackendId id) {
+    if (!g_shard_state || !g_shard_state->tree) {
+        return 0;
+    }
+    const auto& by_backend = g_shard_state->tree->routes_by_backend();
+    auto it = by_backend.find(id);
+    return it == by_backend.end() ? 0 : static_cast<uint64_t>(it->second);
+}
+
 uint64_t get_backend_load(BackendId id) {
     if (!g_shard_state) {
         return 0;

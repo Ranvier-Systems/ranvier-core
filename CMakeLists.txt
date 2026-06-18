@@ -465,6 +465,7 @@ target_link_libraries(radix_tree_test
   PRIVATE
   GTest::gtest_main
   absl::inlined_vector
+  absl::flat_hash_map
 )
 gtest_discover_tests(radix_tree_test)
 
