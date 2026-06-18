@@ -707,6 +707,7 @@ target_link_libraries(node_slab_test
   PRIVATE
   GTest::gtest_main
   absl::inlined_vector
+  absl::flat_hash_map  # radix_tree.hpp's routes_by_backend_ member (BACKLOG §21 P1)
 )
 gtest_discover_tests(node_slab_test)
 
@@ -1543,6 +1544,7 @@ if(RANVIER_BUILD_FUZZERS)
     target_link_libraries(radix_tree_fuzz
       PRIVATE
       absl::inlined_vector
+      absl::flat_hash_map
     )
     # Skip the DumpNode machinery (self-referential vector that Clang +
     # libstdc++ rejects but GCC + libstdc++ accepts). The fuzz harness only
