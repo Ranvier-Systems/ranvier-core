@@ -48,6 +48,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -305,6 +306,47 @@ inline MergedHotPrefixes merge_hot_prefixes(const std::vector<HotPrefixWindow>& 
         merged.top.resize(k);
     }
     return merged;
+}
+
+// Concentration of prefix-routed traffic on the hottest prefix(es), 0..1.
+// total == 0 (no prefix-routed traffic this window) yields 0.0, not a divide
+// by zero. Pure / reactor-free.
+inline double hot_prefix_top1_share(const std::vector<HotPrefixEntry>& top, uint64_t total) {
+    if (total == 0 || top.empty()) return 0.0;
+    return static_cast<double>(top.front().request_count) / static_cast<double>(total);
+}
+inline double hot_prefix_topk_share(const std::vector<HotPrefixEntry>& top, uint64_t total) {
+    if (total == 0) return 0.0;
+    uint64_t sum = 0;
+    for (const auto& e : top) sum += e.request_count;
+    return static_cast<double>(sum) / static_cast<double>(total);
+}
+
+// Content-free JSON for GET /v1/cache/topology: prefix FINGERPRINTS (hex) and
+// counts only — never token text. Bounded by top.size() (<= K). Pure.
+inline std::string format_hot_prefix_topology_json(const std::vector<HotPrefixEntry>& top,
+                                                   uint64_t total_touches,
+                                                   int64_t snapshot_age_ms) {
+    std::string out;
+    out.reserve(96 + top.size() * 56);
+    char head[192];
+    std::snprintf(head, sizeof(head),
+        "{\"snapshot_age_ms\":%lld,\"total_touches\":%llu,\"count\":%zu,\"hot_prefixes\":[",
+        static_cast<long long>(snapshot_age_ms),
+        static_cast<unsigned long long>(total_touches),
+        top.size());
+    out += head;
+    for (size_t i = 0; i < top.size(); ++i) {
+        char ent[96];
+        std::snprintf(ent, sizeof(ent),
+            "%s{\"prefix_fp\":\"%016llx\",\"request_count\":%llu}",
+            (i == 0 ? "" : ","),
+            static_cast<unsigned long long>(top[i].prefix_fp),
+            static_cast<unsigned long long>(top[i].request_count));
+        out += ent;
+    }
+    out += "]}";
+    return out;
 }
 
 // =============================================================================

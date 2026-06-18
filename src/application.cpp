@@ -32,6 +32,37 @@
 
 namespace ranvier {
 
+namespace {
+
+// GET /v1/cache/topology (BACKLOG §21 P1). The metrics server is sharded, but the
+// hot-prefix snapshot is cached on shard 0 (the telemetry emitter), so hop there,
+// build the JSON on shard 0, and copy the bytes into a calling-shard sstring
+// (Rule #14). Low-QPS admin pull, so the cross-shard hop is immaterial.
+class CacheTopologyHandler : public seastar::httpd::handler_base {
+public:
+    explicit CacheTopologyHandler(seastar::sharded<TelemetryService>* telemetry)
+        : _telemetry(telemetry) {}
+
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle(
+        const seastar::sstring& /*path*/,
+        std::unique_ptr<seastar::http::request> /*req*/,
+        std::unique_ptr<seastar::http::reply> rep) override {
+        auto* telemetry = _telemetry;
+        auto fp = co_await seastar::smp::submit_to(0, [telemetry] {
+            return seastar::make_foreign(
+                std::make_unique<std::string>(telemetry->local().hot_prefix_topology_json()));
+        });
+        rep->_content = seastar::sstring(fp->data(), fp->size());  // local copy (Rule #14)
+        rep->done("json");
+        co_return std::move(rep);
+    }
+
+private:
+    seastar::sharded<TelemetryService>* _telemetry;
+};
+
+}  // namespace
+
 Application::Application(RanvierConfig config, std::string config_path)
     : _config(std::move(config))
     , _config_path(std::move(config_path))
@@ -1334,6 +1365,25 @@ seastar::future<> Application::start_servers() {
                       }, "json"));
         });
         log_main.info("Dashboard enabled at /dashboard on metrics port");
+    }
+
+    // GET /v1/cache/topology — hot-prefix top-K snapshot (BACKLOG §21 P1). Only
+    // when telemetry tracking is on (otherwise the snapshot is always empty).
+    // Auth-gated with the same Bearer/IP policy as /metrics when configured.
+    if (_config.telemetry_sink.enabled) {
+        auto* telemetry = &_telemetry;
+        bool auth_on = _config.metrics.auth_enabled() || _config.metrics.ip_filter_enabled();
+        MetricsAuthConfig auth_config(_config.metrics);
+        co_await _metrics_server->set_routes(
+            [telemetry, auth_on, auth_config](seastar::httpd::routes& r) {
+                seastar::httpd::handler_base* h = new CacheTopologyHandler(telemetry);
+                if (auth_on) {
+                    h = new MetricsAuthHandler(auth_config, h);  // delegates after auth
+                }
+                r.add(seastar::httpd::operation_type::GET,
+                      seastar::httpd::url("/v1/cache/topology"), h);
+            });
+        log_main.info("Cache-topology endpoint at /v1/cache/topology on metrics port");
     }
 
     auto metrics_addr = seastar::socket_address(

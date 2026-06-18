@@ -468,3 +468,39 @@ TEST(MergeHotPrefixes, TruncatesToK) {
     EXPECT_EQ(merged.top[0].request_count, 50u);
     EXPECT_EQ(merged.top[9].request_count, 41u);  // 10th highest
 }
+
+// =============================================================================
+// Hot-prefix concentration shares + topology JSON (BACKLOG §21 P1)
+// =============================================================================
+
+TEST(HotPrefixShares, ZeroTotalIsSafe) {
+    std::vector<HotPrefixEntry> empty;
+    EXPECT_DOUBLE_EQ(hot_prefix_top1_share(empty, 0), 0.0);
+    EXPECT_DOUBLE_EQ(hot_prefix_topk_share(empty, 0), 0.0);
+    // Non-empty top but zero total (shouldn't happen, but must not divide by 0).
+    std::vector<HotPrefixEntry> some = {{1, 5}};
+    EXPECT_DOUBLE_EQ(hot_prefix_top1_share(some, 0), 0.0);
+}
+
+TEST(HotPrefixShares, ComputesFractions) {
+    std::vector<HotPrefixEntry> top = {{10, 6}, {20, 2}};  // sorted desc
+    EXPECT_DOUBLE_EQ(hot_prefix_top1_share(top, 10), 0.6);   // 6/10
+    EXPECT_DOUBLE_EQ(hot_prefix_topk_share(top, 10), 0.8);   // (6+2)/10
+}
+
+TEST(HotPrefixTopologyJson, EmptyShape) {
+    auto json = format_hot_prefix_topology_json({}, 0, 0);
+    EXPECT_EQ(json, "{\"snapshot_age_ms\":0,\"total_touches\":0,\"count\":0,\"hot_prefixes\":[]}");
+}
+
+TEST(HotPrefixTopologyJson, EntriesAreHexFingerprintsNeverTokens) {
+    std::vector<HotPrefixEntry> top = {{0xa93f, 412}, {0x0c11, 388}};
+    auto json = format_hot_prefix_topology_json(top, 800, 1873);
+    EXPECT_NE(json.find("\"snapshot_age_ms\":1873"), std::string::npos);
+    EXPECT_NE(json.find("\"total_touches\":800"), std::string::npos);
+    EXPECT_NE(json.find("\"count\":2"), std::string::npos);
+    // 16-char zero-padded hex fingerprint, comma-separated, count present.
+    EXPECT_NE(json.find("\"prefix_fp\":\"000000000000a93f\",\"request_count\":412"), std::string::npos);
+    EXPECT_NE(json.find("\"prefix_fp\":\"0000000000000c11\",\"request_count\":388"), std::string::npos);
+    EXPECT_NE(json.find("},{"), std::string::npos);  // separator between entries
+}

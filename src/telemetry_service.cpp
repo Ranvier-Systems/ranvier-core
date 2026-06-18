@@ -113,6 +113,26 @@ seastar::future<> TelemetryService::start_emitter(
         sm::make_counter("reports_dropped_backpressure_total", _reports_dropped_backpressure,
             sm::description("Window reports dropped because the prior consume() future had not "
                             "resolved by the next window tick (sink slow / down)")),
+
+        // Hot-prefix concentration (BACKLOG §21 P1). Label-free, shard-0 only —
+        // read from the cached merged top-K. A cache-aware autoscaler uses these
+        // to size pre-warm / pin headroom for the hot set.
+        sm::make_gauge("hot_prefix_top1_request_share",
+            sm::description("Fraction of prefix-routed requests hitting the single hottest prefix (0..1)."),
+            [this] { return hot_prefix_top1_share(_last_hot_prefixes, _last_hot_prefix_touches); }),
+        sm::make_gauge("hot_prefix_topk_request_share",
+            sm::description("Fraction of prefix-routed requests hitting the tracked top-K prefixes (0..1)."),
+            [this] { return hot_prefix_topk_share(_last_hot_prefixes, _last_hot_prefix_touches); }),
+        sm::make_gauge("hot_prefix_distinct_estimate",
+            sm::description("Distinct hot prefixes tracked in the last window (<= K)."),
+            [this] { return static_cast<double>(_last_hot_prefixes.size()); }),
+        sm::make_gauge("topk_snapshot_age_seconds",
+            sm::description("Age of the cached hot-prefix snapshot in seconds (0 before the first window)."),
+            [this] {
+                if (_last_hot_prefix_at.time_since_epoch().count() == 0) return 0.0;
+                return std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - _last_hot_prefix_at).count();
+            }),
     });
 
     _emitter_started = true;
@@ -340,8 +360,14 @@ seastar::future<> TelemetryService::emit_async() {
     // BACKLOG §21 P1: cluster-merge the per-shard hot-prefix top-K. Bounded to K
     // entries (= per-shard summary capacity); merge input is <= K * shards.
     auto merged_hot = merge_hot_prefixes(shard_hot, StreamSummary::kDefaultCapacity);
-    report.hot_prefixes       = std::move(merged_hot.top);
     report.hot_prefix_touches = merged_hot.total_touches;
+    // Cache (copy) for the concentration gauges + /v1/cache/topology before the
+    // move into the report. Synchronous write — no suspension point before a
+    // reader can run, so the shard-0 snapshot is never observed torn (Rule #1).
+    _last_hot_prefixes       = merged_hot.top;
+    _last_hot_prefix_touches = merged_hot.total_touches;
+    _last_hot_prefix_at      = std::chrono::steady_clock::now();
+    report.hot_prefixes      = std::move(merged_hot.top);
 
     _window_start_ms = report.window_end_ms;
 
@@ -374,6 +400,19 @@ seastar::future<> TelemetryService::stop() {
 
     _buckets.clear();
     return seastar::make_ready_future<>();
+}
+
+// =============================================================================
+// Hot-prefix topology JSON (BACKLOG §21 P1)
+// =============================================================================
+
+std::string TelemetryService::hot_prefix_topology_json() const {
+    int64_t age_ms = 0;
+    if (_last_hot_prefix_at.time_since_epoch().count() != 0) {
+        age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - _last_hot_prefix_at).count();
+    }
+    return format_hot_prefix_topology_json(_last_hot_prefixes, _last_hot_prefix_touches, age_ms);
 }
 
 }  // namespace ranvier
