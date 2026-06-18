@@ -30,6 +30,10 @@ namespace ranvier {
 // Defined in router_service.cpp - reads shard-local BackendInfo::active_requests
 uint64_t get_backend_load(BackendId id);
 
+// Forward declaration for the per-backend resident-route gauge (BACKLOG §21 P1).
+// Defined in router_service.cpp - reads the shard-local ART's per-backend tally.
+uint64_t get_resident_routes(BackendId id);
+
 // Thread-local metrics for the HTTP controller
 // Each shard has its own counters/histograms (shared-nothing model)
 class MetricsService {
@@ -1017,6 +1021,15 @@ private:
                 seastar::metrics::description("Current number of in-flight requests to backend. Use for load-aware routing observability."),
                 {{"backend_id", backend_id_str}},
                 [backend_id] { return static_cast<double>(get_backend_load(backend_id)); }),
+
+            // Per-backend resident routes (BACKLOG §21 P1): routes pinned to this
+            // backend in this shard's ART = working-set proxy a cache-aware
+            // autoscaler drains coldest-first. Shard-local read (the ART is router
+            // shard state); Prometheus sums shards = cluster total per backend.
+            seastar::metrics::make_gauge("backend_resident_routes",
+                seastar::metrics::description("Routes resident in this node's ART pinned to this backend. Lower = colder = safer to drain."),
+                {{"backend_id", backend_id_str}},
+                [backend_id] { return static_cast<double>(get_resident_routes(backend_id)); }),
 
             // Per-backend vLLM metrics gauges (read from HealthService on shard 0)
             // Returns 0/default when HealthService is not set or backend has no vLLM data

@@ -225,6 +225,100 @@ TEST_F(RadixTreeTest, OverwriteExistingRoute) {
     EXPECT_EQ(result.value(), 99);
 }
 
+// =============================================================================
+// Per-backend resident-route tally (BACKLOG §21 P1)
+// =============================================================================
+//
+// Invariant under test: routes_by_backend() tracks route_count() exactly across
+// insert / overwrite / evict / expire / remove-by-backend, and self-cleans
+// (an entry disappears when its backend has no live routes).
+
+namespace {
+// Sum of all per-backend counts — must always equal route_count().
+size_t sum_by_backend(const RadixTree& t) {
+    size_t total = 0;
+    for (const auto& [backend, count] : t.routes_by_backend()) {
+        total += count;
+    }
+    return total;
+}
+}  // namespace
+
+TEST_F(RadixTreeTest, ResidentRoutesEmptyInitially) {
+    EXPECT_TRUE(tree.routes_by_backend().empty());
+    EXPECT_EQ(sum_by_backend(tree), tree.route_count());
+}
+
+TEST_F(RadixTreeTest, ResidentRoutesCountsPerBackend) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 1);
+    tree.insert(tokens({7, 8, 9}), 2);
+
+    const auto& by_backend = tree.routes_by_backend();
+    ASSERT_TRUE(by_backend.contains(1));
+    ASSERT_TRUE(by_backend.contains(2));
+    EXPECT_EQ(by_backend.at(1), 2u);
+    EXPECT_EQ(by_backend.at(2), 1u);
+    EXPECT_EQ(sum_by_backend(tree), tree.route_count());
+}
+
+TEST_F(RadixTreeTest, ResidentRoutesOverwriteSameBackendNoDoubleCount) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({1, 2, 3}), 1);  // same backend -> no tally change
+
+    EXPECT_EQ(tree.routes_by_backend().at(1), 1u);
+    EXPECT_EQ(tree.route_count(), 1u);
+    EXPECT_EQ(sum_by_backend(tree), tree.route_count());
+}
+
+TEST_F(RadixTreeTest, ResidentRoutesOverwriteDifferentBackendMovesCount) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({1, 2, 3}), 2);  // overwrite -> move 1 -> 2
+
+    const auto& by_backend = tree.routes_by_backend();
+    EXPECT_FALSE(by_backend.contains(1));  // self-cleaned at 0
+    EXPECT_EQ(by_backend.at(2), 1u);
+    EXPECT_EQ(tree.route_count(), 1u);
+    EXPECT_EQ(sum_by_backend(tree), tree.route_count());
+}
+
+TEST_F(RadixTreeTest, ResidentRoutesEvictOldestDecrements) {
+    tree.insert(tokens({1, 2, 3}), 1);  // oldest (LRU tail)
+    tree.insert(tokens({4, 5, 6}), 2);
+
+    ASSERT_TRUE(tree.evict_oldest());
+
+    const auto& by_backend = tree.routes_by_backend();
+    EXPECT_FALSE(by_backend.contains(1));  // evicted -> self-cleaned
+    EXPECT_EQ(by_backend.at(2), 1u);
+    EXPECT_EQ(sum_by_backend(tree), tree.route_count());
+}
+
+TEST_F(RadixTreeTest, ResidentRoutesRemoveExpiredClearsTally) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+
+    // cutoff in the future -> every leaf is older than it -> all removed.
+    auto cutoff = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    tree.remove_expired(cutoff);
+
+    EXPECT_TRUE(tree.routes_by_backend().empty());
+    EXPECT_EQ(tree.route_count(), 0u);
+}
+
+TEST_F(RadixTreeTest, ResidentRoutesRemoveByBackendDecrements) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 1);
+    tree.insert(tokens({7, 8, 9}), 2);
+
+    tree.remove_routes_by_backend(1, RouteOrigin::LOCAL);
+
+    const auto& by_backend = tree.routes_by_backend();
+    EXPECT_FALSE(by_backend.contains(1));  // both backend-1 routes gone
+    EXPECT_EQ(by_backend.at(2), 1u);
+    EXPECT_EQ(sum_by_backend(tree), tree.route_count());
+}
+
 TEST_F(RadixTreeTest, CommonPrefixWithDifferentSuffixes) {
     // All share prefix {1, 2}
     tree.insert(tokens({1, 2, 10}), 10);
