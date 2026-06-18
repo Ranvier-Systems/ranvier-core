@@ -153,6 +153,14 @@ inline constexpr size_t MAX_TRACKED_BACKENDS = 10000;
 struct BackendMetrics {
     MetricHistogram latency;  // ranvier_backend_latency_seconds
     MetricHistogram first_byte_latency;
+
+    // Cache-aware scaler signals (BACKLOG §21 P0). Shard-local, lock-free
+    // (Rule #1). prefix_hits / prefix_attempts is the per-replica prefix-affinity
+    // cache hit rate ("warmth"); a prefix-routed request always bumps attempts and
+    // bumps hits when it matched a warm prefix.
+    uint64_t prefix_hits = 0;
+    uint64_t prefix_attempts = 0;
+
     bool registered = false;
 
     BackendMetrics()

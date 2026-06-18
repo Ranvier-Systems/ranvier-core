@@ -1033,6 +1033,10 @@ Touch points: `telemetry_service.{hpp,cpp}`, `telemetry_schema.hpp`,
   `QuorumState::DEGRADED` (fail-safe — freeze reaping signal during split-brain).
 - **Residency threshold (P3):** what `residency_weight` counts as "warm enough" to
   be a holder — same calibration as cache-headroom routing.
+- **StreamSummary eviction (deferred, P0 decision):** `src/stream_summary.hpp` uses
+  an O(capacity) min-scan on eviction — sub-µs at K=128, far under the task quota
+  (Rule #17). Upgrade to the O(1) bucket-list Space-Saving variant only if K is
+  raised by orders of magnitude.
 
 ### Hard-Rule watch (per proposal)
 

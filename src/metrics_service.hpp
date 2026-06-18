@@ -571,6 +571,23 @@ public:
         }
     }
 
+    // Per-backend prefix-affinity outcome (BACKLOG §21 P0). One call per
+    // prefix-routed request: bumps attempts, and hits when the prefix was warm.
+    // hits/attempts = the per-replica cache "warmth" a cache-aware autoscaler
+    // drains on. Shard-local, lock-free (Rule #1); bounded by
+    // get_or_create_backend_metrics' MAX_TRACKED_BACKENDS (Rule #4) — over the cap,
+    // the per-backend split is dropped while cache_hits_total still aggregates it.
+    void record_prefix_outcome_by_id(BackendId backend_id, bool cache_hit) {
+        auto* bm = get_or_create_backend_metrics(backend_id);
+        if (!bm) {
+            return;
+        }
+        ++bm->prefix_attempts;
+        if (cache_hit) {
+            ++bm->prefix_hits;
+        }
+    }
+
     // Set HealthService pointer for vLLM metrics gauge lambdas.
     // Called during init; null-safe (gauges return 0 when unset).
     void set_health_service(HealthService* hs) { _health_service = hs; }
@@ -1066,7 +1083,22 @@ private:
                 [this, backend_id] {
                     if (!_health_service) return 0.0;
                     return _health_service->get_backend_effective_cache_usage(backend_id);
-                })
+                }),
+
+            // Per-backend prefix-affinity warmth (BACKLOG §21 P0):
+            // backend_prefix_hits / backend_prefix_attempts = per-replica cache hit
+            // rate. make_gauge (not counter) because the reactor-free test stub only
+            // provides labeled gauge/histogram overloads; mirrors
+            // prefix_hits_by_compression_tier. No _total suffix (gauge convention).
+            seastar::metrics::make_gauge("backend_prefix_hits",
+                seastar::metrics::description("Prefix-affinity cache hits routed to this backend; ratio with backend_prefix_attempts = per-replica warmth."),
+                {{"backend_id", backend_id_str}},
+                [&metrics] { return static_cast<double>(metrics.prefix_hits); }),
+
+            seastar::metrics::make_gauge("backend_prefix_attempts",
+                seastar::metrics::description("Prefix-affinity routing attempts dispatched to this backend."),
+                {{"backend_id", backend_id_str}},
+                [&metrics] { return static_cast<double>(metrics.prefix_attempts); })
         });
 
         metrics.registered = true;
