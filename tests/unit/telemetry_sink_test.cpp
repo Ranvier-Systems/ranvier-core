@@ -265,7 +265,7 @@ TEST(AggregateRecord, MergeFromPrefixReuseDepthAccumulates) {
 TEST(WindowReport, DefaultsCarryCurrentFormatVersion) {
     WindowReport report;
     EXPECT_EQ(report.format_version, kTelemetryReportFormatVersion);
-    EXPECT_EQ(report.format_version, 3u);  // v3: route-scorer weights added to the strategy snapshot
+    EXPECT_EQ(report.format_version, 4u);  // v4: hot-prefix top-K added to the window report
     EXPECT_TRUE(report.records.empty());
     EXPECT_EQ(report.shard_count, 0u);
     EXPECT_EQ(report.window_eviction_churn, 0u);
@@ -425,4 +425,46 @@ TEST(TelemetryOutcome, KindOrdinalsArePinned) {
     EXPECT_EQ(static_cast<uint8_t>(TelemetryOutcome::Kind::FAILURE),          1);
     EXPECT_EQ(static_cast<uint8_t>(TelemetryOutcome::Kind::TIMEOUT),          2);
     EXPECT_EQ(static_cast<uint8_t>(TelemetryOutcome::Kind::CONNECTION_ERROR), 3);
+}
+
+// =============================================================================
+// merge_hot_prefixes: cluster top-K merge (BACKLOG §21 P1)
+// =============================================================================
+
+TEST(MergeHotPrefixes, EmptyInput) {
+    auto merged = merge_hot_prefixes({}, 128);
+    EXPECT_TRUE(merged.top.empty());
+    EXPECT_EQ(merged.total_touches, 0u);
+}
+
+TEST(MergeHotPrefixes, SumsCountsPerPrefixAcrossShards) {
+    std::vector<HotPrefixWindow> per_shard = {
+        {{{10, 5}, {20, 3}}, 8},   // shard 0: fp10=5, fp20=3, total 8
+        {{{10, 2}, {30, 9}}, 11},  // shard 1: fp10=2, fp30=9, total 11
+    };
+    auto merged = merge_hot_prefixes(per_shard, 128);
+
+    EXPECT_EQ(merged.total_touches, 19u);
+    ASSERT_EQ(merged.top.size(), 3u);
+    // Sorted by summed count desc: fp30=9, fp10=7, fp20=3.
+    EXPECT_EQ(merged.top[0].prefix_fp, 30u);
+    EXPECT_EQ(merged.top[0].request_count, 9u);
+    EXPECT_EQ(merged.top[1].prefix_fp, 10u);
+    EXPECT_EQ(merged.top[1].request_count, 7u);  // 5 + 2 summed across shards
+    EXPECT_EQ(merged.top[2].prefix_fp, 20u);
+    EXPECT_EQ(merged.top[2].request_count, 3u);
+}
+
+TEST(MergeHotPrefixes, TruncatesToK) {
+    std::vector<HotPrefixWindow> per_shard(1);
+    for (uint64_t fp = 0; fp < 50; ++fp) {
+        per_shard[0].entries.push_back({fp, fp + 1});  // distinct counts
+        per_shard[0].total_touches += fp + 1;
+    }
+    auto merged = merge_hot_prefixes(per_shard, 10);
+
+    EXPECT_EQ(merged.top.size(), 10u);          // capped at k
+    EXPECT_EQ(merged.top[0].prefix_fp, 49u);    // highest count first
+    EXPECT_EQ(merged.top[0].request_count, 50u);
+    EXPECT_EQ(merged.top[9].request_count, 41u);  // 10th highest
 }

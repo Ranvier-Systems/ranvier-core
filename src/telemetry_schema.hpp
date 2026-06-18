@@ -44,12 +44,14 @@
 
 #include <absl/container/flat_hash_map.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ranvier {
@@ -61,6 +63,10 @@ namespace ranvier {
 // Current wire format version of WindowReport. See the FORWARD-COMPATIBILITY
 // CONTRACT comment at the top of this file before bumping.
 //
+//   v4: added the hot-prefix top-K window aggregate (WindowReport::hot_prefixes
+//       + hot_prefix_touches; BACKLOG §21 P1). Body widened at the end; a v3
+//       reader simply doesn't see the new fields (append-only, format_version
+//       recorded not enforced).
 //   v3: added the unified route-scorer weights (RoutingStrategyParams::scoring,
 //       a ScoringWeights) to the per-window strategy snapshot. The body widened;
 //       a v2 reader simply doesn't see the weights — older payloads still parse
@@ -70,7 +76,7 @@ namespace ranvier {
 //       collapses engine classes into the other dimensions; the bump signals
 //       the wider key.
 //   v1: initial telemetry window-report schema.
-inline constexpr uint16_t kTelemetryReportFormatVersion = 3;
+inline constexpr uint16_t kTelemetryReportFormatVersion = 4;
 
 // =============================================================================
 // WorkloadPattern (stable wire-mirror of RequestIntent)
@@ -243,6 +249,65 @@ private:
 };
 
 // =============================================================================
+// Hot-prefix top-K (BACKLOG §21 P1)
+// =============================================================================
+//
+// A content-free fingerprint of a routing prefix and how often it was routed in
+// the window. `prefix_fp` is the router's prefix_hash — NOT reversible to tokens.
+struct HotPrefixEntry {
+    uint64_t prefix_fp     = 0;
+    uint64_t request_count = 0;
+};
+
+// One shard's per-window top-K snapshot, produced by the router's Space-Saving
+// summary (approximate; counts are upper bounds). `total_touches` is the full
+// prefix-routed request count this shard saw — the denominator for "what share
+// of traffic the hot set accounts for". Crosses shards by value inside
+// ShardSnapshot.
+struct HotPrefixWindow {
+    std::vector<HotPrefixEntry> entries;        // size <= K, unordered
+    uint64_t                    total_touches = 0;
+};
+
+// Cluster-merged result: top `k` prefixes by summed count + the cluster-wide
+// total touch count.
+struct MergedHotPrefixes {
+    std::vector<HotPrefixEntry> top;            // size <= k, sorted by count desc
+    uint64_t                    total_touches = 0;
+};
+
+// Merge per-shard hot-prefix windows into a cluster top-K. Sums request_count
+// per prefix_fp across shards, returns the top `k` by count (desc). Pure /
+// reactor-free so it is unit-testable without a running reactor. The merged map
+// is bounded by k * shard_count (each shard contributes <= K entries).
+inline MergedHotPrefixes merge_hot_prefixes(const std::vector<HotPrefixWindow>& per_shard,
+                                            size_t k) {
+    absl::flat_hash_map<uint64_t, uint64_t> summed;
+    uint64_t total = 0;
+    for (const auto& w : per_shard) {
+        total += w.total_touches;
+        for (const auto& e : w.entries) {
+            summed[e.prefix_fp] += e.request_count;
+        }
+    }
+
+    MergedHotPrefixes merged;
+    merged.total_touches = total;
+    merged.top.reserve(summed.size());
+    for (const auto& [fp, count] : summed) {
+        merged.top.push_back(HotPrefixEntry{fp, count});
+    }
+    std::sort(merged.top.begin(), merged.top.end(),
+              [](const HotPrefixEntry& a, const HotPrefixEntry& b) {
+                  return a.request_count > b.request_count;
+              });
+    if (merged.top.size() > k) {
+        merged.top.resize(k);
+    }
+    return merged;
+}
+
+// =============================================================================
 // RoutingStrategyParams (snapshot of policy in effect for the window)
 // =============================================================================
 //
@@ -296,6 +361,14 @@ struct WindowReport {
 
     // Routing-strategy params in effect for this window. See above.
     RoutingStrategyParams strategy;
+
+    // Hot-prefix top-K for this window (BACKLOG §21 P1; format v4). Cluster-merged
+    // top prefixes by request rate, content-free (prefix fingerprints only), and
+    // hot_prefix_touches is the cluster-wide prefix-routed request count — the
+    // denominator a consumer uses for top-1 / top-K concentration. Empty when
+    // hot-prefix tracking is disabled.
+    std::vector<HotPrefixEntry> hot_prefixes;
+    uint64_t                    hot_prefix_touches = 0;
 };
 
 // =============================================================================

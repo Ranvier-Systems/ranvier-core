@@ -41,6 +41,9 @@ struct ShardSnapshot {
     std::vector<AggregateRecord> records;
     uint64_t                     eviction_delta  = 0;
     uint64_t                     buckets_overflowed = 0;
+    // Hot-prefix top-K for this shard's window (BACKLOG §21 P1). Pulled from the
+    // router's Space-Saving summary via the getter; empty when tracking is off.
+    HotPrefixWindow              hot_prefixes;
 };
 
 class TelemetryService {
@@ -54,10 +57,13 @@ public:
     // Apply per-shard configuration. Idempotent. Pre-inserts the `_overflow`
     // sentinel. `eviction_counter_getter` returns the CUMULATIVE per-shard
     // ART eviction count; the service tracks the last-seen value to derive
-    // a per-window delta. Pass a null function to disable eviction-churn
-    // reporting (the field stays 0).
+    // a per-window delta. `hot_prefix_getter` returns this shard's hot-prefix
+    // top-K window AND resets it (called once per window from snapshot_and_reset);
+    // BACKLOG §21 P1. Pass null functions to disable the respective signal (the
+    // fields stay empty/0).
     seastar::future<> start_shard(TelemetrySinkConfig config,
-                                  std::function<uint64_t()> eviction_counter_getter);
+                                  std::function<uint64_t()> eviction_counter_getter,
+                                  std::function<HotPrefixWindow()> hot_prefix_getter);
 
     // -------------------------------------------------------------------------
     // Shard-0 emitter (called only on shard 0)
@@ -114,6 +120,7 @@ private:
     size_t      _max_buckets   = 0;
     std::function<uint64_t()> _eviction_counter_getter;
     uint64_t    _eviction_last_seen = 0;
+    std::function<HotPrefixWindow()> _hot_prefix_getter;  // BACKLOG §21 P1
 
     absl::flat_hash_map<TelemetryBucketKey, AggregateRecord, TelemetryBucketKeyHash> _buckets;
     uint64_t    _buckets_overflowed = 0;  // overflow attributions in the current window

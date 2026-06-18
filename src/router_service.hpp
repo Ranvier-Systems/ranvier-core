@@ -23,6 +23,9 @@
 
 namespace ranvier {
 
+// Defined in telemetry_schema.hpp; used here only as a by-value return type.
+struct HotPrefixWindow;
+
 // ============================================================================
 // Route Batching Types
 // ============================================================================
@@ -413,6 +416,14 @@ public:
     // Calling shard's cumulative ART route-eviction count. Returns 0 when
     // shard state is not initialised.
     static uint64_t get_local_routes_evicted();
+
+    // Hot-prefix telemetry (BACKLOG §21 P1). set_hot_prefix_tracking() arms the
+    // gated touch() on the routing path for the calling shard (off => one branch,
+    // no hashing). snapshot_hot_prefixes() returns the calling shard's current
+    // top-K window and RESETS it — called once per telemetry window by the sink
+    // emitter via its getter seam. Both read/write shard-local state.
+    static void set_hot_prefix_tracking(bool enabled);
+    static HotPrefixWindow snapshot_hot_prefixes();
 
     // Start draining a backend (stops new requests, allows existing cache hits)
     // After backend_drain_timeout, the backend will be fully removed
