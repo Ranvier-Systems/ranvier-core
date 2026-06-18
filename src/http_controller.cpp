@@ -1980,6 +1980,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         captured_telemetry_was_cost_redirect = route_result.was_cost_redirect;
         captured_telemetry_was_fast_lane     = route_result.was_fast_lane;
         captured_telemetry_matched_prefix_depth = route_result.matched_prefix_depth;
+
+        // BACKLOG §21 P0: per-replica prefix warmth. Attribute only prefix-routed
+        // requests — cache_hit is only ever set on the prefix path, so counting
+        // hash/random traffic would dilute the hit-rate denominator. Shard-local,
+        // lock-free (Rule #1).
+        if (route_result.routing_mode == "prefix") {
+            metrics().record_prefix_outcome_by_id(target_id, route_result.cache_hit);
+        }
     } // route_span ends here
 
     // Speculative load increment: create BackendRequestGuard immediately after routing

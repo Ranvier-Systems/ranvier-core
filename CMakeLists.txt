@@ -607,6 +607,22 @@ target_link_libraries(metrics_service_test
 )
 gtest_discover_tests(metrics_service_test)
 
+# StreamSummary Unit Tests (Pure C++, no Seastar deps)
+# Space-Saving bounded top-K: capacity bound (Rule #4), eviction + error bounds,
+# heavy-hitter retention, snapshot ordering. Reactor-free by construction.
+add_executable(stream_summary_test
+  tests/unit/stream_summary_test.cpp
+)
+target_include_directories(stream_summary_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(stream_summary_test
+  PRIVATE
+  GTest::gtest_main
+  absl::flat_hash_map
+)
+gtest_discover_tests(stream_summary_test)
+
 # Telemetry Sink Unit Tests (Pure C++, uses stubs for Seastar future + metrics)
 # Tests the wire-stable BackendType / HardwareLabel / WorkloadPattern ordinals
 # (forward-compat contract — see src/telemetry_schema.hpp), TelemetryBucketKey
