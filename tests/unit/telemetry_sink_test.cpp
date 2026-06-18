@@ -265,7 +265,7 @@ TEST(AggregateRecord, MergeFromPrefixReuseDepthAccumulates) {
 TEST(WindowReport, DefaultsCarryCurrentFormatVersion) {
     WindowReport report;
     EXPECT_EQ(report.format_version, kTelemetryReportFormatVersion);
-    EXPECT_EQ(report.format_version, 3u);  // v3: route-scorer weights added to the strategy snapshot
+    EXPECT_EQ(report.format_version, 4u);  // v4: hot-prefix top-K added to the window report
     EXPECT_TRUE(report.records.empty());
     EXPECT_EQ(report.shard_count, 0u);
     EXPECT_EQ(report.window_eviction_churn, 0u);
