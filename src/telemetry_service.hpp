@@ -107,6 +107,12 @@ public:
     size_t bucket_count_for_testing() const { return _buckets.size(); }
     uint64_t reports_dropped_for_testing() const { return _reports_dropped_backpressure; }
 
+    // Content-free JSON of the last window's merged hot-prefix top-K (BACKLOG
+    // §21 P1). Shard-0 state — call on shard 0 (the metrics-server topology
+    // handler hops there). Returns an empty/zeroed snapshot before the first
+    // window or when tracking is disabled.
+    std::string hot_prefix_topology_json() const;
+
     // Sentinel that the overflow path attributes to. The "_overflow"
     // model_family is the marker; the other dimensions are inert filler.
     static TelemetryBucketKey overflow_key() {
@@ -135,6 +141,13 @@ private:
     bool                                _consume_in_flight = false;
     uint64_t                            _reports_dropped_backpressure = 0;
     uint64_t                            _reports_emitted = 0;
+
+    // Cached merged hot-prefix top-K from the last window (BACKLOG §21 P1; shard
+    // 0 only). Read lock-free by the concentration gauges and the
+    // /v1/cache/topology handler. _last_hot_prefix_at == default => no window yet.
+    std::vector<HotPrefixEntry>         _last_hot_prefixes;
+    uint64_t                            _last_hot_prefix_touches = 0;
+    std::chrono::steady_clock::time_point _last_hot_prefix_at{};
     int64_t                             _window_start_ms = 0;
     seastar::metrics::metric_groups     _emitter_metrics;
     bool                                _emitter_started = false;
