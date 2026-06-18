@@ -10,9 +10,9 @@
 #include <chrono>
 #include <functional>
 #include <cassert>
+#include <unordered_map>
 
 #include <absl/container/inlined_vector.h>
-#include <absl/container/flat_hash_map.h>
 
 #include "byte_order.hpp"
 #include "types.hpp"
@@ -448,7 +448,7 @@ public:
     // so it cannot drift. Holds only backends with >= 1 live route (self-cleaning),
     // so Prometheus summing across shards yields cluster-total resident routes per
     // backend. Backend a scaler would drain coldest = the one with the fewest here.
-    const absl::flat_hash_map<BackendId, size_t>& routes_by_backend() const {
+    const std::unordered_map<BackendId, size_t>& routes_by_backend() const {
         return routes_by_backend_;
     }
 
@@ -754,7 +754,11 @@ private:
     // with live routes — operationally bounded by the registry (backend_ids are
     // not untrusted input). kMaxTrackedBackends is a defense-in-depth cap.
     static constexpr size_t kMaxTrackedBackends = 10000;
-    absl::flat_hash_map<BackendId, size_t> routes_by_backend_;
+    // std::unordered_map (not absl::flat_hash_map) so this header stays clear of
+    // absl's SwissTable "generations" sanitizer machinery, which null-derefs under
+    // the ASan/UBSan fuzz build against a non-sanitizer system libabsl. Mirrors
+    // metrics_service's std::unordered_map<BackendId, ...> per-backend map.
+    std::unordered_map<BackendId, size_t> routes_by_backend_;
 
     // Intrusive LRU doubly-linked list of leaf nodes.
     // lru_head_ = most recently accessed, lru_tail_ = oldest (eviction target).
