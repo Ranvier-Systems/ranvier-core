@@ -950,16 +950,57 @@ and the sole-holder index scoping (asymmetry insight + 5-phase plan).
 | Priority | Item | Complexity | Depends on |
 |----------|------|------------|-----------|
 | P0 | `StreamSummary` bounded top-K structure (`stream_summary.hpp`) + reactor-free unit tests | Low | — |
-| P0 | Per-backend prefix hit/attempt counters `backend_prefix_{hits,attempts}_total{backend_id}` (extend `BackendMetrics`, §6.A/B) | Low | — |
-| P0 | Decision spike: K default; labeled-`make_counter` overload vs gauge fallback; hit-attribution call-site | Low | — |
+| P0 | Per-backend prefix hit/attempt **gauges** `backend_prefix_{hits,attempts}{backend_id}` via `make_gauge`+lambda (extend `BackendMetrics`, §6.A/B) | Low | — |
+| ✅ | Decision spike — **RESOLVED** (see "Spike findings" below): K=128; gauge-not-counter; call-site located; reuse `TelemetryService` | — | done |
 | P1 | Per-backend resident-route gauge `backend_resident_routes{backend_id}` (RouterService, §6.C) | Low | — |
-| P1 | Shard-0 top-K merge timer + concentration gauges `hot_prefix_*` (§6.E/F) | Medium | StreamSummary |
-| P1 | `GET /v1/cache/topology` JSON, single-node holders (no gossip yet), auth-gated (§6.G) | Medium | merge timer |
+| P1 | Hot-prefix top-K as a `TelemetryService` window aggregate (extend `ShardSnapshot`/`WindowReport`) + concentration gauges `hot_prefix_*` (§6.E/F) | Low-Med | StreamSummary, TelemetryService |
+| P1 | `GET /v1/cache/topology` JSON, single-node holders (no gossip yet), auth-gated (§6.G) | Medium | window aggregate |
 | P2 | `HOT_PREFIX_DIGEST` (0x07) gossip packet + handler (sole-holder Phase 2) | Medium | StreamSummary |
 | P2 | Shard-0 `CacheTopologyIndex` (prefix→nodes), peer-death eviction, bounded + overflow counter (Phase 3) | Medium | 0x07 packet |
 | P2 | `sole_held`/`holders` in topology JSON + `sole_held_hot_prefixes` gauge (Phase 4) | Low | CacheTopologyIndex |
 | P3 | Residency-verified holders — intersect digest with `residency_weight`/native KV (Phase 5) | Medium-High | CacheTopologyIndex |
 | P3 | Benchmark: hot-path overhead of per-request top-K increment | Low | P0/P1 |
+
+### Spike findings (2026-06-18)
+
+The P0 decision spike is closed.
+
+1. **`StreamSummary` K = 128** — shared with the P2 gossip-digest cap so the local
+   top-K and the wire digest use one constant. Per-shard memory is negligible.
+2. **Per-backend hit/attempt are gauges, not counters.** The reactor-free test
+   stub provides labeled overloads for `make_gauge`/`make_histogram` only —
+   `make_counter` with a `{{"backend_id",…}}` label list does not deduce
+   (`tests/stubs/seastar/core/metrics.hh:46-54`). Mirror
+   `prefix_hits_by_compression_tier` (`metrics_service.hpp:277`): `make_gauge` +
+   lambda reading the `BackendMetrics` field, named without the `_total` suffix.
+3. **Hit-attribution call-site** is the existing per-backend recording site,
+   `record_backend_latency_by_id(ctx.current_backend, …)`
+   (`http_controller.cpp:734`); `route_result.cache_hit` is already captured
+   (`:1978`). Add a `record_prefix_outcome_by_id(backend, cache_hit)` wrapper
+   alongside it.
+
+**Course-correction — reuse `TelemetryService` for P1 aggregation.** The §20
+`TelemetryService` (`seastar::sharded<>`, off by default) already implements the
+per-shard→shard-0 aggregation this proposal's §"Aggregation path" described
+building from scratch: bounded per-shard buckets + `_overflow` sentinel (#4),
+`foreign_ptr<ShardSnapshot>` gather (#14), gate + shard-0 window-emitter timer
+(#5), forward-compat append-only schema, pluggable sink. Its `AggregateRecord`
+already carries `cache_hit_count`/`cache_miss_count`/`prefix_reuse_depth`, and
+`TelemetryOutcome` already carries `cache_hit` + `matched_prefix_depth`.
+
+Implications:
+- **Do not build a parallel shard-0 aggregator.** P1's hot-prefix top-K becomes a
+  *window-level aggregate* (sibling of `window_eviction_churn`) on
+  `ShardSnapshot`/`WindowReport`, reusing the existing gather/gate/timer/overflow
+  machinery.
+- **Per-backend hit rate stays in `metrics_service`** (P0) — `TelemetryService`
+  buckets are content-free (`model_family`/`backend_type`/`hardware_label`/
+  `workload`), deliberately *not* per-`BackendId`.
+- The shard-0 merged window state feeds the label-free concentration gauges and
+  `/v1/cache/topology`, and continues to flow to any configured sink.
+
+Touch points: `telemetry_service.{hpp,cpp}`, `telemetry_schema.hpp`,
+`tests/stubs/seastar/core/metrics.hh`.
 
 ### Sequencing / PR boundaries
 
@@ -967,10 +1008,11 @@ and the sole-holder index scoping (asymmetry insight + 5-phase plan).
    the keystone dependency; build and unit-test it first (pure, no Seastar). The
    per-backend hit counters land immediately useful value with one struct field +
    one `add_group` line. Ships independently.
-2. **P1 — node-level view.** Resident-route gauge, the shard-0 merge timer feeding
-   the label-free concentration gauges, and the JSON endpoint reporting *local*
-   backends as holders. Already actionable for a single-node or
-   manually-correlated scaler.
+2. **P1 — node-level view.** Resident-route gauge, the hot-prefix top-K added as a
+   `TelemetryService` window aggregate (reusing its gather/gate/timer rather than a
+   new aggregator — see Spike findings) feeding the label-free concentration
+   gauges, and the JSON endpoint reporting *local* backends as holders. Already
+   actionable for a single-node or manually-correlated scaler.
 3. **P2 — cluster-wide sole-holder.** Introduces gossip type `0x07`; needs
    rolling-upgrade care (append-only enum, `is_known_packet_type`, forward-compat
    tail — see proposal). Delivers approximate `sole_held` suitable for

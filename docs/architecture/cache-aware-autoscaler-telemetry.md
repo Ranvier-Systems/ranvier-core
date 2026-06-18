@@ -129,12 +129,24 @@ counter, per shard, with fixed `K` (propose 128):
 
 ## Aggregation path (per-shard → node) and hot-path cost
 
+> **Implementation note (2026-06-18 spike):** the per-shard→shard-0 aggregation
+> described below is **already built** as `TelemetryService` (`telemetry_service.{hpp,cpp}`,
+> `seastar::sharded<>`, off by default): bounded per-shard buckets + `_overflow`
+> sentinel (#4), `foreign_ptr<ShardSnapshot>` gather (#14), gate + shard-0
+> window-emitter timer (#5), forward-compat append-only schema, pluggable sink.
+> Prefer **extending it** — add the hot-prefix top-K as a window-level aggregate
+> (a sibling of `window_eviction_churn` on `ShardSnapshot`/`WindowReport`) — over
+> standing up the standalone aggregator the steps below imply. Per-backend hit
+> rate stays in `metrics_service` (its buckets are content-free, not per-`BackendId`).
+> See BACKLOG §21 "Spike findings".
+
 Per-shard ART + Space-Saving summaries are shard-local (Rule #8). The scaler
 wants a node view. **Do not aggregate on scrape** — a gauge lambda fanning out to
-N shards would stall the reactor on every scrape (Rule #1/#17). Copy the
-established **refresh-into-cached-snapshot-on-a-timer** pattern already used by
-`shard_load_balancer.hpp::refresh_all_snapshots()` and the `gpu_load_cache` /
-`*_age_seconds` gauges.
+N shards would stall the reactor on every scrape (Rule #1/#17). Use the
+established **refresh-into-cached-snapshot-on-a-timer** pattern — which is exactly
+what `TelemetryService`'s shard-0 window emitter already does (and which
+`shard_load_balancer.hpp::refresh_all_snapshots()` / the `gpu_load_cache` /
+`*_age_seconds` gauges also follow).
 
 1. **Hot path (per request):** one O(1) increment into the shard-local
    Space-Saving summary, keyed by the already-computed `prefix_hash`. No locks,
