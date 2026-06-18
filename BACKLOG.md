@@ -959,7 +959,7 @@ and the sole-holder index scoping (asymmetry insight + 5-phase plan).
 | P2 | Shard-0 `CacheTopologyIndex` (prefix→nodes), peer-death eviction, bounded + overflow counter (Phase 3) | Medium | 0x07 packet |
 | P2 | `sole_held`/`holders` in topology JSON + `sole_held_hot_prefixes` gauge (Phase 4) | Low | CacheTopologyIndex |
 | P3 | Residency-verified holders — intersect digest with `residency_weight`/native KV (Phase 5) | Medium-High | CacheTopologyIndex |
-| P3 | Benchmark: hot-path overhead of per-request top-K increment | Low | P0/P1 |
+| P3 | Routing-overhead micro-benchmark (telemetry off vs on) — see "Verification & benchmark gate" | Low | P0/P1 |
 
 ### Spike findings (2026-06-18)
 
@@ -1033,6 +1033,46 @@ Touch points: `telemetry_service.{hpp,cpp}`, `telemetry_schema.hpp`,
   `QuorumState::DEGRADED` (fail-safe — freeze reaping signal during split-brain).
 - **Residency threshold (P3):** what `residency_weight` counts as "warm enough" to
   be a holder — same calibration as cache-headroom routing.
+
+### Verification & benchmark gate
+
+Static analysis predicts the per-request tax is sub-100ns (P0: a `routing_mode`
+compare + one `absl` lookup + 2 increments; P1: one `StreamSummary::touch()`,
+O(1) hit / O(K=128) evict). This gate turns that prediction into a failable
+measurement. Modelled on `docs/benchmarks/epp-overhead-microbenchmark.md` (the
+existing per-request-overhead A/B); not runnable in the sandbox.
+
+**A/B method (single-stream, the cleanest overhead signal).** Two otherwise
+identical runs through one ingress, telemetry **off** (baseline) then **on**,
+using the existing driver:
+
+```sh
+python tests/integration/http_ab_load.py --target http://localhost:8080 \
+    --requests 5000 --warmup 500     # once per arm; --concurrency 1
+```
+
+Prefer a Makefile wrapper following the `bench-epp` pattern
+(`scripts/bench-cache-topology-overhead.sh` → `make bench-cache-topology`) that
+brings up one node, toggles the telemetry config between arms, and tears down.
+
+**Primary signal — server-side, brackets exactly our code:** scrape
+`ranvier_router_routing_latency_seconds` (histogram, `metrics_service.hpp`) from
+`:9180` at the end of each arm; compare p50/p99. This isolates the routing
+decision (where `touch()` + `record_prefix_outcome_by_id` sit) from backend and
+network time. The client-side percentiles from `http_ab_load.py` are the
+secondary, end-to-end signal.
+
+**Pass thresholds:**
+- Routing-decision p50/p99 delta (on − off) within run-to-run noise — target
+  **< 1%**, and necessarily **≪ the ~35 µs** that prefix routing already adds over
+  bare load/hash (per the EPP microbench), since our addition is two-plus orders
+  of magnitude smaller.
+- **No periodic p99 spike** aligned to the P1 shard-0 window-emit cadence — the
+  real thing to watch is the merge timer, not `touch()`. Cross-check for
+  Seastar reactor-stall warnings on shard 0 during the run.
+
+When first run, promote the methodology + recorded floor to
+`docs/benchmarks/cache-topology-telemetry-overhead.md` (as `bench-epp` did).
 
 ### Hard-Rule watch (per proposal)
 
