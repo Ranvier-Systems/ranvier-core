@@ -31,6 +31,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 18. [Request Lifecycle Crash-Risk Audit Follow-ups (2026-05-08)](#18-request-lifecycle-crash-risk-audit-follow-ups-2026-05-08)
 19. [Heterogeneous Backend Support (2026-05-16)](#19-heterogeneous-backend-support-2026-05-16)
 20. [Routing Parity & Ecosystem Alignment](#20-routing-parity--ecosystem-alignment-2026-06-07)
+21. [Cache-Aware Autoscaling Telemetry (2026-06-18)](#21-cache-aware-autoscaling-telemetry-2026-06-18)
 
 ---
 
@@ -929,6 +930,78 @@ Deferred follow-ups (recorded in the retrospective; would be promoted to new bac
 The section heading and anchor (`#20-routing-parity--ecosystem-alignment-2026-06-07`) are preserved here as a stable pointer for the in-source cross-references in `src/route_scorer.hpp`, `src/router_service.cpp`, `src/types.hpp`, `src/k8s_discovery_service.hpp`, `src/sqlite_persistence.cpp`, `src/gie_epp_server.hpp`, `src/http_controller.cpp`, and `src/application.cpp` (and the §20-referencing internals docs).
 
 ---
+
+## 21. Cache-Aware Autoscaling Telemetry (2026-06-18)
+
+Export the prefix→replica and per-prefix-hotness signals an external
+cache-aware autoscaler needs to (a) drain the *coldest* replica rather than a hot
+one, and (b) avoid reaping the last warm holder of a hot prefix. Ranvier already
+knows the prefix→replica mapping and per-replica KV/load state; this work surfaces
+the missing prefix-level intelligence as bounded telemetry.
+
+**Scope boundary:** Ranvier *exports* telemetry only. The autoscaler itself
+(reap/pin policy, replica lifecycle) lives in the external platform — reap-gating
+semantics in particular are the scaler's decision, not Ranvier's.
+
+**Full proposal:** [`docs/architecture/cache-aware-autoscaler-telemetry.md`](docs/architecture/cache-aware-autoscaler-telemetry.md)
+— signal inventory, export surface (§6 registration sketch), aggregation path,
+and the sole-holder index scoping (asymmetry insight + 5-phase plan).
+
+| Priority | Item | Complexity | Depends on |
+|----------|------|------------|-----------|
+| P0 | `StreamSummary` bounded top-K structure (`stream_summary.hpp`) + reactor-free unit tests | Low | — |
+| P0 | Per-backend prefix hit/attempt counters `backend_prefix_{hits,attempts}_total{backend_id}` (extend `BackendMetrics`, §6.A/B) | Low | — |
+| P0 | Decision spike: K default; labeled-`make_counter` overload vs gauge fallback; hit-attribution call-site | Low | — |
+| P1 | Per-backend resident-route gauge `backend_resident_routes{backend_id}` (RouterService, §6.C) | Low | — |
+| P1 | Shard-0 top-K merge timer + concentration gauges `hot_prefix_*` (§6.E/F) | Medium | StreamSummary |
+| P1 | `GET /v1/cache/topology` JSON, single-node holders (no gossip yet), auth-gated (§6.G) | Medium | merge timer |
+| P2 | `HOT_PREFIX_DIGEST` (0x07) gossip packet + handler (sole-holder Phase 2) | Medium | StreamSummary |
+| P2 | Shard-0 `CacheTopologyIndex` (prefix→nodes), peer-death eviction, bounded + overflow counter (Phase 3) | Medium | 0x07 packet |
+| P2 | `sole_held`/`holders` in topology JSON + `sole_held_hot_prefixes` gauge (Phase 4) | Low | CacheTopologyIndex |
+| P3 | Residency-verified holders — intersect digest with `residency_weight`/native KV (Phase 5) | Medium-High | CacheTopologyIndex |
+| P3 | Benchmark: hot-path overhead of per-request top-K increment | Low | P0/P1 |
+
+### Sequencing / PR boundaries
+
+1. **P0 — observability foundation, zero wire/cluster risk.** `StreamSummary` is
+   the keystone dependency; build and unit-test it first (pure, no Seastar). The
+   per-backend hit counters land immediately useful value with one struct field +
+   one `add_group` line. Ships independently.
+2. **P1 — node-level view.** Resident-route gauge, the shard-0 merge timer feeding
+   the label-free concentration gauges, and the JSON endpoint reporting *local*
+   backends as holders. Already actionable for a single-node or
+   manually-correlated scaler.
+3. **P2 — cluster-wide sole-holder.** Introduces gossip type `0x07`; needs
+   rolling-upgrade care (append-only enum, `is_known_packet_type`, forward-compat
+   tail — see proposal). Delivers approximate `sole_held` suitable for
+   **operator observability**.
+4. **P3 — accuracy gate.** Residency verification is the prerequisite before any
+   autoscaler consumes `sole_held` for **automated reaping** (route-membership
+   alone can false-negative → reap the last warm copy; see proposal's asymmetry
+   analysis). Benchmark confirms the per-request increment stays off the stall
+   budget.
+
+### Prerequisites & open decisions
+
+- **Config gate:** add `enable_cache_topology` (default off) so P2 gossip can ship
+  dark and be enabled per-cluster once stabilized.
+- **Gossiped K vs MTU:** cap digest at ~128 × 8B hashes to stay under a 1500B MTU
+  before DTLS overhead; chunking/truncation only if a larger K is required.
+- **DEGRADED-quorum behavior:** do not assert `sole_held=false` while
+  `QuorumState::DEGRADED` (fail-safe — freeze reaping signal during split-brain).
+- **Residency threshold (P3):** what `residency_weight` counts as "warm enough" to
+  be a holder — same calibration as cache-headroom routing.
+
+### Hard-Rule watch (per proposal)
+
+Lock-free shard-local counters (#1); bounded by construction — fixed-K
+`StreamSummary`, `CacheTopologyIndex` `MAX_HOT_PREFIXES` + overflow metric (#4);
+broadcast/merge timer gate (#5); deregister gauges first in `stop()` (#6); shard-0
+read of cross-shard/peer state — never from another shard's lambda (#14); yield
+when merging K·N entries (#17).
+
+Section anchor (`#21-cache-aware-autoscaling-telemetry-2026-06-18`) is the stable
+pointer for future in-source `// BACKLOG §21` cross-references.
 
 ---
 
