@@ -17,7 +17,7 @@ sketches are illustrative API shape, not a line-for-line match to the merged cod
 | Hot-prefix top-K + concentration | ✅ shipped (P1) | bounded `StreamSummary` + shard-0 merge (§6.D/E/F) |
 | `GET /v1/cache/topology` snapshot | ✅ shipped (P1) | bounded JSON on `:9180`, auth-gated (§6.G) |
 | Cluster-wide sole-holder index | ✅ shipped (P2) | `HOT_PREFIX_DIGEST` (0x07) + shard-0 `CacheTopologyIndex`; `sole_held`/`holders` in the JSON + `ranvier_sole_held_hot_prefixes` / `hot_prefix_sole_held_request_share` gauges. Gated by `enable_cache_topology` (default off) + DEGRADED-quorum freeze. **Operator-observability only** until the P3 residency gate — see below |
-| Residency-verified holders (accuracy gate) | ⏭ proposed (P3) | intersect digest with `residency_weight`/native KV before any automated reaping (Phase 5; the asymmetry below) |
+| Residency-verified holders (accuracy gate) | ⏭ proposed (P3) — **scoped**, see [residency-verification design](cache-topology-residency-verification.md) | intersect digest with native-KV `prefix_hash_index` before any automated reaping (Phase 5; the asymmetry below) |
 
 ### P2 prerequisites — shipped (2026-06-19)
 
@@ -270,7 +270,7 @@ scoping.
 | **2** | `HOT_PREFIX_DIGEST = 0x07` packet: serialize/deserialize, `is_known_packet_type`, broadcast + handler callback | `gossip_protocol.{hpp,cpp}`, `byte_order.hpp` | #4 (bound payload to K), big-endian + append-only enum + forward-compat tail, #9 (log deserialize failures) | M |
 | **3** | Shard-0 cluster index `hash → NodeSet`: per-node replacement, TTL, peer-death eviction, bounded + overflow counter | new `cache_topology_index.hpp` + wire into `gossip_service`/consensus | #4 (cap + overflow metric), #17 (yield merging K·N), #14 (shard-0-only; foreign_ptr if distributed), #5 (broadcast timer gate) | M |
 | **4** | Expose: `sole_held`/`holders` in `/v1/cache/topology` JSON + `ranvier_sole_held_hot_prefixes` gauge (stubbed in §F) | aggregator service | #6 (deregister gauge first), shard-0 read trap | S |
-| **5** | **Residency-verified holders** — intersect digest membership with `residency_weight` / native KV events; required before automated reap-gating | `cache_topology_index`, consume CACHE_STATE | accuracy, not new Rule traps | M–L |
+| **5** | **Residency-verified holders** — intersect digest membership with native-KV `prefix_hash_index`; required before automated reap-gating. **Scoped: [residency-verification design](cache-topology-residency-verification.md)** (Q1 sidecar/`self_backend_id`, Q2 native-KV-only, Q3 trust fallback; sub-phases 5a–5d) | `telemetry_service`, `router_service`, `gossip_protocol`, `cache_topology_index` | M–L |
 
 MVP for **observability** = Phases 1–4. MVP for **gating a scaler's reaping** = +Phase 5.
 
