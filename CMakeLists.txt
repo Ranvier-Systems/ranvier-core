@@ -864,6 +864,20 @@ target_link_libraries(gossip_hot_prefix_digest_test
 )
 gtest_discover_tests(gossip_hot_prefix_digest_test)
 
+# Cache-Topology Index Unit Tests (BACKLOG §21 P2; pure structure, no Seastar).
+# Per-node set-replace, peer-death eviction, TTL age-out, self-clean, bounds.
+add_executable(cache_topology_index_test
+  tests/unit/cache_topology_index_test.cpp
+)
+target_include_directories(cache_topology_index_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(cache_topology_index_test
+  PRIVATE
+  GTest::gtest_main
+  absl::flat_hash_map
+  absl::flat_hash_set
+)
+gtest_discover_tests(cache_topology_index_test)
+
 # Gossip Transport Ownership Pattern Tests (Pure C++, no Seastar dependency)
 # Tests verifying shard-local ownership patterns (Rule #0: no std::shared_ptr)
 add_executable(gossip_transport_ownership_test
