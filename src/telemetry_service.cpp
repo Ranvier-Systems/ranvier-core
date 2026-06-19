@@ -77,7 +77,8 @@ seastar::future<> TelemetryService::start_emitter(
     std::unique_ptr<TelemetrySink> sink,
     std::function<RoutingStrategyParams()> strategy_snapshot,
     BackendId self_backend_id,
-    std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster) {
+    std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster,
+    std::function<bool()> quorum_degraded_getter) {
 
     if (seastar::this_shard_id() != 0) {
         return seastar::make_exception_future<>(
@@ -96,6 +97,7 @@ seastar::future<> TelemetryService::start_emitter(
     _strategy_snapshot  = std::move(strategy_snapshot);
     _self_backend_id    = self_backend_id;                                  // BACKLOG §21 P2
     _hot_prefix_digest_broadcaster = std::move(hot_prefix_digest_broadcaster);
+    _quorum_degraded_getter = std::move(quorum_degraded_getter);            // BACKLOG §21 P2
     _window_start_ms    = now_ms();
 
     if (!_enabled) {
@@ -138,13 +140,19 @@ seastar::future<> TelemetryService::start_emitter(
         // window boundary. An autoscaler scrapes every node and unions the set.
         sm::make_gauge("ranvier_sole_held_hot_prefixes",
             sm::description("Count of this node's hot top-K prefixes held by exactly one cluster node "
-                            "(sole-held => unsafe to reap that node)."),
-            [this] { return static_cast<double>(hot_prefix_sole_held_count(current_holder_counts())); }),
+                            "(sole-held => unsafe to reap that node). Frozen to all hot prefixes while "
+                            "quorum is DEGRADED (split-brain freeze)."),
+            [this] {
+                return static_cast<double>(
+                    hot_prefix_sole_held_count(current_holder_counts(), quorum_degraded()));
+            }),
         sm::make_gauge("hot_prefix_sole_held_request_share",
-            sm::description("Fraction of prefix-routed requests hitting sole-held hot prefixes (0..1)."),
+            sm::description("Fraction of prefix-routed requests hitting sole-held hot prefixes (0..1). "
+                            "Frozen to the full top-K share while quorum is DEGRADED."),
             [this] {
                 return hot_prefix_sole_held_request_share(
-                    _last_hot_prefixes, current_holder_counts(), _last_hot_prefix_touches);
+                    _last_hot_prefixes, current_holder_counts(), _last_hot_prefix_touches,
+                    quorum_degraded());
             }),
         sm::make_gauge("topk_snapshot_age_seconds",
             sm::description("Age of the cached hot-prefix snapshot in seconds (0 before the first window)."),
@@ -434,6 +442,7 @@ seastar::future<> TelemetryService::stop() {
             _sink.reset();
             _strategy_snapshot = nullptr;
             _hot_prefix_digest_broadcaster = nullptr;  // BACKLOG §21 P2
+            _quorum_degraded_getter = nullptr;         // BACKLOG §21 P2
             _container = nullptr;
             _emitter_started = false;
             _buckets.clear();
@@ -477,7 +486,7 @@ std::string TelemetryService::hot_prefix_topology_json() const {
             std::chrono::steady_clock::now() - _last_hot_prefix_at).count();
     }
     return format_hot_prefix_topology_json(_last_hot_prefixes, current_holder_counts(),
-                                           _last_hot_prefix_touches, age_ms);
+                                           _last_hot_prefix_touches, age_ms, quorum_degraded());
 }
 
 }  // namespace ranvier

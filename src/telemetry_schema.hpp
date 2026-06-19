@@ -329,7 +329,16 @@ inline double hot_prefix_topk_share(const std::vector<HotPrefixEntry>& top, uint
 // self-applied into the index), holders[i] >= 1 and sole-held == "only we hold
 // it". Both pure / reactor-free; tolerant of holders shorter than top (missing
 // => treated as 0, e.g. a prefix dropped at the index cap).
-inline size_t hot_prefix_sole_held_count(const std::vector<size_t>& holders) {
+//
+// `quorum_degraded` is the split-brain freeze (open-decision "DEGRADED-quorum
+// behavior", fail-safe): while the cluster view is unreliable a stale-but-
+// unevicted peer can inflate holder counts and mask a true sole-holder (the
+// fail-dangerous false-negative), so we NEVER report sole_held=false — every hot
+// prefix is treated as sole-held until quorum recovers. This freezes the reaping
+// signal toward "do not reap".
+inline size_t hot_prefix_sole_held_count(const std::vector<size_t>& holders,
+                                         bool quorum_degraded = false) {
+    if (quorum_degraded) return holders.size();  // freeze: all treated sole-held
     size_t n = 0;
     for (size_t h : holders) {
         if (h == 1) ++n;
@@ -338,12 +347,13 @@ inline size_t hot_prefix_sole_held_count(const std::vector<size_t>& holders) {
 }
 inline double hot_prefix_sole_held_request_share(const std::vector<HotPrefixEntry>& top,
                                                  const std::vector<size_t>& holders,
-                                                 uint64_t total) {
+                                                 uint64_t total,
+                                                 bool quorum_degraded = false) {
     if (total == 0) return 0.0;
     uint64_t sum = 0;
     const size_t n = std::min(top.size(), holders.size());
     for (size_t i = 0; i < n; ++i) {
-        if (holders[i] == 1) sum += top[i].request_count;
+        if (quorum_degraded || holders[i] == 1) sum += top[i].request_count;
     }
     return static_cast<double>(sum) / static_cast<double>(total);
 }
@@ -352,22 +362,27 @@ inline double hot_prefix_sole_held_request_share(const std::vector<HotPrefixEntr
 // counts only — never token text. `holders[i]` is the live cluster holder count
 // for top[i] (BACKLOG §21 P2 slice 3); a prefix with exactly one holder is
 // emitted as "sole_held":true. holders shorter than top => missing counts are 0
-// (sole_held false). Bounded by top.size() (<= K). Pure.
+// (sole_held false). `quorum_degraded` surfaces as "quorum":"DEGRADED" and forces
+// every entry's sole_held=true (split-brain freeze — see helpers above); the real
+// (untrustworthy) holder count is still shown. Bounded by top.size() (<= K). Pure.
 inline std::string format_hot_prefix_topology_json(const std::vector<HotPrefixEntry>& top,
                                                    const std::vector<size_t>& holders,
                                                    uint64_t total_touches,
-                                                   int64_t snapshot_age_ms) {
+                                                   int64_t snapshot_age_ms,
+                                                   bool quorum_degraded = false) {
     std::string out;
     out.reserve(96 + top.size() * 96);
-    char head[192];
+    char head[224];
     std::snprintf(head, sizeof(head),
-        "{\"snapshot_age_ms\":%lld,\"total_touches\":%llu,\"count\":%zu,\"hot_prefixes\":[",
+        "{\"snapshot_age_ms\":%lld,\"total_touches\":%llu,\"count\":%zu,\"quorum\":\"%s\",\"hot_prefixes\":[",
         static_cast<long long>(snapshot_age_ms),
         static_cast<unsigned long long>(total_touches),
-        top.size());
+        top.size(),
+        (quorum_degraded ? "DEGRADED" : "HEALTHY"));
     out += head;
     for (size_t i = 0; i < top.size(); ++i) {
         const size_t h = (i < holders.size()) ? holders[i] : 0;
+        const bool sole_held = quorum_degraded || (h == 1);
         char ent[160];
         std::snprintf(ent, sizeof(ent),
             "%s{\"prefix_fp\":\"%016llx\",\"request_count\":%llu,\"holders\":%zu,\"sole_held\":%s}",
@@ -375,7 +390,7 @@ inline std::string format_hot_prefix_topology_json(const std::vector<HotPrefixEn
             static_cast<unsigned long long>(top[i].prefix_fp),
             static_cast<unsigned long long>(top[i].request_count),
             h,
-            (h == 1 ? "true" : "false"));
+            (sole_held ? "true" : "false"));
         out += ent;
     }
     out += "]}";

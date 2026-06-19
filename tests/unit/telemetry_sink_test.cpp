@@ -507,9 +507,29 @@ TEST(HotPrefixSoleHeld, ZeroTotalAndShortHoldersAreSafe) {
     EXPECT_DOUBLE_EQ(hot_prefix_sole_held_request_share(top, {}, 1000), 0.0); // missing => 0 holders
 }
 
+// DEGRADED-quorum freeze: never assert sole_held=false; treat ALL as sole-held.
+TEST(HotPrefixSoleHeld, DegradedQuorumFreezesAllSoleHeld) {
+    std::vector<HotPrefixEntry> top = {{0x1, 600}, {0x2, 200}, {0x3, 100}};
+    std::vector<size_t> holders = {2, 4, 3};  // none sole-held under HEALTHY
+    EXPECT_EQ(hot_prefix_sole_held_count(holders, /*degraded=*/false), 0u);
+    EXPECT_EQ(hot_prefix_sole_held_count(holders, /*degraded=*/true), 3u);  // all frozen sole-held
+    EXPECT_DOUBLE_EQ(hot_prefix_sole_held_request_share(top, holders, 900, false), 0.0);
+    EXPECT_DOUBLE_EQ(hot_prefix_sole_held_request_share(top, holders, 900, true), 1.0);  // (600+200+100)/900
+}
+
 TEST(HotPrefixTopologyJson, EmptyShape) {
     auto json = format_hot_prefix_topology_json({}, {}, 0, 0);
-    EXPECT_EQ(json, "{\"snapshot_age_ms\":0,\"total_touches\":0,\"count\":0,\"hot_prefixes\":[]}");
+    EXPECT_EQ(json,
+        "{\"snapshot_age_ms\":0,\"total_touches\":0,\"count\":0,\"quorum\":\"HEALTHY\",\"hot_prefixes\":[]}");
+}
+
+TEST(HotPrefixTopologyJson, DegradedQuorumFreezesSoleHeldAndLabelsQuorum) {
+    std::vector<HotPrefixEntry> top = {{0x0c11, 388}};
+    std::vector<size_t> holders = {3};  // shared by 3 — sole_held=false under HEALTHY
+    auto json = format_hot_prefix_topology_json(top, holders, 800, 0, /*degraded=*/true);
+    EXPECT_NE(json.find("\"quorum\":\"DEGRADED\""), std::string::npos);
+    // Real (untrustworthy) holder count still shown, but sole_held frozen true.
+    EXPECT_NE(json.find("\"holders\":3,\"sole_held\":true"), std::string::npos);
 }
 
 TEST(HotPrefixTopologyJson, EntriesCarryHoldersAndSoleHeld) {

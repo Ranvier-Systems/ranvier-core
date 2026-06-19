@@ -4211,6 +4211,13 @@ void RouterService::attach_shard0_telemetry(TelemetryService* telemetry) {
     }
 }
 
+bool RouterService::cache_topology_quorum_degraded() {
+    // Shard 0 only (gossip_ptr is set there). No gossip => single node => never
+    // split-brain => HEALTHY.
+    return g_shard_state && g_shard_state->gossip_ptr
+        && g_shard_state->gossip_ptr->is_degraded();
+}
+
 seastar::future<> RouterService::apply_peer_cache_state(
         BackendId backend_id, double /*cache_usage*/, double residency_weight) {
     // Peer-reported residency arrives on shard 0 (gossip receive loop). Upsert it
