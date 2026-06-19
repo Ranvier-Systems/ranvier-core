@@ -48,6 +48,7 @@ enum class GossipPacketType : uint8_t {
     NODE_STATE = 0x04,
     CACHE_EVICTION = 0x05,
     CACHE_STATE = 0x06,
+    HOT_PREFIX_DIGEST = 0x07,
 };
 
 // Rolling-upgrade safety contract: a node that receives a type tag it does not
@@ -64,6 +65,7 @@ inline constexpr bool is_known_packet_type(GossipPacketType type) {
         case GossipPacketType::NODE_STATE:
         case GossipPacketType::CACHE_EVICTION:
         case GossipPacketType::CACHE_STATE:
+        case GossipPacketType::HOT_PREFIX_DIGEST:
             return true;
     }
     return false;
@@ -82,6 +84,10 @@ using CacheEvictionCallback = std::function<seastar::future<>(uint64_t prefix_ha
 // cache_usage and residency_weight are both normalized to [0.0, 1.0].
 using CacheStateCallback =
     std::function<seastar::future<>(BackendId backend_id, double cache_usage, double residency_weight)>;
+// One node's current hot-prefix top-K fingerprints (BACKLOG §21 P2). By value —
+// the callback is a coroutine (Rule #21).
+using HotPrefixDigestCallback =
+    std::function<seastar::future<>(BackendId backend_id, std::vector<uint64_t> prefix_hashes)>;
 
 // Wire format for route announcements (v2 with sequence numbers)
 struct RouteAnnouncementPacket {
@@ -178,6 +184,39 @@ struct CacheStatePacket {
     static std::optional<CacheStatePacket> deserialize(const uint8_t* data, size_t len);
 };
 
+// Wire format for hot-prefix digests (BACKLOG §21 P2): one node's current
+// top-K most-requested routing-prefix fingerprints, so shard 0 can build the
+// cluster prefix->nodes index that answers "is this hot prefix held by exactly
+// one node" (unsafe to reap).
+//
+// Format: [type:1][version:1][backend_id:4][count:2][ prefix_hash:8 × count ]
+//   HEADER_SIZE = 8; total = 8 + count*8, capped at MAX_HASHES entries.
+//
+// count is bounded by MAX_HASHES on BOTH serialize and deserialize (Rule #4) —
+// MAX_HASHES * 8 + 8 = 1032 bytes stays under a 1500B MTU before DTLS overhead.
+//
+// FORWARD COMPATIBILITY (mirrors CacheStatePacket): deserialize accepts
+// len >= HEADER_SIZE + count*8 (not ==), reading the hashes it knows and
+// ignoring any trailing bytes a future version appends. version is recorded but
+// not a rejection boundary; an unrecognized *type* is (see is_known_packet_type).
+//
+// Broadcast unreliably (no ACK / seq_num): periodic, idempotent,
+// latest-value-wins per node — a dropped digest self-heals next window.
+struct HotPrefixDigestPacket {
+    static constexpr uint8_t PROTOCOL_VERSION = 1;
+    static constexpr size_t HEADER_SIZE = 8;
+    static constexpr size_t MAX_HASHES = 128;
+    static constexpr size_t MAX_PACKET_SIZE = HEADER_SIZE + MAX_HASHES * sizeof(uint64_t);
+
+    GossipPacketType type = GossipPacketType::HOT_PREFIX_DIGEST;
+    uint8_t version = PROTOCOL_VERSION;
+    BackendId backend_id = 0;
+    std::vector<uint64_t> prefix_hashes;
+
+    std::vector<uint8_t> serialize() const;
+    static std::optional<HotPrefixDigestPacket> deserialize(const uint8_t* data, size_t len);
+};
+
 // GossipProtocol: Manages message handling and reliable delivery
 //
 // This class handles the protocol logic:
@@ -215,12 +254,17 @@ public:
     void set_cache_state_callback(CacheStateCallback callback) {
         _cache_state_callback = std::move(callback);
     }
+    void set_hot_prefix_digest_callback(HotPrefixDigestCallback callback) {
+        _hot_prefix_digest_callback = std::move(callback);
+    }
 
     // Broadcast methods
     seastar::future<> broadcast_route(const std::vector<TokenId>& tokens, BackendId backend);
     seastar::future<> broadcast_node_state(NodeState state, BackendId local_backend_id);
     seastar::future<> broadcast_cache_eviction(uint64_t prefix_hash, BackendId backend_id);
     seastar::future<> broadcast_cache_state(BackendId backend_id, double cache_usage, double residency_weight);
+    // BACKLOG §21 P2. By value (coroutine — Rule #21); capped at MAX_HASHES.
+    seastar::future<> broadcast_hot_prefix_digest(BackendId backend_id, std::vector<uint64_t> prefix_hashes);
     seastar::future<> broadcast_heartbeat();
 
     // Handle incoming packet (called from receive loop)
@@ -250,6 +294,8 @@ public:
     uint64_t cache_evictions_received() const { return _cache_evictions_received; }
     uint64_t cache_states_sent() const { return _cache_states_sent; }
     uint64_t cache_states_received() const { return _cache_states_received; }
+    uint64_t hot_prefix_digests_sent() const { return _hot_prefix_digests_sent; }
+    uint64_t hot_prefix_digests_received() const { return _hot_prefix_digests_received; }
     uint64_t unknown_packet_types() const { return _unknown_packet_types; }
 
     // Clear reliable delivery state (used during resync/shutdown)
@@ -273,6 +319,7 @@ private:
     NodeStateCallback _node_state_callback;
     CacheEvictionCallback _cache_eviction_callback;
     CacheStateCallback _cache_state_callback;
+    HotPrefixDigestCallback _hot_prefix_digest_callback;
 
     // Timers
     seastar::timer<> _heartbeat_timer;
@@ -322,6 +369,8 @@ private:
     uint64_t _cache_evictions_received = 0;
     uint64_t _cache_states_sent = 0;
     uint64_t _cache_states_received = 0;
+    uint64_t _hot_prefix_digests_sent = 0;
+    uint64_t _hot_prefix_digests_received = 0;
     uint64_t _unknown_packet_types = 0;
 
     // Internal methods
