@@ -202,6 +202,11 @@ private:
     void ensure_overflow_sentinel();
     void on_emit_timer();
     seastar::future<> emit_async();
+
+    // Live cluster holder count for each entry of `_last_hot_prefixes`, parallel
+    // to it (BACKLOG §21 P2 slice 3). Queried per scrape so the counts reflect
+    // peer digests that arrived since the last window. Shard-0, lock-free.
+    std::vector<size_t> current_holder_counts() const;
 };
 
 }  // namespace ranvier
