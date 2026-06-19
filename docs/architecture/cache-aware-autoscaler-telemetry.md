@@ -591,10 +591,25 @@ lambda (#14); yield when merging K·N entries (#17).
 
 **Overhead.** Microbench (`make bench-hot-prefix`, reactor-free): `touch()` 2.3 ns
 warm / 72 ns evict at K=128; `hash_prefix` ~0.4 µs at 128 tokens, ~2 µs at 512 —
-the hit-path hash is byte-bound (motivates the P3 fingerprint-hash cap). See
+the hit-path hash is byte-bound. See
 `docs/benchmarks/cache-topology-telemetry-overhead.md`. The end-to-end A/B release
 gate (telemetry on vs off; routing-latency p50/p99 < 1% delta, no p99 spike at the
 shard-0 window cadence) is **not yet run** — tracked in the backlog.
+
+**On bounding the fingerprint hash (reclassified 2026-06-19).** The §21 follow-up
+"cap the fingerprint to ~64 tokens" was scoped Low but is correctness-sensitive,
+not a quick win. The fingerprint is already bounded on the fallback path
+(`prefix_len = min(len, prefix_token_length)`, default 128). The only uncapped cost
+is the `prefix_boundary` branch, which hashes the full declared/detected prefix *by
+design* — so requests sharing a system message co-locate for cache reuse. A cap
+there would degrade routing precision (distinct prompts sharing the first N tokens
+collide) and must respect the KV-event ledger's **boundary-identity invariant**
+(`kv_event_ledger.hpp`): the ledger reconstructs Ranvier's exact `prefix_hash` by
+continuing an FNV accumulator over the full token sequence at each block boundary,
+so any cap must be a `block_alignment` multiple applied consistently to lookup, both
+learn paths, and the `X-Ranvier-Prefix-Hash` header, or native-KV route-learning
+stops matching routing lookups. If pursued, do it as an opt-in
+`prefix_hash_max_tokens` (default = current/unbounded), never a default change.
 
 ## Related
 

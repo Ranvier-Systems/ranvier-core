@@ -2539,6 +2539,16 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     //    This ensures consistent hashing across cluster nodes for requests
     //    with the same system message but different user queries.
     // 2. Otherwise, fall back to prefix_token_length (default: 128)
+    //
+    // NOTE (BACKLOG §21): the prefix_boundary branch is deliberately NOT capped —
+    // hashing the full system message is what makes requests sharing it co-locate
+    // for cache reuse, and hash_prefix's cost scales with this length. Do NOT cap
+    // it for speed without preserving correctness: any cap must be a
+    // block_alignment multiple applied consistently to this lookup, BOTH learn
+    // paths, and the X-Ranvier-Prefix-Hash header, or the kv_event_ledger's
+    // boundary-identity invariant breaks and native-KV route-learning stops
+    // matching routing lookups. If ever needed, gate it behind an opt-in
+    // prefix_hash_max_tokens (default unbounded), not a default change.
     size_t prefix_len;
     if (prefix_boundary > 0 && prefix_boundary <= tokens.size()) {
         prefix_len = prefix_boundary;
