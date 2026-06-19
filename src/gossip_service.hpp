@@ -95,6 +95,13 @@ public:
     // Set callback for handling received cache-state notifications from peers
     void set_cache_state_callback(CacheStateCallback callback);
 
+    // BACKLOG §21 P2: gossip our node's merged hot-prefix top-K to peers, and
+    // register the callback that feeds received digests into shard 0's
+    // cache-topology index. Mirrors the cache_state pair above.
+    seastar::future<> broadcast_hot_prefix_digest(BackendId backend_id,
+                                                  std::vector<uint64_t> prefix_hashes);
+    void set_hot_prefix_digest_callback(HotPrefixDigestCallback callback);
+
     // Check if gossip is enabled
     bool is_enabled() const { return _config.enabled; }
 

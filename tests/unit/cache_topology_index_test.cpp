@@ -133,3 +133,50 @@ TEST(CacheTopologyIndexTest, BoundedByMaxPrefixes) {
     EXPECT_EQ(idx.prefix_count(), CacheTopologyIndex::MAX_HOT_PREFIXES);
     EXPECT_GT(idx.prefix_overflow(), 0u);
 }
+
+// Slice 2b sole-holder lifecycle: encodes the exact sequence the telemetry
+// emitter + gossip callbacks drive against the index, so the contract slice 3
+// consumes is pinned without a reactor.
+//   - emit self-apply  -> apply_digest(self, our top-K)
+//   - peer digest recv -> apply_digest(peer, ...)   (gossip callback)
+//   - peer death       -> evict_node(peer)          (prune hook)
+//   - peer goes silent -> age_out(now - window*N)   (emit backstop)
+TEST(CacheTopologyIndexTest, P2SoleHolderLifecycle) {
+    CacheTopologyIndex idx;
+    constexpr BackendId kSelf = 7, kPeerA = 8, kPeerB = 9;
+    constexpr uint64_t kOurs = 0xABC;    // a hot prefix only we hold
+    constexpr uint64_t kShared = 0xDEF;  // a hot prefix we and a peer hold
+    const auto base = t0();
+    using std::chrono::seconds;
+
+    // Emit window: self-apply our merged top-K. The correctness point — a prefix
+    // only we hold must read as 1 holder (sole-held), NOT 0. Without self-apply
+    // the autoscaler would think nobody holds it and reap it.
+    idx.apply_digest(kSelf, {kOurs, kShared}, base);
+    EXPECT_EQ(idx.holder_count(kOurs), 1u);
+    EXPECT_EQ(idx.holder_count(kShared), 1u);
+
+    // Peer A's digest arrives (gossip apply_peer_digest): kShared becomes shared.
+    idx.apply_digest(kPeerA, {kShared}, base + seconds(1));
+    EXPECT_EQ(idx.holder_count(kShared), 2u);  // shared -> safe to reap on A
+    EXPECT_EQ(idx.holder_count(kOurs), 1u);     // ours is still sole-held
+
+    // Peer A dies (prune hook -> evict_node): kShared reverts to sole-held by us.
+    idx.evict_node(kPeerA);
+    EXPECT_EQ(idx.holder_count(kShared), 1u);
+
+    // Peer B reports kShared, then goes silent without being marked dead.
+    idx.apply_digest(kPeerB, {kShared}, base + seconds(2));
+    EXPECT_EQ(idx.holder_count(kShared), 2u);
+
+    // Next emit window: the emitter self-applies FIRST (refreshing our last_seen
+    // to now), THEN ages out anyone older than now - window*N — the exact order
+    // in emit_async. So our just-refreshed entry always survives; only the silent
+    // peer B (last_seen base+2s) is older than the base+5s cutoff and drops.
+    const auto t_emit = base + seconds(10);
+    idx.apply_digest(kSelf, {kOurs, kShared}, t_emit);   // self refresh
+    EXPECT_EQ(idx.age_out(t_emit - seconds(5)), 1u);     // only silent peer B
+    EXPECT_EQ(idx.holder_count(kShared), 1u);            // sole-held by us again
+    EXPECT_EQ(idx.holder_count(kOurs), 1u);              // and ours never lapsed
+    EXPECT_EQ(idx.node_count(), 1u);                     // only self remains, fresh
+}

@@ -7,6 +7,7 @@
 #include "route_scorer.hpp"
 #include "stream_summary.hpp"
 #include "telemetry_schema.hpp"  // HotPrefixWindow / HotPrefixEntry
+#include "telemetry_service.hpp"  // BACKLOG §21 P2: shard-0 cache-topology index feeds
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/smp.hh>
@@ -360,6 +361,12 @@ struct ShardLocalState {
     // Whether gossip is enabled (set on all shards during init for fast checks)
     bool gossip_enabled = false;
 
+    // TelemetryService pointer (set on shard 0 only; nullptr elsewhere — same
+    // shard-0-only shape as gossip_ptr above). BACKLOG §21 P2: the gossip
+    // hot-prefix-digest callback and the peer-death prune hook feed the shard-0
+    // cache-topology index through this handle.
+    TelemetryService* telemetry_ptr = nullptr;
+
     // ========================================================================
     // GPU Load Cache (per-shard, broadcast from shard 0 by HealthService)
     // ========================================================================
@@ -687,6 +694,7 @@ struct ShardLocalState {
         pending_local_routes.clear();
         gossip_ptr = nullptr;
         gossip_enabled = false;
+        telemetry_ptr = nullptr;  // BACKLOG §21 P2 (shard 0 only; harmless elsewhere)
 
         // Clear GPU load cache
         gpu_load_cache.scores.clear();
@@ -1549,6 +1557,19 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         _gossip->set_cache_state_callback(
             [](BackendId backend_id, double cache_usage, double residency_weight) {
                 return RouterService::apply_peer_cache_state(backend_id, cache_usage, residency_weight);
+            });
+
+        // BACKLOG §21 P2: feed received hot-prefix digests into shard 0's
+        // cache-topology index. The gossip receive loop runs on shard 0, where
+        // telemetry_ptr is set and the index lives — no fan-out, no `this`.
+        // Latest digest per node wins (set-replace inside apply_peer_digest).
+        _gossip->set_hot_prefix_digest_callback(
+            [](BackendId backend_id, std::vector<uint64_t> prefix_hashes) {
+                if (g_shard_state && g_shard_state->telemetry_ptr) {
+                    g_shard_state->telemetry_ptr->apply_peer_digest(
+                        backend_id, std::move(prefix_hashes));
+                }
+                return seastar::make_ready_future<>();
             });
 
         // Pre-allocate buffer for route batching to avoid reallocations during operation
@@ -3429,6 +3450,12 @@ seastar::future<> RouterService::start_gossip() {
     // locally on its own allocator.
     co_await seastar::smp::invoke_on_all([] {
         GossipConsensus::register_local_prune_callback([](BackendId backend) {
+            // BACKLOG §21 P2: on shard 0, also drop the dead peer from the
+            // cache-topology index so a stale dead holder can't mask a
+            // sole-holder. Other shards only prune their local routes.
+            if (seastar::this_shard_id() == 0 && g_shard_state && g_shard_state->telemetry_ptr) {
+                g_shard_state->telemetry_ptr->evict_peer(backend);
+            }
             return RouterService::remove_routes_for_backend(backend);
         });
     });
@@ -4154,6 +4181,33 @@ seastar::future<> RouterService::broadcast_cache_state_global(
                         }
                     });
             });
+    }
+}
+
+seastar::future<> RouterService::broadcast_hot_prefix_digest_global(
+        BackendId self_id, std::vector<uint64_t> prefix_hashes) {
+    // Runs on shard 0 (telemetry emitter home), where gossip_ptr is set.
+    // No-op without gossip. Best-effort (Rule #18): a dropped digest self-corrects
+    // next window since digests are latest-value-wins.
+    if (!g_shard_state || !g_shard_state->gossip_ptr) {
+        return seastar::make_ready_future<>();
+    }
+    return g_shard_state->gossip_ptr
+        ->broadcast_hot_prefix_digest(self_id, std::move(prefix_hashes))
+        .handle_exception([](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_router.debug("hot-prefix digest gossip failed: {}", e.what());
+            }
+        });
+}
+
+void RouterService::attach_shard0_telemetry(TelemetryService* telemetry) {
+    // Called on shard 0 once telemetry is up; shard 0's ShardLocalState exists
+    // by then (router constructed before init_telemetry_service).
+    if (g_shard_state) {
+        g_shard_state->telemetry_ptr = telemetry;
     }
 }
 

@@ -1346,6 +1346,7 @@ if(Seastar_FOUND)
     add_executable(router_service_test
       tests/unit/router_service_test.cpp
       src/router_service.cpp
+      src/telemetry_service.cpp
       src/node_slab.cpp
       src/gossip_service.cpp
       src/gossip_protocol.cpp
@@ -1373,6 +1374,7 @@ if(Seastar_FOUND)
     add_executable(cache_eviction_test
       tests/unit/cache_eviction_test.cpp
       src/router_service.cpp
+      src/telemetry_service.cpp
       src/node_slab.cpp
       src/gossip_service.cpp
       src/gossip_protocol.cpp

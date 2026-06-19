@@ -75,7 +75,9 @@ void TelemetryService::ensure_overflow_sentinel() {
 seastar::future<> TelemetryService::start_emitter(
     seastar::sharded<TelemetryService>* container,
     std::unique_ptr<TelemetrySink> sink,
-    std::function<RoutingStrategyParams()> strategy_snapshot) {
+    std::function<RoutingStrategyParams()> strategy_snapshot,
+    BackendId self_backend_id,
+    std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster) {
 
     if (seastar::this_shard_id() != 0) {
         return seastar::make_exception_future<>(
@@ -92,6 +94,8 @@ seastar::future<> TelemetryService::start_emitter(
     _container          = container;
     _sink               = std::move(sink);
     _strategy_snapshot  = std::move(strategy_snapshot);
+    _self_backend_id    = self_backend_id;                                  // BACKLOG §21 P2
+    _hot_prefix_digest_broadcaster = std::move(hot_prefix_digest_broadcaster);
     _window_start_ms    = now_ms();
 
     if (!_enabled) {
@@ -371,6 +375,27 @@ seastar::future<> TelemetryService::emit_async() {
 
     _window_start_ms = report.window_end_ms;
 
+    // BACKLOG §21 P2: maintain the cluster cache-topology index for this window.
+    // Self-apply our own merged top-K (so this node counts as a holder of its own
+    // hot prefixes — sole-holder math is wrong otherwise), age out peers gone
+    // silent (backstop to peer-death eviction), then gossip our digest to peers.
+    // Skipped entirely when the node has no cluster identity (_self_backend_id 0).
+    if (_self_backend_id != 0) {
+        std::vector<uint64_t> digest;
+        digest.reserve(_last_hot_prefixes.size());
+        for (const auto& e : _last_hot_prefixes) digest.push_back(e.prefix_fp);
+
+        const auto now_tp = _last_hot_prefix_at;  // same steady_clock read as above
+        _topology_index.apply_digest(_self_backend_id, digest, now_tp);
+        _topology_index.age_out(now_tp - _window * kTopologyStaleWindows);
+
+        if (_hot_prefix_digest_broadcaster) {
+            // Rule #18: failures are logged inside the broadcaster; the digest is
+            // best-effort and self-corrects next window (latest-value-wins).
+            co_await _hot_prefix_digest_broadcaster(std::move(digest));
+        }
+    }
+
     // Hand to sink. consume() must not block per the sink contract; the
     // drop-on-backpressure guard upstream protects against a slow sink.
     co_await _sink->consume(report);
@@ -392,6 +417,7 @@ seastar::future<> TelemetryService::stop() {
         return _emit_gate.close().then([this] {
             _sink.reset();
             _strategy_snapshot = nullptr;
+            _hot_prefix_digest_broadcaster = nullptr;  // BACKLOG §21 P2
             _container = nullptr;
             _emitter_started = false;
             _buckets.clear();
@@ -405,6 +431,19 @@ seastar::future<> TelemetryService::stop() {
 // =============================================================================
 // Hot-prefix topology JSON (BACKLOG §21 P1)
 // =============================================================================
+
+// =============================================================================
+// Cluster cache-topology feeds (BACKLOG §21 P2; shard 0 only)
+// =============================================================================
+
+void TelemetryService::apply_peer_digest(BackendId node, std::vector<uint64_t> prefix_hashes) {
+    // Receive-time timestamp drives the age_out backstop in the emit loop.
+    _topology_index.apply_digest(node, prefix_hashes, std::chrono::steady_clock::now());
+}
+
+void TelemetryService::evict_peer(BackendId node) {
+    _topology_index.evict_node(node);
+}
 
 std::string TelemetryService::hot_prefix_topology_json() const {
     int64_t age_ms = 0;

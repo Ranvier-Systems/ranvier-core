@@ -811,13 +811,29 @@ seastar::future<> Application::init_telemetry_service() {
             [] { return RouterService::snapshot_hot_prefixes(); });
     });
 
+    // BACKLOG §21 P2: hand the emitter our cluster identity + a digest broadcaster
+    // so each window it self-applies and gossips our merged hot-prefix top-K.
+    // self_backend_id 0 (no cluster) leaves the P2 emit path inert.
+    const auto self_backend_id = static_cast<BackendId>(_config.cluster.self_backend_id);
     co_await _telemetry.invoke_on(0,
-        [&container = _telemetry, strategy_fn = [this] { return make_strategy_snapshot(); }]
+        [&container = _telemetry, strategy_fn = [this] { return make_strategy_snapshot(); },
+         self_backend_id]
         (TelemetryService& s) mutable {
             return s.start_emitter(&container,
                                    get_telemetry_sink_factory()(),
-                                   std::move(strategy_fn));
+                                   std::move(strategy_fn),
+                                   self_backend_id,
+                                   [self_backend_id](std::vector<uint64_t> hashes) {
+                                       return RouterService::broadcast_hot_prefix_digest_global(
+                                           self_backend_id, std::move(hashes));
+                                   });
         });
+
+    // BACKLOG §21 P2: publish shard 0's telemetry instance so the gossip digest
+    // callback and peer-death prune hook can feed the cache-topology index.
+    co_await _telemetry.invoke_on(0, [](TelemetryService& s) {
+        RouterService::attach_shard0_telemetry(&s);
+    });
 
     // Each controller talks to its LOCAL telemetry instance — no cross-shard
     // hop on the request path.
