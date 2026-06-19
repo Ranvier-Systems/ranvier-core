@@ -16,20 +16,28 @@ sketches are illustrative API shape, not a line-for-line match to the merged cod
 | Per-replica resident working set | ✅ shipped (P1) | per-backend resident-route gauge in RouterService (§6.C) |
 | Hot-prefix top-K + concentration | ✅ shipped (P1) | bounded `StreamSummary` + shard-0 merge (§6.D/E/F) |
 | `GET /v1/cache/topology` snapshot | ✅ shipped (P1) | bounded JSON on `:9180`, auth-gated (§6.G) |
-| Cluster-wide sole-holder index | ✅ shipped (P2) | `HOT_PREFIX_DIGEST` (0x07) + shard-0 `CacheTopologyIndex`; `sole_held`/`holders` in the JSON + `ranvier_sole_held_hot_prefixes` / `hot_prefix_sole_held_request_share` gauges. **Operator-observability only** — see "Carve-outs still open" |
+| Cluster-wide sole-holder index | ✅ shipped (P2) | `HOT_PREFIX_DIGEST` (0x07) + shard-0 `CacheTopologyIndex`; `sole_held`/`holders` in the JSON + `ranvier_sole_held_hot_prefixes` / `hot_prefix_sole_held_request_share` gauges. Gated by `enable_cache_topology` (default off) + DEGRADED-quorum freeze. **Operator-observability only** until the P3 residency gate — see below |
 | Residency-verified holders (accuracy gate) | ⏭ proposed (P3) | intersect digest with `residency_weight`/native KV before any automated reaping (Phase 5; the asymmetry below) |
 
-### Carve-outs still open (as of 2026-06-19)
+### P2 prerequisites — shipped (2026-06-19)
 
-The P2 *implementation* shipped, but two prerequisites from "Open decisions" / the
-failure-mode table did **not** land and gate when `sole_held` can be trusted:
+Both prerequisites that gate when `sole_held` can be trusted have landed:
 
-- **`enable_cache_topology` dark-launch flag (default off)** — not implemented; P2
-  is active whenever cluster gossip + telemetry are on and `cluster.self_backend_id != 0`.
-- **DEGRADED-quorum freeze** — not implemented; `sole_held` is computed regardless
-  of `QuorumState`, so during split-brain a stale-but-not-evicted peer can mask a
-  true sole-holder (the fail-dangerous FN). Until this lands, plus the P3 residency
-  gate, `sole_held` is for **operator observability**, not automated reaping.
+- **`enable_cache_topology` dark-launch flag (default off)** — `ClusterConfig`
+  flag (env `RANVIER_CLUSTER_ENABLE_CACHE_TOPOLOGY`, YAML
+  `cluster.enable_cache_topology`). When off the cluster sole-holder path is dark:
+  no `HOT_PREFIX_DIGEST` gossip is emitted, received digests are ignored, and
+  `/v1/cache/topology` + the sole-held gauges omit the holders/sole_held/quorum
+  surface (the endpoint reverts to its P1 shape — it never emits a misleading
+  `sole_held=false` from an empty index). Change requires restart.
+- **DEGRADED-quorum freeze** — while `GossipConsensus` quorum is `DEGRADED`,
+  `sole_held` never reads `false`: every hot prefix is treated as sole-held and
+  the JSON carries `"quorum":"DEGRADED"`. This is the fail-safe response to the
+  split-brain FN (a stale-but-unevicted peer masking a true sole-holder).
+
+**Still operator-observability only.** Even with both gates, `sole_held` is *not*
+yet safe for **automated reaping** — that waits on the P3 residency accuracy gate
+below (route-membership alone can false-negative; see the asymmetry analysis).
 
 ## Problem Statement
 
@@ -328,7 +336,7 @@ The one row that breaks safety (stale-route FN) is exactly what Phase 5 closes.
 
 1. **Gossiped K vs MTU** — cap at ~128 with 8-byte hashes, or chunk for larger? (Recommend cap.)
 2. **Reap-gating semantics** — is `sole_held` a hard veto or a weighted cost? Hard veto + conservative-FP bias can pin capacity (hot-but-singly-held replicas become un-reapable); weighted cost degrades gracefully. (Lean weighted.)
-3. **DEGRADED-quorum behavior** — fail safe (freeze reaping) vs fail stale (serve last-known + staleness flag)? (Lean fail-safe — chosen direction, but **not yet implemented**; see "Carve-outs still open" at the top.)
+3. **DEGRADED-quorum behavior** — fail safe (freeze reaping) vs fail stale (serve last-known + staleness flag)? **Resolved: fail-safe, shipped 2026-06-19** — `sole_held` never reads `false` while quorum is `DEGRADED`; JSON carries `"quorum":"DEGRADED"`.
 4. **Phase-5 residency threshold** — what `residency_weight` counts as "warm enough"? Same calibration as cache-headroom routing.
 
 ## Registration sketch (illustrative — not shipped)
@@ -571,8 +579,9 @@ hot prefixes — sole-holder math is wrong otherwise) and gossips it. The endpoi
 lists *this node's* top-K, so `holders ≥ 1` and `sole_held` means "only we hold it"
 — the per-node reaping signal a scaler unions across nodes. Surfaced as
 `holders`/`sole_held` per JSON entry + `ranvier_sole_held_hot_prefixes` and
-`hot_prefix_sole_held_request_share` gauges. **Two prerequisites remain open — see
-"Carve-outs still open" at the top.**
+`hot_prefix_sole_held_request_share` gauges. Both P2 prerequisites (the
+`enable_cache_topology` gate + the DEGRADED-quorum freeze) shipped — see "P2
+prerequisites — shipped" at the top.
 
 **Hard-Rule watch (held across the work).** Lock-free shard-local counters (#1);
 bounded by construction — fixed-K `StreamSummary`, `CacheTopologyIndex` caps +
