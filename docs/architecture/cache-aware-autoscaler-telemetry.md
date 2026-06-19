@@ -1,7 +1,9 @@
 # Cache-Aware Autoscaler Telemetry
 
-**Status:** Proposal — nothing built yet. The code sketches in §6 are illustrative API shape, NOT shipped surface.
-**Date:** 2026-06-17
+**Status:** Largely implemented (P0–P2 shipped & merged 2026-06-19); see Status
+Snapshot. This document remains the design rationale of record — the §6 code
+sketches are illustrative API shape, not a line-for-line match to the merged code.
+**Date:** 2026-06-17 (proposal); status updated 2026-06-19
 **Author:** Generated exploration
 
 ## Status Snapshot
@@ -10,11 +12,24 @@
 |---|---|---|
 | Per-replica KV %, running/queued, load score, throughput | ✅ already exported | `backend_vllm_*{backend_id}` on `:9180` (metrics_service.hpp) |
 | Per-replica / fleet effective cache capacity | ✅ already exported | `backend_effective_cache_*{backend_id}`, `fleet_effective_cache_*_total` (health_service.cpp) |
-| Per-replica prefix hit rate | ⏭ proposed | extend `BackendMetrics` (§6.A/B) |
-| Per-replica resident working set | ⏭ proposed | per-backend resident-route gauge in RouterService (§6.C) |
-| Hot-prefix top-K + concentration | ⏭ proposed | bounded `StreamSummary` + shard-0 merge (§6.D/E/F) |
-| `GET /v1/cache/topology` snapshot | ⏭ proposed | bounded JSON on `:9180`, auth-gated (§6.G) |
-| Cluster-wide sole-holder index | ❗ scoped (see "Sole-holder index — scoping") | new gossip digest + shard-0 reverse index; automated reap-gating waits for residency verification |
+| Per-replica prefix hit rate | ✅ shipped (P0) | `BackendMetrics` hit/attempt gauges (§6.A/B) |
+| Per-replica resident working set | ✅ shipped (P1) | per-backend resident-route gauge in RouterService (§6.C) |
+| Hot-prefix top-K + concentration | ✅ shipped (P1) | bounded `StreamSummary` + shard-0 merge (§6.D/E/F) |
+| `GET /v1/cache/topology` snapshot | ✅ shipped (P1) | bounded JSON on `:9180`, auth-gated (§6.G) |
+| Cluster-wide sole-holder index | ✅ shipped (P2) | `HOT_PREFIX_DIGEST` (0x07) + shard-0 `CacheTopologyIndex`; `sole_held`/`holders` in the JSON + `ranvier_sole_held_hot_prefixes` / `hot_prefix_sole_held_request_share` gauges. **Operator-observability only** — see "Carve-outs still open" |
+| Residency-verified holders (accuracy gate) | ⏭ proposed (P3) | intersect digest with `residency_weight`/native KV before any automated reaping (Phase 5; the asymmetry below) |
+
+### Carve-outs still open (as of 2026-06-19)
+
+The P2 *implementation* shipped, but two prerequisites from "Open decisions" / the
+failure-mode table did **not** land and gate when `sole_held` can be trusted:
+
+- **`enable_cache_topology` dark-launch flag (default off)** — not implemented; P2
+  is active whenever cluster gossip + telemetry are on and `cluster.self_backend_id != 0`.
+- **DEGRADED-quorum freeze** — not implemented; `sole_held` is computed regardless
+  of `QuorumState`, so during split-brain a stale-but-not-evicted peer can mask a
+  true sole-holder (the fail-dangerous FN). Until this lands, plus the P3 residency
+  gate, `sole_held` is for **operator observability**, not automated reaping.
 
 ## Problem Statement
 
@@ -313,7 +328,7 @@ The one row that breaks safety (stale-route FN) is exactly what Phase 5 closes.
 
 1. **Gossiped K vs MTU** — cap at ~128 with 8-byte hashes, or chunk for larger? (Recommend cap.)
 2. **Reap-gating semantics** — is `sole_held` a hard veto or a weighted cost? Hard veto + conservative-FP bias can pin capacity (hot-but-singly-held replicas become un-reapable); weighted cost degrades gracefully. (Lean weighted.)
-3. **DEGRADED-quorum behavior** — fail safe (freeze reaping) vs fail stale (serve last-known + staleness flag)? (Lean fail-safe.)
+3. **DEGRADED-quorum behavior** — fail safe (freeze reaping) vs fail stale (serve last-known + staleness flag)? (Lean fail-safe — chosen direction, but **not yet implemented**; see "Carve-outs still open" at the top.)
 4. **Phase-5 residency threshold** — what `residency_weight` counts as "warm enough"? Same calibration as cache-headroom routing.
 
 ## Registration sketch (illustrative — not shipped)
