@@ -937,7 +937,7 @@ Export the prefix→replica and per-prefix-hotness signals an external cache-awa
 autoscaler needs to (a) drain the *coldest* replica rather than a hot one, and
 (b) avoid reaping the last warm holder of a hot prefix.
 
-**Status: P0–P2 CLOSED (2026-06-19); P3 + two carve-outs OPEN (see "Still open").**
+**Status: P0–P2 CLOSED (2026-06-19), incl. both P2 carve-outs; P3 OPEN (see "Still open").**
 
 P0–P2 shipped and merged across three layers: the observability foundation
 (bounded `StreamSummary` top-K + per-backend prefix hit/attempt gauges); the
@@ -947,9 +947,17 @@ JSON); and the cluster-wide sole-holder path (`HOT_PREFIX_DIGEST` 0x07 gossip �
 shard-0 `CacheTopologyIndex` with peer-death eviction + TTL age-out and per-window
 self-apply, surfaced as `holders`/`sole_held` per JSON entry plus the
 `ranvier_sole_held_hot_prefixes` and `hot_prefix_sole_held_request_share` gauges).
-The decision spike (K=128; gauges-not-counters; reuse `TelemetryService` rather
-than a new aggregator) and the per-slice as-built record were folded into the
+Both P2 carve-outs also shipped: the DEGRADED-quorum freeze (during split-brain
+`sole_held` never reads `false` — fail-safe toward "do not reap") and the
+`enable_cache_topology` dark-launch flag (default off; when off the cluster
+sole-holder surface is omitted and the endpoint reverts to its P1 shape). The
+decision spike (K=128; gauges-not-counters; reuse `TelemetryService` rather than
+a new aggregator) and the per-slice as-built record were folded into the
 architecture doc on closeout to keep this entry focused on active work.
+
+`sole_held` remains **operator-observability only** pending the P3 residency
+accuracy gate below — route-membership alone can false-negative, so it is not yet
+safe for an autoscaler to consume for *automated* reaping.
 
 **Scope boundary:** Ranvier *exports* telemetry only. The autoscaler (reap/pin
 policy, replica lifecycle) lives in the external platform — reap-gating semantics
@@ -967,8 +975,6 @@ in particular are the scaler's decision, not Ranvier's.
 
 | Priority | Item | Notes |
 |----------|------|-------|
-| P2 carve-out | `enable_cache_topology` dark-launch flag (default off) | Not shipped — P2 is active whenever cluster gossip + telemetry are on and `cluster.self_backend_id != 0` (inert otherwise). Add before enabling P2 by default on shared clusters. |
-| P2 carve-out | DEGRADED-quorum freeze | Not shipped — `sole_held` is computed regardless of `QuorumState`. Fail-dangerous case: during split-brain a stale-but-unevicted peer keeps a prefix at `holders ≥ 2` (`sole_held=false`) when we are in fact its only reachable holder. Gate the signal on `GossipConsensus::quorum_state() == DEGRADED` (queryable on shard 0). Until then `sole_held` is **operator-observability only**. |
 | P3 | Residency-verified holders (Phase 5) | Intersect the digest with `residency_weight`/native KV — the accuracy prerequisite before any autoscaler consumes `sole_held` for **automated reaping** (route-membership alone can false-negative; see the asymmetry analysis in the architecture doc). Threshold: same calibration as cache-headroom routing. |
 | P3 | Bound the hot-prefix fingerprint hash (~64 tokens) | Constant-time hit path for long context — the microbench shows `hash_prefix` is byte-bound (~2 µs @512 tok). |
 | Release gate | End-to-end A/B (telemetry on vs off) | Not yet run (not runnable in sandbox). Single-stream through one ingress; primary signal is `ranvier_router_routing_latency_seconds` p50/p99 delta **< 1%** with no p99 spike at the shard-0 window cadence. Wrap as `make bench-cache-topology` (per `bench-epp`); promote method + recorded floor to the benchmark doc when first run. |
