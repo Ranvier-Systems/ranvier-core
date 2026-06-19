@@ -389,6 +389,11 @@ void Application::log_non_reloadable_changes(const RanvierConfig& new_config) co
         log_main.warn("Config reload: cluster.enabled changes require restart to take effect");
     }
 
+    // Cache-topology (BACKLOG §21 P2) is captured at the telemetry emitter start.
+    if (new_config.cluster.enable_cache_topology != _config.cluster.enable_cache_topology) {
+        log_main.warn("Config reload: cluster.enable_cache_topology changes require restart to take effect");
+    }
+
     // Telemetry initialization is one-time
     if (new_config.telemetry.enabled != _config.telemetry.enabled) {
         log_main.warn("Config reload: telemetry.enabled changes require restart to take effect");
@@ -815,9 +820,10 @@ seastar::future<> Application::init_telemetry_service() {
     // so each window it self-applies and gossips our merged hot-prefix top-K.
     // self_backend_id 0 (no cluster) leaves the P2 emit path inert.
     const auto self_backend_id = static_cast<BackendId>(_config.cluster.self_backend_id);
+    const bool cache_topology_enabled = _config.cluster.enable_cache_topology;  // BACKLOG §21 P2
     co_await _telemetry.invoke_on(0,
         [&container = _telemetry, strategy_fn = [this] { return make_strategy_snapshot(); },
-         self_backend_id]
+         self_backend_id, cache_topology_enabled]
         (TelemetryService& s) mutable {
             return s.start_emitter(&container,
                                    get_telemetry_sink_factory()(),
@@ -828,7 +834,9 @@ seastar::future<> Application::init_telemetry_service() {
                                            self_backend_id, std::move(hashes));
                                    },
                                    // BACKLOG §21 P2: split-brain freeze for sole_held.
-                                   [] { return RouterService::cache_topology_quorum_degraded(); });
+                                   [] { return RouterService::cache_topology_quorum_degraded(); },
+                                   // BACKLOG §21 P2 dark-launch gate (default off).
+                                   cache_topology_enabled);
         });
 
     // BACKLOG §21 P2: publish shard 0's telemetry instance so the gossip digest

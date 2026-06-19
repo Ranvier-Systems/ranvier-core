@@ -85,7 +85,8 @@ public:
         std::function<RoutingStrategyParams()> strategy_snapshot,
         BackendId self_backend_id = 0,
         std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster = nullptr,
-        std::function<bool()> quorum_degraded_getter = nullptr);
+        std::function<bool()> quorum_degraded_getter = nullptr,
+        bool cache_topology_enabled = false);
 
     // -------------------------------------------------------------------------
     // Recording entry (hot path; shard-local)
@@ -191,6 +192,10 @@ private:
     // evict_peer and our own self-applied digest each window. Plain structure,
     // no Seastar; touched only on shard 0.
     CacheTopologyIndex                  _topology_index;
+    // BACKLOG §21 P2 dark-launch gate (ClusterConfig::enable_cache_topology). When
+    // false: no self-apply/broadcast, peer digests ignored, and the topology JSON +
+    // sole-held gauges omit the cluster surface (index stays empty => gauges read 0).
+    bool                                _cache_topology_enabled = false;
     BackendId                           _self_backend_id = 0;
     std::function<seastar::future<>(std::vector<uint64_t>)> _hot_prefix_digest_broadcaster;
     // Split-brain freeze (BACKLOG §21 P2). When this returns true the sole_held

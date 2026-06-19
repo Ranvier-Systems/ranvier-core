@@ -553,3 +553,16 @@ TEST(HotPrefixTopologyJson, ZeroHoldersIsNotSoleHeld) {
     auto json = format_hot_prefix_topology_json(top, {0}, 10, 0);
     EXPECT_NE(json.find("\"holders\":0,\"sole_held\":false"), std::string::npos);
 }
+
+// Dark-launch gate (BACKLOG §21 P2 config): when P2 is disabled the endpoint
+// reverts to its P1 shape — no holders/sole_held/quorum — never a misleading
+// sole_held=false from the empty index.
+TEST(HotPrefixTopologyJson, DisabledRevertsToP1Shape) {
+    std::vector<HotPrefixEntry> top = {{0xa93f, 412}};
+    auto json = format_hot_prefix_topology_json(top, {}, 800, 1873,
+                                                /*quorum_degraded=*/false, /*include_topology=*/false);
+    EXPECT_EQ(json.find("\"holders\""), std::string::npos);
+    EXPECT_EQ(json.find("\"sole_held\""), std::string::npos);
+    EXPECT_EQ(json.find("\"quorum\""), std::string::npos);
+    EXPECT_NE(json.find("\"prefix_fp\":\"000000000000a93f\",\"request_count\":412}"), std::string::npos);
+}
