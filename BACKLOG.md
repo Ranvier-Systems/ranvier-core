@@ -955,9 +955,9 @@ and the sole-holder index scoping (asymmetry insight + 5-phase plan).
 | P1 | Per-backend resident-route gauge `backend_resident_routes{backend_id}` (RouterService, §6.C) | Low | — |
 | P1 | Hot-prefix top-K as a `TelemetryService` window aggregate (extend `ShardSnapshot`/`WindowReport`) + concentration gauges `hot_prefix_*` (§6.E/F) | Low-Med | StreamSummary, TelemetryService |
 | P1 | `GET /v1/cache/topology` JSON, single-node holders (no gossip yet), auth-gated (§6.G) | Medium | window aggregate |
-| P2 | `HOT_PREFIX_DIGEST` (0x07) gossip packet + handler (sole-holder Phase 2) | Medium | StreamSummary |
-| P2 | Shard-0 `CacheTopologyIndex` (prefix→nodes), peer-death eviction, bounded + overflow counter (Phase 3) | Medium | 0x07 packet |
-| P2 | `sole_held`/`holders` in topology JSON + `sole_held_hot_prefixes` gauge (Phase 4) | Low | CacheTopologyIndex |
+| ✅ | `HOT_PREFIX_DIGEST` (0x07) gossip packet + handler (sole-holder Phase 2) — DONE (2026-06-19) | Medium | done |
+| ✅ | Shard-0 `CacheTopologyIndex` (prefix→nodes), peer-death eviction, bounded + overflow counter (Phase 3) — DONE (2026-06-19) | Medium | done |
+| ✅ | `sole_held`/`holders` in topology JSON + `ranvier_sole_held_hot_prefixes` (+`hot_prefix_sole_held_request_share`) gauges (Phase 4) — DONE (2026-06-19) | Low | done |
 | P3 | Residency-verified holders — intersect digest with `residency_weight`/native KV (Phase 5) | Medium-High | CacheTopologyIndex |
 | ✅ | Routing-overhead micro-benchmark (`make bench-hot-prefix`) — DONE: touch 2.3ns warm / 72ns evict; hash_prefix ~0.4µs @128 tok, ~2µs @512 | Low | done |
 | P3 | Bound the hot-prefix fingerprint hash (cap to ~64 tokens) — constant-time hit path for long-context; see benchmark doc | Low | P1 |
@@ -1014,10 +1014,19 @@ Touch points: `telemetry_service.{hpp,cpp}`, `telemetry_schema.hpp`,
    new aggregator — see Spike findings) feeding the label-free concentration
    gauges, and the JSON endpoint reporting *local* backends as holders. Already
    actionable for a single-node or manually-correlated scaler.
-3. **P2 — cluster-wide sole-holder.** Introduces gossip type `0x07`; needs
+3. **P2 — cluster-wide sole-holder. Implementation shipped (2026-06-19); two
+   prerequisites OPEN — see below.** Introduces gossip type `0x07`; needs
    rolling-upgrade care (append-only enum, `is_known_packet_type`, forward-compat
    tail — see proposal). Delivers approximate `sole_held` suitable for
-   **operator observability**.
+   **operator observability**. Landed in four merged slices: 0x07 digest packet;
+   shard-0 `CacheTopologyIndex` (reactor-free, bounded + overflow counters);
+   gossip/peer-death wiring with per-window self-apply; and the `sole_held`/`holders`
+   JSON fields + `ranvier_sole_held_hot_prefixes` / `hot_prefix_sole_held_request_share`
+   gauges. **NOT yet done:** the `enable_cache_topology` dark-launch config gate and
+   the DEGRADED-quorum freeze on the reaping signal (both in "open decisions" below).
+   Until the DEGRADED freeze lands, `sole_held` is **operator-observability only** —
+   not safe for automated reaping during split-brain (the P3 accuracy gate already
+   blocks automated reaping regardless).
 4. **P3 — accuracy gate.** Residency verification is the prerequisite before any
    autoscaler consumes `sole_held` for **automated reaping** (route-membership
    alone can false-negative → reap the last warm copy; see proposal's asymmetry
@@ -1027,11 +1036,21 @@ Touch points: `telemetry_service.{hpp,cpp}`, `telemetry_schema.hpp`,
 ### Prerequisites & open decisions
 
 - **Config gate:** add `enable_cache_topology` (default off) so P2 gossip can ship
-  dark and be enabled per-cluster once stabilized.
+  dark and be enabled per-cluster once stabilized. **OPEN (not implemented in the
+  2026-06-19 P2 work).** As shipped, the topology index + digest emit are active
+  whenever cluster gossip + telemetry are on and `cluster.self_backend_id != 0`
+  (inert otherwise) — there is no dedicated dark-launch flag. Add one before
+  enabling P2 by default on shared clusters.
 - **Gossiped K vs MTU:** cap digest at ~128 × 8B hashes to stay under a 1500B MTU
   before DTLS overhead; chunking/truncation only if a larger K is required.
 - **DEGRADED-quorum behavior:** do not assert `sole_held=false` while
   `QuorumState::DEGRADED` (fail-safe — freeze reaping signal during split-brain).
+  **OPEN (not implemented in the 2026-06-19 P2 work).** The topology JSON + gauges
+  currently compute `sole_held` regardless of quorum state. This is the documented
+  fail-dangerous case: during split-brain a stale-but-not-evicted peer can keep a
+  prefix reading `holders >= 2` (`sole_held=false`) when we are in fact its only
+  reachable holder. `GossipConsensus::quorum_state()` is queryable on shard 0;
+  gate/freeze the signal on `DEGRADED` before any consumer treats it as authoritative.
 - **Residency threshold (P3):** what `residency_weight` counts as "warm enough" to
   be a holder — same calibration as cache-headroom routing.
 - **StreamSummary eviction (deferred, P0 decision):** `src/stream_summary.hpp` uses
