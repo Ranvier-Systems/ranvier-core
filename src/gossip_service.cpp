@@ -407,6 +407,37 @@ void GossipService::set_cache_state_callback(CacheStateCallback callback) {
     }
 }
 
+// BACKLOG §21 P2: thin delegations to the protocol's hot-prefix-digest support
+// (callback wiring + broadcast), mirroring the cache_state pair above.
+void GossipService::set_hot_prefix_digest_callback(HotPrefixDigestCallback callback) {
+    if (_protocol) {
+        _protocol->set_hot_prefix_digest_callback(std::move(callback));
+    }
+}
+
+seastar::future<> GossipService::broadcast_hot_prefix_digest(BackendId backend_id,
+                                                             std::vector<uint64_t> prefix_hashes) {
+    if (!_config.enabled || !_protocol || _peer_addresses.empty()) {
+        return seastar::make_ready_future<>();
+    }
+
+    if (!is_accepting_tasks()) {
+        log_gossip.debug("Hot-prefix digest broadcast rejected: gossip service not accepting tasks");
+        return seastar::make_ready_future<>();
+    }
+
+    seastar::gate::holder gate_holder;
+    try {
+        gate_holder = _gossip_task_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        log_gossip.debug("Hot-prefix digest broadcast rejected: gossip gate closed");
+        return seastar::make_ready_future<>();
+    }
+
+    return _protocol->broadcast_hot_prefix_digest(backend_id, std::move(prefix_hashes))
+        .finally([gate_holder = std::move(gate_holder)] {});
+}
+
 seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tokens, BackendId backend) {
     if (!_config.enabled || !_protocol || _peer_addresses.empty()) {
         return seastar::make_ready_future<>();

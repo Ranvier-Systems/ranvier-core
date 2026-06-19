@@ -72,6 +72,7 @@ struct RouteBatchConfig {
 
 // Forward declaration
 class GossipService;
+class TelemetryService;  // BACKLOG §21 P2: fed via ShardLocalState::telemetry_ptr
 
 // ============================================================================
 // Unified Route Result
@@ -595,6 +596,18 @@ public:
     // Takes params by value (Rule #22: coroutine params by value).
     static seastar::future<> apply_peer_cache_state(
         BackendId backend_id, double cache_usage, double residency_weight);
+
+    // BACKLOG §21 P2: gossip our node's merged hot-prefix digest to cluster
+    // peers. Runs on shard 0 (the telemetry emitter home), where gossip_ptr is
+    // set; a no-op when gossip is disabled. `self_id` stamps the digest as ours.
+    // Takes the hash vector by value (Rule #22: coroutine params by value).
+    static seastar::future<> broadcast_hot_prefix_digest_global(
+        BackendId self_id, std::vector<uint64_t> prefix_hashes);
+
+    // BACKLOG §21 P2: publish shard 0's TelemetryService instance into
+    // ShardLocalState so the gossip digest callback and the peer-death prune
+    // hook (both shard 0) can feed the cache-topology index. Call on shard 0.
+    static void attach_shard0_telemetry(TelemetryService* telemetry);
 
     // Flush locally-buffered routes to all shards (runs on calling shard)
     // Deduplicates within the batch, broadcasts via parallel_for_each,

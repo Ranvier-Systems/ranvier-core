@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "cache_topology_index.hpp"  // BACKLOG §21 P2 (shard-0 reverse index)
 #include "config_infra.hpp"   // TelemetrySinkConfig
 #include "telemetry_schema.hpp"
 #include "telemetry_sink.hpp"
@@ -71,10 +72,19 @@ public:
 
     // Install the sink + container ref + strategy-snapshot source and arm
     // the window timer. Must be called on shard 0; idempotent.
+    //
+    // BACKLOG §21 P2: `self_backend_id` is this node's BackendId (0 = no cluster)
+    // and `hot_prefix_digest_broadcaster` gossips our merged top-K to peers.
+    // Each window the emitter self-applies our own digest into the topology index
+    // (so we count as a holder of our own hot prefixes — required for correct
+    // sole-holder math) and then broadcasts it. Both default to inert: when the
+    // node has no cluster identity the P2 emit path is skipped entirely.
     seastar::future<> start_emitter(
         seastar::sharded<TelemetryService>* container,
         std::unique_ptr<TelemetrySink> sink,
-        std::function<RoutingStrategyParams()> strategy_snapshot);
+        std::function<RoutingStrategyParams()> strategy_snapshot,
+        BackendId self_backend_id = 0,
+        std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster = nullptr);
 
     // -------------------------------------------------------------------------
     // Recording entry (hot path; shard-local)
@@ -112,6 +122,29 @@ public:
     // handler hops there). Returns an empty/zeroed snapshot before the first
     // window or when tracking is disabled.
     std::string hot_prefix_topology_json() const;
+
+    // -------------------------------------------------------------------------
+    // Cluster cache-topology feeds (BACKLOG §21 P2; shard 0 only)
+    // -------------------------------------------------------------------------
+    //
+    // Both run on shard 0 (the gossip receive home), where the index lives. They
+    // are plain synchronous calls — no reactor/async, no fan-out — invoked from
+    // the gossip hot-prefix-digest callback and the peer-death prune hook via the
+    // shard-0 ShardLocalState::telemetry_ptr bridge.
+
+    // Replace `node`'s contribution with `prefix_hashes` (latest digest wins).
+    void apply_peer_digest(BackendId node, std::vector<uint64_t> prefix_hashes);
+
+    // Drop a dead/removed peer so it can't inflate holder counts (the dangerous
+    // sole-holder false-negative).
+    void evict_peer(BackendId node);
+
+    // Holder count for `hash` across live cluster nodes (0 if none; ==1 => sole
+    // held). Consumed by P2 slice 3's /v1/cache/topology annotation. Shard 0.
+    size_t topology_holder_count(uint64_t hash) const {
+        return _topology_index.holder_count(hash);
+    }
+    size_t topology_node_count_for_testing() const { return _topology_index.node_count(); }
 
     // Sentinel that the overflow path attributes to. The "_overflow"
     // model_family is the marker; the other dimensions are inert filler.
@@ -151,6 +184,17 @@ private:
     int64_t                             _window_start_ms = 0;
     seastar::metrics::metric_groups     _emitter_metrics;
     bool                                _emitter_started = false;
+
+    // ---- Cluster cache-topology index (BACKLOG §21 P2; shard 0 only) ----
+    // Reverse index prefix_fp -> live holder nodes, fed by apply_peer_digest /
+    // evict_peer and our own self-applied digest each window. Plain structure,
+    // no Seastar; touched only on shard 0.
+    CacheTopologyIndex                  _topology_index;
+    BackendId                           _self_backend_id = 0;
+    std::function<seastar::future<>(std::vector<uint64_t>)> _hot_prefix_digest_broadcaster;
+    // Backstop to peer-death eviction: a node silent for this many windows is
+    // aged out of the index even if it was never marked dead.
+    static constexpr int kTopologyStaleWindows = 4;
 
     // ---- Internal helpers ----
 
