@@ -933,170 +933,49 @@ The section heading and anchor (`#20-routing-parity--ecosystem-alignment-2026-06
 
 ## 21. Cache-Aware Autoscaling Telemetry (2026-06-18)
 
-Export the prefix→replica and per-prefix-hotness signals an external
-cache-aware autoscaler needs to (a) drain the *coldest* replica rather than a hot
-one, and (b) avoid reaping the last warm holder of a hot prefix. Ranvier already
-knows the prefix→replica mapping and per-replica KV/load state; this work surfaces
-the missing prefix-level intelligence as bounded telemetry.
+Export the prefix→replica and per-prefix-hotness signals an external cache-aware
+autoscaler needs to (a) drain the *coldest* replica rather than a hot one, and
+(b) avoid reaping the last warm holder of a hot prefix.
 
-**Scope boundary:** Ranvier *exports* telemetry only. The autoscaler itself
-(reap/pin policy, replica lifecycle) lives in the external platform — reap-gating
-semantics in particular are the scaler's decision, not Ranvier's.
+**Status: P0–P2 CLOSED (2026-06-19); P3 + two carve-outs OPEN (see "Still open").**
 
-**Full proposal:** [`docs/architecture/cache-aware-autoscaler-telemetry.md`](docs/architecture/cache-aware-autoscaler-telemetry.md)
-— signal inventory, export surface (§6 registration sketch), aggregation path,
-and the sole-holder index scoping (asymmetry insight + 5-phase plan).
+P0–P2 shipped and merged across three layers: the observability foundation
+(bounded `StreamSummary` top-K + per-backend prefix hit/attempt gauges); the
+node-level view (resident-route gauge, hot-prefix top-K as a `TelemetryService`
+window aggregate + concentration gauges, and the auth-gated `GET /v1/cache/topology`
+JSON); and the cluster-wide sole-holder path (`HOT_PREFIX_DIGEST` 0x07 gossip →
+shard-0 `CacheTopologyIndex` with peer-death eviction + TTL age-out and per-window
+self-apply, surfaced as `holders`/`sole_held` per JSON entry plus the
+`ranvier_sole_held_hot_prefixes` and `hot_prefix_sole_held_request_share` gauges).
+The decision spike (K=128; gauges-not-counters; reuse `TelemetryService` rather
+than a new aggregator) and the per-slice as-built record were folded into the
+architecture doc on closeout to keep this entry focused on active work.
 
-| Priority | Item | Complexity | Depends on |
-|----------|------|------------|-----------|
-| P0 | `StreamSummary` bounded top-K structure (`stream_summary.hpp`) + reactor-free unit tests | Low | — |
-| P0 | Per-backend prefix hit/attempt **gauges** `backend_prefix_{hits,attempts}{backend_id}` via `make_gauge`+lambda (extend `BackendMetrics`, §6.A/B) | Low | — |
-| ✅ | Decision spike — **RESOLVED** (see "Spike findings" below): K=128; gauge-not-counter; call-site located; reuse `TelemetryService` | — | done |
-| P1 | Per-backend resident-route gauge `backend_resident_routes{backend_id}` (RouterService, §6.C) | Low | — |
-| P1 | Hot-prefix top-K as a `TelemetryService` window aggregate (extend `ShardSnapshot`/`WindowReport`) + concentration gauges `hot_prefix_*` (§6.E/F) | Low-Med | StreamSummary, TelemetryService |
-| P1 | `GET /v1/cache/topology` JSON, single-node holders (no gossip yet), auth-gated (§6.G) | Medium | window aggregate |
-| P2 | `HOT_PREFIX_DIGEST` (0x07) gossip packet + handler (sole-holder Phase 2) | Medium | StreamSummary |
-| P2 | Shard-0 `CacheTopologyIndex` (prefix→nodes), peer-death eviction, bounded + overflow counter (Phase 3) | Medium | 0x07 packet |
-| P2 | `sole_held`/`holders` in topology JSON + `sole_held_hot_prefixes` gauge (Phase 4) | Low | CacheTopologyIndex |
-| P3 | Residency-verified holders — intersect digest with `residency_weight`/native KV (Phase 5) | Medium-High | CacheTopologyIndex |
-| ✅ | Routing-overhead micro-benchmark (`make bench-hot-prefix`) — DONE: touch 2.3ns warm / 72ns evict; hash_prefix ~0.4µs @128 tok, ~2µs @512 | Low | done |
-| P3 | Bound the hot-prefix fingerprint hash (cap to ~64 tokens) — constant-time hit path for long-context; see benchmark doc | Low | P1 |
+**Scope boundary:** Ranvier *exports* telemetry only. The autoscaler (reap/pin
+policy, replica lifecycle) lives in the external platform — reap-gating semantics
+in particular are the scaler's decision, not Ranvier's.
 
-### Spike findings (2026-06-18)
+- [`docs/architecture/cache-aware-autoscaler-telemetry.md`](docs/architecture/cache-aware-autoscaler-telemetry.md)
+  — design rationale, signal inventory, the sole-holder asymmetry + 5-phase plan,
+  and the **Implementation notes (as-built)** closeout record (spike findings,
+  the `TelemetryService` course-correction, Hard-Rule watch).
+- [`docs/benchmarks/cache-topology-telemetry-overhead.md`](docs/benchmarks/cache-topology-telemetry-overhead.md)
+  — routing-overhead microbench (`touch()` 2.3 ns warm / 72 ns evict @ K=128;
+  `hash_prefix` ~0.4 µs @128 tok, ~2 µs @512).
 
-The P0 decision spike is closed.
+### Still open
 
-1. **`StreamSummary` K = 128** — shared with the P2 gossip-digest cap so the local
-   top-K and the wire digest use one constant. Per-shard memory is negligible.
-2. **Per-backend hit/attempt are gauges, not counters.** The reactor-free test
-   stub provides labeled overloads for `make_gauge`/`make_histogram` only —
-   `make_counter` with a `{{"backend_id",…}}` label list does not deduce
-   (`tests/stubs/seastar/core/metrics.hh:46-54`). Mirror
-   `prefix_hits_by_compression_tier` (`metrics_service.hpp:277`): `make_gauge` +
-   lambda reading the `BackendMetrics` field, named without the `_total` suffix.
-3. **Hit-attribution call-site** is the existing per-backend recording site,
-   `record_backend_latency_by_id(ctx.current_backend, …)`
-   (`http_controller.cpp:734`); `route_result.cache_hit` is already captured
-   (`:1978`). Add a `record_prefix_outcome_by_id(backend, cache_hit)` wrapper
-   alongside it.
+| Priority | Item | Notes |
+|----------|------|-------|
+| P2 carve-out | `enable_cache_topology` dark-launch flag (default off) | Not shipped — P2 is active whenever cluster gossip + telemetry are on and `cluster.self_backend_id != 0` (inert otherwise). Add before enabling P2 by default on shared clusters. |
+| P2 carve-out | DEGRADED-quorum freeze | Not shipped — `sole_held` is computed regardless of `QuorumState`. Fail-dangerous case: during split-brain a stale-but-unevicted peer keeps a prefix at `holders ≥ 2` (`sole_held=false`) when we are in fact its only reachable holder. Gate the signal on `GossipConsensus::quorum_state() == DEGRADED` (queryable on shard 0). Until then `sole_held` is **operator-observability only**. |
+| P3 | Residency-verified holders (Phase 5) | Intersect the digest with `residency_weight`/native KV — the accuracy prerequisite before any autoscaler consumes `sole_held` for **automated reaping** (route-membership alone can false-negative; see the asymmetry analysis in the architecture doc). Threshold: same calibration as cache-headroom routing. |
+| P3 | Bound the hot-prefix fingerprint hash (~64 tokens) | Constant-time hit path for long context — the microbench shows `hash_prefix` is byte-bound (~2 µs @512 tok). |
+| Release gate | End-to-end A/B (telemetry on vs off) | Not yet run (not runnable in sandbox). Single-stream through one ingress; primary signal is `ranvier_router_routing_latency_seconds` p50/p99 delta **< 1%** with no p99 spike at the shard-0 window cadence. Wrap as `make bench-cache-topology` (per `bench-epp`); promote method + recorded floor to the benchmark doc when first run. |
 
-**Course-correction — reuse `TelemetryService` for P1 aggregation.** The §20
-`TelemetryService` (`seastar::sharded<>`, off by default) already implements the
-per-shard→shard-0 aggregation this proposal's §"Aggregation path" described
-building from scratch: bounded per-shard buckets + `_overflow` sentinel (#4),
-`foreign_ptr<ShardSnapshot>` gather (#14), gate + shard-0 window-emitter timer
-(#5), forward-compat append-only schema, pluggable sink. Its `AggregateRecord`
-already carries `cache_hit_count`/`cache_miss_count`/`prefix_reuse_depth`, and
-`TelemetryOutcome` already carries `cache_hit` + `matched_prefix_depth`.
-
-Implications:
-- **Do not build a parallel shard-0 aggregator.** P1's hot-prefix top-K becomes a
-  *window-level aggregate* (sibling of `window_eviction_churn`) on
-  `ShardSnapshot`/`WindowReport`, reusing the existing gather/gate/timer/overflow
-  machinery.
-- **Per-backend hit rate stays in `metrics_service`** (P0) — `TelemetryService`
-  buckets are content-free (`model_family`/`backend_type`/`hardware_label`/
-  `workload`), deliberately *not* per-`BackendId`.
-- The shard-0 merged window state feeds the label-free concentration gauges and
-  `/v1/cache/topology`, and continues to flow to any configured sink.
-
-Touch points: `telemetry_service.{hpp,cpp}`, `telemetry_schema.hpp`,
-`tests/stubs/seastar/core/metrics.hh`.
-
-### Sequencing / PR boundaries
-
-1. **P0 — observability foundation, zero wire/cluster risk.** `StreamSummary` is
-   the keystone dependency; build and unit-test it first (pure, no Seastar). The
-   per-backend hit counters land immediately useful value with one struct field +
-   one `add_group` line. Ships independently.
-2. **P1 — node-level view.** Resident-route gauge, the hot-prefix top-K added as a
-   `TelemetryService` window aggregate (reusing its gather/gate/timer rather than a
-   new aggregator — see Spike findings) feeding the label-free concentration
-   gauges, and the JSON endpoint reporting *local* backends as holders. Already
-   actionable for a single-node or manually-correlated scaler.
-3. **P2 — cluster-wide sole-holder.** Introduces gossip type `0x07`; needs
-   rolling-upgrade care (append-only enum, `is_known_packet_type`, forward-compat
-   tail — see proposal). Delivers approximate `sole_held` suitable for
-   **operator observability**.
-4. **P3 — accuracy gate.** Residency verification is the prerequisite before any
-   autoscaler consumes `sole_held` for **automated reaping** (route-membership
-   alone can false-negative → reap the last warm copy; see proposal's asymmetry
-   analysis). Benchmark confirms the per-request increment stays off the stall
-   budget.
-
-### Prerequisites & open decisions
-
-- **Config gate:** add `enable_cache_topology` (default off) so P2 gossip can ship
-  dark and be enabled per-cluster once stabilized.
-- **Gossiped K vs MTU:** cap digest at ~128 × 8B hashes to stay under a 1500B MTU
-  before DTLS overhead; chunking/truncation only if a larger K is required.
-- **DEGRADED-quorum behavior:** do not assert `sole_held=false` while
-  `QuorumState::DEGRADED` (fail-safe — freeze reaping signal during split-brain).
-- **Residency threshold (P3):** what `residency_weight` counts as "warm enough" to
-  be a holder — same calibration as cache-headroom routing.
-- **StreamSummary eviction (deferred, P0 decision):** `src/stream_summary.hpp` uses
-  an O(capacity) min-scan on eviction — **measured 72 ns at K=128** (vs 2.3 ns
-  warm; `make bench-hot-prefix`), far under the task quota (Rule #17). Upgrade to
-  the O(1) bucket-list Space-Saving variant only if K is raised by orders of
-  magnitude — not warranted at K=128.
-
-### Verification & benchmark gate
-
-Static analysis predicts the per-request tax is sub-100ns (P0: a `routing_mode`
-compare + one `absl` lookup + 2 increments; P1: one `StreamSummary::touch()`,
-O(1) hit / O(K=128) evict). Two ways to confirm it:
-
-- **Targeted microbench (implemented):** `make bench-hot-prefix` →
-  `StreamSummary::touch()` + `hash_prefix()` ns/op, reactor-free, no Docker. The
-  direct measurement of the tax (an end-to-end A/B can't resolve a sub-µs delta
-  under ms-scale latency). See `docs/benchmarks/cache-topology-telemetry-overhead.md`.
-  **First run:** touch 2.3 ns warm / 72 ns evict; `hash_prefix` ~0.4 µs at the
-  default 128-token prefix, ~2 µs at 512. Conclusion: `touch()` is free; the
-  hit-path hash is byte-bound and grows with `prefix_token_length` → the
-  "bound the fingerprint hash" follow-up (table above) addresses long-context.
-- **End-to-end A/B (release gate, below):** confirms the tax is invisible under
-  load. Modelled on `docs/benchmarks/epp-overhead-microbenchmark.md`; not runnable
-  in the sandbox.
-
-**A/B method (single-stream, the cleanest overhead signal).** Two otherwise
-identical runs through one ingress, telemetry **off** (baseline) then **on**,
-using the existing driver:
-
-```sh
-python tests/integration/http_ab_load.py --target http://localhost:8080 \
-    --requests 5000 --warmup 500     # once per arm; --concurrency 1
-```
-
-Prefer a Makefile wrapper following the `bench-epp` pattern
-(`scripts/bench-cache-topology-overhead.sh` → `make bench-cache-topology`) that
-brings up one node, toggles the telemetry config between arms, and tears down.
-
-**Primary signal — server-side, brackets exactly our code:** scrape
-`ranvier_router_routing_latency_seconds` (histogram, `metrics_service.hpp`) from
-`:9180` at the end of each arm; compare p50/p99. This isolates the routing
-decision (where `touch()` + `record_prefix_outcome_by_id` sit) from backend and
-network time. The client-side percentiles from `http_ab_load.py` are the
-secondary, end-to-end signal.
-
-**Pass thresholds:**
-- Routing-decision p50/p99 delta (on − off) within run-to-run noise — target
-  **< 1%**, and necessarily **≪ the ~35 µs** that prefix routing already adds over
-  bare load/hash (per the EPP microbench), since our addition is two-plus orders
-  of magnitude smaller.
-- **No periodic p99 spike** aligned to the P1 shard-0 window-emit cadence — the
-  real thing to watch is the merge timer, not `touch()`. Cross-check for
-  Seastar reactor-stall warnings on shard 0 during the run.
-
-When first run, promote the methodology + recorded floor to
-`docs/benchmarks/cache-topology-telemetry-overhead.md` (as `bench-epp` did).
-
-### Hard-Rule watch (per proposal)
-
-Lock-free shard-local counters (#1); bounded by construction — fixed-K
-`StreamSummary`, `CacheTopologyIndex` `MAX_HOT_PREFIXES` + overflow metric (#4);
-broadcast/merge timer gate (#5); deregister gauges first in `stop()` (#6); shard-0
-read of cross-shard/peer state — never from another shard's lambda (#14); yield
-when merging K·N entries (#17).
+Deferred design note: `StreamSummary` keeps its O(K) min-scan eviction (72 ns @
+K=128, far under the Rule #17 quota); upgrade to the O(1) bucket-list Space-Saving
+variant only if K rises by orders of magnitude.
 
 Section anchor (`#21-cache-aware-autoscaling-telemetry-2026-06-18`) is the stable
 pointer for future in-source `// BACKLOG §21` cross-references.
