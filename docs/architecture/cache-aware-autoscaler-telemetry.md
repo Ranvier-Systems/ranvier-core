@@ -535,6 +535,58 @@ no fan-out on request, so it cannot stall the reactor (Rule #1/#17).
 The only churning, high-cardinality data (prefix identity) never becomes a
 Prometheus label — it stays in the K-bounded JSON snapshot.
 
+## Implementation notes (as-built, 2026-06-19)
+
+Extracted from the BACKLOG §21 working entry on closeout, so the backlog stays
+focused on active work while the decisions that shaped the merged code live here.
+
+**Decision spike (P0, 2026-06-18).**
+- **`StreamSummary` K = 128**, shared as the gossip-digest cap so the local top-K
+  and the wire digest use one constant. Per-shard memory is negligible.
+- **Per-backend hit/attempt are gauges, not counters.** The reactor-free test stub
+  only provides labeled `make_gauge`/`make_histogram` overloads (`make_counter`
+  with a `{{"backend_id",…}}` label list does not deduce). Mirrors
+  `prefix_hits_by_compression_tier` — `make_gauge` + lambda over a `BackendMetrics`
+  field, named without `_total`.
+- **Hit-attribution call-site** is the existing per-backend recording site
+  (`record_backend_latency_by_id`, `http_controller.cpp`); `route_result.cache_hit`
+  was already captured, so a `record_prefix_outcome_by_id(backend, cache_hit)`
+  wrapper sits alongside it.
+
+**Course-correction — reused `TelemetryService` for P1 aggregation** instead of a
+new shard-0 aggregator. The §20 `TelemetryService` (`seastar::sharded<>`, off by
+default) already implements the per-shard→shard-0 path: bounded per-shard buckets +
+`_overflow` sentinel (#4), `foreign_ptr<ShardSnapshot>` gather (#14), gate + shard-0
+window-emitter timer (#5), append-only schema, pluggable sink. The hot-prefix top-K
+became a window-level aggregate on `ShardSnapshot`/`WindowReport` (sibling of
+`window_eviction_churn`); per-backend hit rate stayed in `metrics_service` (the
+telemetry buckets are deliberately content-free, not per-`BackendId`). Touch points:
+`telemetry_service.{hpp,cpp}`, `telemetry_schema.hpp`, the seastar metrics stub.
+
+**P2 sole-holder, as shipped.** Gossip `HOT_PREFIX_DIGEST` (0x07) → shard-0
+`CacheTopologyIndex` (prefix→nodes, peer-death eviction + TTL age-out, bounded by
+`MAX_HOT_PREFIXES`/`MAX_NODES` with overflow counters). Each telemetry window the
+emitter self-applies this node's merged top-K (so we count as a holder of our own
+hot prefixes — sole-holder math is wrong otherwise) and gossips it. The endpoint
+lists *this node's* top-K, so `holders ≥ 1` and `sole_held` means "only we hold it"
+— the per-node reaping signal a scaler unions across nodes. Surfaced as
+`holders`/`sole_held` per JSON entry + `ranvier_sole_held_hot_prefixes` and
+`hot_prefix_sole_held_request_share` gauges. **Two prerequisites remain open — see
+"Carve-outs still open" at the top.**
+
+**Hard-Rule watch (held across the work).** Lock-free shard-local counters (#1);
+bounded by construction — fixed-K `StreamSummary`, `CacheTopologyIndex` caps +
+overflow metric (#4); broadcast/merge timer gate (#5); deregister gauges first in
+`stop()` (#6); shard-0 reads of cross-shard/peer state, never from another shard's
+lambda (#14); yield when merging K·N entries (#17).
+
+**Overhead.** Microbench (`make bench-hot-prefix`, reactor-free): `touch()` 2.3 ns
+warm / 72 ns evict at K=128; `hash_prefix` ~0.4 µs at 128 tokens, ~2 µs at 512 —
+the hit-path hash is byte-bound (motivates the P3 fingerprint-hash cap). See
+`docs/benchmarks/cache-topology-telemetry-overhead.md`. The end-to-end A/B release
+gate (telemetry on vs off; routing-latency p50/p99 < 1% delta, no p99 spike at the
+shard-0 window cadence) is **not yet run** — tracked in the backlog.
+
 ## Related
 
 - `docs/architecture/push-cache-eviction-notifications.md` — the `prefix_hash`
