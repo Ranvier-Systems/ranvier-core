@@ -165,11 +165,18 @@ TEST(CacheTopologyIndexTest, P2SoleHolderLifecycle) {
     idx.evict_node(kPeerA);
     EXPECT_EQ(idx.holder_count(kShared), 1u);
 
-    // Peer B reports kShared, then goes silent without being marked dead; the
-    // age_out backstop (emit loop cutoff = now - window*N) drops it.
+    // Peer B reports kShared, then goes silent without being marked dead.
     idx.apply_digest(kPeerB, {kShared}, base + seconds(2));
     EXPECT_EQ(idx.holder_count(kShared), 2u);
-    EXPECT_EQ(idx.age_out(base + seconds(5)), 1u);  // B (last_seen base+2s) stale
-    EXPECT_EQ(idx.holder_count(kShared), 1u);        // sole-held by us again
-    EXPECT_EQ(idx.node_count(), 1u);                 // only self remains, fresh
+
+    // Next emit window: the emitter self-applies FIRST (refreshing our last_seen
+    // to now), THEN ages out anyone older than now - window*N — the exact order
+    // in emit_async. So our just-refreshed entry always survives; only the silent
+    // peer B (last_seen base+2s) is older than the base+5s cutoff and drops.
+    const auto t_emit = base + seconds(10);
+    idx.apply_digest(kSelf, {kOurs, kShared}, t_emit);   // self refresh
+    EXPECT_EQ(idx.age_out(t_emit - seconds(5)), 1u);     // only silent peer B
+    EXPECT_EQ(idx.holder_count(kShared), 1u);            // sole-held by us again
+    EXPECT_EQ(idx.holder_count(kOurs), 1u);              // and ours never lapsed
+    EXPECT_EQ(idx.node_count(), 1u);                     // only self remains, fresh
 }
