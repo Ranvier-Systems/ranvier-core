@@ -826,7 +826,9 @@ seastar::future<> Application::init_telemetry_service() {
                                    [self_backend_id](std::vector<uint64_t> hashes) {
                                        return RouterService::broadcast_hot_prefix_digest_global(
                                            self_backend_id, std::move(hashes));
-                                   });
+                                   },
+                                   // BACKLOG §21 P2: split-brain freeze for sole_held.
+                                   [] { return RouterService::cache_topology_quorum_degraded(); });
         });
 
     // BACKLOG §21 P2: publish shard 0's telemetry instance so the gossip digest

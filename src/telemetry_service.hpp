@@ -84,7 +84,8 @@ public:
         std::unique_ptr<TelemetrySink> sink,
         std::function<RoutingStrategyParams()> strategy_snapshot,
         BackendId self_backend_id = 0,
-        std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster = nullptr);
+        std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster = nullptr,
+        std::function<bool()> quorum_degraded_getter = nullptr);
 
     // -------------------------------------------------------------------------
     // Recording entry (hot path; shard-local)
@@ -192,6 +193,10 @@ private:
     CacheTopologyIndex                  _topology_index;
     BackendId                           _self_backend_id = 0;
     std::function<seastar::future<>(std::vector<uint64_t>)> _hot_prefix_digest_broadcaster;
+    // Split-brain freeze (BACKLOG §21 P2). When this returns true the sole_held
+    // signal is frozen toward "do not reap" (never asserts sole_held=false).
+    // Null => always HEALTHY (no cluster / single node).
+    std::function<bool()>               _quorum_degraded_getter;
     // Backstop to peer-death eviction: a node silent for this many windows is
     // aged out of the index even if it was never marked dead.
     static constexpr int kTopologyStaleWindows = 4;
@@ -207,6 +212,12 @@ private:
     // to it (BACKLOG §21 P2 slice 3). Queried per scrape so the counts reflect
     // peer digests that arrived since the last window. Shard-0, lock-free.
     std::vector<size_t> current_holder_counts() const;
+
+    // Is cluster quorum DEGRADED right now? Drives the sole_held split-brain
+    // freeze. Null getter => false (no cluster). Shard-0, lock-free.
+    bool quorum_degraded() const {
+        return _quorum_degraded_getter && _quorum_degraded_getter();
+    }
 };
 
 }  // namespace ranvier

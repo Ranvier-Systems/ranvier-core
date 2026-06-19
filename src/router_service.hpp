@@ -609,6 +609,11 @@ public:
     // hook (both shard 0) can feed the cache-topology index. Call on shard 0.
     static void attach_shard0_telemetry(TelemetryService* telemetry);
 
+    // BACKLOG §21 P2 (DEGRADED-quorum freeze): is cluster quorum currently
+    // DEGRADED? Read on shard 0 via gossip_ptr; false when there is no gossip
+    // (a single node is never split-brain). Drives the sole_held freeze.
+    static bool cache_topology_quorum_degraded();
+
     // Flush locally-buffered routes to all shards (runs on calling shard)
     // Deduplicates within the batch, broadcasts via parallel_for_each,
     // and submits gossip batch to shard 0
