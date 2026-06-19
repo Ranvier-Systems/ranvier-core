@@ -976,12 +976,28 @@ in particular are the scaler's decision, not Ranvier's.
 | Priority | Item | Notes |
 |----------|------|-------|
 | P3 | Residency-verified holders (Phase 5) | Intersect the digest with `residency_weight`/native KV — the accuracy prerequisite before any autoscaler consumes `sole_held` for **automated reaping** (route-membership alone can false-negative; see the asymmetry analysis in the architecture doc). Threshold: same calibration as cache-headroom routing. |
-| P3 | Bound the hot-prefix fingerprint hash (~64 tokens) | Constant-time hit path for long context — the microbench shows `hash_prefix` is byte-bound (~2 µs @512 tok). |
 | Release gate | End-to-end A/B (telemetry on vs off) | Not yet run (not runnable in sandbox). Single-stream through one ingress; primary signal is `ranvier_router_routing_latency_seconds` p50/p99 delta **< 1%** with no p99 spike at the shard-0 window cadence. Wrap as `make bench-cache-topology` (per `bench-epp`); promote method + recorded floor to the benchmark doc when first run. |
 
 Deferred design note: `StreamSummary` keeps its O(K) min-scan eviction (72 ns @
 K=128, far under the Rule #17 quota); upgrade to the O(1) bucket-list Space-Saving
 variant only if K rises by orders of magnitude.
+
+Bounding the fingerprint hash (originally scoped "P3, Low" — **reclassified
+2026-06-19 after investigation: NOT a quick win**). The fingerprint *is* already
+bounded on the fallback path (`prefix_len = min(len, prefix_token_length)`, default
+128 ≈ 0.4 µs); the only uncapped cost is the `prefix_boundary` branch
+(`router_service.cpp`), which hashes the full declared/detected prefix — and that
+is **intentional**: it hashes the entire system message so requests sharing it
+co-locate for cache reuse. A cap there is correctness-sensitive, not free: (1) it
+degrades routing precision (distinct prompts sharing the first N tokens collide);
+(2) the KV-event ledger's boundary-identity invariant requires any cap to be a
+`block_alignment` multiple applied consistently, else native-KV route-learning
+stops matching routing lookups; (3) lookup, both learn paths, and the
+`X-Ranvier-Prefix-Hash` header must use the same effective depth or hits silently
+become misses. If ever pursued, do it as an opt-in `prefix_hash_max_tokens` config
+(default = current/unbounded), not a default change. The ~2 µs figure only arises
+when an operator runs a large `prefix_token_length`/system prompt — an explicit
+precision-vs-cost choice. See the architecture doc's as-built notes.
 
 Section anchor (`#21-cache-aware-autoscaling-telemetry-2026-06-18`) is the stable
 pointer for future in-source `// BACKLOG §21` cross-references.
