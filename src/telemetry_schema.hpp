@@ -359,38 +359,59 @@ inline double hot_prefix_sole_held_request_share(const std::vector<HotPrefixEntr
 }
 
 // Content-free JSON for GET /v1/cache/topology: prefix FINGERPRINTS (hex) and
-// counts only — never token text. `holders[i]` is the live cluster holder count
-// for top[i] (BACKLOG §21 P2 slice 3); a prefix with exactly one holder is
-// emitted as "sole_held":true. holders shorter than top => missing counts are 0
-// (sole_held false). `quorum_degraded` surfaces as "quorum":"DEGRADED" and forces
-// every entry's sole_held=true (split-brain freeze — see helpers above); the real
-// (untrustworthy) holder count is still shown. Bounded by top.size() (<= K). Pure.
+// counts only — never token text. When `include_topology` (BACKLOG §21 P2 is
+// enabled), each entry carries the live cluster holder count `holders[i]` and a
+// `sole_held` flag (exactly one holder), plus a top-level `quorum`. `holders`
+// shorter than top => missing counts are 0 (sole_held false). `quorum_degraded`
+// surfaces as "quorum":"DEGRADED" and forces every sole_held=true (split-brain
+// freeze — see helpers above); the real (untrustworthy) holder count is still
+// shown. When `include_topology` is false (P2 disabled) the cluster fields are
+// omitted entirely — the endpoint reverts to its P1 shape (prefix_fp +
+// request_count), never emitting a misleading sole_held=false. Bounded by
+// top.size() (<= K). Pure.
 inline std::string format_hot_prefix_topology_json(const std::vector<HotPrefixEntry>& top,
                                                    const std::vector<size_t>& holders,
                                                    uint64_t total_touches,
                                                    int64_t snapshot_age_ms,
-                                                   bool quorum_degraded = false) {
+                                                   bool quorum_degraded = false,
+                                                   bool include_topology = true) {
     std::string out;
     out.reserve(96 + top.size() * 96);
     char head[224];
-    std::snprintf(head, sizeof(head),
-        "{\"snapshot_age_ms\":%lld,\"total_touches\":%llu,\"count\":%zu,\"quorum\":\"%s\",\"hot_prefixes\":[",
-        static_cast<long long>(snapshot_age_ms),
-        static_cast<unsigned long long>(total_touches),
-        top.size(),
-        (quorum_degraded ? "DEGRADED" : "HEALTHY"));
+    if (include_topology) {
+        std::snprintf(head, sizeof(head),
+            "{\"snapshot_age_ms\":%lld,\"total_touches\":%llu,\"count\":%zu,\"quorum\":\"%s\",\"hot_prefixes\":[",
+            static_cast<long long>(snapshot_age_ms),
+            static_cast<unsigned long long>(total_touches),
+            top.size(),
+            (quorum_degraded ? "DEGRADED" : "HEALTHY"));
+    } else {
+        std::snprintf(head, sizeof(head),
+            "{\"snapshot_age_ms\":%lld,\"total_touches\":%llu,\"count\":%zu,\"hot_prefixes\":[",
+            static_cast<long long>(snapshot_age_ms),
+            static_cast<unsigned long long>(total_touches),
+            top.size());
+    }
     out += head;
     for (size_t i = 0; i < top.size(); ++i) {
-        const size_t h = (i < holders.size()) ? holders[i] : 0;
-        const bool sole_held = quorum_degraded || (h == 1);
         char ent[160];
-        std::snprintf(ent, sizeof(ent),
-            "%s{\"prefix_fp\":\"%016llx\",\"request_count\":%llu,\"holders\":%zu,\"sole_held\":%s}",
-            (i == 0 ? "" : ","),
-            static_cast<unsigned long long>(top[i].prefix_fp),
-            static_cast<unsigned long long>(top[i].request_count),
-            h,
-            (sole_held ? "true" : "false"));
+        if (include_topology) {
+            const size_t h = (i < holders.size()) ? holders[i] : 0;
+            const bool sole_held = quorum_degraded || (h == 1);
+            std::snprintf(ent, sizeof(ent),
+                "%s{\"prefix_fp\":\"%016llx\",\"request_count\":%llu,\"holders\":%zu,\"sole_held\":%s}",
+                (i == 0 ? "" : ","),
+                static_cast<unsigned long long>(top[i].prefix_fp),
+                static_cast<unsigned long long>(top[i].request_count),
+                h,
+                (sole_held ? "true" : "false"));
+        } else {
+            std::snprintf(ent, sizeof(ent),
+                "%s{\"prefix_fp\":\"%016llx\",\"request_count\":%llu}",
+                (i == 0 ? "" : ","),
+                static_cast<unsigned long long>(top[i].prefix_fp),
+                static_cast<unsigned long long>(top[i].request_count));
+        }
         out += ent;
     }
     out += "]}";

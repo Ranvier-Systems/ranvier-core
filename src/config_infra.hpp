@@ -381,6 +381,13 @@ struct ClusterConfig {
     // When this node shuts down, it broadcasts DRAINING with this ID so peers
     // can set the backend's weight to 0 and stop sending new traffic
     int32_t self_backend_id = 0;                           // This node's backend ID (0 = unset, must configure for cluster)
+
+    // Cache-aware autoscaling telemetry (BACKLOG §21 P2). When off, the cluster
+    // sole-holder path is dark: no HOT_PREFIX_DIGEST gossip is emitted, received
+    // digests are ignored, and /v1/cache/topology + the sole-held gauges omit the
+    // holders/sole_held/quorum surface (P1 hot-prefix reporting is unaffected).
+    // Default off so P2 ships dark and is enabled per-cluster once stabilized.
+    bool enable_cache_topology = false;
 };
 
 // =============================================================================

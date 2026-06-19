@@ -78,7 +78,8 @@ seastar::future<> TelemetryService::start_emitter(
     std::function<RoutingStrategyParams()> strategy_snapshot,
     BackendId self_backend_id,
     std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster,
-    std::function<bool()> quorum_degraded_getter) {
+    std::function<bool()> quorum_degraded_getter,
+    bool cache_topology_enabled) {
 
     if (seastar::this_shard_id() != 0) {
         return seastar::make_exception_future<>(
@@ -98,6 +99,7 @@ seastar::future<> TelemetryService::start_emitter(
     _self_backend_id    = self_backend_id;                                  // BACKLOG §21 P2
     _hot_prefix_digest_broadcaster = std::move(hot_prefix_digest_broadcaster);
     _quorum_degraded_getter = std::move(quorum_degraded_getter);            // BACKLOG §21 P2
+    _cache_topology_enabled = cache_topology_enabled;                       // BACKLOG §21 P2 dark-launch gate
     _window_start_ms    = now_ms();
 
     if (!_enabled) {
@@ -403,8 +405,9 @@ seastar::future<> TelemetryService::emit_async() {
     // Self-apply our own merged top-K (so this node counts as a holder of its own
     // hot prefixes — sole-holder math is wrong otherwise), age out peers gone
     // silent (backstop to peer-death eviction), then gossip our digest to peers.
-    // Skipped entirely when the node has no cluster identity (_self_backend_id 0).
-    if (_self_backend_id != 0) {
+    // Skipped when P2 is disabled (dark-launch gate) or the node has no cluster
+    // identity (_self_backend_id 0).
+    if (_cache_topology_enabled && _self_backend_id != 0) {
         std::vector<uint64_t> digest;
         digest.reserve(_last_hot_prefixes.size());
         for (const auto& e : _last_hot_prefixes) digest.push_back(e.prefix_fp);
@@ -462,11 +465,13 @@ seastar::future<> TelemetryService::stop() {
 // =============================================================================
 
 void TelemetryService::apply_peer_digest(BackendId node, std::vector<uint64_t> prefix_hashes) {
+    if (!_cache_topology_enabled) return;  // dark-launch gate: ignore peer digests
     // Receive-time timestamp drives the age_out backstop in the emit loop.
     _topology_index.apply_digest(node, prefix_hashes, std::chrono::steady_clock::now());
 }
 
 void TelemetryService::evict_peer(BackendId node) {
+    if (!_cache_topology_enabled) return;
     _topology_index.evict_node(node);
 }
 
@@ -485,8 +490,16 @@ std::string TelemetryService::hot_prefix_topology_json() const {
         age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - _last_hot_prefix_at).count();
     }
+    // P2 disabled => omit the holders/sole_held/quorum surface (revert to P1
+    // shape); the empty index would otherwise report a misleading sole_held=false.
+    if (!_cache_topology_enabled) {
+        return format_hot_prefix_topology_json(_last_hot_prefixes, {}, _last_hot_prefix_touches,
+                                               age_ms, /*quorum_degraded=*/false,
+                                               /*include_topology=*/false);
+    }
     return format_hot_prefix_topology_json(_last_hot_prefixes, current_holder_counts(),
-                                           _last_hot_prefix_touches, age_ms, quorum_degraded());
+                                           _last_hot_prefix_touches, age_ms, quorum_degraded(),
+                                           /*include_topology=*/true);
 }
 
 }  // namespace ranvier

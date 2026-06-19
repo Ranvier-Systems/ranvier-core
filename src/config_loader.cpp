@@ -511,6 +511,9 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_CLUSTER_ACCEPT_GOSSIP_ON_QUORUM_LOSS")) {
         cluster.accept_gossip_on_quorum_loss = (*v == "1" || *v == "true" || *v == "yes");
     }
+    if (auto v = get_env("RANVIER_CLUSTER_ENABLE_CACHE_TOPOLOGY")) {
+        cluster.enable_cache_topology = (*v == "1" || *v == "true" || *v == "yes");
+    }
 
     // K8s discovery overrides
     if (auto v = get_env("RANVIER_K8S_DISCOVERY_ENABLED")) {
@@ -1443,6 +1446,9 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             }
             if (c["self_backend_id"]) {
                 config.cluster.self_backend_id = c["self_backend_id"].as<int32_t>();
+            }
+            if (c["enable_cache_topology"]) {
+                config.cluster.enable_cache_topology = c["enable_cache_topology"].as<bool>();
             }
         }
 
