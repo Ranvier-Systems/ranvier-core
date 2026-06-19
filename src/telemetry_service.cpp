@@ -130,6 +130,22 @@ seastar::future<> TelemetryService::start_emitter(
         sm::make_gauge("hot_prefix_distinct_estimate",
             sm::description("Distinct hot prefixes tracked in the last window (<= K)."),
             [this] { return static_cast<double>(_last_hot_prefixes.size()); }),
+
+        // Sole-holder signals (BACKLOG §21 P2 slice 3). Among this node's hot
+        // top-K, how many prefixes does exactly one cluster node hold — i.e.
+        // reaping this node is a cache cliff for them. Holder counts are queried
+        // live (reflect peer digests since the last window), not cached at the
+        // window boundary. An autoscaler scrapes every node and unions the set.
+        sm::make_gauge("ranvier_sole_held_hot_prefixes",
+            sm::description("Count of this node's hot top-K prefixes held by exactly one cluster node "
+                            "(sole-held => unsafe to reap that node)."),
+            [this] { return static_cast<double>(hot_prefix_sole_held_count(current_holder_counts())); }),
+        sm::make_gauge("hot_prefix_sole_held_request_share",
+            sm::description("Fraction of prefix-routed requests hitting sole-held hot prefixes (0..1)."),
+            [this] {
+                return hot_prefix_sole_held_request_share(
+                    _last_hot_prefixes, current_holder_counts(), _last_hot_prefix_touches);
+            }),
         sm::make_gauge("topk_snapshot_age_seconds",
             sm::description("Age of the cached hot-prefix snapshot in seconds (0 before the first window)."),
             [this] {
@@ -445,13 +461,23 @@ void TelemetryService::evict_peer(BackendId node) {
     _topology_index.evict_node(node);
 }
 
+std::vector<size_t> TelemetryService::current_holder_counts() const {
+    std::vector<size_t> holders;
+    holders.reserve(_last_hot_prefixes.size());
+    for (const auto& e : _last_hot_prefixes) {
+        holders.push_back(_topology_index.holder_count(e.prefix_fp));
+    }
+    return holders;
+}
+
 std::string TelemetryService::hot_prefix_topology_json() const {
     int64_t age_ms = 0;
     if (_last_hot_prefix_at.time_since_epoch().count() != 0) {
         age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - _last_hot_prefix_at).count();
     }
-    return format_hot_prefix_topology_json(_last_hot_prefixes, _last_hot_prefix_touches, age_ms);
+    return format_hot_prefix_topology_json(_last_hot_prefixes, current_holder_counts(),
+                                           _last_hot_prefix_touches, age_ms);
 }
 
 }  // namespace ranvier

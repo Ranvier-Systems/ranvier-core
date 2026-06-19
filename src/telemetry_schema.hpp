@@ -322,13 +322,43 @@ inline double hot_prefix_topk_share(const std::vector<HotPrefixEntry>& top, uint
     return static_cast<double>(sum) / static_cast<double>(total);
 }
 
+// Cache-topology sole-holder signals (BACKLOG §21 P2 slice 3). `holders[i]` is
+// the live cluster holder count for top[i] (parallel vectors). A prefix is
+// "sole-held" when exactly one node holds it hot — reaping that node is a cache
+// cliff for that prefix. Since `top` is THIS node's own top-K (always
+// self-applied into the index), holders[i] >= 1 and sole-held == "only we hold
+// it". Both pure / reactor-free; tolerant of holders shorter than top (missing
+// => treated as 0, e.g. a prefix dropped at the index cap).
+inline size_t hot_prefix_sole_held_count(const std::vector<size_t>& holders) {
+    size_t n = 0;
+    for (size_t h : holders) {
+        if (h == 1) ++n;
+    }
+    return n;
+}
+inline double hot_prefix_sole_held_request_share(const std::vector<HotPrefixEntry>& top,
+                                                 const std::vector<size_t>& holders,
+                                                 uint64_t total) {
+    if (total == 0) return 0.0;
+    uint64_t sum = 0;
+    const size_t n = std::min(top.size(), holders.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (holders[i] == 1) sum += top[i].request_count;
+    }
+    return static_cast<double>(sum) / static_cast<double>(total);
+}
+
 // Content-free JSON for GET /v1/cache/topology: prefix FINGERPRINTS (hex) and
-// counts only — never token text. Bounded by top.size() (<= K). Pure.
+// counts only — never token text. `holders[i]` is the live cluster holder count
+// for top[i] (BACKLOG §21 P2 slice 3); a prefix with exactly one holder is
+// emitted as "sole_held":true. holders shorter than top => missing counts are 0
+// (sole_held false). Bounded by top.size() (<= K). Pure.
 inline std::string format_hot_prefix_topology_json(const std::vector<HotPrefixEntry>& top,
+                                                   const std::vector<size_t>& holders,
                                                    uint64_t total_touches,
                                                    int64_t snapshot_age_ms) {
     std::string out;
-    out.reserve(96 + top.size() * 56);
+    out.reserve(96 + top.size() * 96);
     char head[192];
     std::snprintf(head, sizeof(head),
         "{\"snapshot_age_ms\":%lld,\"total_touches\":%llu,\"count\":%zu,\"hot_prefixes\":[",
@@ -337,12 +367,15 @@ inline std::string format_hot_prefix_topology_json(const std::vector<HotPrefixEn
         top.size());
     out += head;
     for (size_t i = 0; i < top.size(); ++i) {
-        char ent[96];
+        const size_t h = (i < holders.size()) ? holders[i] : 0;
+        char ent[160];
         std::snprintf(ent, sizeof(ent),
-            "%s{\"prefix_fp\":\"%016llx\",\"request_count\":%llu}",
+            "%s{\"prefix_fp\":\"%016llx\",\"request_count\":%llu,\"holders\":%zu,\"sole_held\":%s}",
             (i == 0 ? "" : ","),
             static_cast<unsigned long long>(top[i].prefix_fp),
-            static_cast<unsigned long long>(top[i].request_count));
+            static_cast<unsigned long long>(top[i].request_count),
+            h,
+            (h == 1 ? "true" : "false"));
         out += ent;
     }
     out += "]}";

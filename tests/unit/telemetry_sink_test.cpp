@@ -488,19 +488,48 @@ TEST(HotPrefixShares, ComputesFractions) {
     EXPECT_DOUBLE_EQ(hot_prefix_topk_share(top, 10), 0.8);   // (6+2)/10
 }
 
+// BACKLOG §21 P2 slice 3: sole-holder pure helpers.
+TEST(HotPrefixSoleHeld, CountsSingleHolderEntries) {
+    EXPECT_EQ(hot_prefix_sole_held_count({}), 0u);
+    EXPECT_EQ(hot_prefix_sole_held_count({1, 2, 1, 5, 1}), 3u);
+    EXPECT_EQ(hot_prefix_sole_held_count({0, 2, 3}), 0u);  // 0 holders is NOT sole-held
+}
+
+TEST(HotPrefixSoleHeld, RequestShareWeightsBySoleHeldTraffic) {
+    std::vector<HotPrefixEntry> top = {{0x1, 600}, {0x2, 200}, {0x3, 100}};
+    std::vector<size_t> holders = {1, 4, 1};       // first + third are sole-held
+    EXPECT_DOUBLE_EQ(hot_prefix_sole_held_request_share(top, holders, 1000), 0.7);  // (600+100)/1000
+}
+
+TEST(HotPrefixSoleHeld, ZeroTotalAndShortHoldersAreSafe) {
+    std::vector<HotPrefixEntry> top = {{0x1, 600}};
+    EXPECT_DOUBLE_EQ(hot_prefix_sole_held_request_share(top, {1}, 0), 0.0);   // div-by-zero guard
+    EXPECT_DOUBLE_EQ(hot_prefix_sole_held_request_share(top, {}, 1000), 0.0); // missing => 0 holders
+}
+
 TEST(HotPrefixTopologyJson, EmptyShape) {
-    auto json = format_hot_prefix_topology_json({}, 0, 0);
+    auto json = format_hot_prefix_topology_json({}, {}, 0, 0);
     EXPECT_EQ(json, "{\"snapshot_age_ms\":0,\"total_touches\":0,\"count\":0,\"hot_prefixes\":[]}");
 }
 
-TEST(HotPrefixTopologyJson, EntriesAreHexFingerprintsNeverTokens) {
+TEST(HotPrefixTopologyJson, EntriesCarryHoldersAndSoleHeld) {
     std::vector<HotPrefixEntry> top = {{0xa93f, 412}, {0x0c11, 388}};
-    auto json = format_hot_prefix_topology_json(top, 800, 1873);
+    std::vector<size_t> holders = {1, 3};  // first sole-held; second shared by 3 nodes
+    auto json = format_hot_prefix_topology_json(top, holders, 800, 1873);
     EXPECT_NE(json.find("\"snapshot_age_ms\":1873"), std::string::npos);
     EXPECT_NE(json.find("\"total_touches\":800"), std::string::npos);
     EXPECT_NE(json.find("\"count\":2"), std::string::npos);
-    // 16-char zero-padded hex fingerprint, comma-separated, count present.
-    EXPECT_NE(json.find("\"prefix_fp\":\"000000000000a93f\",\"request_count\":412"), std::string::npos);
-    EXPECT_NE(json.find("\"prefix_fp\":\"0000000000000c11\",\"request_count\":388"), std::string::npos);
+    // 16-char zero-padded hex fingerprint (never token text) + holders + sole_held.
+    EXPECT_NE(json.find("\"prefix_fp\":\"000000000000a93f\",\"request_count\":412,\"holders\":1,\"sole_held\":true"),
+              std::string::npos);
+    EXPECT_NE(json.find("\"prefix_fp\":\"0000000000000c11\",\"request_count\":388,\"holders\":3,\"sole_held\":false"),
+              std::string::npos);
     EXPECT_NE(json.find("},{"), std::string::npos);  // separator between entries
+}
+
+TEST(HotPrefixTopologyJson, ZeroHoldersIsNotSoleHeld) {
+    // A prefix dropped at the index cap reports 0 holders, not sole-held.
+    std::vector<HotPrefixEntry> top = {{0x5, 10}};
+    auto json = format_hot_prefix_topology_json(top, {0}, 10, 0);
+    EXPECT_NE(json.find("\"holders\":0,\"sole_held\":false"), std::string::npos);
 }
