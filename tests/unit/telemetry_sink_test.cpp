@@ -517,52 +517,93 @@ TEST(HotPrefixSoleHeld, DegradedQuorumFreezesAllSoleHeld) {
     EXPECT_DOUBLE_EQ(hot_prefix_sole_held_request_share(top, holders, 900, true), 1.0);  // (600+200+100)/900
 }
 
+// BACKLOG §21 Phase 5d: the ranvier_sole_held_verified_hot_prefixes gauge reuses
+// hot_prefix_sole_held_count over the verified-holder vector. Pins the count==1
+// semantics including the 0 case (hot-but-evicted-everywhere is NOT sole-held) and
+// the DEGRADED freeze.
+TEST(HotPrefixSoleHeld, VerifiedSoleHeldCountReusesGenericHelper) {
+    std::vector<size_t> verified = {1, 0, 2, 1};  // entries 0 and 3 verified-sole-held
+    EXPECT_EQ(hot_prefix_sole_held_count(verified, /*degraded=*/false), 2u);
+    // 0 verified holders (nobody resident) is never sole-held — only exactly 1 is.
+    EXPECT_EQ(hot_prefix_sole_held_count(std::vector<size_t>{0, 0}, /*degraded=*/false), 0u);
+    // Split-brain: freeze every hot prefix toward "do not auto-reap".
+    EXPECT_EQ(hot_prefix_sole_held_count(verified, /*degraded=*/true), 4u);
+}
+
 TEST(HotPrefixTopologyJson, EmptyShape) {
-    auto json = format_hot_prefix_topology_json({}, {}, 0, 0);
+    auto json = format_hot_prefix_topology_json({}, {}, {}, 0, 0);
     EXPECT_EQ(json,
         "{\"snapshot_age_ms\":0,\"total_touches\":0,\"count\":0,\"quorum\":\"HEALTHY\",\"hot_prefixes\":[]}");
 }
 
 TEST(HotPrefixTopologyJson, DegradedQuorumFreezesSoleHeldAndLabelsQuorum) {
     std::vector<HotPrefixEntry> top = {{0x0c11, 388}};
-    std::vector<size_t> holders = {3};  // shared by 3 — sole_held=false under HEALTHY
-    auto json = format_hot_prefix_topology_json(top, holders, 800, 0, /*degraded=*/true);
+    std::vector<size_t> holders = {3};   // shared by 3 — sole_held=false under HEALTHY
+    std::vector<size_t> verified = {2};  // resident on 2 — verified_sole_held=false under HEALTHY
+    auto json = format_hot_prefix_topology_json(top, holders, verified, 800, 0, /*degraded=*/true);
     EXPECT_NE(json.find("\"quorum\":\"DEGRADED\""), std::string::npos);
-    // Real (untrustworthy) holder count still shown, but sole_held frozen true.
+    // Real (untrustworthy) counts still shown, but BOTH tiers frozen sole-held true.
     EXPECT_NE(json.find("\"holders\":3,\"sole_held\":true"), std::string::npos);
+    EXPECT_NE(json.find("\"verified_holders\":2,\"verified_sole_held\":true"), std::string::npos);
 }
 
 TEST(HotPrefixTopologyJson, EntriesCarryHoldersAndSoleHeld) {
     std::vector<HotPrefixEntry> top = {{0xa93f, 412}, {0x0c11, 388}};
-    std::vector<size_t> holders = {1, 3};  // first sole-held; second shared by 3 nodes
-    auto json = format_hot_prefix_topology_json(top, holders, 800, 1873);
+    std::vector<size_t> holders = {1, 3};   // first sole-held; second shared by 3 nodes
+    std::vector<size_t> verified = {1, 2};  // first verified-sole-held; second resident on 2
+    auto json = format_hot_prefix_topology_json(top, holders, verified, 800, 1873);
     EXPECT_NE(json.find("\"snapshot_age_ms\":1873"), std::string::npos);
     EXPECT_NE(json.find("\"total_touches\":800"), std::string::npos);
     EXPECT_NE(json.find("\"count\":2"), std::string::npos);
-    // 16-char zero-padded hex fingerprint (never token text) + holders + sole_held.
-    EXPECT_NE(json.find("\"prefix_fp\":\"000000000000a93f\",\"request_count\":412,\"holders\":1,\"sole_held\":true"),
+    // 16-char zero-padded hex fingerprint (never token text) + both holder tiers.
+    EXPECT_NE(json.find("\"prefix_fp\":\"000000000000a93f\",\"request_count\":412,\"holders\":1,\"sole_held\":true,"
+                        "\"verified_holders\":1,\"verified_sole_held\":true"),
               std::string::npos);
-    EXPECT_NE(json.find("\"prefix_fp\":\"0000000000000c11\",\"request_count\":388,\"holders\":3,\"sole_held\":false"),
+    EXPECT_NE(json.find("\"prefix_fp\":\"0000000000000c11\",\"request_count\":388,\"holders\":3,\"sole_held\":false,"
+                        "\"verified_holders\":2,\"verified_sole_held\":false"),
               std::string::npos);
     EXPECT_NE(json.find("},{"), std::string::npos);  // separator between entries
 }
 
+// The signal the autoscaler gates automated reaping on: a prefix can be membership-
+// shared (holders:2, sole_held:false => looks safe) yet verified-sole-held
+// (verified_holders:1, verified_sole_held:true => only one node truly resident).
+TEST(HotPrefixTopologyJson, VerifiedSoleHeldSurfacesIndependentlyOfMembership) {
+    std::vector<HotPrefixEntry> top = {{0xbeef, 500}};
+    auto json = format_hot_prefix_topology_json(top, {2}, {1}, 500, 0);
+    EXPECT_NE(json.find("\"holders\":2,\"sole_held\":false,\"verified_holders\":1,\"verified_sole_held\":true"),
+              std::string::npos);
+}
+
 TEST(HotPrefixTopologyJson, ZeroHoldersIsNotSoleHeld) {
-    // A prefix dropped at the index cap reports 0 holders, not sole-held.
+    // A prefix dropped at the index cap reports 0 holders, not sole-held. A prefix
+    // hot-but-evicted-everywhere reports verified_holders:0 (not verified-sole-held).
     std::vector<HotPrefixEntry> top = {{0x5, 10}};
-    auto json = format_hot_prefix_topology_json(top, {0}, 10, 0);
-    EXPECT_NE(json.find("\"holders\":0,\"sole_held\":false"), std::string::npos);
+    auto json = format_hot_prefix_topology_json(top, {0}, {0}, 10, 0);
+    EXPECT_NE(json.find("\"holders\":0,\"sole_held\":false,\"verified_holders\":0,\"verified_sole_held\":false"),
+              std::string::npos);
+}
+
+TEST(HotPrefixTopologyJson, MissingVerifiedCountsTreatedAsZero) {
+    // verified_holders shorter than top => missing entries are 0 (not sole-held).
+    std::vector<HotPrefixEntry> top = {{0x1, 10}, {0x2, 20}};
+    auto json = format_hot_prefix_topology_json(top, {1, 1}, {1}, 30, 0);  // verified omits 2nd
+    EXPECT_NE(json.find("\"prefix_fp\":\"0000000000000002\",\"request_count\":20,\"holders\":1,\"sole_held\":true,"
+                        "\"verified_holders\":0,\"verified_sole_held\":false"),
+              std::string::npos);
 }
 
 // Dark-launch gate (BACKLOG §21 P2 config): when P2 is disabled the endpoint
-// reverts to its P1 shape — no holders/sole_held/quorum — never a misleading
-// sole_held=false from the empty index.
+// reverts to its P1 shape — no holders/sole_held/verified/quorum — never a
+// misleading sole_held=false from the empty index.
 TEST(HotPrefixTopologyJson, DisabledRevertsToP1Shape) {
     std::vector<HotPrefixEntry> top = {{0xa93f, 412}};
-    auto json = format_hot_prefix_topology_json(top, {}, 800, 1873,
+    auto json = format_hot_prefix_topology_json(top, {}, {}, 800, 1873,
                                                 /*quorum_degraded=*/false, /*include_topology=*/false);
     EXPECT_EQ(json.find("\"holders\""), std::string::npos);
     EXPECT_EQ(json.find("\"sole_held\""), std::string::npos);
+    EXPECT_EQ(json.find("\"verified_holders\""), std::string::npos);
+    EXPECT_EQ(json.find("\"verified_sole_held\""), std::string::npos);
     EXPECT_EQ(json.find("\"quorum\""), std::string::npos);
     EXPECT_NE(json.find("\"prefix_fp\":\"000000000000a93f\",\"request_count\":412}"), std::string::npos);
 }

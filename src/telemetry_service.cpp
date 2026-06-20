@@ -150,6 +150,20 @@ seastar::future<> TelemetryService::start_emitter(
                 return static_cast<double>(
                     hot_prefix_sole_held_count(current_holder_counts(), quorum_degraded()));
             }),
+        // BACKLOG §21 Phase 5d: the verified-residency analogue — the autoscaler's
+        // automated-reaping gate. A prefix is verified-sole-held when exactly one
+        // node reports it RESIDENT in its KV cache (native trust), even if multiple
+        // nodes route it (membership). Reuses hot_prefix_sole_held_count over the
+        // verified-holder vector. Frozen to all hot prefixes while DEGRADED.
+        sm::make_gauge("ranvier_sole_held_verified_hot_prefixes",
+            sm::description("Count of this node's hot top-K prefixes verified-resident on exactly one "
+                            "cluster node (verified-sole-held => unsafe to auto-reap that node). A strict "
+                            "subset of ranvier_sole_held_hot_prefixes. Frozen to all hot prefixes while "
+                            "quorum is DEGRADED (split-brain freeze)."),
+            [this] {
+                return static_cast<double>(
+                    hot_prefix_sole_held_count(current_verified_holder_counts(), quorum_degraded()));
+            }),
         sm::make_gauge("hot_prefix_sole_held_request_share",
             sm::description("Fraction of prefix-routed requests hitting sole-held hot prefixes (0..1). "
                             "Frozen to the full top-K share while quorum is DEGRADED."),
@@ -511,6 +525,15 @@ std::vector<size_t> TelemetryService::current_holder_counts() const {
     return holders;
 }
 
+std::vector<size_t> TelemetryService::current_verified_holder_counts() const {
+    std::vector<size_t> verified;
+    verified.reserve(_last_hot_prefixes.size());
+    for (const auto& e : _last_hot_prefixes) {
+        verified.push_back(_topology_index.verified_holder_count(e.prefix_fp));
+    }
+    return verified;
+}
+
 std::string TelemetryService::hot_prefix_topology_json() const {
     int64_t age_ms = 0;
     if (_last_hot_prefix_at.time_since_epoch().count() != 0) {
@@ -520,11 +543,12 @@ std::string TelemetryService::hot_prefix_topology_json() const {
     // P2 disabled => omit the holders/sole_held/quorum surface (revert to P1
     // shape); the empty index would otherwise report a misleading sole_held=false.
     if (!_cache_topology_enabled) {
-        return format_hot_prefix_topology_json(_last_hot_prefixes, {}, _last_hot_prefix_touches,
+        return format_hot_prefix_topology_json(_last_hot_prefixes, {}, {}, _last_hot_prefix_touches,
                                                age_ms, /*quorum_degraded=*/false,
                                                /*include_topology=*/false);
     }
     return format_hot_prefix_topology_json(_last_hot_prefixes, current_holder_counts(),
+                                           current_verified_holder_counts(),
                                            _last_hot_prefix_touches, age_ms, quorum_degraded(),
                                            /*include_topology=*/true);
 }
