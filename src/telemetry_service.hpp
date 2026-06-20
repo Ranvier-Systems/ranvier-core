@@ -142,7 +142,10 @@ public:
     // shard-0 ShardLocalState::telemetry_ptr bridge.
 
     // Replace `node`'s contribution with `prefix_hashes` (latest digest wins).
-    void apply_peer_digest(BackendId node, std::vector<uint64_t> prefix_hashes);
+    // `verified_hashes` (BACKLOG §21 Phase 5c) is the subset the peer verifies
+    // resident in its own KV cache; empty for old/non-native peers.
+    void apply_peer_digest(BackendId node, std::vector<uint64_t> prefix_hashes,
+                           std::vector<uint64_t> verified_hashes);
 
     // Drop a dead/removed peer so it can't inflate holder counts (the dangerous
     // sole-holder false-negative).

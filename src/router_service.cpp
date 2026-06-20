@@ -1564,10 +1564,11 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         // telemetry_ptr is set and the index lives — no fan-out, no `this`.
         // Latest digest per node wins (set-replace inside apply_peer_digest).
         _gossip->set_hot_prefix_digest_callback(
-            [](BackendId backend_id, std::vector<uint64_t> prefix_hashes) {
+            [](BackendId backend_id, std::vector<uint64_t> prefix_hashes,
+               std::vector<uint64_t> verified_hashes) {
                 if (g_shard_state && g_shard_state->telemetry_ptr) {
                     g_shard_state->telemetry_ptr->apply_peer_digest(
-                        backend_id, std::move(prefix_hashes));
+                        backend_id, std::move(prefix_hashes), std::move(verified_hashes));
                 }
                 return seastar::make_ready_future<>();
             });

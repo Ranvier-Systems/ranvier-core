@@ -84,10 +84,13 @@ using CacheEvictionCallback = std::function<seastar::future<>(uint64_t prefix_ha
 // cache_usage and residency_weight are both normalized to [0.0, 1.0].
 using CacheStateCallback =
     std::function<seastar::future<>(BackendId backend_id, double cache_usage, double residency_weight)>;
-// One node's current hot-prefix top-K fingerprints (BACKLOG §21 P2). By value —
-// the callback is a coroutine (Rule #21).
+// One node's current hot-prefix top-K fingerprints (BACKLOG §21 P2) plus the
+// subset it verifies resident in its own KV cache (BACKLOG §21 Phase 5c;
+// verified ⊆ prefix_hashes, empty for old/non-native peers). By value — the
+// callback is a coroutine (Rule #21).
 using HotPrefixDigestCallback =
-    std::function<seastar::future<>(BackendId backend_id, std::vector<uint64_t> prefix_hashes)>;
+    std::function<seastar::future<>(BackendId backend_id, std::vector<uint64_t> prefix_hashes,
+                                    std::vector<uint64_t> verified_hashes)>;
 
 // Wire format for route announcements (v2 with sequence numbers)
 struct RouteAnnouncementPacket {

@@ -41,7 +41,14 @@ public:
     // Replace `node`'s entire contribution with `hashes` (per-node set-replace:
     // a node's latest digest wholly supersedes its prior one). O(|old| + |new|),
     // both bounded by the gossip digest cap.
-    void apply_digest(BackendId node, const std::vector<uint64_t>& hashes, TimePoint now) {
+    //
+    // `verified` (BACKLOG §21 Phase 5c) is the subset of `hashes` the node reports
+    // verified-resident in its own KV cache (native KV-event stream fresh). It is
+    // intersected with the ACCEPTED membership, so a hash rejected at the cap — or
+    // a malformed peer claiming verified outside its membership — never counts
+    // verified. Empty `verified` => membership-only (old peer / no native trust).
+    void apply_digest(BackendId node, const std::vector<uint64_t>& hashes,
+                      const std::vector<uint64_t>& verified, TimePoint now) {
         auto node_it = _by_node.find(node);
         if (node_it == _by_node.end()) {
             if (_by_node.size() >= MAX_NODES) {  // Rule #4: bound node fan-out
@@ -73,8 +80,38 @@ public:
         }
         for (uint64_t h : rejected) next.erase(h);
 
+        // Verified tier: the subset of ACCEPTED membership (`next`) the node marks
+        // verified. Intersecting with `next` enforces verified ⊆ membership, so a
+        // cap-rejected/absent hash can never inflate the verified holder count.
+        absl::flat_hash_set<uint64_t> next_verified;
+        next_verified.reserve(verified.size());
+        for (uint64_t h : verified) {
+            if (next.contains(h)) next_verified.insert(h);
+        }
+        // Verified removals (prefixes the node no longer verifies).
+        for (uint64_t h : entry.verified) {
+            if (!next_verified.contains(h)) {
+                remove_verified_holder(node, h);
+            }
+        }
+        // Verified additions. Each `h` is in `next` (accepted membership), so its
+        // `_holders` key exists and `_verified_holders` keeps within the membership
+        // keyspace — implicitly bounded by MAX_HOT_PREFIXES (Rule #4).
+        for (uint64_t h : next_verified) {
+            if (!entry.verified.contains(h)) {
+                add_verified_holder(node, h);
+            }
+        }
+
         entry.hashes = std::move(next);
+        entry.verified = std::move(next_verified);
         entry.last_seen = now;
+    }
+
+    // Membership-only convenience (no native-verified subset). Used by callers
+    // that have no residency information and by the membership-tier unit tests.
+    void apply_digest(BackendId node, const std::vector<uint64_t>& hashes, TimePoint now) {
+        apply_digest(node, hashes, {}, now);
     }
 
     // Drop a node entirely (peer death). Removing a dead node is what keeps the
@@ -85,6 +122,9 @@ public:
         if (it == _by_node.end()) return;
         for (uint64_t h : it->second.hashes) {
             remove_holder(node, h);
+        }
+        for (uint64_t h : it->second.verified) {
+            remove_verified_holder(node, h);
         }
         _by_node.erase(it);
     }
@@ -113,6 +153,19 @@ public:
         return it == _holders.end() ? 0 : it->second.size();
     }
 
+    // BACKLOG §21 Phase 5c: nodes that report `hash` verified-resident, or nullptr.
+    // A subset of holders_of(hash) (verified ⊆ membership).
+    const absl::flat_hash_set<BackendId>* verified_holders_of(uint64_t hash) const {
+        auto it = _verified_holders.find(hash);
+        return it == _verified_holders.end() ? nullptr : &it->second;
+    }
+    // Count of holders whose contribution marks `hash` verified-resident (0 if
+    // none). == 1 means verified-sole-held => the automated-reaping gate (5d).
+    size_t verified_holder_count(uint64_t hash) const {
+        auto it = _verified_holders.find(hash);
+        return it == _verified_holders.end() ? 0 : it->second.size();
+    }
+
     size_t prefix_count() const { return _holders.size(); }
     size_t node_count() const { return _by_node.size(); }
     uint64_t prefix_overflow() const { return _prefix_overflow; }
@@ -120,7 +173,8 @@ public:
 
 private:
     struct NodeEntry {
-        absl::flat_hash_set<uint64_t> hashes;
+        absl::flat_hash_set<uint64_t> hashes;    // membership (this node's hot top-K)
+        absl::flat_hash_set<uint64_t> verified;  // 5c: subset verified-resident; ⊆ hashes
         TimePoint last_seen{};
     };
 
@@ -146,7 +200,23 @@ private:
         if (it->second.empty()) _holders.erase(it);  // self-clean
     }
 
+    // Verified-tier holder maintenance (BACKLOG §21 Phase 5c). No cap check: a
+    // verified hash is always an accepted member (verified ⊆ accepted membership),
+    // so `_verified_holders` keys ⊆ `_holders` keys ≤ MAX_HOT_PREFIXES (Rule #4).
+    void add_verified_holder(BackendId node, uint64_t hash) {
+        _verified_holders[hash].insert(node);
+    }
+    void remove_verified_holder(BackendId node, uint64_t hash) {
+        auto it = _verified_holders.find(hash);
+        if (it == _verified_holders.end()) return;
+        it->second.erase(node);
+        if (it->second.empty()) _verified_holders.erase(it);  // self-clean
+    }
+
     absl::flat_hash_map<uint64_t, absl::flat_hash_set<BackendId>> _holders;
+    // Verified-resident reverse index (5c): hash -> nodes reporting it resident.
+    // Parallel to _holders; keys are always a subset of _holders' keys.
+    absl::flat_hash_map<uint64_t, absl::flat_hash_set<BackendId>> _verified_holders;
     absl::flat_hash_map<BackendId, NodeEntry> _by_node;
     uint64_t _prefix_overflow = 0;
     uint64_t _node_overflow = 0;

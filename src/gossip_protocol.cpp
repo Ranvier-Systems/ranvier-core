@@ -815,11 +815,12 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
                                     hp_pkt->verified_hashes.size());
 
         // Rule #16: return the callback's future directly (no lambda-coroutine).
-        // BACKLOG §21 Phase 5b decodes hp_pkt->verified_hashes off the wire; Phase
-        // 5c widens the callback + cache-topology index to record it (verified
-        // holder tier). Until then the membership digest drives holder counts.
+        // BACKLOG §21 Phase 5c forwards the wire-decoded verified-resident subset
+        // into the cache-topology index's verified-holder tier.
         if (_hot_prefix_digest_callback) {
-            return _hot_prefix_digest_callback(hp_pkt->backend_id, std::move(hp_pkt->prefix_hashes));
+            return _hot_prefix_digest_callback(hp_pkt->backend_id,
+                                               std::move(hp_pkt->prefix_hashes),
+                                               std::move(hp_pkt->verified_hashes));
         }
         return seastar::make_ready_future<>();
     }
