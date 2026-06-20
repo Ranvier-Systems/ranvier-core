@@ -600,7 +600,7 @@ public:
     // BACKLOG §21 P2: gossip our node's merged hot-prefix digest to cluster
     // peers. Runs on shard 0 (the telemetry emitter home), where gossip_ptr is
     // set; a no-op when gossip is disabled. `self_id` stamps the digest as ours.
-    // `verified_hashes` (BACKLOG §21 Phase 5b) is the subset we verify resident in
+    // `verified_hashes` (BACKLOG §21 P3) is the subset we verify resident in
     // our own KV cache; empty => membership-only. Both by value (Rule #22).
     static seastar::future<> broadcast_hot_prefix_digest_global(
         BackendId self_id, std::vector<uint64_t> prefix_hashes,
@@ -616,15 +616,15 @@ public:
     // (a single node is never split-brain). Drives the sole_held freeze.
     static bool cache_topology_quorum_degraded();
 
-    // BACKLOG §21 Phase 5a: residency-query seam for the telemetry emitter
+    // BACKLOG §21 P3: residency-query seam for the telemetry emitter
     // (shard 0). Given this node's hot-prefix membership hashes, return the
     // subset that is VERIFIED-RESIDENT in self_id's KV cache right now — present
     // in prefix_hash_index while self_id's native KV-event stream is fresh.
     // Returns empty when the stream is not fresh (no native trust) or KV-events
     // are disabled (ttl 0): the caller then treats the digest as membership-only.
-    // This is the additive "verified subset" of the B-as-superset model — the
-    // full membership digest is unchanged; this rides alongside it. Mirrors the
-    // routing decision-time verified-residency check exactly. Reads only shard
+    // This is the additive verified subset — the full membership digest is
+    // unchanged; this rides alongside it. Mirrors the routing decision-time
+    // verified-residency check exactly. Reads only shard
     // 0's g_shard_state: native KV ops mirror prefix_hash_index to every shard,
     // so shard 0 is a complete residency mirror for self_id (Rule #1/#14).
     static std::vector<uint64_t> verified_resident_subset(

@@ -238,7 +238,7 @@ std::vector<uint8_t> HotPrefixDigestPacket::serialize() const {
     uint16_t count = static_cast<uint16_t>(
         std::min(prefix_hashes.size(), static_cast<size_t>(MAX_HASHES)));  // Rule #4
 
-    // BACKLOG §21 Phase 5b: the verified-resident subset rides the forward-compat
+    // BACKLOG §21 P3: the verified-resident subset rides the forward-compat
     // tail as a bitmap over the membership array — bit i (LSB-first) set means
     // prefix_hashes[i] is verified-resident on the sender. Emitted only when
     // non-empty, so a membership-only digest is byte-identical to an old v1 peer's
@@ -307,7 +307,7 @@ std::optional<HotPrefixDigestPacket> HotPrefixDigestPacket::deserialize(const ui
         pkt.prefix_hashes.push_back(be_read_u64(data + HEADER_SIZE + i * sizeof(uint64_t)));
     }
 
-    // BACKLOG §21 Phase 5b: optional verified-resident bitmap tail (see serialize).
+    // BACKLOG §21 P3: optional verified-resident bitmap tail (see serialize).
     // Present only when the sender had a non-empty verified subset; absent for v1
     // peers and membership-only windows. A partial tail (fewer than ceil(count/8)
     // bytes) is ignored rather than rejecting the digest — membership is still
@@ -678,7 +678,7 @@ seastar::future<> GossipProtocol::broadcast_hot_prefix_digest(BackendId backend_
     HotPrefixDigestPacket pkt;
     pkt.backend_id = backend_id;
     pkt.prefix_hashes = std::move(prefix_hashes);  // serialize() caps at MAX_HASHES (Rule #4)
-    pkt.verified_hashes = std::move(verified_hashes);  // BACKLOG §21 Phase 5b
+    pkt.verified_hashes = std::move(verified_hashes);  // BACKLOG §21 P3
     auto serialized = pkt.serialize();
 
     log_gossip_protocol().trace("Broadcasting hot-prefix digest: backend={}, hashes={}, verified={} to {} peers",
@@ -815,8 +815,8 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
                                     hp_pkt->verified_hashes.size());
 
         // Rule #16: return the callback's future directly (no lambda-coroutine).
-        // BACKLOG §21 Phase 5c forwards the wire-decoded verified-resident subset
-        // into the cache-topology index's verified-holder tier.
+        // BACKLOG §21 P3: the wire-decoded verified-resident subset feeds the
+        // cache-topology index's verified-holder tier.
         if (_hot_prefix_digest_callback) {
             return _hot_prefix_digest_callback(hp_pkt->backend_id,
                                                std::move(hp_pkt->prefix_hashes),

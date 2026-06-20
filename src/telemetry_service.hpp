@@ -84,11 +84,11 @@ public:
         std::unique_ptr<TelemetrySink> sink,
         std::function<RoutingStrategyParams()> strategy_snapshot,
         BackendId self_backend_id = 0,
-        // BACKLOG §21 Phase 5b: (membership digest, verified-resident subset).
+        // BACKLOG §21 P3: (membership digest, verified-resident subset).
         std::function<seastar::future<>(std::vector<uint64_t>, std::vector<uint64_t>)>
             hot_prefix_digest_broadcaster = nullptr,
         std::function<bool()> quorum_degraded_getter = nullptr,
-        // BACKLOG §21 Phase 5a: given our membership hashes, returns the subset
+        // BACKLOG §21 P3: given our membership hashes, returns the subset
         // verified-resident in our own backend's KV cache (empty when native KV
         // trust is absent). Null => no verified tier (membership-only). Shard-0.
         std::function<std::vector<uint64_t>(const std::vector<uint64_t>&)>
@@ -142,7 +142,7 @@ public:
     // shard-0 ShardLocalState::telemetry_ptr bridge.
 
     // Replace `node`'s contribution with `prefix_hashes` (latest digest wins).
-    // `verified_hashes` (BACKLOG §21 Phase 5c) is the subset the peer verifies
+    // `verified_hashes` (BACKLOG §21 P3) is the subset the peer verifies
     // resident in its own KV cache; empty for old/non-native peers.
     void apply_peer_digest(BackendId node, std::vector<uint64_t> prefix_hashes,
                            std::vector<uint64_t> verified_hashes);
@@ -207,22 +207,21 @@ private:
     // sole-held gauges omit the cluster surface (index stays empty => gauges read 0).
     bool                                _cache_topology_enabled = false;
     BackendId                           _self_backend_id = 0;
-    // BACKLOG §21 Phase 5b: broadcasts (membership digest, verified-resident subset).
+    // BACKLOG §21 P3: broadcasts (membership digest, verified-resident subset).
     std::function<seastar::future<>(std::vector<uint64_t>, std::vector<uint64_t>)>
                                         _hot_prefix_digest_broadcaster;
     // Split-brain freeze (BACKLOG §21 P2). When this returns true the sole_held
     // signal is frozen toward "do not reap" (never asserts sole_held=false).
     // Null => always HEALTHY (no cluster / single node).
     std::function<bool()>               _quorum_degraded_getter;
-    // BACKLOG §21 Phase 5a: residency-query seam (shard 0). Maps our membership
+    // BACKLOG §21 P3: residency-query seam (shard 0). Maps our membership
     // hashes -> the subset verified-resident in our own backend's KV cache.
     // Null => membership-only (no verified tier). The membership digest is never
-    // altered by this (B-as-superset); the verified subset rides alongside.
+    // altered by this; the verified subset rides alongside it.
     std::function<std::vector<uint64_t>(const std::vector<uint64_t>&)>
                                         _residency_verified_getter;
     // Count of the last window's hot top-K that were verified-resident on our own
-    // backend, surfaced as the ranvier_hot_prefix_verified_resident gauge. 5b
-    // carries the subset on the wire; 5c/5d build the cluster verified tier.
+    // backend, surfaced as the ranvier_hot_prefix_verified_resident gauge.
     size_t                              _last_verified_resident_count = 0;
     // Backstop to peer-death eviction: a node silent for this many windows is
     // aged out of the index even if it was never marked dead.
@@ -240,7 +239,7 @@ private:
     // peer digests that arrived since the last window. Shard-0, lock-free.
     std::vector<size_t> current_holder_counts() const;
 
-    // BACKLOG §21 Phase 5d: verified-resident holder count per `_last_hot_prefixes`
+    // BACKLOG §21 P3: verified-resident holder count per `_last_hot_prefixes`
     // entry, parallel to it — the subset of holders that report it resident in
     // their own KV cache. Drives verified_sole_held (the automated-reaping gate).
     // Shard-0, lock-free.

@@ -42,7 +42,7 @@ public:
     // a node's latest digest wholly supersedes its prior one). O(|old| + |new|),
     // both bounded by the gossip digest cap.
     //
-    // `verified` (BACKLOG §21 Phase 5c) is the subset of `hashes` the node reports
+    // `verified` (BACKLOG §21 P3) is the subset of `hashes` the node reports
     // verified-resident in its own KV cache (native KV-event stream fresh). It is
     // intersected with the ACCEPTED membership, so a hash rejected at the cap — or
     // a malformed peer claiming verified outside its membership — never counts
@@ -153,14 +153,14 @@ public:
         return it == _holders.end() ? 0 : it->second.size();
     }
 
-    // BACKLOG §21 Phase 5c: nodes that report `hash` verified-resident, or nullptr.
+    // BACKLOG §21 P3: nodes that report `hash` verified-resident, or nullptr.
     // A subset of holders_of(hash) (verified ⊆ membership).
     const absl::flat_hash_set<BackendId>* verified_holders_of(uint64_t hash) const {
         auto it = _verified_holders.find(hash);
         return it == _verified_holders.end() ? nullptr : &it->second;
     }
     // Count of holders whose contribution marks `hash` verified-resident (0 if
-    // none). == 1 means verified-sole-held => the automated-reaping gate (5d).
+    // none). == 1 means verified-sole-held => the automated-reaping gate.
     size_t verified_holder_count(uint64_t hash) const {
         auto it = _verified_holders.find(hash);
         return it == _verified_holders.end() ? 0 : it->second.size();
@@ -174,7 +174,7 @@ public:
 private:
     struct NodeEntry {
         absl::flat_hash_set<uint64_t> hashes;    // membership (this node's hot top-K)
-        absl::flat_hash_set<uint64_t> verified;  // 5c: subset verified-resident; ⊆ hashes
+        absl::flat_hash_set<uint64_t> verified;  // verified-resident subset; ⊆ hashes
         TimePoint last_seen{};
     };
 
@@ -200,7 +200,7 @@ private:
         if (it->second.empty()) _holders.erase(it);  // self-clean
     }
 
-    // Verified-tier holder maintenance (BACKLOG §21 Phase 5c). No cap check: a
+    // Verified-tier holder maintenance (BACKLOG §21 P3). No cap check: a
     // verified hash is always an accepted member (verified ⊆ accepted membership),
     // so `_verified_holders` keys ⊆ `_holders` keys ≤ MAX_HOT_PREFIXES (Rule #4).
     void add_verified_holder(BackendId node, uint64_t hash) {
@@ -214,7 +214,7 @@ private:
     }
 
     absl::flat_hash_map<uint64_t, absl::flat_hash_set<BackendId>> _holders;
-    // Verified-resident reverse index (5c): hash -> nodes reporting it resident.
+    // Verified-resident reverse index: hash -> nodes reporting it resident.
     // Parallel to _holders; keys are always a subset of _holders' keys.
     absl::flat_hash_map<uint64_t, absl::flat_hash_set<BackendId>> _verified_holders;
     absl::flat_hash_map<BackendId, NodeEntry> _by_node;

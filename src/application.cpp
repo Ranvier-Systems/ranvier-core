@@ -836,7 +836,7 @@ seastar::future<> Application::init_telemetry_service() {
                                    },
                                    // BACKLOG §21 P2: split-brain freeze for sole_held.
                                    [] { return RouterService::cache_topology_quorum_degraded(); },
-                                   // BACKLOG §21 Phase 5a: verified-resident subset
+                                   // BACKLOG §21 P3: verified-resident subset
                                    // of our membership hashes (native KV residency).
                                    [self_backend_id](const std::vector<uint64_t>& hashes) {
                                        return RouterService::verified_resident_subset(
