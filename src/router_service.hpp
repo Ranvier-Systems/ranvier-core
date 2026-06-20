@@ -614,6 +614,20 @@ public:
     // (a single node is never split-brain). Drives the sole_held freeze.
     static bool cache_topology_quorum_degraded();
 
+    // BACKLOG §21 Phase 5a: residency-query seam for the telemetry emitter
+    // (shard 0). Given this node's hot-prefix membership hashes, return the
+    // subset that is VERIFIED-RESIDENT in self_id's KV cache right now — present
+    // in prefix_hash_index while self_id's native KV-event stream is fresh.
+    // Returns empty when the stream is not fresh (no native trust) or KV-events
+    // are disabled (ttl 0): the caller then treats the digest as membership-only.
+    // This is the additive "verified subset" of the B-as-superset model — the
+    // full membership digest is unchanged; this rides alongside it. Mirrors the
+    // routing decision-time verified-residency check exactly. Reads only shard
+    // 0's g_shard_state: native KV ops mirror prefix_hash_index to every shard,
+    // so shard 0 is a complete residency mirror for self_id (Rule #1/#14).
+    static std::vector<uint64_t> verified_resident_subset(
+        BackendId self_id, const std::vector<uint64_t>& hashes);
+
     // Flush locally-buffered routes to all shards (runs on calling shard)
     // Deduplicates within the batch, broadcasts via parallel_for_each,
     // and submits gossip batch to shard 0

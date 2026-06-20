@@ -996,6 +996,62 @@ TEST_F(RouterServiceTest, FreshnessTtlZeroDisablesVerifiedPath) {
     EXPECT_TRUE(result.cache_hit);
 }
 
+// ----- BACKLOG §21 Phase 5a: verified_resident_subset seam -----
+// The telemetry emitter calls this each window to find which of its hot-prefix
+// membership hashes its own backend verifies resident. It mirrors the routing
+// decision-time verified-residency check: subset = hashes present in
+// prefix_hash_index for self_id, but only while self_id's native stream is fresh.
+
+TEST_F(RouterServiceTest, VerifiedResidentSubsetReturnsOnlyResidentHashesWhenFresh) {
+    register_two_backends();
+    RouterService::set_native_fresh_for_testing(1);
+    // h1, h3 resident for self (backend 1); h2 never stored.
+    RouterService::update_prefix_hash_index_for_testing(/*hash=*/111, 1);
+    RouterService::update_prefix_hash_index_for_testing(/*hash=*/333, 1);
+
+    auto subset = RouterService::verified_resident_subset(1, {111, 222, 333});
+    EXPECT_EQ(subset, (std::vector<uint64_t>{111, 333}));
+}
+
+TEST_F(RouterServiceTest, VerifiedResidentSubsetEmptyWithoutNativeTrust) {
+    register_two_backends();
+    // Index has entries, but the native stream was never marked fresh: the
+    // verified path must not trigger (falls back to membership-only).
+    RouterService::update_prefix_hash_index_for_testing(111, 1);
+
+    auto subset = RouterService::verified_resident_subset(1, {111, 222});
+    EXPECT_TRUE(subset.empty());
+}
+
+TEST_F(RouterServiceTest, VerifiedResidentSubsetIgnoresOtherBackendsResidency) {
+    register_two_backends();
+    RouterService::set_native_fresh_for_testing(1);
+    // Hash resident for backend 2, not for self (backend 1).
+    RouterService::update_prefix_hash_index_for_testing(111, 2);
+
+    auto subset = RouterService::verified_resident_subset(1, {111});
+    EXPECT_TRUE(subset.empty());
+}
+
+TEST_F(RouterServiceTest, VerifiedResidentSubsetEmptyWhenFreshnessTtlZero) {
+    cfg_.kv_residency_freshness_ttl = std::chrono::seconds(0);
+    recreate_router(cfg_);
+    register_two_backends();
+    RouterService::set_native_fresh_for_testing(1);
+    RouterService::update_prefix_hash_index_for_testing(111, 1);
+    // KV-events disabled (ttl 0): no verified tier even though the index has the
+    // entry — mirrors FreshnessTtlZeroDisablesVerifiedPath for the emit seam.
+    auto subset = RouterService::verified_resident_subset(1, {111});
+    EXPECT_TRUE(subset.empty());
+}
+
+TEST_F(RouterServiceTest, VerifiedResidentSubsetEmptyForEmptyInput) {
+    register_two_backends();
+    RouterService::set_native_fresh_for_testing(1);
+    auto subset = RouterService::verified_resident_subset(1, {});
+    EXPECT_TRUE(subset.empty());
+}
+
 TEST_F(RouterServiceTest, ApplyNativeOpsLocalUpsertRemoveAndStaleness) {
     register_two_backends();
     std::vector<int32_t> tokens = {751, 752, 753, 754};

@@ -86,6 +86,11 @@ public:
         BackendId self_backend_id = 0,
         std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster = nullptr,
         std::function<bool()> quorum_degraded_getter = nullptr,
+        // BACKLOG §21 Phase 5a: given our membership hashes, returns the subset
+        // verified-resident in our own backend's KV cache (empty when native KV
+        // trust is absent). Null => no verified tier (membership-only). Shard-0.
+        std::function<std::vector<uint64_t>(const std::vector<uint64_t>&)>
+            residency_verified_getter = nullptr,
         bool cache_topology_enabled = false);
 
     // -------------------------------------------------------------------------
@@ -202,6 +207,16 @@ private:
     // signal is frozen toward "do not reap" (never asserts sole_held=false).
     // Null => always HEALTHY (no cluster / single node).
     std::function<bool()>               _quorum_degraded_getter;
+    // BACKLOG §21 Phase 5a: residency-query seam (shard 0). Maps our membership
+    // hashes -> the subset verified-resident in our own backend's KV cache.
+    // Null => membership-only (no verified tier). The membership digest is never
+    // altered by this (B-as-superset); the verified subset rides alongside.
+    std::function<std::vector<uint64_t>(const std::vector<uint64_t>&)>
+                                        _residency_verified_getter;
+    // Count of the last window's hot top-K that were verified-resident on our own
+    // backend, surfaced as the ranvier_hot_prefix_verified_resident gauge. 5b
+    // carries the subset on the wire; 5c/5d build the cluster verified tier.
+    size_t                              _last_verified_resident_count = 0;
     // Backstop to peer-death eviction: a node silent for this many windows is
     // aged out of the index even if it was never marked dead.
     static constexpr int kTopologyStaleWindows = 4;
