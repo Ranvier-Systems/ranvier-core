@@ -16,8 +16,8 @@ sketches are illustrative API shape, not a line-for-line match to the merged cod
 | Per-replica resident working set | ✅ shipped (P1) | per-backend resident-route gauge in RouterService (§6.C) |
 | Hot-prefix top-K + concentration | ✅ shipped (P1) | bounded `StreamSummary` + shard-0 merge (§6.D/E/F) |
 | `GET /v1/cache/topology` snapshot | ✅ shipped (P1) | bounded JSON on `:9180`, auth-gated (§6.G) |
-| Cluster-wide sole-holder index | ✅ shipped (P2) | `HOT_PREFIX_DIGEST` (0x07) + shard-0 `CacheTopologyIndex`; `sole_held`/`holders` in the JSON + `ranvier_sole_held_hot_prefixes` / `hot_prefix_sole_held_request_share` gauges. Gated by `enable_cache_topology` (default off) + DEGRADED-quorum freeze. **Operator-observability only** until the P3 residency gate — see below |
-| Residency-verified holders (accuracy gate) | ⏭ proposed (P3) — **scoped**, see [residency-verification design](cache-topology-residency-verification.md) | intersect digest with native-KV `prefix_hash_index` before any automated reaping (Phase 5; the asymmetry below) |
+| Cluster-wide sole-holder index | ✅ shipped (P2) | `HOT_PREFIX_DIGEST` (0x07) + shard-0 `CacheTopologyIndex`; `sole_held`/`holders` in the JSON + `ranvier_sole_held_hot_prefixes` / `hot_prefix_sole_held_request_share` gauges. Gated by `enable_cache_topology` (default off) + DEGRADED-quorum freeze. **Operator-observability** (membership tier) |
+| Residency-verified holders (accuracy gate) | ✅ shipped (P3 / Phase 5, PRs #587–#590), see [residency-verification design](cache-topology-residency-verification.md) | native-KV `prefix_hash_index` residency intersected into a `verified_holders`/`verified_sole_held` tier (`HOT_PREFIX_DIGEST` v2 bitmap tail; two-state index) + `ranvier_sole_held_verified_hot_prefixes` gauge. The accuracy-gated signal for **automated reaping**; same dark-launch flag + DEGRADED freeze |
 
 ### P2 prerequisites — shipped (2026-06-19)
 
@@ -35,9 +35,16 @@ Both prerequisites that gate when `sole_held` can be trusted have landed:
   the JSON carries `"quorum":"DEGRADED"`. This is the fail-safe response to the
   split-brain FN (a stale-but-unevicted peer masking a true sole-holder).
 
-**Still operator-observability only.** Even with both gates, `sole_held` is *not*
-yet safe for **automated reaping** — that waits on the P3 residency accuracy gate
-below (route-membership alone can false-negative; see the asymmetry analysis).
+**Membership `sole_held` is operator-observability; `verified_sole_held` is the
+reaping gate.** The two P2 gates make `sole_held` *safe to look at*, but
+route-membership alone can false-negative (a node ranks a prefix hot yet has
+evicted it from KV). P3 / Phase 5 (shipped 2026-06-20) closes that with a parallel
+**verified** tier: `verified_holders` counts only nodes that confirm a prefix
+RESIDENT in their own KV cache (native-KV trust), and `verified_sole_held` is the
+accuracy-gated signal an autoscaler consumes for **automated reaping**. The
+membership tier is unchanged (B-as-superset); both tiers share the
+`enable_cache_topology` flag and the DEGRADED freeze. See the
+[residency-verification design](cache-topology-residency-verification.md).
 
 ## Problem Statement
 
@@ -113,7 +120,9 @@ ranvier_hot_prefix_topk_request_share                gauge
 ranvier_hot_prefix_distinct_estimate                 gauge
 
 # Drain-safety summary (label-free)
-ranvier_sole_held_hot_prefixes                       gauge
+ranvier_sole_held_hot_prefixes                       gauge     # membership tier (operator-observability)
+ranvier_sole_held_verified_hot_prefixes              gauge     # P3: verified-resident tier (automated-reaping gate); ⊆ above
+ranvier_hot_prefix_verified_resident                 gauge     # P3 (5a): this node's hot top-K verified resident on its OWN backend
 ranvier_topk_snapshot_age_seconds                    gauge     # cf. router_gpu_load_cache_age_seconds
 ```
 
@@ -121,16 +130,26 @@ ranvier_topk_snapshot_age_seconds                    gauge     # cf. router_gpu_
 
 Returns the merged top-K (length ≤ K, hard cap), auth-gated by the existing
 `metrics_auth_handler`. `prefix_fp` is the existing `prefix_hash` truncated —
-never token text. `sole_held: true` is the single bit that makes a replica
-unsafe to reap.
+never token text. `holders` is a scalar count (not a node list — node identities
+are never exported). `sole_held: true` makes a replica unsafe to reap; the P3
+`verified_sole_held` is the accuracy-gated form an autoscaler acts on. When
+`enable_cache_topology` is off, the cluster fields (`holders`/`sole_held`/
+`verified_*`/`quorum`) are omitted entirely (P1 shape).
 
 ```jsonc
 {
   "snapshot_age_ms": 1873,
-  "k": 128,
+  "total_touches": 9120,
+  "count": 128,                 // entries in this snapshot (≤ K)
+  "quorum": "HEALTHY",          // "DEGRADED" freezes every sole_held/verified_sole_held to true
   "hot_prefixes": [
-    { "prefix_fp": "a93f…", "req_rate_est": 412, "holders": [3],     "sole_held": true  },
-    { "prefix_fp": "0c11…", "req_rate_est": 388, "holders": [1,4,7], "sole_held": false }
+    // Routed by one node AND resident there: unsafe to reap on both tiers.
+    { "prefix_fp": "000000000000a93f", "request_count": 412, "holders": 1, "sole_held": true,
+      "verified_holders": 1, "verified_sole_held": true },
+    // Routed by three nodes (membership says "safe") but resident on only one:
+    // verified_sole_held flags the residency cliff membership alone would miss.
+    { "prefix_fp": "0000000000000c11", "request_count": 388, "holders": 3, "sole_held": false,
+      "verified_holders": 1, "verified_sole_held": true }
   ]
 }
 ```

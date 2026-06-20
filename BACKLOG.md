@@ -937,7 +937,7 @@ Export the prefix→replica and per-prefix-hotness signals an external cache-awa
 autoscaler needs to (a) drain the *coldest* replica rather than a hot one, and
 (b) avoid reaping the last warm holder of a hot prefix.
 
-**Status: P0–P2 CLOSED (2026-06-19), incl. both P2 carve-outs; P3 OPEN (see "Still open").**
+**Status: P0–P3 CLOSED (P0–P2 2026-06-19; P3 / Phase 5 2026-06-20), incl. both P2 carve-outs.**
 
 P0–P2 shipped and merged across three layers: the observability foundation
 (bounded `StreamSummary` top-K + per-backend prefix hit/attempt gauges); the
@@ -955,9 +955,21 @@ decision spike (K=128; gauges-not-counters; reuse `TelemetryService` rather than
 a new aggregator) and the per-slice as-built record were folded into the
 architecture doc on closeout to keep this entry focused on active work.
 
-`sole_held` remains **operator-observability only** pending the P3 residency
-accuracy gate below — route-membership alone can false-negative, so it is not yet
-safe for an autoscaler to consume for *automated* reaping.
+P3 (Residency-verified holders, Phase 5) shipped and merged in 4 sub-phases (PRs
+#587–#590): a shard-0 `RouterService::verified_resident_subset` seam intersects our
+hot top-K with the native-KV `prefix_hash_index` residency mirror (5a); the subset
+rides `HOT_PREFIX_DIGEST` v2 as a bitmap tail alongside the unchanged membership
+digest (B-as-superset, 5b); `CacheTopologyIndex` records a two-state `(member,
+verified)` holder tier (5c); and `verified_holders`/`verified_sole_held` surface in
+the JSON plus the `ranvier_sole_held_verified_hot_prefixes` gauge, with the
+DEGRADED-quorum freeze applied to the verified tier too (5d).
+
+With P3 landed, `verified_sole_held` is the **accuracy-gated** signal an autoscaler
+can consume for *automated* reaping: it counts nodes that verify a prefix RESIDENT
+in their own KV cache (native trust), not merely route it, closing the
+route-membership false-negative. The membership `sole_held` is unchanged and stays
+the broader operator-observability signal. Both remain gated by the
+`enable_cache_topology` dark-launch flag and the split-brain freeze.
 
 **Scope boundary:** Ranvier *exports* telemetry only. The autoscaler (reap/pin
 policy, replica lifecycle) lives in the external platform — reap-gating semantics
@@ -975,8 +987,8 @@ in particular are the scaler's decision, not Ranvier's.
 
 | Priority | Item | Notes |
 |----------|------|-------|
-| P3 | Residency-verified holders (Phase 5) — **scoped** ([design](docs/architecture/cache-topology-residency-verification.md)) | The accuracy prerequisite before any autoscaler consumes `sole_held` for **automated reaping** (route-membership alone can false-negative). Design resolves the holder model (sidecar/`self_backend_id`), reuses the native-KV `prefix_hash_index` residency mirror, and adds a `verified_holders`/`verified_sole_held` tier in 4 sub-phases (5a–5d). |
 | Release gate | End-to-end A/B (telemetry on vs off) | Not yet run (not runnable in sandbox). Single-stream through one ingress; primary signal is `ranvier_router_routing_latency_seconds` p50/p99 delta **< 1%** with no p99 spike at the shard-0 window cadence. Wrap as `make bench-cache-topology` (per `bench-epp`); promote method + recorded floor to the benchmark doc when first run. |
+| Optional | `cluster.residency_filter_membership` knob (Phase 5 follow-up) | Deferred, default off. Filters the membership digest to resident hashes before broadcast (the old "A"); needs no wire change since the full set is already transmitted. Only worth it for homogeneous native-KV fleets that want smaller digests. |
 
 Deferred design note: `StreamSummary` keeps its O(K) min-scan eviction (72 ns @
 K=128, far under the Rule #17 quota); upgrade to the O(1) bucket-list Space-Saving
