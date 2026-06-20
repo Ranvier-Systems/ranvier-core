@@ -435,7 +435,9 @@ seastar::future<> TelemetryService::emit_async() {
         _last_verified_resident_count = verified.size();
 
         const auto now_tp = _last_hot_prefix_at;  // same steady_clock read as above
-        _topology_index.apply_digest(_self_backend_id, digest, now_tp);
+        // Self-apply both tiers (5c): our own verified residency must count toward
+        // verified_holders, exactly as a peer's does.
+        _topology_index.apply_digest(_self_backend_id, digest, verified, now_tp);
         _topology_index.age_out(now_tp - _window * kTopologyStaleWindows);
 
         if (_hot_prefix_digest_broadcaster) {
@@ -486,10 +488,13 @@ seastar::future<> TelemetryService::stop() {
 // Cluster cache-topology feeds (BACKLOG §21 P2; shard 0 only)
 // =============================================================================
 
-void TelemetryService::apply_peer_digest(BackendId node, std::vector<uint64_t> prefix_hashes) {
+void TelemetryService::apply_peer_digest(BackendId node, std::vector<uint64_t> prefix_hashes,
+                                         std::vector<uint64_t> verified_hashes) {
     if (!_cache_topology_enabled) return;  // dark-launch gate: ignore peer digests
-    // Receive-time timestamp drives the age_out backstop in the emit loop.
-    _topology_index.apply_digest(node, prefix_hashes, std::chrono::steady_clock::now());
+    // Receive-time timestamp drives the age_out backstop in the emit loop. The
+    // verified subset feeds the verified-holder tier (BACKLOG §21 Phase 5c).
+    _topology_index.apply_digest(node, prefix_hashes, verified_hashes,
+                                 std::chrono::steady_clock::now());
 }
 
 void TelemetryService::evict_peer(BackendId node) {

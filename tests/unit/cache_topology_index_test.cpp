@@ -180,3 +180,100 @@ TEST(CacheTopologyIndexTest, P2SoleHolderLifecycle) {
     EXPECT_EQ(idx.holder_count(kOurs), 1u);              // and ours never lapsed
     EXPECT_EQ(idx.node_count(), 1u);                     // only self remains, fresh
 }
+
+// =============================================================================
+// BACKLOG §21 Phase 5c: verified-resident holder tier
+// =============================================================================
+// The membership tier (holder_count) is unchanged; verified_holder_count is the
+// strict subset of holders whose digest marked a hash verified-resident in their
+// own KV cache. verified ⊆ membership is enforced inside apply_digest.
+
+TEST(CacheTopologyIndexTest, VerifiedSubsetRecorded) {
+    CacheTopologyIndex idx;
+    // Node 1 holds {10,20,30}; verifies only {10,30} resident.
+    idx.apply_digest(1, {10, 20, 30}, {10, 30}, t0());
+
+    EXPECT_EQ(idx.holder_count(10), 1u);
+    EXPECT_EQ(idx.holder_count(20), 1u);
+    EXPECT_EQ(idx.verified_holder_count(10), 1u);
+    EXPECT_EQ(idx.verified_holder_count(20), 0u);  // member but not verified
+    EXPECT_EQ(idx.verified_holder_count(30), 1u);
+    ASSERT_NE(idx.verified_holders_of(10), nullptr);
+    EXPECT_TRUE(idx.verified_holders_of(10)->contains(1));
+    EXPECT_EQ(idx.verified_holders_of(20), nullptr);
+}
+
+TEST(CacheTopologyIndexTest, MembershipOnlyDigestHasNoVerified) {
+    CacheTopologyIndex idx;
+    // 3-arg overload (or empty verified) => membership-only, e.g. an old/non-native
+    // peer: holders count, but nothing is verified-resident.
+    idx.apply_digest(1, {10, 20}, t0());
+    EXPECT_EQ(idx.holder_count(10), 1u);
+    EXPECT_EQ(idx.verified_holder_count(10), 0u);
+    EXPECT_EQ(idx.verified_holders_of(10), nullptr);
+}
+
+TEST(CacheTopologyIndexTest, VerifiedOutsideMembershipIsDropped) {
+    CacheTopologyIndex idx;
+    // A malformed peer claims 99 verified but doesn't hold it: verified ⊆ membership
+    // must drop it so it can't inflate the verified count.
+    idx.apply_digest(1, {10, 20}, {10, 99}, t0());
+    EXPECT_EQ(idx.verified_holder_count(10), 1u);
+    EXPECT_EQ(idx.verified_holder_count(99), 0u);
+    EXPECT_EQ(idx.holder_count(99), 0u);  // not a member either
+}
+
+TEST(CacheTopologyIndexTest, SetReplaceUpdatesVerifiedTier) {
+    CacheTopologyIndex idx;
+    auto now = t0();
+    idx.apply_digest(1, {10, 20}, {10, 20}, now);
+    EXPECT_EQ(idx.verified_holder_count(10), 1u);
+    EXPECT_EQ(idx.verified_holder_count(20), 1u);
+
+    // Next window: 20 evicted from KV (still a member), 10 stays verified, 30 new
+    // and verified.
+    idx.apply_digest(1, {10, 20, 30}, {10, 30}, now);
+    EXPECT_EQ(idx.holder_count(20), 1u);            // still a member
+    EXPECT_EQ(idx.verified_holder_count(20), 0u);   // no longer verified-resident
+    EXPECT_EQ(idx.verified_holder_count(10), 1u);
+    EXPECT_EQ(idx.verified_holder_count(30), 1u);
+}
+
+TEST(CacheTopologyIndexTest, EvictNodeClearsVerified) {
+    CacheTopologyIndex idx;
+    auto now = t0();
+    idx.apply_digest(1, {10}, {10}, now);
+    idx.apply_digest(2, {10}, {10}, now);
+    EXPECT_EQ(idx.verified_holder_count(10), 2u);
+
+    idx.evict_node(2);
+    EXPECT_EQ(idx.verified_holder_count(10), 1u);   // self-cleaned with the node
+    EXPECT_TRUE(idx.verified_holders_of(10)->contains(1));
+}
+
+TEST(CacheTopologyIndexTest, AgeOutClearsVerified) {
+    CacheTopologyIndex idx;
+    auto base = t0();
+    idx.apply_digest(1, {10}, {10}, base);
+    idx.apply_digest(2, {10}, {10}, base + std::chrono::seconds(10));
+
+    EXPECT_EQ(idx.age_out(base + std::chrono::seconds(5)), 1u);  // node 1 stale
+    EXPECT_EQ(idx.verified_holder_count(10), 1u);                // only node 2 left
+}
+
+// The core distinction 5d gates reaping on: a prefix can be membership-shared
+// (holder_count==2 => looks safe) yet verified-sole-held (verified_holder_count==1
+// => actually only one node truly has it resident, unsafe to reap that one).
+TEST(CacheTopologyIndexTest, VerifiedSoleHeldDespiteSharedMembership) {
+    CacheTopologyIndex idx;
+    auto now = t0();
+    // Both nodes route the prefix (membership), but only node 1 verifies it resident
+    // (node 2 routes it but evicted it from KV, or is non-native => empty verified).
+    idx.apply_digest(1, {0xAA}, {0xAA}, now);
+    idx.apply_digest(2, {0xAA}, {}, now);
+
+    EXPECT_EQ(idx.holder_count(0xAA), 2u);           // membership: shared
+    EXPECT_EQ(idx.verified_holder_count(0xAA), 1u);  // residency: sole-held by node 1
+    EXPECT_TRUE(idx.verified_holders_of(0xAA)->contains(1));
+    EXPECT_FALSE(idx.verified_holders_of(0xAA)->contains(2));
+}
