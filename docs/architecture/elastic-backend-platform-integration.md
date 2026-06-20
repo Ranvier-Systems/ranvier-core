@@ -31,19 +31,19 @@ particular are the platform's decision, not Ranvier's.
 ## The abstraction
 
 ```
-   ┌──────────────────────────── Elastic Backend Platform ───────────────────────────┐
-   │  scheduler / autoscaler        logical replicas            GPU instances         │
+   ┌──────────────────────────── Elastic Backend Platform ─────────────────────────────┐
+   │  scheduler / autoscaler        logical replicas            GPU instances          │
    │       (reap/pin policy)   ┌── slot A ──┐ ┌── slot B ──┐   (vLLM / SGLang / …)     │
    └───────────▲───────────────│            │ │            │──────────▲────────────────┘
                │               └─────┬──────┘ └─────┬──────┘          │
    Leg 2: telemetry              Leg 1: register      Leg 1: register   Leg 3: native-KV
    (Ranvier → platform)          (platform → Ranvier) stable identity   residency events
                │                       │                  │            (backend → Ranvier)
-   ┌───────────┴───────────────────────┴──────────────────┴────────────────────────────┐
-   │                                  R A N V I E R                                      │
+   ┌───────────┴───────────────────────┴──────────────────┴──────────────────────────────┐
+   │                                  R a n v i e r                                      │
    │   BackendRegistry → RadixTree (ART) routing → TelemetryService / CacheTopologyIndex │
    │   exports: Prometheus :9180  +  GET /v1/cache/topology                              │
-   └────────────────────────────────────────────────────────────────────────────────────┘
+   └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 A **logical replica** (a *slot*) is a stable routing identity the platform binds
