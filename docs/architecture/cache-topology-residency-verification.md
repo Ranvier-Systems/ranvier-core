@@ -96,30 +96,60 @@ Two holder counts, exposed side by side:
 non-native fleets it stays conservative (more apparently-sole). This is a
 documented limitation, not a bug — the safe direction.
 
-## Wire format — `residency_verified` flag
+### Q4 — Membership-tier preservation: **B-as-superset** (resolved 2026-06-20)
 
-`HOT_PREFIX_DIGEST (0x07)` gains a **single per-digest flag** via the forward-compat
-tail the packet already carries (parent doc §"New wire format"). One bit suffices
-because a *verified* digest is already filtered to resident hashes — every hash in
-it is verified-resident on the sending backend.
+An earlier draft proposed a *single per-digest flag* with the verified digest
+**filtered** to resident hashes only. That conflicts with the stated invariant
+"`holders` — P2 behavior, unchanged": on a native-KV fleet a filtered digest drops
+*hot-but-evicted* prefixes from membership, shifting the shipped `sole_held` /
+`ranvier_sole_held_hot_prefixes` gauge and collapsing the useful
+"hot-and-routed-but-nobody-resident" signal to `holders=0` (indistinguishable from
+"not hot").
 
-- **Set:** sender's `self_backend_id` had fresh native-KV trust and the hash set was
-  residency-filtered.
-- **Clear / absent (old peers, non-native backends):** membership — treated as
-  unverified (back-compat; an old peer's digest simply never counts toward
-  `verified_holders`).
+**Resolved: the wire carries the full membership set as superset, plus an optional
+verified-resident subset.** This:
+
+- preserves P2 `sole_held` byte-for-byte everywhere (membership = full hot top-K);
+- adds strictly more signal — *sole-held & resident*, *sole-held but evicted*, and
+  *multiply-routed, singly-resident* are all distinguishable;
+- keeps the A/B choice a **runtime detail, not a one-way door**: filtering the
+  membership digest before broadcast (the old "A") is expressible as a future
+  per-node config knob (`cluster.residency_filter_membership`, default off) *without
+  a wire change*, because the full set is always transmitted. The reverse (A's
+  1-bit wire → B) would require a wire extension.
+
+The verified subset is bounded by the membership set (≤ K), so Rule #4 holds.
+
+## Wire format — membership array + verified-resident subset
+
+`HOT_PREFIX_DIGEST (0x07)` keeps its existing membership hash array unchanged
+(P2 wire, full hot top-K) and **appends an optional verified-resident subset** via
+the forward-compat tail the packet already carries (parent doc §"New wire format"):
+
+- **Verified subset present:** sender's `self_backend_id` had fresh native-KV trust;
+  the subset lists those membership hashes confirmed resident in
+  `prefix_hash_index`. Every hash in the subset is also in the membership array
+  (subset ⊆ membership).
+- **Absent (old peers, non-native backends, trust-suspended):** membership only —
+  the digest contributes to `holders` but never to `verified_holders` (back-compat;
+  an old peer's tail-less digest deserializes cleanly as "no verified subset").
+
+Encoding: the subset rides the tail as a count-prefixed delta against the membership
+array (indices into it, not raw 64-bit hashes) to stay compact — bounded by K.
 
 ## Index change
 
-`CacheTopologyIndex` records a **per-holder verified bit** alongside membership:
+`CacheTopologyIndex` records, per `(hash, holder)`, a **two-state contribution**
+— *member* (always) and *verified* (resident subset) — verified ⊆ member:
 
-- `apply_digest(node, hashes, verified, now)` — store whether this node's
-  contribution is residency-verified.
-- `verified_holder_count(hash)` — count of holders whose contribution is verified.
-- `holder_count(hash)` unchanged (membership) for the observability tier.
+- `apply_digest(node, membership_hashes, verified_hashes, now)` — `verified_hashes`
+  ⊆ `membership_hashes`; empty when the holder sent no verified subset.
+- `holder_count(hash)` — unchanged (membership) for the observability tier.
+- `verified_holder_count(hash)` — holders whose contribution marked `hash` verified.
 
-Same bounds/eviction/age-out as today (the verified bit is per-node, so it follows
-the existing per-node set-replace and peer-death/TTL paths).
+Same bounds/eviction/age-out as today: both states are per-node, so they follow the
+existing per-node set-replace and peer-death/TTL paths (the verified set is stored
+alongside the membership set per holder and dropped together).
 
 ## Exposure
 
@@ -135,10 +165,14 @@ the existing per-node set-replace and peer-death/TTL paths).
 
 | Sub-phase | Deliverable | Files | Size |
 |---|---|---|---|
-| **5a** | Emit-time residency filter: if `self_backend_id` has fresh native-KV trust, intersect the hot top-K with `prefix_hash_index[hash].contains(self_backend_id)`; else membership. Add a shard-0 `RouterService` residency-query seam. | `telemetry_service.cpp`, `router_service.{hpp,cpp}` | S–M |
-| **5b** | `residency_verified` flag on `HOT_PREFIX_DIGEST` (forward-compat tail); set on send, read on receive; `GossipService`/protocol plumbing. | `gossip_protocol.{hpp,cpp}`, `gossip_service.*` | S |
-| **5c** | Per-holder verified bit in `CacheTopologyIndex` + `verified_holder_count`; reactor-free tests. | `cache_topology_index.hpp`, `tests/unit/cache_topology_index_test.cpp` | M |
+| **5a** | Shard-0 `RouterService` residency-query seam — `verified_resident_subset(self_id, hashes)`: when `self_id` has fresh native-KV trust, return the subset of hashes present in `prefix_hash_index`; empty otherwise. Inject as a getter into `start_emitter`; each window compute the subset and expose a **local** `ranvier_hot_prefix_verified_resident` gauge. **Membership digest and `sole_held` untouched** (B-as-superset). | `telemetry_service.{hpp,cpp}`, `router_service.{hpp,cpp}`, `application.cpp` | S–M |
+| **5b** | Carry the verified-resident subset on `HOT_PREFIX_DIGEST` (forward-compat tail, index-delta against the membership array); set on send, read on receive; `GossipService`/protocol plumbing. Old peers' tail-less digests decode as "no subset." | `gossip_protocol.{hpp,cpp}`, `gossip_service.*`, `router_service.cpp` | S–M |
+| **5c** | Two-state per-`(hash, holder)` (`member` + `verified`) in `CacheTopologyIndex`; `apply_digest(node, membership, verified, now)` + `verified_holder_count`; reactor-free tests. | `cache_topology_index.hpp`, `tests/unit/cache_topology_index_test.cpp` | M |
 | **5d** | `verified_holders`/`verified_sole_held` in the JSON + `ranvier_sole_held_verified_hot_prefixes` gauge; DEGRADED freeze applies. | `telemetry_schema.hpp`, `telemetry_service.cpp`, `tests/unit/telemetry_sink_test.cpp` | S |
+
+Optional follow-up (not in 5a–5d): `cluster.residency_filter_membership` knob to
+filter the membership digest before broadcast (the old "A"); default off. No wire
+change — the full set is already transmitted.
 
 MVP for gating automated reaping = 5a–5d. Each sub-phase is independently
 mergeable; 5a+5b are inert until 5c/5d expose the tier.

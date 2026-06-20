@@ -4228,6 +4228,31 @@ bool RouterService::cache_topology_quorum_degraded() {
         && g_shard_state->gossip_ptr->is_degraded();
 }
 
+std::vector<uint64_t> RouterService::verified_resident_subset(
+        BackendId self_id, const std::vector<uint64_t>& hashes) {
+    // BACKLOG §21 Phase 5a. Runs on shard 0 (telemetry emitter home). No state,
+    // KV-events disabled (ttl 0), or no fresh native trust for self_id => no
+    // verified subset; the caller keeps the membership-only digest. This gate
+    // mirrors the routing decision-time check (route_request's verified-residency
+    // branch) so the emitted subset means exactly what routing means by "resident."
+    std::vector<uint64_t> resident;
+    if (!g_shard_state) return resident;
+    auto& state = *g_shard_state;
+    if (state.config.kv_residency_freshness_ttl.count() <= 0 ||
+        !state.native_residency_fresh(self_id)) {
+        return resident;
+    }
+    // Exact per-(hash, backend) residency mirror, fed by vLLM BlockStored/Removed.
+    resident.reserve(hashes.size());
+    for (uint64_t h : hashes) {
+        auto it = state.prefix_hash_index.find(h);
+        if (it != state.prefix_hash_index.end() && it->second.contains(self_id)) {
+            resident.push_back(h);
+        }
+    }
+    return resident;
+}
+
 seastar::future<> RouterService::apply_peer_cache_state(
         BackendId backend_id, double /*cache_usage*/, double residency_weight) {
     // Peer-reported residency arrives on shard 0 (gossip receive loop). Upsert it

@@ -79,6 +79,7 @@ seastar::future<> TelemetryService::start_emitter(
     BackendId self_backend_id,
     std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster,
     std::function<bool()> quorum_degraded_getter,
+    std::function<std::vector<uint64_t>(const std::vector<uint64_t>&)> residency_verified_getter,
     bool cache_topology_enabled) {
 
     if (seastar::this_shard_id() != 0) {
@@ -99,6 +100,7 @@ seastar::future<> TelemetryService::start_emitter(
     _self_backend_id    = self_backend_id;                                  // BACKLOG §21 P2
     _hot_prefix_digest_broadcaster = std::move(hot_prefix_digest_broadcaster);
     _quorum_degraded_getter = std::move(quorum_degraded_getter);            // BACKLOG §21 P2
+    _residency_verified_getter = std::move(residency_verified_getter);      // BACKLOG §21 Phase 5a
     _cache_topology_enabled = cache_topology_enabled;                       // BACKLOG §21 P2 dark-launch gate
     _window_start_ms    = now_ms();
 
@@ -163,6 +165,15 @@ seastar::future<> TelemetryService::start_emitter(
                 return std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - _last_hot_prefix_at).count();
             }),
+        // BACKLOG §21 Phase 5a: of this node's hot top-K, how many its own backend
+        // verifies resident in KV cache right now (native KV-event stream fresh).
+        // 0 when native KV-events are disabled or trust is suspended — the local
+        // precursor to the cluster verified_holders tier (5c/5d).
+        sm::make_gauge("ranvier_hot_prefix_verified_resident",
+            sm::description("Count of this node's hot top-K prefixes verified-resident in its own "
+                            "backend's KV cache (native KV-event stream fresh). 0 when KV-events "
+                            "are disabled or native trust is suspended (membership-only window)."),
+            [this] { return static_cast<double>(_last_verified_resident_count); }),
     });
 
     _emitter_started = true;
@@ -411,6 +422,15 @@ seastar::future<> TelemetryService::emit_async() {
         std::vector<uint64_t> digest;
         digest.reserve(_last_hot_prefixes.size());
         for (const auto& e : _last_hot_prefixes) digest.push_back(e.prefix_fp);
+
+        // BACKLOG §21 Phase 5a: of our membership hashes, which does our own
+        // backend verify resident in KV cache right now? Empty (membership-only)
+        // when the getter is null or native trust is absent. The membership
+        // `digest` below is self-applied and broadcast UNCHANGED (B-as-superset);
+        // only the local ranvier_hot_prefix_verified_resident gauge consumes this
+        // today — 5b carries the subset on the wire, 5c/5d build the cluster tier.
+        _last_verified_resident_count =
+            _residency_verified_getter ? _residency_verified_getter(digest).size() : 0;
 
         const auto now_tp = _last_hot_prefix_at;  // same steady_clock read as above
         _topology_index.apply_digest(_self_backend_id, digest, now_tp);
