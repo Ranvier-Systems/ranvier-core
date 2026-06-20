@@ -600,9 +600,11 @@ public:
     // BACKLOG §21 P2: gossip our node's merged hot-prefix digest to cluster
     // peers. Runs on shard 0 (the telemetry emitter home), where gossip_ptr is
     // set; a no-op when gossip is disabled. `self_id` stamps the digest as ours.
-    // Takes the hash vector by value (Rule #22: coroutine params by value).
+    // `verified_hashes` (BACKLOG §21 Phase 5b) is the subset we verify resident in
+    // our own KV cache; empty => membership-only. Both by value (Rule #22).
     static seastar::future<> broadcast_hot_prefix_digest_global(
-        BackendId self_id, std::vector<uint64_t> prefix_hashes);
+        BackendId self_id, std::vector<uint64_t> prefix_hashes,
+        std::vector<uint64_t> verified_hashes);
 
     // BACKLOG §21 P2: publish shard 0's TelemetryService instance into
     // ShardLocalState so the gossip digest callback and the peer-death prune

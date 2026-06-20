@@ -238,8 +238,16 @@ std::vector<uint8_t> HotPrefixDigestPacket::serialize() const {
     uint16_t count = static_cast<uint16_t>(
         std::min(prefix_hashes.size(), static_cast<size_t>(MAX_HASHES)));  // Rule #4
 
+    // BACKLOG §21 Phase 5b: the verified-resident subset rides the forward-compat
+    // tail as a bitmap over the membership array — bit i (LSB-first) set means
+    // prefix_hashes[i] is verified-resident on the sender. Emitted only when
+    // non-empty, so a membership-only digest is byte-identical to an old v1 peer's
+    // (tail-less) and the common "nothing verified" window stays compact.
+    const size_t bitmap_bytes = verified_hashes.empty()
+        ? 0 : (static_cast<size_t>(count) + 7) / 8;
+
     std::vector<uint8_t> buffer;
-    buffer.reserve(HEADER_SIZE + static_cast<size_t>(count) * sizeof(uint64_t));
+    buffer.reserve(HEADER_SIZE + static_cast<size_t>(count) * sizeof(uint64_t) + bitmap_bytes);
 
     buffer.push_back(static_cast<uint8_t>(type));
     buffer.push_back(version);
@@ -248,6 +256,18 @@ std::vector<uint8_t> HotPrefixDigestPacket::serialize() const {
 
     for (size_t i = 0; i < count; ++i) {
         be_write_u64(buffer, prefix_hashes[i]);
+    }
+
+    if (bitmap_bytes > 0) {
+        // ≤128 entries; a set keeps this robust to any ordering of verified_hashes.
+        std::unordered_set<uint64_t> verified(verified_hashes.begin(), verified_hashes.end());
+        const size_t bitmap_off = buffer.size();
+        buffer.resize(bitmap_off + bitmap_bytes, 0);
+        for (size_t i = 0; i < count; ++i) {
+            if (verified.count(prefix_hashes[i])) {
+                buffer[bitmap_off + (i >> 3)] |= static_cast<uint8_t>(1u << (i & 7));
+            }
+        }
     }
     return buffer;
 }
@@ -285,6 +305,21 @@ std::optional<HotPrefixDigestPacket> HotPrefixDigestPacket::deserialize(const ui
     pkt.prefix_hashes.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         pkt.prefix_hashes.push_back(be_read_u64(data + HEADER_SIZE + i * sizeof(uint64_t)));
+    }
+
+    // BACKLOG §21 Phase 5b: optional verified-resident bitmap tail (see serialize).
+    // Present only when the sender had a non-empty verified subset; absent for v1
+    // peers and membership-only windows. A partial tail (fewer than ceil(count/8)
+    // bytes) is ignored rather than rejecting the digest — membership is still
+    // authoritative. Bytes past the bitmap are future fields (forward-compat).
+    const size_t bitmap_bytes = (static_cast<size_t>(count) + 7) / 8;
+    if (count > 0 && len >= need + bitmap_bytes) {
+        const uint8_t* bm = data + need;
+        for (size_t i = 0; i < count; ++i) {
+            if (bm[i >> 3] & static_cast<uint8_t>(1u << (i & 7))) {
+                pkt.verified_hashes.push_back(pkt.prefix_hashes[i]);
+            }
+        }
     }
     return pkt;
 }
@@ -630,7 +665,8 @@ seastar::future<> GossipProtocol::broadcast_cache_state(BackendId backend_id, do
 }
 
 seastar::future<> GossipProtocol::broadcast_hot_prefix_digest(BackendId backend_id,
-                                                              std::vector<uint64_t> prefix_hashes) {
+                                                              std::vector<uint64_t> prefix_hashes,
+                                                              std::vector<uint64_t> verified_hashes) {
     // Rule #22: coroutine converts any pre-future throw into a failed future.
     if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
         co_return;
@@ -642,10 +678,12 @@ seastar::future<> GossipProtocol::broadcast_hot_prefix_digest(BackendId backend_
     HotPrefixDigestPacket pkt;
     pkt.backend_id = backend_id;
     pkt.prefix_hashes = std::move(prefix_hashes);  // serialize() caps at MAX_HASHES (Rule #4)
+    pkt.verified_hashes = std::move(verified_hashes);  // BACKLOG §21 Phase 5b
     auto serialized = pkt.serialize();
 
-    log_gossip_protocol().trace("Broadcasting hot-prefix digest: backend={}, hashes={} to {} peers",
-                                backend_id, pkt.prefix_hashes.size(), _peer_addresses->size());
+    log_gossip_protocol().trace("Broadcasting hot-prefix digest: backend={}, hashes={}, verified={} to {} peers",
+                                backend_id, pkt.prefix_hashes.size(), pkt.verified_hashes.size(),
+                                _peer_addresses->size());
 
     // Unreliable broadcast (no ACK): periodic, idempotent, latest-value-wins per
     // node — a dropped digest self-heals on the next window.
@@ -772,10 +810,14 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
         }
 
         ++_hot_prefix_digests_received;
-        log_gossip_protocol().trace("Received HOT_PREFIX_DIGEST from {}: backend={}, hashes={}",
-                                    src_addr, hp_pkt->backend_id, hp_pkt->prefix_hashes.size());
+        log_gossip_protocol().trace("Received HOT_PREFIX_DIGEST from {}: backend={}, hashes={}, verified={}",
+                                    src_addr, hp_pkt->backend_id, hp_pkt->prefix_hashes.size(),
+                                    hp_pkt->verified_hashes.size());
 
         // Rule #16: return the callback's future directly (no lambda-coroutine).
+        // BACKLOG §21 Phase 5b decodes hp_pkt->verified_hashes off the wire; Phase
+        // 5c widens the callback + cache-topology index to record it (verified
+        // holder tier). Until then the membership digest drives holder counts.
         if (_hot_prefix_digest_callback) {
             return _hot_prefix_digest_callback(hp_pkt->backend_id, std::move(hp_pkt->prefix_hashes));
         }

@@ -416,7 +416,8 @@ void GossipService::set_hot_prefix_digest_callback(HotPrefixDigestCallback callb
 }
 
 seastar::future<> GossipService::broadcast_hot_prefix_digest(BackendId backend_id,
-                                                             std::vector<uint64_t> prefix_hashes) {
+                                                             std::vector<uint64_t> prefix_hashes,
+                                                             std::vector<uint64_t> verified_hashes) {
     if (!_config.enabled || !_protocol || _peer_addresses.empty()) {
         return seastar::make_ready_future<>();
     }
@@ -434,7 +435,8 @@ seastar::future<> GossipService::broadcast_hot_prefix_digest(BackendId backend_i
         return seastar::make_ready_future<>();
     }
 
-    return _protocol->broadcast_hot_prefix_digest(backend_id, std::move(prefix_hashes))
+    return _protocol->broadcast_hot_prefix_digest(backend_id, std::move(prefix_hashes),
+                                                  std::move(verified_hashes))
         .finally([gate_holder = std::move(gate_holder)] {});
 }
 

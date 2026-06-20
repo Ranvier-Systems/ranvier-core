@@ -134,8 +134,17 @@ the forward-compat tail the packet already carries (parent doc §"New wire forma
   the digest contributes to `holders` but never to `verified_holders` (back-compat;
   an old peer's tail-less digest deserializes cleanly as "no verified subset").
 
-Encoding: the subset rides the tail as a count-prefixed delta against the membership
-array (indices into it, not raw 64-bit hashes) to stay compact — bounded by K.
+Encoding (resolved in 5b): the subset rides the tail as a **bitmap over the
+membership array** — `ceil(count/8)` bytes, bit `i` (LSB-first) set ⇒
+`prefix_hashes[i]` is verified. Chosen over an index-list because it needs no
+per-element validation (bits past `count` are ignored), is most compact in the
+common "mostly-resident" case (`count/8` bytes regardless of how many are set),
+and is bounded by `ceil(MAX_HASHES/8) = 16` bytes. The bitmap is emitted only when
+the verified subset is non-empty, so a membership-only window stays byte-identical
+to an old v1 (tail-less) peer. `PROTOCOL_VERSION` bumped to 2; version is recorded
+but never a rejection boundary (capability is length-detected), so v1 readers
+ignore the tail and v1 senders simply omit it. A partial/truncated tail is ignored
+(membership stays authoritative) rather than rejecting the digest.
 
 ## Index change
 
@@ -166,8 +175,8 @@ alongside the membership set per holder and dropped together).
 | Sub-phase | Deliverable | Files | Size |
 |---|---|---|---|
 | **5a** | Shard-0 `RouterService` residency-query seam — `verified_resident_subset(self_id, hashes)`: when `self_id` has fresh native-KV trust, return the subset of hashes present in `prefix_hash_index`; empty otherwise. Inject as a getter into `start_emitter`; each window compute the subset and expose a **local** `ranvier_hot_prefix_verified_resident` gauge. **Membership digest and `sole_held` untouched** (B-as-superset). | `telemetry_service.{hpp,cpp}`, `router_service.{hpp,cpp}`, `application.cpp` | S–M |
-| **5b** | Carry the verified-resident subset on `HOT_PREFIX_DIGEST` (forward-compat tail, index-delta against the membership array); set on send, read on receive; `GossipService`/protocol plumbing. Old peers' tail-less digests decode as "no subset." | `gossip_protocol.{hpp,cpp}`, `gossip_service.*`, `router_service.cpp` | S–M |
-| **5c** | Two-state per-`(hash, holder)` (`member` + `verified`) in `CacheTopologyIndex`; `apply_digest(node, membership, verified, now)` + `verified_holder_count`; reactor-free tests. | `cache_topology_index.hpp`, `tests/unit/cache_topology_index_test.cpp` | M |
+| **5b** | Carry the verified-resident subset on `HOT_PREFIX_DIGEST` as a bitmap tail (v2); thread it through the **send** path (telemetry → router → gossip_service → protocol); `serialize`/`deserialize` round-trip. Receive-side `deserialize` populates the field; the live dispatch still forwards membership only (5c wires receive→index). Old/v1 peers decode as "no subset." | `gossip_protocol.{hpp,cpp}`, `gossip_service.*`, `router_service.{hpp,cpp}`, `telemetry_service.*`, `application.cpp`, `tests/unit/gossip_hot_prefix_digest_test.cpp` | S–M |
+| **5c** | Widen the receive callback + `apply_peer_digest` to forward `verified_hashes`; two-state per-`(hash, holder)` (`member` + `verified`) in `CacheTopologyIndex`; `apply_digest(node, membership, verified, now)` + `verified_holder_count`; reactor-free tests. | `gossip_protocol.hpp`, `router_service.cpp`, `telemetry_service.*`, `cache_topology_index.hpp`, `tests/unit/cache_topology_index_test.cpp` | M |
 | **5d** | `verified_holders`/`verified_sole_held` in the JSON + `ranvier_sole_held_verified_hot_prefixes` gauge; DEGRADED freeze applies. | `telemetry_schema.hpp`, `telemetry_service.cpp`, `tests/unit/telemetry_sink_test.cpp` | S |
 
 Optional follow-up (not in 5a–5d): `cluster.residency_filter_membership` knob to

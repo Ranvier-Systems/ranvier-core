@@ -84,7 +84,9 @@ public:
         std::unique_ptr<TelemetrySink> sink,
         std::function<RoutingStrategyParams()> strategy_snapshot,
         BackendId self_backend_id = 0,
-        std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster = nullptr,
+        // BACKLOG §21 Phase 5b: (membership digest, verified-resident subset).
+        std::function<seastar::future<>(std::vector<uint64_t>, std::vector<uint64_t>)>
+            hot_prefix_digest_broadcaster = nullptr,
         std::function<bool()> quorum_degraded_getter = nullptr,
         // BACKLOG §21 Phase 5a: given our membership hashes, returns the subset
         // verified-resident in our own backend's KV cache (empty when native KV
@@ -202,7 +204,9 @@ private:
     // sole-held gauges omit the cluster surface (index stays empty => gauges read 0).
     bool                                _cache_topology_enabled = false;
     BackendId                           _self_backend_id = 0;
-    std::function<seastar::future<>(std::vector<uint64_t>)> _hot_prefix_digest_broadcaster;
+    // BACKLOG §21 Phase 5b: broadcasts (membership digest, verified-resident subset).
+    std::function<seastar::future<>(std::vector<uint64_t>, std::vector<uint64_t>)>
+                                        _hot_prefix_digest_broadcaster;
     // Split-brain freeze (BACKLOG §21 P2). When this returns true the sole_held
     // signal is frozen toward "do not reap" (never asserts sole_held=false).
     // Null => always HEALTHY (no cluster / single node).

@@ -77,7 +77,7 @@ seastar::future<> TelemetryService::start_emitter(
     std::unique_ptr<TelemetrySink> sink,
     std::function<RoutingStrategyParams()> strategy_snapshot,
     BackendId self_backend_id,
-    std::function<seastar::future<>(std::vector<uint64_t>)> hot_prefix_digest_broadcaster,
+    std::function<seastar::future<>(std::vector<uint64_t>, std::vector<uint64_t>)> hot_prefix_digest_broadcaster,
     std::function<bool()> quorum_degraded_getter,
     std::function<std::vector<uint64_t>(const std::vector<uint64_t>&)> residency_verified_getter,
     bool cache_topology_enabled) {
@@ -423,14 +423,16 @@ seastar::future<> TelemetryService::emit_async() {
         digest.reserve(_last_hot_prefixes.size());
         for (const auto& e : _last_hot_prefixes) digest.push_back(e.prefix_fp);
 
-        // BACKLOG §21 Phase 5a: of our membership hashes, which does our own
+        // BACKLOG §21 Phase 5a/5b: of our membership hashes, which does our own
         // backend verify resident in KV cache right now? Empty (membership-only)
         // when the getter is null or native trust is absent. The membership
-        // `digest` below is self-applied and broadcast UNCHANGED (B-as-superset);
-        // only the local ranvier_hot_prefix_verified_resident gauge consumes this
-        // today — 5b carries the subset on the wire, 5c/5d build the cluster tier.
-        _last_verified_resident_count =
-            _residency_verified_getter ? _residency_verified_getter(digest).size() : 0;
+        // `digest` is self-applied and broadcast UNCHANGED (B-as-superset); the
+        // verified subset rides ALONGSIDE it on the wire (5b) and feeds the local
+        // ranvier_hot_prefix_verified_resident gauge. 5c/5d build the cluster tier.
+        std::vector<uint64_t> verified =
+            _residency_verified_getter ? _residency_verified_getter(digest)
+                                       : std::vector<uint64_t>{};
+        _last_verified_resident_count = verified.size();
 
         const auto now_tp = _last_hot_prefix_at;  // same steady_clock read as above
         _topology_index.apply_digest(_self_backend_id, digest, now_tp);
@@ -439,7 +441,7 @@ seastar::future<> TelemetryService::emit_async() {
         if (_hot_prefix_digest_broadcaster) {
             // Rule #18: failures are logged inside the broadcaster; the digest is
             // best-effort and self-corrects next window (latest-value-wins).
-            co_await _hot_prefix_digest_broadcaster(std::move(digest));
+            co_await _hot_prefix_digest_broadcaster(std::move(digest), std::move(verified));
         }
     }
 
