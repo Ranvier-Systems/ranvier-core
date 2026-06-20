@@ -99,7 +99,8 @@ public:
     // register the callback that feeds received digests into shard 0's
     // cache-topology index. Mirrors the cache_state pair above.
     seastar::future<> broadcast_hot_prefix_digest(BackendId backend_id,
-                                                  std::vector<uint64_t> prefix_hashes);
+                                                  std::vector<uint64_t> prefix_hashes,
+                                                  std::vector<uint64_t> verified_hashes);
     void set_hot_prefix_digest_callback(HotPrefixDigestCallback callback);
 
     // Check if gossip is enabled

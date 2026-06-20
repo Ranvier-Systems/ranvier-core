@@ -203,15 +203,26 @@ struct CacheStatePacket {
 // Broadcast unreliably (no ACK / seq_num): periodic, idempotent,
 // latest-value-wins per node — a dropped digest self-heals next window.
 struct HotPrefixDigestPacket {
-    static constexpr uint8_t PROTOCOL_VERSION = 1;
+    // v2 (BACKLOG §21 Phase 5b): appends an optional verified-resident bitmap
+    // tail. v1 peers send no tail; v1 readers ignore it (forward-compat). Version
+    // is recorded, never a rejection boundary — capability is length-detected.
+    static constexpr uint8_t PROTOCOL_VERSION = 2;
     static constexpr size_t HEADER_SIZE = 8;
     static constexpr size_t MAX_HASHES = 128;
-    static constexpr size_t MAX_PACKET_SIZE = HEADER_SIZE + MAX_HASHES * sizeof(uint64_t);
+    // Verified-resident bitmap: 1 bit per membership entry, ceil(count/8) bytes.
+    static constexpr size_t MAX_BITMAP_BYTES = (MAX_HASHES + 7) / 8;
+    static constexpr size_t MAX_PACKET_SIZE =
+        HEADER_SIZE + MAX_HASHES * sizeof(uint64_t) + MAX_BITMAP_BYTES;
 
     GossipPacketType type = GossipPacketType::HOT_PREFIX_DIGEST;
     uint8_t version = PROTOCOL_VERSION;
     BackendId backend_id = 0;
     std::vector<uint64_t> prefix_hashes;
+    // BACKLOG §21 Phase 5b: the subset of prefix_hashes the sender verifies
+    // resident in its own KV cache (native KV-event stream fresh). Empty =>
+    // membership-only (old peer or no native trust). Always a subset of
+    // prefix_hashes, kept in membership order. Rides the wire as a bitmap tail.
+    std::vector<uint64_t> verified_hashes;
 
     std::vector<uint8_t> serialize() const;
     static std::optional<HotPrefixDigestPacket> deserialize(const uint8_t* data, size_t len);
@@ -264,7 +275,9 @@ public:
     seastar::future<> broadcast_cache_eviction(uint64_t prefix_hash, BackendId backend_id);
     seastar::future<> broadcast_cache_state(BackendId backend_id, double cache_usage, double residency_weight);
     // BACKLOG §21 P2. By value (coroutine — Rule #21); capped at MAX_HASHES.
-    seastar::future<> broadcast_hot_prefix_digest(BackendId backend_id, std::vector<uint64_t> prefix_hashes);
+    seastar::future<> broadcast_hot_prefix_digest(BackendId backend_id,
+                                                  std::vector<uint64_t> prefix_hashes,
+                                                  std::vector<uint64_t> verified_hashes);
     seastar::future<> broadcast_heartbeat();
 
     // Handle incoming packet (called from receive loop)

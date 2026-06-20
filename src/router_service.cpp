@@ -4195,7 +4195,8 @@ seastar::future<> RouterService::broadcast_cache_state_global(
 }
 
 seastar::future<> RouterService::broadcast_hot_prefix_digest_global(
-        BackendId self_id, std::vector<uint64_t> prefix_hashes) {
+        BackendId self_id, std::vector<uint64_t> prefix_hashes,
+        std::vector<uint64_t> verified_hashes) {
     // Runs on shard 0 (telemetry emitter home), where gossip_ptr is set.
     // No-op without gossip. Best-effort (Rule #18): a dropped digest self-corrects
     // next window since digests are latest-value-wins.
@@ -4203,7 +4204,7 @@ seastar::future<> RouterService::broadcast_hot_prefix_digest_global(
         return seastar::make_ready_future<>();
     }
     return g_shard_state->gossip_ptr
-        ->broadcast_hot_prefix_digest(self_id, std::move(prefix_hashes))
+        ->broadcast_hot_prefix_digest(self_id, std::move(prefix_hashes), std::move(verified_hashes))
         .handle_exception([](std::exception_ptr ep) {
             try {
                 std::rethrow_exception(ep);
