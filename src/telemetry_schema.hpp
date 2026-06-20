@@ -369,7 +369,7 @@ inline double hot_prefix_sole_held_request_share(const std::vector<HotPrefixEntr
 // omitted entirely — the endpoint reverts to its P1 shape (prefix_fp +
 // request_count), never emitting a misleading sole_held=false. Bounded by
 // top.size() (<= K). Pure.
-// `verified_holders[i]` (BACKLOG §21 Phase 5d) is the count of holders that report
+// `verified_holders[i]` (BACKLOG §21 P3) is the count of holders that report
 // top[i] VERIFIED-RESIDENT in their own KV cache (native KV trust) — a subset of
 // holders[i]. Each entry gains `verified_holders` and `verified_sole_held` (exactly
 // one verified holder => the automated-reaping gate). The DEGRADED freeze applies

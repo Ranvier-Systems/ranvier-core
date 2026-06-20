@@ -100,7 +100,7 @@ seastar::future<> TelemetryService::start_emitter(
     _self_backend_id    = self_backend_id;                                  // BACKLOG §21 P2
     _hot_prefix_digest_broadcaster = std::move(hot_prefix_digest_broadcaster);
     _quorum_degraded_getter = std::move(quorum_degraded_getter);            // BACKLOG §21 P2
-    _residency_verified_getter = std::move(residency_verified_getter);      // BACKLOG §21 Phase 5a
+    _residency_verified_getter = std::move(residency_verified_getter);      // BACKLOG §21 P3
     _cache_topology_enabled = cache_topology_enabled;                       // BACKLOG §21 P2 dark-launch gate
     _window_start_ms    = now_ms();
 
@@ -150,7 +150,7 @@ seastar::future<> TelemetryService::start_emitter(
                 return static_cast<double>(
                     hot_prefix_sole_held_count(current_holder_counts(), quorum_degraded()));
             }),
-        // BACKLOG §21 Phase 5d: the verified-residency analogue — the autoscaler's
+        // BACKLOG §21 P3: the verified-residency analogue — the autoscaler's
         // automated-reaping gate. A prefix is verified-sole-held when exactly one
         // node reports it RESIDENT in its KV cache (native trust), even if multiple
         // nodes route it (membership). Reuses hot_prefix_sole_held_count over the
@@ -179,10 +179,10 @@ seastar::future<> TelemetryService::start_emitter(
                 return std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - _last_hot_prefix_at).count();
             }),
-        // BACKLOG §21 Phase 5a: of this node's hot top-K, how many its own backend
+        // BACKLOG §21 P3: of this node's hot top-K, how many its own backend
         // verifies resident in KV cache right now (native KV-event stream fresh).
-        // 0 when native KV-events are disabled or trust is suspended — the local
-        // precursor to the cluster verified_holders tier (5c/5d).
+        // 0 when native KV-events are disabled or trust is suspended — a node-local
+        // view; the cluster verified_holders tier aggregates these across nodes.
         sm::make_gauge("ranvier_hot_prefix_verified_resident",
             sm::description("Count of this node's hot top-K prefixes verified-resident in its own "
                             "backend's KV cache (native KV-event stream fresh). 0 when KV-events "
@@ -437,19 +437,18 @@ seastar::future<> TelemetryService::emit_async() {
         digest.reserve(_last_hot_prefixes.size());
         for (const auto& e : _last_hot_prefixes) digest.push_back(e.prefix_fp);
 
-        // BACKLOG §21 Phase 5a/5b: of our membership hashes, which does our own
-        // backend verify resident in KV cache right now? Empty (membership-only)
-        // when the getter is null or native trust is absent. The membership
-        // `digest` is self-applied and broadcast UNCHANGED (B-as-superset); the
-        // verified subset rides ALONGSIDE it on the wire (5b) and feeds the local
-        // ranvier_hot_prefix_verified_resident gauge. 5c/5d build the cluster tier.
+        // BACKLOG §21 P3: of our membership hashes, which does our own backend
+        // verify resident in KV cache right now? Empty (membership-only) when the
+        // getter is null or native trust is absent. The membership `digest` is
+        // self-applied and broadcast unchanged; the verified subset rides alongside
+        // it on the wire and feeds the ranvier_hot_prefix_verified_resident gauge.
         std::vector<uint64_t> verified =
             _residency_verified_getter ? _residency_verified_getter(digest)
                                        : std::vector<uint64_t>{};
         _last_verified_resident_count = verified.size();
 
         const auto now_tp = _last_hot_prefix_at;  // same steady_clock read as above
-        // Self-apply both tiers (5c): our own verified residency must count toward
+        // Self-apply both tiers: our own verified residency must count toward
         // verified_holders, exactly as a peer's does.
         _topology_index.apply_digest(_self_backend_id, digest, verified, now_tp);
         _topology_index.age_out(now_tp - _window * kTopologyStaleWindows);
@@ -506,7 +505,7 @@ void TelemetryService::apply_peer_digest(BackendId node, std::vector<uint64_t> p
                                          std::vector<uint64_t> verified_hashes) {
     if (!_cache_topology_enabled) return;  // dark-launch gate: ignore peer digests
     // Receive-time timestamp drives the age_out backstop in the emit loop. The
-    // verified subset feeds the verified-holder tier (BACKLOG §21 Phase 5c).
+    // verified subset feeds the verified-holder tier (BACKLOG §21 P3).
     _topology_index.apply_digest(node, prefix_hashes, verified_hashes,
                                  std::chrono::steady_clock::now());
 }

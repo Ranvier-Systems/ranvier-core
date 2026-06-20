@@ -4232,7 +4232,7 @@ bool RouterService::cache_topology_quorum_degraded() {
 
 std::vector<uint64_t> RouterService::verified_resident_subset(
         BackendId self_id, const std::vector<uint64_t>& hashes) {
-    // BACKLOG §21 Phase 5a. Runs on shard 0 (telemetry emitter home). No state,
+    // BACKLOG §21 P3. Runs on shard 0 (telemetry emitter home). No state,
     // KV-events disabled (ttl 0), or no fresh native trust for self_id => no
     // verified subset; the caller keeps the membership-only digest. This gate
     // mirrors the routing decision-time check (route_request's verified-residency

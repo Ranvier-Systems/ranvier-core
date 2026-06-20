@@ -85,7 +85,7 @@ using CacheEvictionCallback = std::function<seastar::future<>(uint64_t prefix_ha
 using CacheStateCallback =
     std::function<seastar::future<>(BackendId backend_id, double cache_usage, double residency_weight)>;
 // One node's current hot-prefix top-K fingerprints (BACKLOG §21 P2) plus the
-// subset it verifies resident in its own KV cache (BACKLOG §21 Phase 5c;
+// subset it verifies resident in its own KV cache (BACKLOG §21 P3;
 // verified ⊆ prefix_hashes, empty for old/non-native peers). By value — the
 // callback is a coroutine (Rule #21).
 using HotPrefixDigestCallback =
@@ -206,7 +206,7 @@ struct CacheStatePacket {
 // Broadcast unreliably (no ACK / seq_num): periodic, idempotent,
 // latest-value-wins per node — a dropped digest self-heals next window.
 struct HotPrefixDigestPacket {
-    // v2 (BACKLOG §21 Phase 5b): appends an optional verified-resident bitmap
+    // v2 (BACKLOG §21 P3): appends an optional verified-resident bitmap
     // tail. v1 peers send no tail; v1 readers ignore it (forward-compat). Version
     // is recorded, never a rejection boundary — capability is length-detected.
     static constexpr uint8_t PROTOCOL_VERSION = 2;
@@ -221,7 +221,7 @@ struct HotPrefixDigestPacket {
     uint8_t version = PROTOCOL_VERSION;
     BackendId backend_id = 0;
     std::vector<uint64_t> prefix_hashes;
-    // BACKLOG §21 Phase 5b: the subset of prefix_hashes the sender verifies
+    // BACKLOG §21 P3: the subset of prefix_hashes the sender verifies
     // resident in its own KV cache (native KV-event stream fresh). Empty =>
     // membership-only (old peer or no native trust). Always a subset of
     // prefix_hashes, kept in membership order. Rides the wire as a bitmap tail.
