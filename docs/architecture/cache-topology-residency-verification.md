@@ -172,6 +172,10 @@ alongside the membership set per holder and dropped together).
 
 ## Phased breakdown
 
+**Status: 5a–5c landed on `main` (PRs #587–#589); 5d completes the tier.** Once 5d
+merges the residency-verified holder tier is wired end to end — seam → wire → index
+→ exposure — gated behind the existing P2 `cache_topology_enabled` dark-launch flag.
+
 | Sub-phase | Deliverable | Files | Size |
 |---|---|---|---|
 | **5a** | Shard-0 `RouterService` residency-query seam — `verified_resident_subset(self_id, hashes)`: when `self_id` has fresh native-KV trust, return the subset of hashes present in `prefix_hash_index`; empty otherwise. Inject as a getter into `start_emitter`; each window compute the subset and expose a **local** `ranvier_hot_prefix_verified_resident` gauge. **Membership digest and `sole_held` untouched** (B-as-superset). | `telemetry_service.{hpp,cpp}`, `router_service.{hpp,cpp}`, `application.cpp` | S–M |

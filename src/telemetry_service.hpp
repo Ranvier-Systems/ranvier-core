@@ -240,6 +240,12 @@ private:
     // peer digests that arrived since the last window. Shard-0, lock-free.
     std::vector<size_t> current_holder_counts() const;
 
+    // BACKLOG §21 Phase 5d: verified-resident holder count per `_last_hot_prefixes`
+    // entry, parallel to it — the subset of holders that report it resident in
+    // their own KV cache. Drives verified_sole_held (the automated-reaping gate).
+    // Shard-0, lock-free.
+    std::vector<size_t> current_verified_holder_counts() const;
+
     // Is cluster quorum DEGRADED right now? Drives the sole_held split-brain
     // freeze. Null getter => false (no cluster). Shard-0, lock-free.
     bool quorum_degraded() const {

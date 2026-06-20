@@ -369,8 +369,15 @@ inline double hot_prefix_sole_held_request_share(const std::vector<HotPrefixEntr
 // omitted entirely — the endpoint reverts to its P1 shape (prefix_fp +
 // request_count), never emitting a misleading sole_held=false. Bounded by
 // top.size() (<= K). Pure.
+// `verified_holders[i]` (BACKLOG §21 Phase 5d) is the count of holders that report
+// top[i] VERIFIED-RESIDENT in their own KV cache (native KV trust) — a subset of
+// holders[i]. Each entry gains `verified_holders` and `verified_sole_held` (exactly
+// one verified holder => the automated-reaping gate). The DEGRADED freeze applies
+// identically: verified_sole_held is forced true (never assert "safe to reap" while
+// the cluster view is unreliable). `verified_holders` shorter than top => 0.
 inline std::string format_hot_prefix_topology_json(const std::vector<HotPrefixEntry>& top,
                                                    const std::vector<size_t>& holders,
+                                                   const std::vector<size_t>& verified_holders,
                                                    uint64_t total_touches,
                                                    int64_t snapshot_age_ms,
                                                    bool quorum_degraded = false,
@@ -394,17 +401,22 @@ inline std::string format_hot_prefix_topology_json(const std::vector<HotPrefixEn
     }
     out += head;
     for (size_t i = 0; i < top.size(); ++i) {
-        char ent[160];
+        char ent[224];
         if (include_topology) {
             const size_t h = (i < holders.size()) ? holders[i] : 0;
+            const size_t v = (i < verified_holders.size()) ? verified_holders[i] : 0;
             const bool sole_held = quorum_degraded || (h == 1);
+            const bool verified_sole_held = quorum_degraded || (v == 1);
             std::snprintf(ent, sizeof(ent),
-                "%s{\"prefix_fp\":\"%016llx\",\"request_count\":%llu,\"holders\":%zu,\"sole_held\":%s}",
+                "%s{\"prefix_fp\":\"%016llx\",\"request_count\":%llu,\"holders\":%zu,\"sole_held\":%s,"
+                "\"verified_holders\":%zu,\"verified_sole_held\":%s}",
                 (i == 0 ? "" : ","),
                 static_cast<unsigned long long>(top[i].prefix_fp),
                 static_cast<unsigned long long>(top[i].request_count),
                 h,
-                (sole_held ? "true" : "false"));
+                (sole_held ? "true" : "false"),
+                v,
+                (verified_sole_held ? "true" : "false"));
         } else {
             std::snprintf(ent, sizeof(ent),
                 "%s{\"prefix_fp\":\"%016llx\",\"request_count\":%llu}",
