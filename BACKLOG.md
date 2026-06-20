@@ -975,7 +975,7 @@ in particular are the scaler's decision, not Ranvier's.
 
 | Priority | Item | Notes |
 |----------|------|-------|
-| P3 | Residency-verified holders (Phase 5) | Intersect the digest with `residency_weight`/native KV — the accuracy prerequisite before any autoscaler consumes `sole_held` for **automated reaping** (route-membership alone can false-negative; see the asymmetry analysis in the architecture doc). Threshold: same calibration as cache-headroom routing. |
+| P3 | Residency-verified holders (Phase 5) — **scoped** ([design](docs/architecture/cache-topology-residency-verification.md)) | The accuracy prerequisite before any autoscaler consumes `sole_held` for **automated reaping** (route-membership alone can false-negative). Design resolves the holder model (sidecar/`self_backend_id`), reuses the native-KV `prefix_hash_index` residency mirror, and adds a `verified_holders`/`verified_sole_held` tier in 4 sub-phases (5a–5d). |
 | Release gate | End-to-end A/B (telemetry on vs off) | Not yet run (not runnable in sandbox). Single-stream through one ingress; primary signal is `ranvier_router_routing_latency_seconds` p50/p99 delta **< 1%** with no p99 spike at the shard-0 window cadence. Wrap as `make bench-cache-topology` (per `bench-epp`); promote method + recorded floor to the benchmark doc when first run. |
 
 Deferred design note: `StreamSummary` keeps its O(K) min-scan eviction (72 ns @
