@@ -802,6 +802,20 @@ target_link_libraries(priority_tier_test
 )
 gtest_discover_tests(priority_tier_test)
 
+# GPU-Seconds Accounting Unit Tests (Pure C++, no Seastar dependency)
+# Tests the capacity-weighted-uptime arithmetic behind backend_gpu_seconds_total.
+add_executable(gpu_seconds_accounting_test
+  tests/unit/gpu_seconds_accounting_test.cpp
+)
+target_include_directories(gpu_seconds_accounting_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(gpu_seconds_accounting_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(gpu_seconds_accounting_test)
+
 # Request Scheduler Unit Tests (No Seastar dependency, uses absl::flat_hash_map)
 add_executable(request_scheduler_test
   tests/unit/request_scheduler_test.cpp
