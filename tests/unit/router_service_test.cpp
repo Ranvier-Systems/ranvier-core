@@ -2059,6 +2059,29 @@ TEST_F(RouterServiceTest, GetBackendLoadReturnsZeroForUnknown) {
     EXPECT_EQ(get_backend_load(999), 0u);
 }
 
+// Observe-only GPU-count accessor backing the backend_gpu_count gauge.
+// Unlike get_backend_load (0 for unknown), this returns the 1.0 default so a
+// shard missing the backend can't drag down the gauge's min/max aggregation.
+TEST_F(RouterServiceTest, GetBackendGpuCountDefaultsToOneForUnknown) {
+    EXPECT_DOUBLE_EQ(get_backend_gpu_count(999), 1.0);
+}
+
+TEST_F(RouterServiceTest, GetBackendGpuCountDefaultsToOneForRegisteredUnset) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    EXPECT_DOUBLE_EQ(get_backend_gpu_count(1), 1.0);
+}
+
+TEST_F(RouterServiceTest, GetBackendGpuCountReflectsSetter) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+
+    RouterService::set_backend_gpu_count_for_testing(1, 8.0);   // tensor-parallel
+    RouterService::set_backend_gpu_count_for_testing(2, 0.5);   // MIG slice
+
+    EXPECT_DOUBLE_EQ(get_backend_gpu_count(1), 8.0);
+    EXPECT_DOUBLE_EQ(get_backend_gpu_count(2), 0.5);
+}
+
 TEST_F(RouterServiceTest, GetLeastLoadedBackend) {
     RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
     RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));

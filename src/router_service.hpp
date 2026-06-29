@@ -232,6 +232,12 @@ private:
 // Returns 0 if backend not found in shard state
 uint64_t get_backend_load(BackendId id);
 
+// Get the operator-declared GPU count for a backend (shard-local read).
+// Observe-only; backs the backend_gpu_count gauge. Returns the 1.0 default
+// (not 0) when the backend isn't registered, so a missing series never skews
+// the gauge's max/min cross-shard aggregation.
+double get_backend_gpu_count(BackendId id);
+
 // ============================================================================
 // Cost Budget Tracking Functions (shard-local, lock-free)
 // ============================================================================
