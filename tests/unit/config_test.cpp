@@ -2754,6 +2754,7 @@ backends:
     EXPECT_TRUE(e.api_key_env.empty());
     EXPECT_TRUE(e.gpu_tier.empty());            // unset: no tier label
     EXPECT_DOUBLE_EQ(e.cost_per_hour, 0.0);     // unset: no cost preference
+    EXPECT_DOUBLE_EQ(e.gpu_count, 1.0);         // default: one GPU per endpoint
 }
 
 TEST_F(ConfigTest, StaticBackendsParseHardwareCostFields) {
@@ -2778,6 +2779,26 @@ backends:
     EXPECT_DOUBLE_EQ(config.backends.entries[0].cost_per_hour, 4.5);
     EXPECT_EQ(config.backends.entries[1].gpu_tier, "a10g");
     EXPECT_DOUBLE_EQ(config.backends.entries[1].cost_per_hour, 1.2);
+}
+
+TEST_F(ConfigTest, StaticBackendsParseGpuCount) {
+    const std::string yaml = R"(
+backends:
+  - id: 7
+    host: 10.0.0.7
+    port: 8080
+    type: vllm
+    gpu_count: 8
+  - id: 8
+    host: 10.0.0.8
+    port: 8080
+    type: vllm
+    gpu_count: 0.5
+)";
+    auto config = RanvierConfig::load_from_string(yaml);
+    ASSERT_EQ(config.backends.entries.size(), 2u);
+    EXPECT_DOUBLE_EQ(config.backends.entries[0].gpu_count, 8.0);   // tensor-parallel
+    EXPECT_DOUBLE_EQ(config.backends.entries[1].gpu_count, 0.5);   // MIG slice
 }
 
 TEST_F(ConfigTest, StaticBackendsParsePoolRole) {
@@ -2961,6 +2982,46 @@ TEST_F(ConfigTest, ValidateAcceptsStaticBackendUnsetCostPerHour) {
     RanvierConfig config;
     StaticBackendConfig sb;
     sb.id = 1; sb.host = "10.0.0.1";  // cost_per_hour stays 0.0 (unset)
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendZeroGpuCount) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "10.0.0.1"; sb.gpu_count = 0.0;  // 0 is not a valid divisor
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("gpu_count"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendNegativeGpuCount) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "10.0.0.1"; sb.gpu_count = -2.0;
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("gpu_count"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendNonFiniteGpuCount) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "10.0.0.1";
+    sb.gpu_count = std::numeric_limits<double>::quiet_NaN();
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("gpu_count"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateAcceptsStaticBackendFractionalGpuCount) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "10.0.0.1"; sb.gpu_count = 0.25;  // MIG slice
     config.backends.entries.push_back(sb);
     auto error = RanvierConfig::validate(config);
     EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");

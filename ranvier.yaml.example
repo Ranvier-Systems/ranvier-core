@@ -764,6 +764,15 @@ attribution:
 #     preferred and never diverted from, so pricing only part of the
 #     fleet only re-routes among the priced backends.
 #
+# Optional observability field:
+#   `gpu_count` — how many GPUs this single IP:Port endpoint represents:
+#     1 (the default), N for a tensor-parallel replica, a fraction for a MIG
+#     slice (e.g. 0.5), or N for several co-located models. Observe-only — it
+#     never affects routing or any cost decision. Surfaced as the
+#     ranvier_backend_gpu_count gauge so dashboards can normalize per-backend
+#     load into capacity-relative views (requests per GPU, utilization per
+#     GPU). Must be finite and > 0.
+#
 # Optional native KV-event stream field:
 #   `kv_events_port` — port of this backend's vLLM KV-event publisher
 #     (--kv-events-config with a zmq publisher). 0/absent = no stream (the
@@ -805,6 +814,7 @@ attribution:
 #     model_family: llama3
 #     gpu_tier: h100
 #     cost_per_hour: 4.50
+#     gpu_count: 8          # tensor-parallel across 8 GPUs (observability only)
 #
 #   - id: 103
 #     host: api.openai.com

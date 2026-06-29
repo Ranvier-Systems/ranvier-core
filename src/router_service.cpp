@@ -114,6 +114,13 @@ struct BackendInfo {
     std::string gpu_tier;
     double      cost_per_hour = 0.0;
 
+    // Operator-declared GPU count for this endpoint (tensor-parallel size, MIG
+    // fraction, or co-located models). Observe-only: surfaced via the
+    // backend_gpu_count gauge so capacity-normalized views are computable; it
+    // never participates in routing or cost decisions. Written via
+    // set_backend_gpu_count_global; re-registration resets it to 1.0.
+    double      gpu_count = 1.0;
+
     // Disaggregated pool role (BACKLOG §20.1 P0.3). Routing-critical, so it
     // is part of registration proper — NOT a side-broadcast like the labels
     // above — and therefore survives re-registration with whatever the
@@ -942,6 +949,20 @@ uint64_t get_resident_routes(BackendId id) {
     const auto& by_backend = g_shard_state->tree->routes_by_backend();
     auto it = by_backend.find(id);
     return it == by_backend.end() ? 0 : static_cast<uint64_t>(it->second);
+}
+
+// Operator-declared GPU count for backend `id` on this shard (observe-only).
+// Shard-local, lock-free read; mirrors get_resident_routes. A per-backend
+// constant replicated to every shard, so the backend_gpu_count gauge aggregates
+// with max/min across shards, never sum. Returns the 1.0 default when the
+// backend isn't registered on this shard (matching BackendInfo's default), so
+// a missing series never skews a min/max aggregation.
+double get_backend_gpu_count(BackendId id) {
+    if (!g_shard_state) {
+        return 1.0;
+    }
+    auto it = g_shard_state->backends.find(id);
+    return it == g_shard_state->backends.end() ? 1.0 : it->second.gpu_count;
 }
 
 uint64_t get_backend_load(BackendId id) {
@@ -4498,6 +4519,30 @@ seastar::future<> RouterService::set_backend_hardware_cost_global(
         });
 }
 
+// Broadcast the operator-declared GPU count to every shard. Simpler than
+// set_backend_hardware_cost_global: a plain double carries no heap, so no
+// foreign_ptr / local-reallocation dance (Rule #14) is needed. Observe-only —
+// gpu_count never feeds routing or cost. No-op on shards where the backend
+// isn't registered; register_backend_global resets it to the 1.0 default, so
+// callers broadcast this after registration resolves.
+seastar::future<> RouterService::set_backend_gpu_count_global(
+    BackendId id, double gpu_count) {
+
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+        [id, gpu_count](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [id, gpu_count] {
+                if (!g_shard_state) return seastar::make_ready_future<>();
+                auto& state = shard_state();
+                auto it = state.backends.find(id);
+                if (it == state.backends.end()) {
+                    return seastar::make_ready_future<>();
+                }
+                it->second.gpu_count = gpu_count;
+                return seastar::make_ready_future<>();
+            });
+        });
+}
+
 RouterService::BackendTelemetryLabels
 RouterService::telemetry_labels(BackendId id) const {
     BackendTelemetryLabels out;
@@ -5398,6 +5443,13 @@ void RouterService::set_backend_hardware_cost_for_testing(BackendId id, std::str
     if (it == g_shard_state->backends.end()) return;
     it->second.gpu_tier = std::move(gpu_tier);
     it->second.cost_per_hour = cost_per_hour;
+}
+
+void RouterService::set_backend_gpu_count_for_testing(BackendId id, double gpu_count) {
+    if (!g_shard_state) return;
+    auto it = g_shard_state->backends.find(id);
+    if (it == g_shard_state->backends.end()) return;
+    it->second.gpu_count = gpu_count;
 }
 
 } // namespace ranvier
