@@ -232,6 +232,12 @@ private:
 // Returns 0 if backend not found in shard state
 uint64_t get_backend_load(BackendId id);
 
+// Get the operator-declared GPU count for a backend (shard-local read).
+// Observe-only; backs the backend_gpu_count gauge. Returns the 1.0 default
+// (not 0) when the backend isn't registered, so a missing series never skews
+// the gauge's max/min cross-shard aggregation.
+double get_backend_gpu_count(BackendId id);
+
 // ============================================================================
 // Cost Budget Tracking Functions (shard-local, lock-free)
 // ============================================================================
@@ -403,6 +409,15 @@ public:
     seastar::future<> set_backend_hardware_cost_global(BackendId id,
                                                        std::string gpu_tier,
                                                        double cost_per_hour);
+
+    // Operator-declared GPU count for a backend endpoint (tensor-parallel size,
+    // MIG fraction, or co-located models), broadcast to every shard. Observe-
+    // only: surfaced via the backend_gpu_count gauge so capacity-normalized
+    // views are computable; it never feeds routing or cost decisions. Defaults
+    // to 1.0; call after register_backend_global resolves (registration
+    // overwrites BackendInfo wholesale, resetting it to 1.0).
+    seastar::future<> set_backend_gpu_count_global(BackendId id,
+                                                   double gpu_count);
     // Telemetry bucket dimensions for a backend, resolved in one shard-local
     // lookup. `backend_type` is the engine class already on the backend (not an
     // operator-set label); returning it here lets the request site build the
@@ -811,6 +826,11 @@ public:
     // cost preference can be unit-tested without a running reactor.
     static void set_backend_hardware_cost_for_testing(BackendId id, std::string gpu_tier,
                                                       double cost_per_hour);
+
+    // Write the operator-declared GPU count directly into shard-local
+    // BackendInfo. Bypasses set_backend_gpu_count_global's broadcast so the
+    // backend_gpu_count gauge accessor can be unit-tested without a reactor.
+    static void set_backend_gpu_count_for_testing(BackendId id, double gpu_count);
 
     // Remove a backend from shard-local state (bypasses async cross-shard broadcast).
     static void unregister_backend_for_testing(BackendId id);

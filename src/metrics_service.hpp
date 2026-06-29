@@ -34,6 +34,10 @@ uint64_t get_backend_load(BackendId id);
 // Defined in router_service.cpp - reads the shard-local ART's per-backend tally.
 uint64_t get_resident_routes(BackendId id);
 
+// Forward declaration for the per-backend GPU-count gauge (observe-only).
+// Defined in router_service.cpp - reads operator-declared shard-local BackendInfo.
+double get_backend_gpu_count(BackendId id);
+
 // Thread-local metrics for the HTTP controller
 // Each shard has its own counters/histograms (shared-nothing model)
 class MetricsService {
@@ -1030,6 +1034,16 @@ private:
                 seastar::metrics::description("Routes resident in this node's ART pinned to this backend. Lower = colder = safer to drain."),
                 {{"backend_id", backend_id_str}},
                 [backend_id] { return static_cast<double>(get_resident_routes(backend_id)); }),
+
+            // Per-backend operator-declared GPU count (observe-only). Unlike the
+            // sum-aggregated counters above, this is a per-backend constant
+            // replicated identically across shards: aggregate it with max or min,
+            // never sum (summing multiplies it by the shard count). Lets a
+            // dashboard normalize per-backend load into requests/utilization per GPU.
+            seastar::metrics::make_gauge("backend_gpu_count",
+                seastar::metrics::description("Operator-declared number of GPUs this backend endpoint represents (tensor-parallel size, MIG fraction, or co-located models). Per-backend constant replicated across shards: aggregate with max or min, never sum. Enables capacity-normalized views such as requests per GPU."),
+                {{"backend_id", backend_id_str}},
+                [backend_id] { return get_backend_gpu_count(backend_id); }),
 
             // Per-backend vLLM metrics gauges (read from HealthService on shard 0)
             // Returns 0/default when HealthService is not set or backend has no vLLM data

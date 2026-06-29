@@ -723,6 +723,17 @@ seastar::future<> Application::register_static_backends() {
                               sb.id, sb.gpu_tier, sb.cost_per_hour);
             }
 
+            // Operator-declared GPU count rides its own side-broadcast (a plain
+            // double, no foreign_ptr). Observe-only — surfaced via the
+            // backend_gpu_count gauge, never routing. Skip the broadcast at the
+            // 1.0 default since registration already left BackendInfo there.
+            if (sb.gpu_count != 1.0) {
+                co_await _router->set_backend_gpu_count_global(sb.id, sb.gpu_count);
+                log_main.info("Static backend {}: gpu_count={:.4g} "
+                              "(observability only; enables per-GPU normalized views)",
+                              sb.id, sb.gpu_count);
+            }
+
 #ifdef RANVIER_WITH_KV_EVENTS
             if (_kv_subscriber && sb.kv_events_port > 0) {
                 // zmq_connect resolves hostnames itself, on the worker thread

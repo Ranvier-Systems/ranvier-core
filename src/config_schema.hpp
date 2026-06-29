@@ -626,6 +626,14 @@ struct StaticBackendConfig {
     std::string gpu_tier;
     double cost_per_hour = 0.0;   // 0.0 = unset (backend never priced-compared)
 
+    // Operator-declared number of GPUs this single IP:Port endpoint represents:
+    // 1 GPU, N GPUs (tensor-parallel), a fractional MIG slice, or several
+    // co-located models. Observe-only — it never feeds routing or any
+    // cost-based decision; it exists so capacity-normalized views ("requests
+    // per GPU", "utilization per GPU") are computable. Must be finite and > 0;
+    // 1.0 is the default (one GPU per endpoint).
+    double gpu_count = 1.0;
+
     // Disaggregated pool role: "unified" (default) | "prefill" | "decode".
     // DECODE pools are affinity-only routing targets — they never receive
     // fresh-miss or diverted traffic (see PoolRole in types.hpp). Validated

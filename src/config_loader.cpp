@@ -1873,6 +1873,9 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 if (entry["cost_per_hour"]) {
                     sb.cost_per_hour = entry["cost_per_hour"].as<double>();
                 }
+                if (entry["gpu_count"]) {
+                    sb.gpu_count = entry["gpu_count"].as<double>();
+                }
                 if (entry["pool_role"]) {
                     sb.pool_role = entry["pool_role"].as<std::string>();
                 }
@@ -2260,6 +2263,13 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
             if (!std::isfinite(sb.cost_per_hour) || !(sb.cost_per_hour >= 0.0)) {
                 return "backends entry id=" + std::to_string(sb.id)
                     + " has invalid cost_per_hour (must be a finite value >= 0; 0 = unset)";
+            }
+            // !(x > 0.0) rejects 0, negatives, and NaN; isfinite rejects +inf.
+            // gpu_count is a divisor for capacity-normalized views, so it must
+            // be strictly positive (unlike cost_per_hour, where 0 = unset).
+            if (!std::isfinite(sb.gpu_count) || !(sb.gpu_count > 0.0)) {
+                return "backends entry id=" + std::to_string(sb.id)
+                    + " has invalid gpu_count (must be a finite value > 0; default 1.0)";
             }
             if (sb.kv_events_replay_port != 0 && sb.kv_events_port == 0) {
                 return "backends entry id=" + std::to_string(sb.id)
