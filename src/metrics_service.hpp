@@ -38,6 +38,12 @@ uint64_t get_resident_routes(BackendId id);
 // Defined in router_service.cpp - reads operator-declared shard-local BackendInfo.
 double get_backend_gpu_count(BackendId id);
 
+// Forward declaration for the per-backend GPU-seconds counter (observe-only).
+// Defined in router_service.cpp - capacity-weighted uptime (gpu_count integrated
+// over live time), finalized read-only at scrape so repeated scrapes don't
+// double-count.
+double get_backend_gpu_seconds(BackendId id);
+
 // Thread-local metrics for the HTTP controller
 // Each shard has its own counters/histograms (shared-nothing model)
 class MetricsService {
@@ -1044,6 +1050,18 @@ private:
                 seastar::metrics::description("Operator-declared number of GPUs this backend endpoint represents (tensor-parallel size, MIG fraction, or co-located models). Per-backend constant replicated across shards: aggregate with max or min, never sum. Enables capacity-normalized views such as requests per GPU."),
                 {{"backend_id", backend_id_str}},
                 [backend_id] { return get_backend_gpu_count(backend_id); }),
+
+            // Per-backend capacity-weighted uptime (observe-only): gpu_count
+            // integrated over the time the backend has been live, in GPU-seconds.
+            // Monotonic counter; resets to 0 on process restart or backend
+            // re-registration (expected — Prometheus rate() handles resets). Like
+            // backend_gpu_count it is replicated identically across shards, so
+            // aggregate with max or min, never sum. Pairs with a load/utilization
+            // series to reason about capacity contributed over a window.
+            seastar::metrics::make_counter("backend_gpu_seconds_total",
+                [backend_id] { return get_backend_gpu_seconds(backend_id); },
+                seastar::metrics::description("Cumulative GPU-seconds contributed by this backend (gpu_count integrated over live time). Per-backend, replicated across shards: aggregate with max or min, never sum. Resets on process restart or backend re-registration."),
+                {{"backend_id", backend_id_str}}),
 
             // Per-backend vLLM metrics gauges (read from HealthService on shard 0)
             // Returns 0/default when HealthService is not set or backend has no vLLM data

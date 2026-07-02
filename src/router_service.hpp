@@ -238,6 +238,14 @@ uint64_t get_backend_load(BackendId id);
 // the gauge's max/min cross-shard aggregation.
 double get_backend_gpu_count(BackendId id);
 
+// Capacity-weighted uptime for a backend (shard-local, lock-free read).
+// Observe-only; backs the backend_gpu_seconds_total counter. Returns the
+// accumulated GPU-seconds plus the in-progress live segment WITHOUT mutating
+// stored state (safe to call on every scrape — no double counting). 0 for an
+// unregistered backend. Replicated across shards like gpu_count, so aggregate
+// with max/min, never sum.
+double get_backend_gpu_seconds(BackendId id);
+
 // ============================================================================
 // Cost Budget Tracking Functions (shard-local, lock-free)
 // ============================================================================

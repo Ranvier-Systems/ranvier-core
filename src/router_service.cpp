@@ -1,5 +1,6 @@
 #include "router_service.hpp"
 #include "gossip_service.hpp"
+#include "gpu_seconds_accounting.hpp"
 #include "logging.hpp"
 #include "metrics_service.hpp"
 #include "node_slab.hpp"
@@ -120,6 +121,19 @@ struct BackendInfo {
     // never participates in routing or cost decisions. Written via
     // set_backend_gpu_count_global; re-registration resets it to 1.0.
     double      gpu_count = 1.0;
+
+    // Capacity-weighted uptime accounting (observe-only; backs the
+    // backend_gpu_seconds_total counter). gpu_count integrated over the time
+    // this backend has been live. `accumulated_gpu_seconds` holds all finalized
+    // segments; the in-progress segment (gpu_count x time since
+    // `gpu_seconds_segment_start`) is added read-only at scrape time and folded
+    // into the accumulator at each liveness / gpu_count transition. steady_clock
+    // only — durations must never come from a wall clock. Reset wholesale on
+    // re-registration, exactly like gpu_count above (fresh backend = fresh
+    // accumulation); the start is stamped by register_backend_global.
+    double      accumulated_gpu_seconds = 0.0;
+    std::chrono::steady_clock::time_point gpu_seconds_segment_start{};
+    bool        gpu_seconds_live = false;
 
     // Disaggregated pool role (BACKLOG §20.1 P0.3). Routing-critical, so it
     // is part of registration proper — NOT a side-broadcast like the labels
@@ -963,6 +977,34 @@ double get_backend_gpu_count(BackendId id) {
     }
     auto it = g_shard_state->backends.find(id);
     return it == g_shard_state->backends.end() ? 1.0 : it->second.gpu_count;
+}
+
+// Capacity-weighted uptime for backend `id` on this shard (observe-only):
+// gpu_count integrated over live time, in GPU-seconds. Shard-local, lock-free
+// read backing the backend_gpu_seconds_total counter. READ-ONLY: it adds the
+// in-progress segment without folding it into the stored accumulator or moving
+// the segment start, so repeated scrapes never double-count. Like the gpu_count
+// gauge this is replicated across shards (every shard sees the same broadcast
+// transitions), so aggregate with max/min across shards, never sum. Returns 0
+// for an unregistered backend (the series simply disappears on deregistration).
+double get_backend_gpu_seconds(BackendId id) {
+    if (!g_shard_state) {
+        return 0.0;
+    }
+    auto it = g_shard_state->backends.find(id);
+    if (it == g_shard_state->backends.end()) {
+        return 0.0;
+    }
+    const auto& info = it->second;
+    double in_progress_seconds = 0.0;
+    if (info.gpu_seconds_live) {
+        in_progress_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - info.gpu_seconds_segment_start).count();
+    }
+    return gpu_seconds_with_in_progress(info.accumulated_gpu_seconds,
+                                        info.gpu_seconds_live,
+                                        info.gpu_count,
+                                        in_progress_seconds);
 }
 
 uint64_t get_backend_load(BackendId id) {
@@ -4330,16 +4372,22 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
                             : "eligible for fresh-miss placement");
     }
 
+    // One timestamp for the whole broadcast so every shard starts the
+    // capacity-weighted-uptime segment at the same instant (steady_clock —
+    // never a wall clock for durations). time_point is trivially copyable, so
+    // it rides the cross-shard captures by value with no foreign_ptr.
+    auto now = std::chrono::steady_clock::now();
+
     return seastar::do_with(addr, weight, priority, supports_token_ids, compression_ratio, type,
         pool_role,
-        [id](seastar::socket_address& shared_addr, uint32_t& shared_weight,
+        [id, now](seastar::socket_address& shared_addr, uint32_t& shared_weight,
              uint32_t& shared_priority, bool& shared_supports_token_ids,
              double& shared_compression_ratio, BackendType& shared_type,
              PoolRole& shared_pool_role) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
-            [id, &shared_addr, &shared_weight, &shared_priority, &shared_supports_token_ids,
+            [id, now, &shared_addr, &shared_weight, &shared_priority, &shared_supports_token_ids,
              &shared_compression_ratio, &shared_type, &shared_pool_role] (unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [id, addr = shared_addr,
+            return seastar::smp::submit_to(shard_id, [id, now, addr = shared_addr,
                                                        weight = shared_weight,
                                                        priority = shared_priority,
                                                        supports_token_ids = shared_supports_token_ids,
@@ -4350,6 +4398,16 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
                 auto& state = shard_state();
                 state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids,
                                                   compression_ratio, type, pool_role};
+
+                // Begin a fresh capacity-weighted-uptime segment. Wholesale
+                // BackendInfo replacement already zeroed the accumulator (a
+                // re-registered backend accounts from scratch, matching how
+                // gpu_count resets); a backend still quarantined in
+                // dead_backends starts not-live and only begins accruing when
+                // set_backend_status_global marks it up.
+                auto& info = state.backends[id];
+                info.gpu_seconds_segment_start = now;
+                info.gpu_seconds_live = !state.dead_backends.contains(id);
 
                 // Update vector (check for duplicates)
                 bool exists = false;
@@ -4528,16 +4586,29 @@ seastar::future<> RouterService::set_backend_hardware_cost_global(
 seastar::future<> RouterService::set_backend_gpu_count_global(
     BackendId id, double gpu_count) {
 
+    // Shared transition instant: the in-progress capacity-weighted-uptime
+    // segment is finalized at the OLD gpu_count up to `now`, then the new count
+    // takes effect — so a mid-life gpu_count change splits cleanly into two
+    // segments. steady_clock; time_point rides the captures by value.
+    auto now = std::chrono::steady_clock::now();
+
     return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
-        [id, gpu_count](unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [id, gpu_count] {
+        [id, gpu_count, now](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [id, gpu_count, now] {
                 if (!g_shard_state) return seastar::make_ready_future<>();
                 auto& state = shard_state();
                 auto it = state.backends.find(id);
                 if (it == state.backends.end()) {
                     return seastar::make_ready_future<>();
                 }
-                it->second.gpu_count = gpu_count;
+                auto& info = it->second;
+                double elapsed = std::chrono::duration<double>(
+                    now - info.gpu_seconds_segment_start).count();
+                info.accumulated_gpu_seconds = gpu_seconds_with_in_progress(
+                    info.accumulated_gpu_seconds, info.gpu_seconds_live,
+                    info.gpu_count /* old count for the segment just ending */, elapsed);
+                info.gpu_seconds_segment_start = now;
+                info.gpu_count = gpu_count;
                 return seastar::make_ready_future<>();
             });
         });
@@ -4672,15 +4743,36 @@ seastar::future<> RouterService::set_backend_status_global(BackendId id, bool is
         log_health.warn("Backend {} is DOWN (Quarantined)", id);
     }
 
+    // One transition instant shared by every shard (steady_clock).
+    auto now = std::chrono::steady_clock::now();
+
     // Broadcast to all cores
-    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id, is_alive] (unsigned shard_id) {
-        return seastar::smp::submit_to(shard_id, [id, is_alive] {
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id, is_alive, now] (unsigned shard_id) {
+        return seastar::smp::submit_to(shard_id, [id, is_alive, now] {
             if (!g_shard_state) return seastar::make_ready_future<>();
             auto& state = shard_state();
             if (is_alive) {
                 state.dead_backends.erase(id);
             } else {
                 state.dead_backends.insert(id);
+            }
+            // Capacity-weighted-uptime transition: going down finalizes the
+            // in-progress segment into the accumulator; coming up opens a new
+            // one. No-op if the backend isn't registered on this shard.
+            auto it = state.backends.find(id);
+            if (it != state.backends.end()) {
+                auto& info = it->second;
+                if (!is_alive) {
+                    double elapsed = std::chrono::duration<double>(
+                        now - info.gpu_seconds_segment_start).count();
+                    info.accumulated_gpu_seconds = gpu_seconds_with_in_progress(
+                        info.accumulated_gpu_seconds, info.gpu_seconds_live,
+                        info.gpu_count, elapsed);
+                    info.gpu_seconds_live = false;
+                } else {
+                    info.gpu_seconds_live = true;
+                }
+                info.gpu_seconds_segment_start = now;
             }
             return seastar::make_ready_future<>();
         });
@@ -5358,6 +5450,12 @@ void RouterService::register_backend_for_testing(BackendId id, seastar::socket_a
     }
     state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids,
                                       compression_ratio, type, pool_role};
+
+    // Mirror register_backend_global()'s capacity-weighted-uptime stamp so the
+    // gpu_seconds accounting behaves identically under test.
+    auto& info = state.backends[id];
+    info.gpu_seconds_segment_start = std::chrono::steady_clock::now();
+    info.gpu_seconds_live = !state.dead_backends.contains(id);
 
     bool exists = false;
     for (auto existing : state.backend_ids) {

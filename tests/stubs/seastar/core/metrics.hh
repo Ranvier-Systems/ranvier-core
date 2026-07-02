@@ -53,5 +53,12 @@ template<typename... Args>
 inline metric_definition make_gauge(const char*, description,
     std::initializer_list<label_instance>, Args&&...) { return {}; }
 
+// Explicit overload for a labeled counter in canonical Seastar order
+// (name, value/function, description, labels). The trailing braced label list
+// cannot be deduced by the variadic make_counter above.
+template<typename T>
+inline metric_definition make_counter(const char*, T&&, description,
+    std::initializer_list<label_instance>) { return {}; }
+
 } // namespace metrics
 } // namespace seastar
