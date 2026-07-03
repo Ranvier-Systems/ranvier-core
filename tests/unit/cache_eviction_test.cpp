@@ -10,10 +10,14 @@
 // parse_utils_test.cpp alongside other parse utility tests.
 
 #include "parse_utils.hpp"
+#include "radix_tree.hpp"
+#include "node_slab.hpp"
 #include "router_service.hpp"
 
 #include <gtest/gtest.h>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -296,6 +300,171 @@ TEST_F(CacheEvictionTest, LoadThenStaleEvictRejected) {
 
     auto stats = RouterService::get_cache_event_stats();
     EXPECT_GE(stats.evictions_stale, 1u);
+}
+
+// =============================================================================
+// Per-Origin LRU Eviction Tests (RadixTree directly)
+// =============================================================================
+//
+// evict_lowest_trust() / evict_oldest() are O(1) pops over per-origin LRU
+// lists (invariant T8). These tests pin the victim-selection contract —
+// oldest REMOTE, else oldest PUSH, else oldest of any origin — and that
+// origin-changing overwrites relink the node into the correct list.
+
+namespace {
+
+// Ensure distinct last_accessed stamps: steady_clock must tick between
+// inserts so evict_oldest()'s cross-list tail comparison is deterministic.
+void advance_steady_clock() {
+    auto t0 = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() <= t0) {
+    }
+}
+
+}  // namespace
+
+class PerOriginLruTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        prev_slab_ = get_node_slab();
+        slab_ = std::make_unique<NodeSlab>();
+        set_node_slab(slab_.get());
+        tree_ = std::make_unique<RadixTree>(1);  // alignment 1: short keys OK
+    }
+
+    void TearDown() override {
+        tree_.reset();  // nodes must return to slab_ before it is destroyed
+        set_node_slab(prev_slab_);
+        slab_.reset();
+    }
+
+    std::vector<TokenId> tokens(std::initializer_list<TokenId> list) {
+        return std::vector<TokenId>(list);
+    }
+
+    void insert_aged(std::initializer_list<TokenId> key, BackendId backend,
+                     RouteOrigin origin) {
+        advance_steady_clock();
+        tree_->insert(tokens(key), backend, origin);
+        tree_->validate_lru_lists();
+    }
+
+    NodeSlab* prev_slab_ = nullptr;
+    std::unique_ptr<NodeSlab> slab_;
+    std::unique_ptr<RadixTree> tree_;
+};
+
+TEST_F(PerOriginLruTest, EvictLowestTrustFollowsTrustLadder) {
+    insert_aged({1, 1, 1}, 1, RouteOrigin::LOCAL);   // oldest overall
+    insert_aged({2, 2, 2}, 2, RouteOrigin::REMOTE);  // oldest REMOTE
+    insert_aged({3, 3, 3}, 3, RouteOrigin::PUSH);    // oldest PUSH
+    insert_aged({4, 4, 4}, 4, RouteOrigin::REMOTE);
+    insert_aged({5, 5, 5}, 5, RouteOrigin::PUSH);
+    insert_aged({6, 6, 6}, 6, RouteOrigin::LOCAL);
+
+    // Oldest REMOTE goes first even though older LOCAL/PUSH routes exist.
+    ASSERT_TRUE(tree_->evict_lowest_trust());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({2, 2, 2})).has_value());
+
+    ASSERT_TRUE(tree_->evict_lowest_trust());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({4, 4, 4})).has_value());
+
+    // REMOTE exhausted -> oldest PUSH.
+    ASSERT_TRUE(tree_->evict_lowest_trust());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({3, 3, 3})).has_value());
+
+    ASSERT_TRUE(tree_->evict_lowest_trust());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({5, 5, 5})).has_value());
+
+    // PUSH exhausted -> fall back to the oldest of any origin.
+    ASSERT_TRUE(tree_->evict_lowest_trust());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({1, 1, 1})).has_value());
+    EXPECT_TRUE(tree_->lookup(tokens({6, 6, 6})).has_value());
+
+    ASSERT_TRUE(tree_->evict_lowest_trust());
+    EXPECT_FALSE(tree_->evict_lowest_trust());
+    EXPECT_EQ(tree_->route_count(), 0u);
+    tree_->validate_lru_lists();
+}
+
+TEST_F(PerOriginLruTest, EvictOldestIgnoresOrigin) {
+    insert_aged({1, 1, 1}, 1, RouteOrigin::REMOTE);  // oldest overall
+    insert_aged({2, 2, 2}, 2, RouteOrigin::LOCAL);
+    insert_aged({3, 3, 3}, 3, RouteOrigin::PUSH);
+
+    ASSERT_TRUE(tree_->evict_oldest());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({1, 1, 1})).has_value());
+
+    ASSERT_TRUE(tree_->evict_oldest());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({2, 2, 2})).has_value());
+
+    ASSERT_TRUE(tree_->evict_oldest());
+    EXPECT_FALSE(tree_->evict_oldest());
+    EXPECT_EQ(tree_->route_count(), 0u);
+    tree_->validate_lru_lists();
+}
+
+TEST_F(PerOriginLruTest, OverwriteChangingOriginRelinksNode) {
+    insert_aged({1, 1, 1}, 1, RouteOrigin::LOCAL);
+    insert_aged({9, 9, 9}, 9, RouteOrigin::LOCAL);
+
+    // Re-insert the same key as REMOTE: the node must leave the LOCAL list
+    // and join the REMOTE list (unlink happens before origin reassignment).
+    advance_steady_clock();
+    tree_->insert(tokens({1, 1, 1}), 2, RouteOrigin::REMOTE);
+    tree_->validate_lru_lists();
+    EXPECT_EQ(tree_->route_count(), 2u);
+
+    // evict_lowest_trust must now find it in the REMOTE list.
+    ASSERT_TRUE(tree_->evict_lowest_trust());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({1, 1, 1})).has_value());
+    EXPECT_TRUE(tree_->lookup(tokens({9, 9, 9})).has_value());
+}
+
+TEST_F(PerOriginLruTest, TrustedOverwriteRelinksNode) {
+    insert_aged({1, 1, 1}, 1, RouteOrigin::REMOTE);
+    insert_aged({2, 2, 2}, 2, RouteOrigin::REMOTE);
+
+    // PUSH over REMOTE with a different backend takes the OVERWROTE path:
+    // the node must move from the REMOTE list to the PUSH list.
+    advance_steady_clock();
+    auto result = tree_->insert_if_trusted(tokens({1, 1, 1}), 7, RouteOrigin::PUSH);
+    EXPECT_EQ(result, TrustInsertResult::OVERWROTE);
+    tree_->validate_lru_lists();
+
+    // The remaining REMOTE route is evicted first, the PUSH route second.
+    ASSERT_TRUE(tree_->evict_lowest_trust());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({2, 2, 2})).has_value());
+
+    ASSERT_TRUE(tree_->evict_lowest_trust());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({1, 1, 1})).has_value());
+}
+
+TEST_F(PerOriginLruTest, SplitAndGrowthPreserveListMembership) {
+    // Prefix splits relocate leaf nodes and node growth replaces them;
+    // both must splice the replacement into the correct origin's list.
+    for (TokenId t = 0; t < 20; t++) {
+        auto origin = static_cast<RouteOrigin>(t % 3);
+        auto backend = static_cast<BackendId>(t + 1);
+        insert_aged({t, 100, 100}, backend, origin);  // leaf...
+        insert_aged({t, 100, 200}, backend, origin);  // ...split by sibling
+    }
+    EXPECT_EQ(tree_->route_count(), 40u);
+
+    while (tree_->evict_lowest_trust()) {
+        tree_->validate_lru_lists();
+    }
+    EXPECT_EQ(tree_->route_count(), 0u);
 }
 
 // =============================================================================

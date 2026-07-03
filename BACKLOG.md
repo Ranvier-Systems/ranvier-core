@@ -1036,7 +1036,8 @@ catalog it seeded is `.dev-context/invariants.md`).
   _Completed:_ 2026-07-03 — `ttl_cleanup_on_shard` phase 3 rebuilds the index from live routes each TTL cycle (native-fresh entries preserved; counters recomputed); `router_prefix_hash_index_size` gauge added. Pinned by `tests/unit/prefix_hash_index_lifecycle_test.cpp`.
 - [x] [HIGH] Fix: learn-path index inserts must hash at the effective boundary (`tokens.size()`), not `min(len, prefix_token_length)` — boundary-learned entries are keyed at the wrong depth (I-2)
   _Completed:_ 2026-07-03 — both `apply_*_batch` paths hash at `route.tokens.size()` (pre-truncated to the effective boundary). Pinned by the same test file.
-- [ ] [MEDIUM] Fix: O(1) per-origin LRU tails for `evict_lowest_trust` — remove the O(n) LRU scan per insert at capacity (reactor-stall risk on remote-batch apply) (I-3)
+- [x] [MEDIUM] Fix: O(1) per-origin LRU tails for `evict_lowest_trust` — remove the O(n) LRU scan per insert at capacity (reactor-stall risk on remote-batch apply) (I-3)
+  _Completed:_ 2026-07-03 — `RadixTree` now keeps one intrusive LRU list per `RouteOrigin` (invariant T8); `evict_lowest_trust`/`evict_oldest` are O(1) tail pops with identical victim selection. Debug-only `validate_lru_lists()` asserts list integrity. Pinned by `PerOriginLruTest` in `tests/unit/cache_eviction_test.cpp` and eviction ops + per-op validation in `tests/fuzz/radix_tree_fuzz.cpp`.
 - [ ] [MEDIUM] Fix: `run_ttl_cleanup` ships a shard-0-allocated `flat_hash_map` cross-shard without foreign_ptr (Rule #14; latent until compression_ratio > 1.0 is configured) (I-4)
 - [ ] [MEDIUM] Decide: gossip REMOTE routes overwrite LOCAL routes via plain `insert()` — enforce the documented trust ladder with `insert_if_trusted` or document latest-wins (I-5)
 - [ ] [MEDIUM] Fix: fail-open mode only activates on shard 0 — broadcast the flag to per-shard state (I-6)

@@ -22,10 +22,11 @@ Seeded from the 2026-07-03 invariant audit (`invariant-audit-2026-07-03.md`).
 - **T2** ◻ `sum(routes_by_backend_) == route_count_` while under `kMaxTrackedBackends`.
   `note_route_added/removed` must be called at every leaf add/remove/overwrite-to-
   different-backend, before `leaf_value` is reassigned.
-- **T3** ◻ The intrusive LRU list contains exactly the leaf nodes, ordered by recency.
-  Every clear-leaf path must `lru_remove` first; node grow/shrink/split must splice the
-  replacement node into the list (`transfer_node_metadata`, inline splices in
-  `split_node`/`split_long_prefix`).
+- **T3** ◻ The intrusive LRU lists together contain exactly the leaf nodes, each list
+  ordered by recency. Every clear-leaf path must `lru_remove` first; node
+  grow/shrink/split must splice the replacement node into the source node's list
+  (`transfer_node_metadata`, inline splices in `split_node`/`split_long_prefix`).
+  Which list a leaf belongs in is T8's contract.
 - **T4** ◻ Node48 `index[]` ↔ `keys`/`children` parallel-vector consistency: `index[k]`
   is either `EMPTY_MARKER` or the slot of key `k`. `remove_child` (Node48 branch) must
   reindex after erase; the generic `remove_child_keyed` must never be applied to Node48.
@@ -38,6 +39,17 @@ Seeded from the 2026-07-03 invariant audit (`invariant-audit-2026-07-03.md`).
   Enforced by `insert_if_trusted` (PUSH materialization) and `evict_lowest_trust`, but
   **plain `insert()` bypasses it** — the gossip REMOTE apply path overwrites LOCAL
   routes (finding I-5, invariant-audit-2026-07-03).
+- **T8** ✅ Per-origin LRU membership/ordering: each leaf is linked in exactly the
+  intrusive list matching its `origin` (`lru_head_`/`lru_tail_` arrays indexed by
+  origin), each list is ordered by recency, and list lengths sum to `route_count_`.
+  This is what makes `evict_lowest_trust`/`evict_oldest` O(1) tail pops (Rule #17 at
+  the synchronous batch-apply call sites). Because list selection derives from
+  `node->origin`, any path that changes a *linked* node's origin must `lru_remove`
+  BEFORE reassigning `origin`, then `lru_push_front` (the overwrite branch of
+  `insert_recursive` does exactly this). Asserted by `validate_lru_lists()` in debug
+  builds; verified by the `PerOriginLruTest` cases in
+  `tests/unit/cache_eviction_test.cpp` and per-op validation with eviction ops in
+  `tests/fuzz/radix_tree_fuzz.cpp` (fixed 2026-07-03, finding I-3).
 
 ## Router service (`src/router_service.cpp`)
 

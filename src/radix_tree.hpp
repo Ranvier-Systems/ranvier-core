@@ -656,8 +656,13 @@ public:
     //     else oldest PUSH, else oldest of any origin — making the RouteOrigin
     //     eviction-precedence comment (REMOTE > PUSH > LOCAL) literally true.
     //
+    // Rule #17: both are O(1). They run once per insert inside synchronous
+    // per-shard batch application while at capacity, so a scan here would be
+    // a recurring reactor stall. The per-origin LRU lists exist to make the
+    // trust-ladder pick a pop, not a search.
+    //
     // Eviction strategy:
-    //   1. Find leaf with oldest last_accessed timestamp
+    //   1. Pick a victim from the per-origin list tails (O(1))
     //   2. Clear leaf_value (tombstone the route)
     //   3. Decrement route_count_
     //   4. compact() later reclaims empty nodes and returns memory to slab
@@ -666,30 +671,65 @@ public:
     //   while (tree->route_count() >= max_routes) tree->evict_oldest();
     //
     bool evict_oldest() {
-        if (!lru_tail_) return false;
-        Node* oldest = lru_tail_;
-        lru_remove(oldest);
-        note_route_removed(oldest->leaf_value);  // BACKLOG §21 P1
-        oldest->leaf_value = std::nullopt;
-        if (route_count_ > 0) route_count_--;
+        // Globally oldest leaf = oldest of the (up to 3) per-origin list
+        // tails. Iterated lowest-trust-first with a strict comparison so a
+        // last_accessed tie evicts the lower-trust route.
+        Node* oldest = nullptr;
+        for (size_t i = kNumOrigins; i-- > 0;) {
+            Node* tail = lru_tail_[i];
+            if (tail && (!oldest || tail->last_accessed < oldest->last_accessed)) {
+                oldest = tail;
+            }
+        }
+        if (!oldest) return false;
+        evict_leaf(oldest);
         return true;
     }
 
     bool evict_lowest_trust() {
-        // Scan from tail (oldest) for REMOTE, then PUSH, then take the oldest
-        // of any origin. Two passes over the LRU list; capacity-hit path only.
+        // Trust ladder: oldest REMOTE, else oldest PUSH, else oldest of any
+        // origin — each candidate is a per-origin list tail, so O(1).
         for (RouteOrigin target : {RouteOrigin::REMOTE, RouteOrigin::PUSH}) {
-            for (Node* n = lru_tail_; n != nullptr; n = n->lru_prev) {
-                if (n->origin == target) {
-                    lru_remove(n);
-                    note_route_removed(n->leaf_value);  // BACKLOG §21 P1
-                    n->leaf_value = std::nullopt;
-                    if (route_count_ > 0) route_count_--;
-                    return true;
-                }
+            Node* victim = lru_tail_[origin_index(target)];
+            if (victim) {
+                evict_leaf(victim);
+                return true;
             }
         }
         return evict_oldest();
+    }
+
+    // Debug-only: validate the per-origin LRU lists against the tree state
+    // (invariant T8). Every linked node's origin matches its list, links are
+    // doubly-consistent, each list is ordered by recency, and list lengths
+    // sum to route_count_ — which, with T1, means each leaf is linked in
+    // exactly one list. Catches splice bugs from node grow/shrink/split and
+    // origin-changing overwrites.
+    void validate_lru_lists() const {
+#ifndef NDEBUG
+        size_t linked = 0;
+        for (size_t i = 0; i < kNumOrigins; i++) {
+            const Node* prev = nullptr;
+            for (const Node* n = lru_head_[i]; n != nullptr; n = n->lru_next) {
+                assert(n->leaf_value.has_value() &&
+                       "radix_tree: LRU list contains a non-leaf node");
+                assert(origin_index(n->origin) == i &&
+                       "radix_tree: node linked in the wrong origin's LRU list");
+                assert(n->lru_prev == prev &&
+                       "radix_tree: LRU back-pointer mismatch");
+                assert((!prev || prev->last_accessed >= n->last_accessed) &&
+                       "radix_tree: LRU list not ordered by recency");
+                prev = n;
+                linked++;
+                assert(linked <= route_count_ &&
+                       "radix_tree: LRU lists exceed route_count (cycle or double-link)");
+            }
+            assert(lru_tail_[i] == prev &&
+                   "radix_tree: LRU tail does not match last list node");
+        }
+        assert(linked == route_count_ &&
+               "radix_tree: LRU list lengths do not sum to route_count");
+#endif
     }
 
     size_t remove_routes_by_backend(BackendId backend, RouteOrigin origin) {
@@ -760,10 +800,18 @@ private:
     // metrics_service's std::unordered_map<BackendId, ...> per-backend map.
     std::unordered_map<BackendId, size_t> routes_by_backend_;
 
-    // Intrusive LRU doubly-linked list of leaf nodes.
-    // lru_head_ = most recently accessed, lru_tail_ = oldest (eviction target).
-    Node* lru_head_ = nullptr;
-    Node* lru_tail_ = nullptr;
+    // Intrusive LRU doubly-linked lists of leaf nodes, one per RouteOrigin
+    // (invariant T8: a leaf is linked in exactly the list matching its
+    // origin, ordered by recency). Indexed by origin_index(); the enum's
+    // numeric order is the trust order, so evict_lowest_trust() is a tail
+    // pop instead of a list scan (Rule #17: O(1) eviction at capacity).
+    // lru_head_[i] = most recently accessed, lru_tail_[i] = oldest.
+    static constexpr size_t kNumOrigins = 3;
+    static constexpr size_t origin_index(RouteOrigin origin) {
+        return static_cast<size_t>(origin);
+    }
+    std::array<Node*, kNumOrigins> lru_head_{};
+    std::array<Node*, kNumOrigins> lru_tail_{};
 
     // -------------------------------------------------------------------------
     // Slab Allocator Access
@@ -796,49 +844,67 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    // Intrusive LRU List Operations
+    // Intrusive LRU List Operations (per-origin)
     // -------------------------------------------------------------------------
     //
     // O(1) LRU maintenance for leaf nodes.  Only nodes with leaf_value are
-    // linked.  The list is ordered by access time: head = most recent,
+    // linked.  Each list is ordered by access time: head = most recent,
     // tail = oldest (eviction candidate).
     //
+    // Every helper derives the list from node->origin. ORDERING CONTRACT:
+    // any path that changes a LINKED node's origin must lru_remove() first
+    // (while the old origin is still set), then assign the new origin, then
+    // lru_push_front() — otherwise the unlink edits the wrong list's
+    // head/tail and both lists corrupt silently.
+    //
 
-    // Unlink a node from the LRU list (safe to call on unlinked nodes).
+    // Unlink a node from its origin's LRU list (safe to call on unlinked nodes).
     void lru_remove(Node* node) {
         if (!node) return;
+        Node*& head = lru_head_[origin_index(node->origin)];
+        Node*& tail = lru_tail_[origin_index(node->origin)];
         if (node->lru_prev) {
             node->lru_prev->lru_next = node->lru_next;
-        } else if (lru_head_ == node) {
-            lru_head_ = node->lru_next;
+        } else if (head == node) {
+            head = node->lru_next;
         }
         if (node->lru_next) {
             node->lru_next->lru_prev = node->lru_prev;
-        } else if (lru_tail_ == node) {
-            lru_tail_ = node->lru_prev;
+        } else if (tail == node) {
+            tail = node->lru_prev;
         }
         node->lru_prev = nullptr;
         node->lru_next = nullptr;
     }
 
-    // Insert a node at the head of the LRU list (most recently accessed).
+    // Insert a node at the head of its origin's LRU list (most recently accessed).
     void lru_push_front(Node* node) {
+        Node*& head = lru_head_[origin_index(node->origin)];
+        Node*& tail = lru_tail_[origin_index(node->origin)];
         node->lru_prev = nullptr;
-        node->lru_next = lru_head_;
-        if (lru_head_) {
-            lru_head_->lru_prev = node;
+        node->lru_next = head;
+        if (head) {
+            head->lru_prev = node;
         }
-        lru_head_ = node;
-        if (!lru_tail_) {
-            lru_tail_ = node;
+        head = node;
+        if (!tail) {
+            tail = node;
         }
     }
 
-    // Move an existing node to the head (touch on access).
+    // Move an existing node to the head of its origin's list (touch on access).
     void lru_touch(Node* node) {
-        if (!node || node == lru_head_) return;
+        if (!node || node == lru_head_[origin_index(node->origin)]) return;
         lru_remove(node);
         lru_push_front(node);
+    }
+
+    // Shared eviction tail: unlink, tombstone, and account for one leaf.
+    void evict_leaf(Node* victim) {
+        lru_remove(victim);
+        note_route_removed(victim->leaf_value);  // BACKLOG §21 P1
+        victim->leaf_value = std::nullopt;
+        if (route_count_ > 0) route_count_--;
     }
 
     // -------------------------------------------------------------------------
@@ -1064,20 +1130,24 @@ private:
 
     // Transfer metadata and LRU list position from src to dest.
     // src's leaf_value and LRU pointers are cleared after transfer.
+    // origin is copied BEFORE the splice so the head/tail fixups below
+    // target the list src is actually linked in (dest joins that same list).
     void transfer_node_metadata(Node* dest, Node* src) {
         dest->prefix = std::move(src->prefix);
         dest->leaf_value = src->leaf_value;
         dest->origin = src->origin;
         dest->last_accessed = src->last_accessed;
 
-        // Splice dest into src's position in the LRU list
+        // Splice dest into src's position in src's origin's LRU list
         if (src->leaf_value.has_value()) {
+            Node*& head = lru_head_[origin_index(src->origin)];
+            Node*& tail = lru_tail_[origin_index(src->origin)];
             dest->lru_prev = src->lru_prev;
             dest->lru_next = src->lru_next;
             if (src->lru_prev) src->lru_prev->lru_next = dest;
             if (src->lru_next) src->lru_next->lru_prev = dest;
-            if (lru_head_ == src) lru_head_ = dest;
-            if (lru_tail_ == src) lru_tail_ = dest;
+            if (head == src) head = dest;
+            if (tail == src) tail = dest;
             src->lru_prev = nullptr;
             src->lru_next = nullptr;
         }
@@ -1218,14 +1288,17 @@ private:
             new_child->origin = node->origin;
             new_child->last_accessed = node->last_accessed;
 
-            // Transfer LRU position to child
+            // Transfer LRU position to child (same origin — copied above —
+            // so the splice targets the list node is linked in)
             if (node->leaf_value.has_value()) {
+                Node*& head = lru_head_[origin_index(node->origin)];
+                Node*& tail = lru_tail_[origin_index(node->origin)];
                 new_child->lru_prev = node->lru_prev;
                 new_child->lru_next = node->lru_next;
                 if (node->lru_prev) node->lru_prev->lru_next = new_child.get();
                 if (node->lru_next) node->lru_next->lru_prev = new_child.get();
-                if (lru_head_ == node) lru_head_ = new_child.get();
-                if (lru_tail_ == node) lru_tail_ = new_child.get();
+                if (head == node) head = new_child.get();
+                if (tail == node) tail = new_child.get();
                 node->lru_prev = nullptr;
                 node->lru_next = nullptr;
             }
@@ -1264,13 +1337,16 @@ private:
         new_child->origin = node->origin;
         new_child->last_accessed = node->last_accessed;
         if (node->leaf_value.has_value()) {
-            // Replace node's position in the LRU list with new_child
+            // Replace node's position in its origin's LRU list with
+            // new_child (same origin — copied above)
+            Node*& head = lru_head_[origin_index(node->origin)];
+            Node*& tail = lru_tail_[origin_index(node->origin)];
             new_child->lru_prev = node->lru_prev;
             new_child->lru_next = node->lru_next;
             if (node->lru_prev) node->lru_prev->lru_next = new_child.get();
             if (node->lru_next) node->lru_next->lru_prev = new_child.get();
-            if (lru_head_ == node) lru_head_ = new_child.get();
-            if (lru_tail_ == node) lru_tail_ = new_child.get();
+            if (head == node) head = new_child.get();
+            if (tail == node) tail = new_child.get();
             node->lru_prev = nullptr;
             node->lru_next = nullptr;
         }
@@ -1607,14 +1683,15 @@ private:
                 note_route_removed(node->leaf_value);
                 note_route_added(backend);
             }
+            // Unlink BEFORE origin is reassigned: lru_remove derives the list
+            // from node->origin, and an overwrite may change the origin.
+            if (!is_new) {
+                lru_remove(node.get());
+            }
             node->leaf_value = backend;
             node->origin = origin;
             node->last_accessed = std::chrono::steady_clock::now();
-            if (is_new) {
-                lru_push_front(node.get());
-            } else {
-                lru_touch(node.get());
-            }
+            lru_push_front(node.get());
             if (trust_result != nullptr) {
                 *trust_result = is_new ? TrustInsertResult::INSERTED_NEW
                                        : TrustInsertResult::OVERWROTE;
