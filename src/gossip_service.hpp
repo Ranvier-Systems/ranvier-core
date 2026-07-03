@@ -61,6 +61,11 @@ public:
     // Set callback for handling node state changes (e.g., DRAINING notifications)
     void set_node_state_callback(NodeStateCallback callback);
 
+    // Set callback fired on every fail-open posture transition (enter and exit).
+    // RouterService wires this to broadcast the flag into per-shard routing state
+    // so all shards route consistently during split-brain.
+    void set_fail_open_callback(FailOpenCallback callback);
+
     // Set the local backend ID that this node represents
     // Used when broadcasting node state changes (e.g., DRAINING on shutdown)
     void set_local_backend_id(BackendId id);

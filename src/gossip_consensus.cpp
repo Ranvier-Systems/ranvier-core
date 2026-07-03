@@ -301,6 +301,12 @@ void GossipConsensus::check_quorum() {
         _stats_quorum_state = (new_state == QuorumState::HEALTHY) ? 1 : 0;
     }
 
+    // Broadcast the fail-open posture to every shard whenever it flips. Placed
+    // after the state update and outside the transition block so it also converges
+    // an initially-DEGRADED cluster (first recheck, where new_state == _quorum_state)
+    // on the next heartbeat. Self-guards on change, so it is cheap to call every pass.
+    maybe_broadcast_fail_open();
+
     // Check for warning threshold
     if (_config.quorum_warning_threshold > 0 && new_state == QuorumState::HEALTHY) {
         size_t margin = recently_seen_nodes - required;
@@ -343,6 +349,36 @@ void GossipConsensus::broadcast_prune(BackendId b_id) {
             try { std::rethrow_exception(ep); }
             catch (const std::exception& e) {
                 log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
+            }
+        }).finally([holder = std::move(holder)] {});
+}
+
+void GossipConsensus::maybe_broadcast_fail_open() {
+    bool active = is_fail_open_mode();
+    if (active == _fail_open_active) {
+        return;  // No posture change — nothing to broadcast.
+    }
+    _fail_open_active = active;
+
+    if (!_fail_open_callback) {
+        return;
+    }
+
+    // Gate-protect so stop() waits for the in-flight broadcast (Rule #5).
+    // The holder is moved into .finally() to span the full async lifetime.
+    seastar::gate::holder holder;
+    try {
+        holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return;
+    }
+
+    (void)_fail_open_callback(active)
+        .handle_exception([active](auto ep) {
+            try { std::rethrow_exception(ep); }
+            catch (const std::exception& e) {
+                log_gossip_consensus().error("Fail-open broadcast (active={}) failed: {}",
+                                             active, e.what());
             }
         }).finally([holder = std::move(holder)] {});
 }

@@ -323,6 +323,13 @@ void GossipService::set_node_state_callback(NodeStateCallback callback) {
     }
 }
 
+void GossipService::set_fail_open_callback(FailOpenCallback callback) {
+    // Owned by consensus: the fail-open posture flips inside check_quorum().
+    if (_consensus) {
+        _consensus->set_fail_open_callback(std::move(callback));
+    }
+}
+
 void GossipService::set_local_backend_id(BackendId id) {
     if (_consensus) {
         _consensus->set_local_backend_id(id);

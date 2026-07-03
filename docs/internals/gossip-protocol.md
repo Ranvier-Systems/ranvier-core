@@ -166,7 +166,7 @@ Sent by `HttpController` when a local KV-cache eviction is observed and
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |     Type      |    Version    |          Backend ID           |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|     Backend ID (cont)         |  Cache Usage  |  Residency     |
+|     Backend ID (cont)         |  Cache Usage  |  Residency    |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
@@ -487,11 +487,11 @@ Examples with default threshold (0.5):
 
 | Cluster Size | Quorum Required | Can Survive |
 |--------------|-----------------|-------------|
-| 1 node | 1 | 0 failures |
-| 2 nodes | 2 | 0 failures |
-| 3 nodes | 2 | 1 failure |
-| 5 nodes | 3 | 2 failures |
-| 7 nodes | 4 | 3 failures |
+| 1 node       | 1               | 0 failures  |
+| 2 nodes      | 2               | 0 failures  |
+| 3 nodes      | 2               | 1 failure   |
+| 5 nodes      | 3               | 2 failures  |
+| 7 nodes      | 4               | 3 failures  |
 
 ### Recently-Seen Quorum Check
 
@@ -608,19 +608,37 @@ cluster:
 
 When `fail_open_on_quorum_loss=true` and the cluster enters DEGRADED mode:
 
-1. `RouterService::route_request()` detects fail-open mode via `GossipService::is_fail_open_mode()`
-2. Instead of prefix-affinity routing, routes to a **random healthy backend**
-3. This load-balances requests across available backends without relying on potentially stale routing data
+1. Quorum is maintained on shard 0 only. `GossipConsensus::check_quorum` detects the
+   fail-open posture flip and fires a transition seam on **both enter and exit**.
+2. The seam (`RouterService::broadcast_fail_open`) mirrors the posture onto **every
+   shard** via `smp::invoke_on_all`, setting each shard's
+   `ShardLocalState::fail_open_active`.
+3. `RouterService::route_request()` reads `fail_open_active` **shard-locally** — no
+   cross-shard read on the hot path. When set, it skips the RadixTree and routes to a
+   **random healthy backend**, load-balancing across available backends without
+   relying on potentially stale routing data.
+4. On recovery, the exit transition broadcasts `false`, and every shard resumes normal
+   prefix-affinity routing together.
+
+Because the flag is broadcast to all shards (not read live from shard-0 quorum
+state), fail-open engages and disengages uniformly across the whole node — earlier
+builds only ever activated it on shard 0, so 1/N of traffic diverged during
+split-brain (fixed: invariant audit 2026-07-03, finding I-6).
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ Request arrives during split-brain with fail-open enabled       │
+│ Quorum flips on shard 0 (DEGRADED with fail_open enabled)       │
 ├─────────────────────────────────────────────────────────────────┤
-│ 1. Check quorum state → DEGRADED                                │
-│ 2. Check fail_open_on_quorum_loss → true                        │
-│ 3. Skip RadixTree lookup (may have stale data)                  │
-│ 4. Select random healthy backend from available pool            │
-│ 5. Forward request → may miss KV-cache but service continues    │
+│ 1. check_quorum() fires the fail-open seam (enter, active=true) │
+│ 2. broadcast_fail_open() → smp::invoke_on_all sets              │
+│    fail_open_active on EVERY shard                              │
+├─────────────────────────────────────────────────────────────────┤
+│ Request arrives on any shard during split-brain                 │
+├─────────────────────────────────────────────────────────────────┤
+│ 3. route_request() reads shard-local fail_open_active → true    │
+│ 4. Skip RadixTree lookup (may have stale data)                  │
+│ 5. Select random healthy backend from available pool            │
+│ 6. Forward request → may miss KV-cache but service continues    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

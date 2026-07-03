@@ -803,6 +803,80 @@ TEST_F(QuorumTest, FailOpen_IndependentFlags) {
 }
 
 // =============================================================================
+// Fail-Open Transition Seam Tests (finding I-6)
+// =============================================================================
+// Models GossipConsensus::maybe_broadcast_fail_open(): recompute the fail-open
+// posture from the current quorum state + config, and fire the callback ONLY when
+// the posture changed since the last broadcast. Records each fired value so tests
+// can assert the callback fires on BOTH the degraded-enter and the recovery-exit
+// (and never twice for the same posture).
+
+struct FailOpenSeam {
+    bool quorum_enabled;
+    bool fail_open_on_quorum_loss;
+    bool active = false;           // last-broadcast posture (mirrors _fail_open_active)
+    std::vector<bool> fired;       // one entry per callback invocation
+
+    // Call after each quorum recompute with the freshly-decided state.
+    void on_quorum_state(QuorumState state) {
+        bool now = is_fail_open_mode(quorum_enabled, fail_open_on_quorum_loss, state);
+        if (now == active) {
+            return;  // No posture change → no callback (self-guard).
+        }
+        active = now;
+        fired.push_back(now);
+    }
+};
+
+TEST_F(QuorumTest, FailOpenSeam_FiresOnDegradedEnterAndRecoveryExit) {
+    FailOpenSeam seam{/*quorum_enabled=*/true, /*fail_open_on_quorum_loss=*/true};
+
+    // Start healthy: no transition, no callback.
+    seam.on_quorum_state(QuorumState::HEALTHY);
+    EXPECT_TRUE(seam.fired.empty());
+
+    // Quorum lost → enter fail-open: callback fires once with active=true.
+    seam.on_quorum_state(QuorumState::DEGRADED);
+    ASSERT_EQ(seam.fired.size(), 1u);
+    EXPECT_TRUE(seam.fired.back());
+    EXPECT_TRUE(seam.active);
+
+    // Still degraded on the next recheck → no duplicate broadcast.
+    seam.on_quorum_state(QuorumState::DEGRADED);
+    EXPECT_EQ(seam.fired.size(), 1u);
+
+    // Quorum restored → exit fail-open: callback fires once with active=false.
+    seam.on_quorum_state(QuorumState::HEALTHY);
+    ASSERT_EQ(seam.fired.size(), 2u);
+    EXPECT_FALSE(seam.fired.back());
+    EXPECT_FALSE(seam.active);
+}
+
+TEST_F(QuorumTest, FailOpenSeam_NeverFiresWhenFailOpenDisabled) {
+    // fail_open_on_quorum_loss=false → posture is always false, even when degraded.
+    FailOpenSeam seam{/*quorum_enabled=*/true, /*fail_open_on_quorum_loss=*/false};
+
+    seam.on_quorum_state(QuorumState::HEALTHY);
+    seam.on_quorum_state(QuorumState::DEGRADED);
+    seam.on_quorum_state(QuorumState::HEALTHY);
+
+    EXPECT_TRUE(seam.fired.empty());
+    EXPECT_FALSE(seam.active);
+}
+
+TEST_F(QuorumTest, FailOpenSeam_ConvergesInitiallyDegradedCluster) {
+    // A cluster that boots DEGRADED has no HEALTHY→DEGRADED edge, yet the seam is
+    // called every check_quorum pass (outside the transition block), so the first
+    // recompute still flips active false→true and fires. This is what converges an
+    // initially-degraded cluster onto fail-open within one heartbeat.
+    FailOpenSeam seam{/*quorum_enabled=*/true, /*fail_open_on_quorum_loss=*/true};
+
+    seam.on_quorum_state(QuorumState::DEGRADED);
+    ASSERT_EQ(seam.fired.size(), 1u);
+    EXPECT_TRUE(seam.fired.back());
+}
+
+// =============================================================================
 // Deterministic Peer Liveness Tests (TestClock - no sleeps, instant execution)
 // =============================================================================
 // These tests replicate the check_liveness() logic from GossipConsensus using

@@ -588,6 +588,12 @@ public:
     static seastar::future<> broadcast_gpu_load(
         absl::flat_hash_map<BackendId, double> scores);
 
+    // Mirror the cluster-wide fail-open posture onto every shard's routing state.
+    // Wired from the gossip fail-open callback (shard 0) and fires on both quorum
+    // enter and exit so all shards adopt/disengage fail-open together (finding I-6).
+    // Broadcasts a plain bool via invoke_on_all — no foreign_ptr (no heap crosses).
+    static seastar::future<> broadcast_fail_open(bool active);
+
     // Broadcast effective cache pressure from shard 0 to all shards.
     // Called by HealthService::run_loop() alongside GPU load broadcast.
     // pressure_map: BackendId → effective_cache_pressure (0.0–1.0).
@@ -765,6 +771,10 @@ public:
     // Mark a backend's native stream fresh in shard-local state (testing only;
     // production freshness comes from applied ops / ALIVE heartbeats).
     static void set_native_fresh_for_testing(BackendId id);
+
+    // Force the shard-local fail-open posture (testing only; production state is
+    // mirrored from quorum transitions via broadcast_fail_open).
+    static void set_fail_open_for_testing(bool active);
 
     // Get cache event stats for metrics (shard-local read).
     struct CacheEventStatsSnapshot {
