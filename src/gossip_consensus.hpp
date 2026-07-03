@@ -81,6 +81,12 @@ struct ClusterState {
 // Callback type for pruning routes when a peer dies
 using RoutePruneCallback = std::function<seastar::future<>(BackendId)>;
 
+// Fired on every fail-open posture transition (enter and exit) so the router can
+// mirror the cluster-wide fail-open state into per-shard routing state. `active`
+// is the new posture. Invoked on shard 0 only (where quorum is maintained); the
+// callback itself fans the flag out to all shards.
+using FailOpenCallback = std::function<seastar::future<>(bool active)>;
+
 // GossipConsensus: Manages quorum and peer liveness for cluster state
 //
 // This class handles the consensus aspects of the gossip protocol:
@@ -164,6 +170,14 @@ public:
     static void register_local_prune_callback(RoutePruneCallback callback);
     static void clear_local_prune_callback();
 
+    // Register the fail-open transition seam. Invoked on shard 0 whenever the
+    // fail-open posture flips (enter or exit), so the router can broadcast the
+    // flag to per-shard state. Mirrors set_node_state_callback: stored locally on
+    // shard 0's consensus instance (no cross-shard std::function copy).
+    void set_fail_open_callback(FailOpenCallback callback) {
+        _fail_open_callback = std::move(callback);
+    }
+
     // Provide read access to peer table for protocol layer
     const std::unordered_map<seastar::socket_address, PeerState>& peer_table() const {
         return _peer_table;
@@ -215,6 +229,12 @@ private:
     uint64_t _peer_table_overflow = 0;
     bool _quorum_warning_active = false;
 
+    // Fail-open transition seam (shard 0 only). _fail_open_active mirrors the
+    // last-broadcast posture so maybe_broadcast_fail_open() fires the callback
+    // only on an actual enter/exit, not on every quorum recheck.
+    FailOpenCallback _fail_open_callback;
+    bool _fail_open_active = false;
+
     // Timers
     seastar::timer<> _liveness_timer;
     seastar::gate _timer_gate;
@@ -225,6 +245,12 @@ private:
     // invalidate iterators when _peer_table is replaced.
     void check_liveness();
     void check_quorum();
+
+    // Recompute the fail-open posture from current quorum state + config and,
+    // if it changed since the last broadcast, fire _fail_open_callback with the
+    // new value. Gate-guarded fire-and-forget (like broadcast_prune): check_quorum
+    // is synchronous (timer context) and cannot co_await.
+    void maybe_broadcast_fail_open();
 
     // Broadcast route prune to all shards for a dead/removed peer's backend.
     // Gate-protected: stop() waits for in-flight prune operations (Rule #5).

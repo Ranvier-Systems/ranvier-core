@@ -128,6 +128,42 @@ TEST_F(RouterServiceTest, HashFallbackReportsCacheMiss) {
     EXPECT_FALSE(result.cache_hit);  // hash fallback, not ART hit
 }
 
+// =============================================================================
+// Fail-Open Routing (finding I-6): shard-local flag forces random routing
+// =============================================================================
+// route_request() reads the fail-open posture from shard-local state
+// (g_shard_state->fail_open_active), mirrored onto every shard by
+// broadcast_fail_open() on quorum transitions. Verify the flag flips routing to
+// availability-first random selection and back, with no gossip instance involved.
+
+TEST_F(RouterServiceTest, FailOpenFlagForcesRandomRoutingOverArtHit) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {100, 200, 300, 400};
+
+    // A route that WOULD produce an ART hit under normal prefix routing.
+    RouterService::insert_route_for_testing(tokens, 2);
+
+    // Baseline: normal prefix routing returns the learned backend as a cache hit.
+    auto normal = router_->route_request(tokens);
+    ASSERT_TRUE(normal.backend_id.has_value());
+    EXPECT_EQ(normal.routing_mode, "prefix");
+    EXPECT_TRUE(normal.cache_hit);
+
+    // Engage fail-open: routing must bypass the ART and pick a random backend.
+    RouterService::set_fail_open_for_testing(true);
+    auto failed_open = router_->route_request(tokens);
+    ASSERT_TRUE(failed_open.backend_id.has_value());
+    EXPECT_EQ(failed_open.routing_mode, "random");
+    EXPECT_FALSE(failed_open.cache_hit);
+
+    // Disengage: normal prefix routing resumes and the ART hit returns.
+    RouterService::set_fail_open_for_testing(false);
+    auto recovered = router_->route_request(tokens);
+    ASSERT_TRUE(recovered.backend_id.has_value());
+    EXPECT_EQ(recovered.routing_mode, "prefix");
+    EXPECT_TRUE(recovered.cache_hit);
+}
+
 TEST_F(RouterServiceTest, LookupMissReturnsNullopt) {
     register_two_backends();
     RouterService::insert_route_for_testing({1, 2, 3}, 1);

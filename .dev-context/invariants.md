@@ -118,9 +118,15 @@ Seeded from the 2026-07-03 invariant audit (`invariant-audit-2026-07-03.md`).
   issued only while the backend's native stream is fresh
   (`native_residency_fresh`); MATERIALIZE alone must never refresh freshness
   (comment at the MATERIALIZE case explains the divert-loop this prevents).
-- **R12** ◻ Fail-open is a cluster-wide state: when quorum loss triggers fail-open,
-  every shard's routing should observe it. (⚠️ currently only shard 0 does —
-  finding I-6.)
+- **R12** ✅ Fail-open is a cluster-wide state: when quorum loss triggers fail-open,
+  every shard's routing observes it. `GossipConsensus::check_quorum` fires a
+  transition seam on both enter and exit; `RouterService::broadcast_fail_open`
+  mirrors the posture into each shard's `ShardLocalState::fail_open_active` via
+  `smp::invoke_on_all`, and `route_request` reads it shard-locally (no cross-shard
+  read on the hot path). Pinned by `RouterServiceTest.FailOpenFlagForcesRandomRoutingOverArtHit`
+  (`tests/unit/router_service_test.cpp`) and the `QuorumTest.FailOpenSeam_*` cases
+  (`tests/unit/quorum_test.cpp`) covering enter/exit, disabled-config, and
+  initially-degraded convergence (finding I-6).
 
 ## Connection pool (`src/connection_pool.hpp`)
 

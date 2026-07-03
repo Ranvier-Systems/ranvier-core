@@ -386,6 +386,12 @@ struct ShardLocalState {
     // Whether gossip is enabled (set on all shards during init for fast checks)
     bool gossip_enabled = false;
 
+    // Cluster-wide fail-open posture, mirrored onto every shard by
+    // broadcast_fail_open() on quorum transitions (finding I-6). Read shard-locally
+    // by route_request() so all shards adopt availability-first random routing
+    // together during split-brain — no cross-shard read on the hot path (Rule #1).
+    bool fail_open_active = false;
+
     // TelemetryService pointer (set on shard 0 only; nullptr elsewhere — same
     // shard-0-only shape as gossip_ptr above). BACKLOG §21 P2: the gossip
     // hot-prefix-digest callback and the peer-death prune hook feed the shard-0
@@ -725,6 +731,7 @@ struct ShardLocalState {
         pending_local_routes.clear();
         gossip_ptr = nullptr;
         gossip_enabled = false;
+        fail_open_active = false;
         telemetry_ptr = nullptr;  // BACKLOG §21 P2 (shard 0 only; harmless elsewhere)
 
         // Clear GPU load cache
@@ -1632,6 +1639,14 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             return RouterService::handle_node_state_change(backend, state);
         });
 
+        // Mirror the cluster-wide fail-open posture onto every shard's routing
+        // state whenever quorum flips (finding I-6). Fires on BOTH enter and exit
+        // so shards disengage together on recovery. No `this` capture — the static
+        // broadcast only touches g_shard_state (Rule #16).
+        _gossip->set_fail_open_callback([](bool active) {
+            return RouterService::broadcast_fail_open(active);
+        });
+
         // Set up callback to handle incoming cache eviction notifications from peers
         // Use current time as effective timestamp for gossip-relayed evictions
         // (peers trust the originating node's validation).
@@ -2482,10 +2497,10 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
     // bypass normal routing and use random selection to known-healthy backends.
     // This prioritizes availability over cache affinity during split-brain.
     //
-    // Note: _gossip is only valid on shard 0. For other shards, we check if
-    // gossip exists and defer to its is_fail_open_mode() which returns false
-    // on non-shard-0 (as quorum state is only maintained on shard 0).
-    if (_gossip && _gossip->is_fail_open_mode()) {
+    // The flag is mirrored onto every shard by broadcast_fail_open() on quorum
+    // transitions, so this is a shard-local read — no cross-shard access on the
+    // hot path (Rule #1), and all shards adopt fail-open together (finding I-6).
+    if (g_shard_state && g_shard_state->fail_open_active) {
         result.routing_mode = "random";
         result.cache_hit = false;
         auto random_id = get_random_backend();
@@ -4372,6 +4387,16 @@ seastar::future<> RouterService::broadcast_gpu_load(
         });
 }
 
+seastar::future<> RouterService::broadcast_fail_open(bool active) {
+    // Plain scalar — no heap crosses the shard boundary, so no foreign_ptr needed
+    // (unlike broadcast_gpu_load). Each shard sets its own fail_open_active; the
+    // hot path reads it shard-locally (finding I-6, Rule #1/#14).
+    return seastar::smp::invoke_on_all([active] {
+        if (!g_shard_state) return;
+        g_shard_state->fail_open_active = active;
+    });
+}
+
 seastar::future<> RouterService::broadcast_cache_headroom(
         absl::flat_hash_map<BackendId, double> pressure_map) {
     auto shared = seastar::make_foreign(
@@ -5583,6 +5608,11 @@ RouterService::NativeKvStatsSnapshot RouterService::get_native_kv_stats() {
 void RouterService::set_native_fresh_for_testing(BackendId id) {
     if (!g_shard_state) return;
     g_shard_state->touch_native_fresh(id);
+}
+
+void RouterService::set_fail_open_for_testing(bool active) {
+    if (!g_shard_state) return;
+    g_shard_state->fail_open_active = active;
 }
 
 void RouterService::update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id) {
