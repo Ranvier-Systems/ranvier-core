@@ -166,7 +166,7 @@ Sent by `HttpController` when a local KV-cache eviction is observed and
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |     Type      |    Version    |          Backend ID           |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|     Backend ID (cont)         |  Cache Usage  |  Residency     |
+|     Backend ID (cont)         |  Cache Usage  |  Residency    |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
@@ -487,11 +487,11 @@ Examples with default threshold (0.5):
 
 | Cluster Size | Quorum Required | Can Survive |
 |--------------|-----------------|-------------|
-| 1 node | 1 | 0 failures |
-| 2 nodes | 2 | 0 failures |
-| 3 nodes | 2 | 1 failure |
-| 5 nodes | 3 | 2 failures |
-| 7 nodes | 4 | 3 failures |
+| 1 node       | 1               | 0 failures  |
+| 2 nodes      | 2               | 0 failures  |
+| 3 nodes      | 2               | 1 failure   |
+| 5 nodes      | 3               | 2 failures  |
+| 7 nodes      | 4               | 3 failures  |
 
 ### Recently-Seen Quorum Check
 
@@ -627,15 +627,15 @@ split-brain (fixed: invariant audit 2026-07-03, finding I-6).
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ Quorum flips on shard 0 (DEGRADED with fail_open enabled)        │
+│ Quorum flips on shard 0 (DEGRADED with fail_open enabled)       │
 ├─────────────────────────────────────────────────────────────────┤
-│ 1. check_quorum() fires the fail-open seam (enter, active=true)  │
-│ 2. broadcast_fail_open() → smp::invoke_on_all sets               │
-│    fail_open_active on EVERY shard                               │
+│ 1. check_quorum() fires the fail-open seam (enter, active=true) │
+│ 2. broadcast_fail_open() → smp::invoke_on_all sets              │
+│    fail_open_active on EVERY shard                              │
 ├─────────────────────────────────────────────────────────────────┤
-│ Request arrives on any shard during split-brain                  │
+│ Request arrives on any shard during split-brain                 │
 ├─────────────────────────────────────────────────────────────────┤
-│ 3. route_request() reads shard-local fail_open_active → true     │
+│ 3. route_request() reads shard-local fail_open_active → true    │
 │ 4. Skip RadixTree lookup (may have stale data)                  │
 │ 5. Select random healthy backend from available pool            │
 │ 6. Forward request → may miss KV-cache but service continues    │
