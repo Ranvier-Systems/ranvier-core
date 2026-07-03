@@ -10,6 +10,7 @@ The former `claude-*-prompt.md` templates were converted into skills (2026-07-03
 |------|----------|-----------------|
 | `claude-context.md` | **The core doc.** Architecture, source layout, key types, conventions, the 24 Hard Rules. Read every session. | `/doc` (layout sync), `/extract-pattern` (rules) |
 | `seastar-pitfalls-reference.md` | Seastar pitfalls not (yet) elevated to Hard Rules — the "minor leagues" | `/extract-pattern` promotes entries |
+| `invariants.md` | Hot-path invariant catalog: what must always be true (counters, side-indexes, hash identity, trust ladders) with verified/violated status | `/invariant-audit` (appends + flips status) |
 | `claude-locust-sync-map.md` | Python↔C++ couplings (FNV hash pipeline, metrics names) that break *silently* when one side drifts. Check before touching `router_service.cpp`, `http_controller.cpp`, `request_rewriter.hpp`, or the locustfiles; bump "Last verified" when re-checked | `/doc`, `/benchmark` |
 | `cheatsheet.md` | ~2500-line operational runbook: dev-container commands, cluster bring-up, backend registration, benchmark recipes, troubleshooting. **Grep it, don't read it whole.** | Ad hoc |
 
@@ -18,6 +19,7 @@ The former `claude-*-prompt.md` templates were converted into skills (2026-07-03
 | File(s) | What happened |
 |---------|---------------|
 | `adversarial-audit-2026-01-14.md`, `adversarial-audit-2026-02-12.md` | Adversarial audit reports (the 02-12 one includes the post-fix verification pass — findings A1–A10/E1/... are cited by skills as worked examples) |
+| `invariant-audit-2026-07-03.md` | First invariant audit (semantic correctness, hot path): findings I-1…I-8; seeded `invariants.md` |
 | `audit-fix-prompts.md` | Self-contained fix prompts generated from the 2026-01-14 audit — the template `/adversarial-audit` follows for new findings |
 | `investigation-289-routing-regression.md` → `investigation-may22-affinity-thrashing-reproduction.md` → `next-benchmark-checklist.md` | The affinity-thrashing investigation arc, in reading order. `next-benchmark-checklist.md` also documents the bench.sh flag gotchas `/benchmark` cites |
 | `investigations/` | Long-running investigation write-ups (one file per topic). **New investigations go here** — see the post-incident section of `/incident` for the expected structure |
@@ -25,6 +27,6 @@ The former `claude-*-prompt.md` templates were converted into skills (2026-07-03
 
 ## Conventions
 
-- New investigation → `investigations/<topic>.md`; new audit report → `adversarial-audit-YYYY-MM-DD.md` (root).
+- New investigation → `investigations/<topic>.md`; new audit report → `adversarial-audit-YYYY-MM-DD.md` or `invariant-audit-YYYY-MM-DD.md` (root).
 - A dated record is never edited after the fact, with one exception: appending a clearly-marked verification/correction note (see the `*Corrected 2026-05-05*` trail in claude-context.md's Hard Rules, or the 2026-02-13 verification note in the 02-12 audit).
 - If you add/remove/rename files under `src/`, update the Source Code Layout in `claude-context.md` in the same PR.

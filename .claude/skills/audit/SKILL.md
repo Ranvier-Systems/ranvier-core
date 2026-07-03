@@ -60,4 +60,4 @@ Add to BACKLOG.md:
 
 ---
 
-For a hostile, security-focused pass over the whole of `src/`, use `/adversarial-audit` instead. If any finding is systemic (same mistake in 2+ places), follow up with `/extract-pattern` to formalize it as a Hard Rule.
+For a hostile, security-focused pass over the whole of `src/`, use `/adversarial-audit` instead; for semantic-correctness hunting (wrong answers rather than crashes or rule violations), use `/invariant-audit`. If any finding is systemic (same mistake in 2+ places), follow up with `/extract-pattern` to formalize it as a Hard Rule.
