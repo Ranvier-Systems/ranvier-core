@@ -1043,7 +1043,8 @@ catalog it seeded is `.dev-context/invariants.md`).
   _Completed:_ 2026-07-03 — cutoffs now cross shards as a foreign_ptr-wrapped `vector<pair<BackendId, time_point>>` copy per target, rebuilt into a local map on the target shard (same shape as `broadcast_load_snapshot`); empty-cutoff default config keeps the no-foreign_ptr fast path. Behavior pinned by existing TTL suites; cross-shard allocation checked by the ASan Deferred Gate.
 - [ ] [MEDIUM] Decide: gossip REMOTE routes overwrite LOCAL routes via plain `insert()` — enforce the documented trust ladder with `insert_if_trusted` or document latest-wins (I-5)
 - [ ] [MEDIUM] Fix: fail-open mode only activates on shard 0 — broadcast the flag to per-shard state (I-6)
-- [ ] [LOW] Fix: `headroom_redirects` counts headroom-data-presence, not actual redirects (I-7)
+- [x] [LOW] Fix: `headroom_redirects` counts headroom-data-presence, not actual redirects (I-7)
+  _Completed:_ 2026-07-03 — increment now gated on the selection moving off the primary jump-hash bucket with pressure present (BOUNDED_LOAD/P2C only; documented approximation, no second selection pass). Metric name unchanged (sync-map safe); description updated. Pinned by two `CapacityAwareHashTest` cases in `tests/unit/router_service_test.cpp`; invariants.md R9 updated.
 - [ ] [LOW] Fix: single-live-backend verified-cold ART hit counts both a cache hit and a verified downgrade (I-8)
 
 Section anchor (`#22-invariant-audit-findings-2026-07-03`) is the stable pointer for

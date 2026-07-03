@@ -3635,6 +3635,46 @@ TEST_F(CapacityAwareHashTest, HeadroomPenalizesFullCacheBackend) {
     EXPECT_GT(backend2_count, backend1_count);
 }
 
+// ----- Invariant R9: headroom_redirects counts diverts, not data-presence -----
+
+TEST_F(CapacityAwareHashTest, HeadroomRedirectNotCountedWhenSelectionCannotMove) {
+    // One live backend: pressure data is present (adjusted load != base load)
+    // but the selection cannot move off the primary bucket, so the divert
+    // counter must not increment.
+    register_backends(1);
+    RouterService::set_cache_headroom_for_testing(1, 0.5);
+
+    std::vector<int32_t> tokens(128, 7);
+    auto result = router_->get_backend_for_prefix(tokens, "i7-single", 0, 5000.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(*result.backend_id, 1);
+    EXPECT_EQ(RouterService::headroom_redirects_for_testing(), 0u);
+}
+
+TEST_F(CapacityAwareHashTest, HeadroomRedirectCountedWhenPressurePushesPrimaryOverCap) {
+    register_backends(2);
+
+    // Discover the primary hash bucket: with zero load and no headroom data,
+    // bounded-load returns the primary unchanged (and counts no divert).
+    std::vector<int32_t> tokens(128, 8);
+    auto probe = router_->get_backend_for_prefix(tokens, "i7-probe", 0, 5000.0);
+    ASSERT_TRUE(probe.backend_id.has_value());
+    BackendId primary = *probe.backend_id;
+    BackendId other = (primary == 1) ? 2 : 1;
+    EXPECT_EQ(RouterService::headroom_redirects_for_testing(), 0u);
+
+    // Pressure pushes the primary over the bounded-load cap (weight 10 *
+    // pressure 0.9 >= 9 vs cap = ceil(avg * 1.25)); the divert target keeps
+    // nonzero pressure so headroom stays part of the moved decision.
+    RouterService::set_cache_headroom_for_testing(primary, 0.9);
+    RouterService::set_cache_headroom_for_testing(other, 0.1);
+
+    auto result = router_->get_backend_for_prefix(tokens, "i7-divert", 0, 5000.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(*result.backend_id, other);
+    EXPECT_EQ(RouterService::headroom_redirects_for_testing(), 1u);
+}
+
 TEST_F(CapacityAwareHashTest, NoEffectWhenWeightIsZero) {
     // Set weight to 0 — headroom should not influence routing
     cfg_.capacity_headroom_weight = 0.0;

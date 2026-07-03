@@ -239,7 +239,7 @@ struct ShardLocalState {
         uint64_t cost_reserved_total = 0;           // Total cost reservations made
         uint64_t cost_released_total = 0;           // Total cost releases made
         // Capacity-aware hash fallback stats
-        uint64_t headroom_redirects = 0;            // Times cache headroom changed backend selection
+        uint64_t headroom_redirects = 0;            // Headroom-influenced diverts: pressure present on a selection that moved off the primary bucket
         // Cache-residency-aware routing stats
         uint64_t residency_downgrades = 0;          // ART hits downgraded due to low gossiped residency
         // Hardware-cost-aware routing stats
@@ -2951,13 +2951,22 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
             break;
         }
 
-        // Track whether cache headroom influenced the selection.
-        // Compare capacity-adjusted load with base composite load for selected backend:
-        // if they differ, headroom data contributed to the decision.
-        if (estimated_cost > 0.0 && state.config.capacity_headroom_weight > 0.0) {
-            uint64_t base_load = get_composite_backend_load(selected);
-            uint64_t adj_load = get_capacity_adjusted_load(selected, estimated_cost);
-            if (adj_load != base_load) {
+        // Track headroom-influenced diverts: headroom pressure present on a
+        // decision that moved off the primary hash bucket. A primary-bucket
+        // selection cannot have been headroom-diverted; a moved selection
+        // with pressure present may still be load-driven — exact attribution
+        // would need a second selection pass without the headroom term,
+        // deliberately not paid on the hot path. Only BOUNDED_LOAD and P2C
+        // consume the capacity-adjusted load; both anchor on the same
+        // jump-hash primary bucket.
+        if (estimated_cost > 0.0 && state.config.capacity_headroom_weight > 0.0 &&
+            (state.config.hash_strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD ||
+             state.config.hash_strategy == RoutingConfig::HashStrategy::P2C)) {
+            BackendId primary = (*candidates)[jump_consistent_hash(
+                prefix_hash, static_cast<int32_t>(candidates->size()))];
+            if (selected != primary &&
+                get_capacity_adjusted_load(selected, estimated_cost) !=
+                    get_composite_backend_load(selected)) {
                 state.stats.headroom_redirects++;
                 if (g_metrics) {
                     metrics().record_headroom_redirect();
@@ -5574,6 +5583,11 @@ bool RouterService::prefix_hash_index_contains_for_testing(uint64_t prefix_hash,
 size_t RouterService::prefix_hash_index_size_for_testing() {
     if (!g_shard_state) return 0;
     return shard_state().prefix_hash_index.size();
+}
+
+uint64_t RouterService::headroom_redirects_for_testing() {
+    if (!g_shard_state) return 0;
+    return shard_state().stats.headroom_redirects;
 }
 
 uint32_t RouterService::native_index_entries_for_testing(BackendId id) {

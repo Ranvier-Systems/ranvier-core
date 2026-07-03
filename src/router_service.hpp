@@ -865,6 +865,9 @@ public:
                                                        BackendId backend_id);
     static size_t prefix_hash_index_size_for_testing();
 
+    // Shard-local headroom-divert counter observer (invariant R9).
+    static uint64_t headroom_redirects_for_testing();
+
     // Per-backend native index-entry counter (the MAX_ENTRIES_PER_BACKEND
     // backstop recomputed by the index rebuild).
     static uint32_t native_index_entries_for_testing(BackendId id);
