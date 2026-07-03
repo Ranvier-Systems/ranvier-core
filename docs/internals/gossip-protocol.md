@@ -899,6 +899,22 @@ When receiving high volumes of remote route announcements, immediately broadcast
 3. Single `smp::submit_to()` per shard with entire batch (reduces messages from O(routes × shards) to O(shards))
 4. Each shard applies batch to local RadixTree via `apply_route_batch_to_local_tree()`
 
+**Trust ladder on apply (LOCAL > PUSH > REMOTE).** A `ROUTE_ANNOUNCEMENT` is a
+`RouteOrigin::REMOTE` write and **never displaces a higher-trust route**. The
+apply path uses `insert_if_trusted(..., REMOTE)`, not a plain overwrite:
+
+| Existing route at the key | Announcement (REMOTE) result |
+|---|---|
+| none | inserted |
+| REMOTE (any backend) | overwritten — a peer may correct another peer's REMOTE route |
+| LOCAL/PUSH, **same** backend | LRU refresh only; origin unchanged |
+| LOCAL/PUSH, **different** backend | **refused** — the local route stands; counted as `router_remote_routes_trust_refused_total`, and the refused pair is not added to `prefix_hash_index` |
+
+This is what stops two peers serving the same prefix from ping-ponging the
+route between backends (each flip is a KV-cache miss). A sustained cluster-wide
+rise in `router_remote_routes_trust_refused_total` is the signal that peers
+disagree about which backend owns a prefix.
+
 **Performance Impact**:
 
 | Scenario | Without Batching | With Batching | Reduction |

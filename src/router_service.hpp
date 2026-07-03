@@ -869,6 +869,14 @@ public:
     // Shard-local headroom-divert counter observer (invariant R9).
     static uint64_t headroom_redirects_for_testing();
 
+    // Shard-local trust-ladder refusal counter observer (invariant T7): gossip
+    // REMOTE announcements refused by a higher-trust LOCAL/PUSH route.
+    static uint64_t remote_routes_trust_refused_for_testing();
+
+    // Resolve a key against the shard-local RadixTree (backend the tree would
+    // route it to, or nullopt). Confirms which origin's route won a conflict.
+    static std::optional<BackendId> lookup_backend_for_testing(const std::vector<int32_t>& tokens);
+
     // Per-backend native index-entry counter (the MAX_ENTRIES_PER_BACKEND
     // backstop recomputed by the index rebuild).
     static uint32_t native_index_entries_for_testing(BackendId id);
