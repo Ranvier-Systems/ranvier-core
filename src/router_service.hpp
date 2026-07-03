@@ -756,6 +756,7 @@ public:
         uint64_t index_overflow = 0;
         uint64_t verified_hits = 0;
         uint64_t verified_downgrades = 0;
+        uint64_t verified_cold_honored = 0;
         uint64_t routes_materialized = 0;
         uint64_t materialize_trust_skips = 0;
     };

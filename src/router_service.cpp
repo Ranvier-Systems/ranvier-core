@@ -255,6 +255,7 @@ struct ShardLocalState {
         uint64_t native_index_overflow = 0;         // Upserts dropped at the per-backend index cap
         uint64_t native_verified_hits = 0;          // ART hits confirmed resident by the native index
         uint64_t native_verified_downgrades = 0;    // ART hits downgraded because the native index lacked the prefix
+        uint64_t native_verified_cold_honored = 0;  // Verified-cold ART hits honored (no alternative backend live)
         uint64_t native_routes_materialized = 0;    // PUSH routes inserted from BlockStored token chains
         uint64_t native_materialize_trust_skips = 0; // Materializations refused by a higher-trust route
 
@@ -298,6 +299,7 @@ struct ShardLocalState {
             native_index_overflow = 0;
             native_verified_hits = 0;
             native_verified_downgrades = 0;
+            native_verified_cold_honored = 0;
             native_routes_materialized = 0;
             native_materialize_trust_skips = 0;
         }
@@ -1972,6 +1974,10 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             [] { return g_shard_state ? g_shard_state->stats.native_verified_downgrades : 0UL; },
             seastar::metrics::description("ART hits whose prefix was verified ABSENT from the "
                                          "backend's KV cache via the native event stream")),
+        seastar::metrics::make_counter("router_native_verified_cold_honored_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_verified_cold_honored : 0UL; },
+            seastar::metrics::description("Verified-cold ART hits honored because no alternative "
+                                         "backend was live")),
         seastar::metrics::make_counter("router_native_stream_resets_total",
             [] { return g_shard_state ? g_shard_state->stats.native_resets : 0UL; },
             seastar::metrics::description("Native KV streams reset after a sequence gap or "
@@ -2812,6 +2818,11 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 // freshness, fall back to the probabilistic gossiped estimate
                 // and its threshold gate (the engine-agnostic path).
                 bool cache_cold = false;
+                // Verified-cold verdicts are counted at the DECISION below,
+                // not here: with one live backend the cold route is honored,
+                // and counting a downgrade at the verdict would report the
+                // same decision as both a downgrade and a cache hit (I-8).
+                bool native_verified_cold = false;
                 if (state.config.kv_residency_freshness_ttl.count() > 0 &&
                     state.native_residency_fresh(art_backend)) {
                     uint64_t request_hash = hash_prefix(tokens.data(), prefix_len,
@@ -2825,7 +2836,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     } else {
                         anchor_residency = 0.0;
                         cache_cold = true;
-                        state.stats.native_verified_downgrades++;
+                        native_verified_cold = true;
                     }
                 } else {
                     if (state.config.cache_residency_threshold > 0.0 ||
@@ -2842,6 +2853,9 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     // this stat directly (registered in RouterService metrics).
                     residency_cold_backend = art_backend;
                     state.stats.residency_downgrades++;
+                    if (native_verified_cold) {
+                        state.stats.native_verified_downgrades++;
+                    }
                     log_router.debug("[{}] ART backend {} cache-cold (residency={:.2f} < {:.2f}); "
                                      "downgrading prefix hit to load-based selection",
                                      request_id, art_backend, anchor_residency,
@@ -2851,6 +2865,13 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     // ART cache hit - route to learned backend
                     state.stats.cache_hits++;
                     state.stats.prefix_affinity_routes++;
+                    if (native_verified_cold) {
+                        // Verified-cold but no alternative backend was live:
+                        // the route is honored, counted separately so hits,
+                        // downgrades, and cold-honored stay pairwise disjoint
+                        // per decision.
+                        state.stats.native_verified_cold_honored++;
+                    }
                     if (g_metrics) {
                         metrics().record_cache_hit();
                         // Record prefix hit by compression tier
@@ -5531,6 +5552,7 @@ RouterService::NativeKvStatsSnapshot RouterService::get_native_kv_stats() {
     return {st.native_ops_applied, st.native_upserts, st.native_removes,
             st.native_clears, st.native_resets, st.native_index_overflow,
             st.native_verified_hits, st.native_verified_downgrades,
+            st.native_verified_cold_honored,
             st.native_routes_materialized, st.native_materialize_trust_skips};
 }
 

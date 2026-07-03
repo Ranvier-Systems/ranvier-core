@@ -980,6 +980,45 @@ TEST_F(RouterServiceTest, NativeVerifiedEvictedSingleBackendKeepsRoute) {
     EXPECT_EQ(result.backend_id.value(), 1);
 }
 
+// ----- Invariant R9/R11 (I-8): hits, downgrades, cold-honored are disjoint -----
+
+TEST_F(RouterServiceTest, NativeVerifiedColdSingleBackendCountsHonoredNotDowngrade) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    std::vector<int32_t> tokens = {761, 762, 763, 764};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_native_fresh_for_testing(1);
+    // Request hash absent from the fresh index: verified cold, but the only
+    // live backend serves it — one decision, counted once as an honored cold
+    // hit (cache_hit stays true), never also as a downgrade.
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.verified_cold_honored, 1u);
+    EXPECT_EQ(stats.verified_downgrades, 0u);
+}
+
+TEST_F(RouterServiceTest, NativeVerifiedColdTwoBackendsCountsDowngradeNotHonored) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {771, 772, 773, 774};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_native_fresh_for_testing(1);
+
+    // An alternative exists: the downgrade actually happens and is counted;
+    // the honored counter stays untouched.
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 2);
+    EXPECT_FALSE(result.cache_hit);
+
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.verified_downgrades, 1u);
+    EXPECT_EQ(stats.verified_cold_honored, 0u);
+}
+
 TEST_F(RouterServiceTest, FreshnessTtlZeroDisablesVerifiedPath) {
     cfg_.kv_residency_freshness_ttl = std::chrono::seconds(0);
     recreate_router(cfg_);
