@@ -35,12 +35,20 @@ For runtime errors:
 ### Step 3: Check Common Seastar Pitfalls
 | Symptom | Likely Cause | Rule # |
 |---------|--------------|--------|
-| "future leaked" warning | Missing `co_await` or `.discard_result()` | - |
+| "Exceptional future ignored" / "future leaked" | Missing `co_await` or `.discard_result()` | #18 |
 | Segfault in destructor | Cross-shard `shared_ptr` release | #0 |
-| Reactor stall warning | Blocking call or mutex | #1 |
-| Segfault in callback | Timer use-after-free | #5 |
+| Reactor stall warning | Blocking call, mutex, unmarked `seastar::async`, or unyielding loop | #1, #12, #17 |
+| Segfault in callback | Timer use-after-free (gate holder missing or wrongly scoped) | #5 |
 | Segfault on NULL string | C API without null guard | #3 |
-| OOM kill | Unbounded container | #4 |
+| OOM kill / unexplained RSS growth | Unbounded container; pinned `temporary_buffer::share()` | #4, #23 |
+| `free(): invalid pointer`, garbage `si_addr` | Cross-shard heap move; FFI without local reallocation | #14, #15 |
+| Crash at first real suspension (fine in tests) | Lambda coroutine passed to `.then()` unwrapped | #16 |
+| Intermittent UAF under load, unrelated stack | `do_with` missing `auto&`; coroutine took `const&` param | #20, #21 |
+| `.finally()`/`.handle_exception()` never runs | Function threw before returning a future | #22 |
+| Waiters hang forever, semaphore units gone | Raw `wait()`/`signal()` leak on throw | #19 |
+| Hang or UAF only at shutdown | thread_local destructor after reactor teardown; `stop()` ordering | #13, #6 |
+
+For pitfalls beyond the Hard Rules (`when_all_succeed` exception drops, `foreign_ptr` destruction, `abort_source` lifetime, shutdown close-ordering races), check `.dev-context/seastar-pitfalls-reference.md`. To reproduce lifetime bugs deterministically, ask the developer for a `make sanitize-test` run (see `/validate`).
 
 ### Step 4: Verify Recent Changes
 For each recently changed file:

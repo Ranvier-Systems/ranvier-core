@@ -72,6 +72,12 @@ HTTP Request (:8080)
   -> StreamParser (SSE / chunked) -> client
   -> [Async] Learn route -> AsyncPersistence (MPSC ring -> SQLite worker)
                          -> GossipService (shard 0; ROUTE_ANNOUNCEMENT broadcast)
+
+  [Async, opt-in] KvEventSubscriber: vLLM ZMQ KV-event stream -> decoder -> ledger
+                  -> block-granular routing-state ops (see docs/internals/gie-epp.md sibling docs)
+  [Alt ingress, build-gated] GieEppServer: Envoy ext_proc gRPC -> same routing core
+                  (GIE Endpoint-Picker mode; WITH_GIE_EPP)
+  [Async] TelemetryService window reports + UsageLedgerSink per-request events
 ```
 
 ### Source Code Layout
@@ -89,6 +95,8 @@ src/
                               #   route batching via pending buffer; gossip broadcast
   radix_tree.hpp              # Adaptive Radix Tree (Node4/16/48/256, byte-keyed, LRU-bounded)
   node_slab.{hpp,cpp}         # O(1) slab allocator for ART nodes (thread-local free-list)
+  route_scorer.hpp            # Unified weighted route ranking (pure); replaces the sequential
+                              #   override chain (residency/load/cost/hardware-cost)
 
   # HTTP Layer
   http_controller.{hpp,cpp}   # Sharded request handler, proxy, SSE streaming, backpressure
@@ -100,6 +108,7 @@ src/
   request_scheduler.hpp       # Per-agent fair scheduling, priority tiers
   stream_parser.{hpp,cpp}     # Zero-copy chunked + SSE parser
   request_rewriter.hpp        # Inject prompt_token_ids into request body (vLLM schema)
+  request_timeout.hpp         # with_timeout wrapper with phase-tagged timeout exceptions
 
   # Request Processing / Text
   intent_classifier.{hpp,cpp} # AUTOCOMPLETE (FIM) / EDIT / CHAT classification (pure)
@@ -109,13 +118,26 @@ src/
   text_boundary_info.hpp      # Boundary metadata used for multi-depth prefix extraction
   text_validator.hpp          # UTF-8 / null-byte / length validation (pre-tokenizer)
   cache_event_parser.hpp      # POST /v1/cache/events JSON parser (eviction/load events)
+  response_usage_parser.hpp   # Extract engine token counts from OpenAI-compatible responses (pure)
 
   # Tokenization
   tokenizer_service.{hpp,cpp} # 3-layer: LRU cache -> cross-shard P2C -> thread pool
   tokenizer_thread_pool.{hpp,cpp} # Dedicated OS workers for FFI (5-13ms BPE calls)
 
+  # KV-Event Ingestion (vLLM native block-granular cache events)
+  kv_event_decoder.hpp        # Bounded msgpack-subset decoder for vLLM KVEventBatch (pure)
+  kv_event_ledger.hpp         # vLLM block hashes -> Ranvier routing-state ops (pure hash bridge)
+  kv_event_subscriber.{hpp,cpp} # ZMQ SUB per opted-in backend -> RouterService ops
+
+  # GIE Endpoint-Picker (EPP) compatibility mode
+  gie_epp_plan.hpp            # EPP response decision core (pure, dependency-free)
+  gie_epp_server.{hpp,cpp}    # Envoy ext_proc gRPC server exposing the routing core as a
+                              #   GIE Endpoint-Picker (build-gated WITH_GIE_EPP, default OFF)
+
   # Clustering / Gossip
   gossip_service.{hpp,cpp}    # Cluster state sync orchestrator (shard 0 only)
+  cache_topology_index.hpp    # Shard-0 reverse index: prefix fingerprint -> cluster nodes
+                              #   reporting it in their hot-prefix top-K
   gossip_protocol.{hpp,cpp}   # Wire format, reliable delivery (ACKs), DNS discovery;
                               #   ROUTE_ANNOUNCEMENT, HEARTBEAT, ROUTE_ACK,
                               #   NODE_STATE, CACHE_EVICTION (big-endian)
@@ -151,14 +173,26 @@ src/
   prometheus_parser.hpp       # Parse Prometheus text exposition (for vLLM scrape)
   vllm_metrics.hpp            # Per-backend vLLM stats struct (running/queued, KV-cache %, tps)
   tracing_service.{hpp,cpp}   # OpenTelemetry (optional WITH_TELEMETRY=ON; Zipkin/OTLP)
+  worker_affinity.{hpp,cpp}   # Pins foreign worker threads (persistence SQLite worker,
+                              #   tokenizer workers) onto non-reactor cores
+
+  # Telemetry / Usage Accounting
+  telemetry_schema.hpp        # Bucket key + window-report structs (wire: ordinals append-only)
+  telemetry_service.{hpp,cpp} # sharded<TelemetryService>: per-shard bounded bucket map;
+                              #   shard-0-only periodic window reporter
+  telemetry_sink.hpp          # Pluggable window-report export target (default NoopSink)
+  usage_ledger_schema.hpp     # Per-request usage event struct (per-API-key attribution)
+  usage_ledger_sink.hpp       # Pluggable usage export: hot-path record() + shutdown flush()
+  gpu_seconds_accounting.hpp  # Capacity-weighted uptime counters (pure, reactor-free)
   shard_load_balancer.hpp     # Power-of-Two-Choices cross-shard dispatch (snapshot-cached)
   shard_load_metrics.hpp      # Per-shard load tracking (active + queued requests)
   cross_shard_request.hpp     # Safe foreign_ptr unwrap for cross-shard data
 
   # Utilities
-  types.hpp                   # Core aliases (TokenId, BackendId), kYieldInterval
+  types.hpp                   # Core aliases (TokenId, BackendId), BackendType, kYieldInterval
   logging.hpp                 # Structured logging + request-ID generation
   parse_utils.hpp             # Safe string-to-number, hex decoding
+  stream_summary.hpp          # Space-Saving bounded top-K frequency summary (hot-prefix digest)
 
   dashboard/                  # Embedded web UI assets
 
@@ -179,6 +213,13 @@ docs/internals/               # Authoritative deep-dives (see Documentation Map 
 using TokenId   = int32_t;            // BPE token identifier
 using BackendId = int32_t;            // GPU pool identifier
 inline constexpr size_t kYieldInterval = 128;  // co_await maybe_yield() cadence
+
+// Per-backend engine class; gates route learning, metrics scraping, and
+// request-body rewriting. Also a telemetry wire dimension: ordinals are
+// append-only, never renumbered (see src/types.hpp for the full contract).
+enum class BackendType : uint8_t {
+    VLLM, SGLANG, TRT_LLM, OLLAMA, LM_STUDIO, CEREBRAS, OPENAI_COMPATIBLE
+};
 
 struct RouteResult {
     std::optional<BackendId> backend_id;
@@ -358,6 +399,9 @@ The full server binary (`ranvier_server`) requires Seastar installed on the syst
 | `shard-load-balancing.md` | P2C algorithm + snapshot cache; currently advisory (HTTP hot path not yet dispatching). |
 | `gossip-protocol.md` | Wire format, packet types (ROUTE_ANNOUNCEMENT / HEARTBEAT / ROUTE_ACK / NODE_STATE / CACHE_EVICTION), big-endian, ACK-based reliability, DTLS. |
 | `async-persistence.md` | Lock-free MPSC ring -> dedicated OS worker -> SQLite WAL; fire-and-forget API + backpressure; `process_batch` accumulator. |
+| `cache-residency-routing.md` | Routing overrides driven by backend KV-cache residency, plus the gossip plumbing that distributes residency state. |
+| `gie-epp.md` | GIE Endpoint-Picker ext_proc compatibility mode: Envoy bridge, prefix-aware routing, `dynamic_metadata` (build-gated `WITH_GIE_EPP`). |
+| `per-api-key-attribution.md` | Per-API-key attribution: live observability metrics + usage-ledger reporting. |
 
 When changing behavior in any of these areas, update the corresponding doc in the same PR.
 
@@ -367,9 +411,19 @@ GitHub Actions workflows in `.github/workflows/`:
 
 | Workflow | Purpose |
 |----------|---------|
+| `unit-tests.yml` | Google Test unit suite |
+| `integration-tests.yml` | Multi-node Docker Compose integration tests |
+| `sanitizer-tests.yml` | Unit suite under ASan/UBSan (clang) |
+| `fuzz-tests.yml` | libFuzzer harnesses (radix tree, request rewriter, stream parser) |
+| `lint-rule12.yml` | `scripts/lint-seastar-async.sh` — unmarked `seastar::async(` sites fail CI |
+| `benchmark.yml` | Locust load test regression on PRs and pushes to main |
+| `gie-epp-tests.yml` | GIE EPP build + tests (`WITH_GIE_EPP`) |
 | `docker-publish.yml` | Multi-arch Docker images (amd64/arm64) to GHCR on push to main/tags |
 | `docker-base.yml` | Base image with Seastar + build tools (manual trigger, ~30min) |
-| `benchmark.yml` | Locust load test regression on PRs and pushes to main |
+| `release.yml` | Release artifacts on tags |
+| `claude.yml`, `claude-code-review.yml` | Claude Code automation (interactive + PR review) |
+
+Local equivalents of the verification workflows, and when to run which: see the `/validate` skill.
 
 ## Deployment
 
@@ -377,25 +431,28 @@ GitHub Actions workflows in `.github/workflows/`:
 - **Kubernetes:** Helm chart in `deploy/helm/ranvier/` (StatefulSet, HPA, service discovery)
 - **Local development:** Docker Compose via `docker-compose.test.yml` (3 nodes + 2 backends)
 
-## Workflow Prompts
+## Workflow Skills
 
-The `.dev-context/` directory contains specialized prompt templates for different workflows:
+Workflows live as skills in `.claude/skills/` (invoked as `/name`). The former `.dev-context/claude-*-prompt.md` templates were converted into these skills; `.dev-context/` now holds reference docs and historical records only (see `.dev-context/README.md` for the index).
 
-| Prompt | Use When |
-|--------|----------|
-| `claude-prompt.md` | Starting any general task |
-| `claude-impl-prompt.md` | Implementing a feature (staged: plan, code, optimize) |
-| `claude-review-prompt.md` | Self-reviewing code against the Hard Rules |
-| `claude-debug-prompt.md` | Triaging a build/runtime failure |
-| `claude-doc-prompt.md` | Writing tests and updating docs post-implementation |
-| `claude-planning-prompt.md` | Decomposing a feature into atomic steps |
-| `claude-refactor-prompt.md` | Refactoring without behavioral changes |
-| `claude-audit-prompt.md` | Holistic system audit for architecture drift |
-| `claude-adversarial-audit-prompt.md` | Security-focused adversarial audit |
-| `claude-perf-prompt.md` | Performance investigation and optimization |
-| `claude-incident-prompt.md` | Incident response and root cause analysis |
-| `claude-pattern-extractor-prompt.md` | Formalizing new anti-patterns into Hard Rules |
-| `claude-strategic-alignment-prompt.md` | Strategic project assessment |
+| Skill | Use When |
+|-------|----------|
+| `/orient` | Starting a session; deciding which skill/docs apply |
+| `/plan` | Decomposing a feature into atomic steps |
+| `/implement` | Implementing a feature (staged: diagram, code, optimize; verification gates) |
+| `/new-service` | Adding a whole new service/subsystem (lifecycle wiring) |
+| `/review` | Self-reviewing code against the Hard Rules |
+| `/doc` | Writing tests and updating docs post-implementation |
+| `/refactor` | Refactoring without behavioral changes |
+| `/debug-build` | Triaging a build/runtime failure |
+| `/incident` | Incident response and root cause analysis |
+| `/perf` | Performance investigation and optimization |
+| `/benchmark` | Designing/running Locust benchmarks and A/B routing experiments |
+| `/validate` | Choosing the verification ladder; emitting Deferred Gate commands |
+| `/audit` | Holistic system audit for architecture drift |
+| `/adversarial-audit` | Security-focused adversarial audit |
+| `/extract-pattern` | Formalizing new anti-patterns into Hard Rules |
+| `/strategic-review` | Strategic project assessment |
 
 ---
 

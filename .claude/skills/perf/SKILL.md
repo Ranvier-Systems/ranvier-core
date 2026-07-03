@@ -95,3 +95,11 @@ Root Cause:        [why it's slow]
 - [ ] Optimization doesn't violate Hard Rules
 - [ ] Trade-offs are acceptable
 - [ ] Tests still pass
+
+---
+
+## MEASUREMENT & REFERENCES
+
+- Prior art first: `docs/internals/request-lifecycle-perf-analysis.md` documents the existing hot-path mitigations (route batching, tokenization fallback, stale-connection retries, load-aware overrides) — don't re-derive or accidentally undo them.
+- To measure (before AND after): design the run with `/benchmark`. This sandbox cannot execute benchmarks; emit the exact commands for the developer.
+- Component-level costs: `make bench-hot-prefix`, `make bench-epp` (see `/validate` for the full toolchain).
