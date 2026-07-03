@@ -677,12 +677,13 @@ The section heading and anchor (`#7-strategic-assessment-2026-01-31`) are preser
 
 ### 22.5 Deduplicate router_service.cpp Compilation Across Test Targets
 
-- [ ] **Stop recompiling router_service.cpp (and its gossip/telemetry companions) once per test executable**
+- [x] **Stop recompiling router_service.cpp (and its gossip/telemetry companions) once per test executable**
   _Justification:_ `router_service.cpp` is compiled five times per cold build — once into `libranvier_core.a` and once each for `router_service_test`, `cache_eviction_test`, `prefix_hash_index_lifecycle_test`, and `application_test`-class targets that list it as a source. Each instance costs ~1–2 GB of cc1plus RSS (Seastar + Abseil + coroutine headers), so a parallel cold build can OOM-kill the compiler on memory-constrained containers (observed 2026-07-03: `c++: fatal error: Killed signal terminated program cc1plus` during `make test`; retry succeeded once most objects existed). Every new RouterService-adjacent test suite makes this worse.
   _What to change:_ Link Seastar-dependent test executables against `ranvier_core` (or introduce a CMake `OBJECT` library for the shared test source set: router_service, telemetry_service, node_slab, gossip_*, crypto_offloader, dtls_context) instead of relisting the .cpp files per target. Verify no per-target compile-definition differences before consolidating; zero behavioral change intended (`/refactor` scope).
   _Location:_ `CMakeLists.txt` (test target definitions)
   _Complexity:_ Low–Medium (mechanical, but touches every Seastar-dependent test target)
   _Priority:_ P3 — Developer-experience/build-capacity; promote if cold-build OOMs recur in CI or dev containers
+  _Completed:_ 2026-07-03 — Introduced a `router_test_support` CMake `OBJECT` library (router_service, telemetry_service, node_slab, gossip_{service,protocol,consensus,transport}, crypto_offloader, dtls_context) shared by `router_service_test`, `cache_eviction_test`, and `prefix_hash_index_lifecycle_test`, so the 9-file set compiles once for those three targets instead of three times (router_service.cpp: 5→3 total compiles). `application_test` deliberately keeps its own source list: it may define `RANVIER_DEBUG_METRICS` (which `gossip_service.cpp` keys off), so sharing a def-free object set would change its build under `-DRANVIER_DEBUG_METRICS=ON`. The sanitizer loop was extended to instrument the new object library so ASan/UBSan coverage of the shared TUs is unchanged. Zero behavioural change (`/refactor` scope).
 
 ---
 

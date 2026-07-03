@@ -1354,11 +1354,32 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(tokenizer_service_test)
 
-    # RouterService Integration Tests (Seastar-dependent)
-    # Tests the core routing brain: route learning, TTL, backend lifecycle, draining mode.
-    # Links against multiple src/*.cpp files for full RouterService + GossipService compilation.
-    add_executable(router_service_test
-      tests/unit/router_service_test.cpp
+    # =========================================================================
+    # Shared RouterService test support object library (BACKLOG §22.5)
+    # =========================================================================
+    # router_service.cpp and its gossip/telemetry companions are heavy
+    # translation units (Seastar + Abseil + coroutine headers, ~1-2 GB cc1plus
+    # RSS each). router_service_test, cache_eviction_test, and
+    # prefix_hash_index_lifecycle_test each relisted this identical 9-file set,
+    # so a parallel cold build spun up three redundant cc1plus instances per
+    # file and could OOM-kill the compiler on memory-constrained containers.
+    # Compile the set once into an OBJECT library the three targets share.
+    #
+    # Scope note: application_test deliberately does NOT reuse this object
+    # library even though its source list overlaps. It compiles these files
+    # with a different preprocessor environment — it may define
+    # RANVIER_DEBUG_METRICS, which gossip_service.cpp keys off
+    # (src/gossip_service.cpp:159) — so sharing this def-free object set with it
+    # would silently change application_test's build under
+    # -DRANVIER_DEBUG_METRICS=ON. The three targets below never set that def
+    # (nor RANVIER_NO_TELEMETRY, which none of these 9 files reference), so
+    # their compilation is byte-for-byte identical in every config and safe to
+    # share. Zero behavioural change intended (`/refactor` scope).
+    #
+    # Usage requirements are PUBLIC so they apply to this library's own
+    # compilation and propagate to the linking test executables (object files +
+    # transitive Seastar/Abseil/OpenSSL link deps + the src/ include path).
+    add_library(router_test_support OBJECT
       src/router_service.cpp
       src/telemetry_service.cpp
       src/node_slab.cpp
@@ -1369,15 +1390,26 @@ if(Seastar_FOUND)
       src/crypto_offloader.cpp
       src/dtls_context.cpp
     )
-    target_include_directories(router_service_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(router_service_test
-      PRIVATE
+    target_include_directories(router_test_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(router_test_support
+      PUBLIC
       Seastar::seastar
       absl::flat_hash_map
       absl::flat_hash_set
       absl::inlined_vector
       OpenSSL::SSL
       OpenSSL::Crypto
+    )
+
+    # RouterService Integration Tests (Seastar-dependent)
+    # Tests the core routing brain: route learning, TTL, backend lifecycle, draining mode.
+    # Shared RouterService + GossipService compilation comes from router_test_support.
+    add_executable(router_service_test
+      tests/unit/router_service_test.cpp
+    )
+    target_link_libraries(router_service_test
+      PRIVATE
+      router_test_support
       GTest::gtest_main
     )
     gtest_discover_tests(router_service_test)
@@ -1387,25 +1419,10 @@ if(Seastar_FOUND)
     # resolution, eviction logic, and metrics recording.
     add_executable(cache_eviction_test
       tests/unit/cache_eviction_test.cpp
-      src/router_service.cpp
-      src/telemetry_service.cpp
-      src/node_slab.cpp
-      src/gossip_service.cpp
-      src/gossip_protocol.cpp
-      src/gossip_consensus.cpp
-      src/gossip_transport.cpp
-      src/crypto_offloader.cpp
-      src/dtls_context.cpp
     )
-    target_include_directories(cache_eviction_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(cache_eviction_test
       PRIVATE
-      Seastar::seastar
-      absl::flat_hash_map
-      absl::flat_hash_set
-      absl::inlined_vector
-      OpenSSL::SSL
-      OpenSSL::Crypto
+      router_test_support
       GTest::gtest_main
     )
     gtest_discover_tests(cache_eviction_test)
@@ -1416,25 +1433,10 @@ if(Seastar_FOUND)
     # effective boundary).
     add_executable(prefix_hash_index_lifecycle_test
       tests/unit/prefix_hash_index_lifecycle_test.cpp
-      src/router_service.cpp
-      src/telemetry_service.cpp
-      src/node_slab.cpp
-      src/gossip_service.cpp
-      src/gossip_protocol.cpp
-      src/gossip_consensus.cpp
-      src/gossip_transport.cpp
-      src/crypto_offloader.cpp
-      src/dtls_context.cpp
     )
-    target_include_directories(prefix_hash_index_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(prefix_hash_index_lifecycle_test
       PRIVATE
-      Seastar::seastar
-      absl::flat_hash_map
-      absl::flat_hash_set
-      absl::inlined_vector
-      OpenSSL::SSL
-      OpenSSL::Crypto
+      router_test_support
       GTest::gtest_main
     )
     gtest_discover_tests(prefix_hash_index_lifecycle_test)
@@ -1549,7 +1551,10 @@ endforeach()
 # Each *_test target compiles its production source files in-tree (see e.g.
 # radix_tree_test pulling in src/node_slab.cpp), so applying the flags to
 # the test target is sufficient to instrument every translation unit the
-# test exercises — there is no shared library that would otherwise escape.
+# test exercises. The one exception is the router_test_support OBJECT library
+# (BACKLOG §22.5): its production TUs are compiled once and shared by three
+# router tests, so its name does not match the `_test$` filter below and it
+# would otherwise escape instrumentation. The loop instruments it explicitly.
 option(RANVIER_BUILD_SANITIZED "Build unit tests with ASan + UBSan (requires clang)" OFF)
 
 if(RANVIER_BUILD_SANITIZED)
@@ -1587,10 +1592,15 @@ if(RANVIER_BUILD_SANITIZED)
 
     # _ranvier_all_targets was captured above for the unit_tests aggregate
     # and lists every directly-defined target at that point — including all
-    # *_test executables. Fuzz harnesses are added later and are excluded
-    # by construction (they bring their own -fsanitize=fuzzer,address,undefined).
+    # *_test executables and the router_test_support OBJECT library. Fuzz
+    # harnesses are added later and are excluded by construction (they bring
+    # their own -fsanitize=fuzzer,address,undefined).
+    #
+    # router_test_support is matched explicitly: its shared production TUs
+    # (router_service.cpp et al.) must be instrumented so the three router
+    # tests that link it don't run uninstrumented core routing/gossip code.
     foreach(_t ${_ranvier_all_targets})
-        if(_t MATCHES "_test$")
+        if(_t MATCHES "_test$" OR _t STREQUAL "router_test_support")
             target_compile_options(${_t} PRIVATE ${_san_flags})
             target_link_options(${_t} PRIVATE ${_san_flags})
         endif()
