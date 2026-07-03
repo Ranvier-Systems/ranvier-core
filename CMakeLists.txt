@@ -1410,6 +1410,35 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(cache_eviction_test)
 
+    # Prefix Hash Index Lifecycle Tests (Seastar-dependent — RouterService shard-local state)
+    # Pins invariants R1 (index pruned via the TTL-cycle rebuild; native-fresh
+    # entries preserved) and R2 (learn-path index inserts hash at the route's
+    # effective boundary).
+    add_executable(prefix_hash_index_lifecycle_test
+      tests/unit/prefix_hash_index_lifecycle_test.cpp
+      src/router_service.cpp
+      src/telemetry_service.cpp
+      src/node_slab.cpp
+      src/gossip_service.cpp
+      src/gossip_protocol.cpp
+      src/gossip_consensus.cpp
+      src/gossip_transport.cpp
+      src/crypto_offloader.cpp
+      src/dtls_context.cpp
+    )
+    target_include_directories(prefix_hash_index_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(prefix_hash_index_lifecycle_test
+      PRIVATE
+      Seastar::seastar
+      absl::flat_hash_map
+      absl::flat_hash_set
+      absl::inlined_vector
+      OpenSSL::SSL
+      OpenSSL::Crypto
+      GTest::gtest_main
+    )
+    gtest_discover_tests(prefix_hash_index_lifecycle_test)
+
     # AsyncPersistence Concurrency Stress Tests (Requires Seastar types)
     # Tests concurrent enqueue from multiple threads, backpressure enforcement,
     # queue depth accounting, and ClearAll under contention

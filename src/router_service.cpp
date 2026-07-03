@@ -539,8 +539,14 @@ struct ShardLocalState {
     // Cache Event State (Push-Based Cache Eviction Notifications)
     // ========================================================================
     // Reverse map: prefix_hash → set of BackendIds that have that prefix cached.
-    // Populated when routes are learned; cleared when routes expire/evict.
-    // Bounded by max_routes (same as RadixTree). No separate MAX_SIZE needed.
+    // Two producers, one hash identity (invariant R2): route learning hashes at
+    // the route's stored effective-boundary depth, native KV UPSERT/REMOVE at
+    // ledger block boundaries — both match the depths routing lookups compute.
+    // Bound (Rule #4): ttl_cleanup_on_shard phase 3 rebuilds this every TTL
+    // cycle from live tree routes plus fresh-native-stream entries (invariant
+    // R1), so membership tracks live routing state — ≤ route_count learned
+    // hashes + MAX_ENTRIES_PER_BACKEND per fresh backend. Push evictions and
+    // native REMOVE/CLEAR/RESET prune point-wise between cycles.
     absl::flat_hash_map<uint64_t, absl::flat_hash_set<BackendId>> prefix_hash_index;
 
     // Timestamp tracking for conflict resolution: last event timestamp per
@@ -1328,9 +1334,15 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
         // Insert with REMOTE origin (learned from cluster gossip)
         tree->insert(route.tokens, route.backend, RouteOrigin::REMOTE);
 
-        // Update prefix hash reverse index for O(1) eviction lookup
+        // Update prefix hash reverse index for O(1) eviction lookup.
+        // Hash at the route's full stored depth (invariant R2): tokens are
+        // pre-truncated to the effective boundary by the announcing peer, and
+        // routing hashes requests at the uncapped prefix_boundary — re-capping
+        // here at prefix_token_length would key boundary-learned entries at a
+        // depth no lookup, push eviction, or verified-residency check ever
+        // computes.
         {
-            size_t prefix_len = std::min(route.tokens.size(), state.config.prefix_token_length);
+            size_t prefix_len = route.tokens.size();
             if (prefix_len > 0) {
                 uint64_t ph = hash_prefix(route.tokens.data(), prefix_len, state.config.block_alignment);
                 state.prefix_hash_index[ph].insert(route.backend);
@@ -1871,6 +1883,17 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
                 return static_cast<double>(g_shard_state->residency_cache.entries.size());
             }),
 
+        // Gauge: number of prefix hashes in the per-shard reverse index.
+        // Sustained growth past ~max_routes between TTL cycles means the
+        // phase-3 rebuild is not keeping up with churn.
+        seastar::metrics::make_gauge("router_prefix_hash_index_size",
+            seastar::metrics::description("Number of prefix hashes tracked in the per-shard prefix "
+                                          "hash reverse index (rebuilt from live routes each TTL cycle)"),
+            [] {
+                if (!g_shard_state) return static_cast<double>(0);
+                return static_cast<double>(g_shard_state->prefix_hash_index.size());
+            }),
+
         // Gauge: GPU load cache staleness in seconds
         seastar::metrics::make_gauge("router_gpu_load_cache_age_seconds",
             seastar::metrics::description("Age of GPU load cache in seconds (staleness indicator)"),
@@ -2109,6 +2132,64 @@ seastar::future<> RouterService::stop() {
     });
 }
 
+// Index rebuild sub-phase A (ttl_cleanup_on_shard phase 3): hash every live
+// route at its stored depth. for_each_leaf emits the block-aligned tokens the
+// route was inserted with, so this reproduces exactly the hash the learn
+// paths publish and routing lookups compute (invariant R2). Result size is
+// bounded by route_count ≤ max_routes (Rule #4 by construction).
+static absl::flat_hash_map<uint64_t, absl::flat_hash_set<BackendId>>
+collect_live_route_index(const ShardLocalState& state) {
+    absl::flat_hash_map<uint64_t, absl::flat_hash_set<BackendId>> rebuilt;
+    const RadixTree* tree = state.tree.get();
+    if (!tree) return rebuilt;
+    tree->for_each_leaf([&](const RouteEntry& entry) {
+        if (entry.tokens.empty()) return;
+        uint64_t ph = hash_prefix(entry.tokens.data(), entry.tokens.size(),
+                                  state.config.block_alignment);
+        rebuilt[ph].insert(entry.backend);
+    });
+    return rebuilt;
+}
+
+// Index rebuild sub-phase B: carry native-stream-owned entries into the
+// rebuilt index, then swap it in. Entries of backends with a fresh native
+// stream are an exact residency mirror maintained by UPSERT/REMOVE/CLEAR/
+// RESET (invariant R11); the tree walk cannot see them, so dropping them
+// would flip verified residents to "verified evicted". Per-backend native
+// entry counters are recomputed from the preserved entries; counters of
+// non-fresh backends are erased — their native entries were just dropped,
+// and a held-over count would trip MAX_ENTRIES_PER_BACKEND early when the
+// stream resumes.
+static void swap_in_rebuilt_index(
+    ShardLocalState& state,
+    absl::flat_hash_map<uint64_t, absl::flat_hash_set<BackendId>> rebuilt) {
+    // Snapshot fresh backends with one clock read (map ≤ MAX_BACKENDS = 256)
+    // instead of one steady_clock::now() per index entry.
+    absl::flat_hash_set<BackendId> fresh_backends;
+    if (state.config.kv_residency_freshness_ttl.count() > 0) {
+        auto now = std::chrono::steady_clock::now();
+        for (const auto& [id, touched_at] : state.native_kv.fresh) {
+            if (now - touched_at <= state.config.kv_residency_freshness_ttl) {
+                fresh_backends.insert(id);
+            }
+        }
+    }
+
+    absl::flat_hash_map<BackendId, uint32_t> preserved_counts;
+    if (!fresh_backends.empty()) {
+        for (const auto& [hash, backends] : state.prefix_hash_index) {
+            for (BackendId id : backends) {
+                if (fresh_backends.contains(id)) {
+                    rebuilt[hash].insert(id);
+                    preserved_counts[id]++;
+                }
+            }
+        }
+    }
+    state.native_kv.index_entries = std::move(preserved_counts);
+    state.prefix_hash_index = std::move(rebuilt);
+}
+
 // Rule #17: Yielding TTL cleanup coroutine for radix_tree operations.
 // Named coroutine (not lambda) to avoid Rule #16 Lambda Coroutine Fiasco
 // when called from smp::submit_to. Yields between tree phases so each
@@ -2154,6 +2235,22 @@ seastar::future<> RouterService::ttl_cleanup_on_shard(
                        compact_stats.nodes_shrunk,
                        compact_stats.bytes_reclaimed);
     }
+
+    // Yield between phases to bound per-continuation CPU time
+    co_await seastar::coroutine::maybe_yield();
+
+    // Phase 3: Rebuild prefix_hash_index from live routes (invariant R1).
+    // TTL expiry (phase 1), LRU capacity eviction, peer-death pruning, and
+    // backend unregistration all remove tree routes without touching the
+    // index; this rebuild is what makes the index's bound real. Entries of
+    // backends with a fresh native stream are preserved across the swap —
+    // their lifecycle belongs to the native ops (UPSERT/REMOVE/CLEAR/RESET).
+    auto rebuilt = collect_live_route_index(state);
+    co_await seastar::coroutine::maybe_yield();
+    // A route learned between the walk above and this swap misses one cycle
+    // of index membership (self-heals next cycle); native entries do not —
+    // sub-phase B reads the live index at swap time.
+    swap_in_rebuilt_index(state, std::move(rebuilt));
 }
 
 void RouterService::run_ttl_cleanup() {
@@ -3711,9 +3808,12 @@ static void apply_local_batch_to_tree(const std::vector<PendingLocalRoute>& batc
         // Insert with LOCAL origin (direct request on this node)
         tree->insert(route.tokens, route.backend, RouteOrigin::LOCAL);
 
-        // Update prefix hash reverse index for O(1) eviction lookup
+        // Update prefix hash reverse index for O(1) eviction lookup.
+        // Hash at the route's full stored depth — tokens are pre-truncated to
+        // the effective boundary by learn_route_global (invariant R2, same
+        // contract as apply_route_batch_to_local_tree).
         {
-            size_t prefix_len = std::min(route.tokens.size(), state.config.prefix_token_length);
+            size_t prefix_len = route.tokens.size();
             if (prefix_len > 0) {
                 uint64_t ph = hash_prefix(route.tokens.data(), prefix_len, state.config.block_alignment);
                 state.prefix_hash_index[ph].insert(route.backend);
@@ -5412,6 +5512,54 @@ void RouterService::set_native_fresh_for_testing(BackendId id) {
 void RouterService::update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id) {
     if (!g_shard_state) return;
     shard_state().prefix_hash_index[prefix_hash].insert(backend_id);
+}
+
+void RouterService::learn_route_for_testing(std::vector<int32_t> tokens, BackendId backend) {
+    if (!g_shard_state) return;
+    std::vector<PendingLocalRoute> batch;
+    batch.push_back(PendingLocalRoute{std::move(tokens), backend});
+    apply_local_batch_to_tree(batch);
+}
+
+void RouterService::learn_remote_route_for_testing(std::vector<int32_t> tokens, BackendId backend) {
+    if (!g_shard_state) return;
+    std::vector<PendingRemoteRoute> batch;
+    batch.push_back(PendingRemoteRoute{std::move(tokens), backend});
+    apply_route_batch_to_local_tree(batch);
+}
+
+size_t RouterService::ttl_cleanup_phases_for_testing(
+    std::chrono::steady_clock::time_point default_cutoff) {
+    if (!g_shard_state) return 0;
+    auto& state = shard_state();
+    RadixTree* tree = state.tree.get();
+    if (!tree) return 0;
+    size_t removed = tree->remove_expired(default_cutoff);
+    state.stats.routes_expired += removed;
+    tree->compact();
+    auto rebuilt = collect_live_route_index(state);
+    swap_in_rebuilt_index(state, std::move(rebuilt));
+    return removed;
+}
+
+bool RouterService::prefix_hash_index_contains_for_testing(uint64_t prefix_hash,
+                                                           BackendId backend_id) {
+    if (!g_shard_state) return false;
+    auto& index = shard_state().prefix_hash_index;
+    auto it = index.find(prefix_hash);
+    return it != index.end() && it->second.contains(backend_id);
+}
+
+size_t RouterService::prefix_hash_index_size_for_testing() {
+    if (!g_shard_state) return 0;
+    return shard_state().prefix_hash_index.size();
+}
+
+uint32_t RouterService::native_index_entries_for_testing(BackendId id) {
+    if (!g_shard_state) return 0;
+    auto& entries = shard_state().native_kv.index_entries;
+    auto it = entries.find(id);
+    return it == entries.end() ? 0 : it->second;
 }
 
 // ============================================================================

@@ -41,17 +41,24 @@ Seeded from the 2026-07-03 invariant audit (`invariant-audit-2026-07-03.md`).
 
 ## Router service (`src/router_service.cpp`)
 
-- **R1** ⚠️ `prefix_hash_index` membership ⊆ live routing state: an entry
+- **R1** ✅ `prefix_hash_index` membership ⊆ live routing state: an entry
   `(hash, backend)` exists only while either a tree route or a native-KV block backs
-  it. **Violated** — TTL expiry, LRU capacity eviction, peer-death pruning, and backend
-  unregistration remove tree routes without pruning the index (finding I-1). Its
-  claimed bound ("bounded by max_routes") depends on this invariant.
-- **R2** ⚠️ Hash-depth identity: every producer and consumer of a prefix hash for the
+  it. Maintained by `ttl_cleanup_on_shard` phase 3: every TTL cycle the index is
+  rebuilt from the live tree (`for_each_leaf`), preserving entries of backends with
+  fresh native streams (their lifecycle belongs to UPSERT/REMOVE/CLEAR/RESET) and
+  recomputing the per-backend native entry counters. Point removals (push evictions,
+  native REMOVE/CLEAR/RESET) prune between cycles; membership converges within one
+  cycle of any removal path (TTL expiry, LRU eviction, peer prune, unregister).
+  Verified by `tests/unit/prefix_hash_index_lifecycle_test.cpp` (finding I-1, fixed
+  2026-07-03).
+- **R2** ✅ Hash-depth identity: every producer and consumer of a prefix hash for the
   same request must hash the same token count — routing lookup, BOTH learn paths'
   index inserts, the `X-Ranvier-Prefix-Hash` header, and the ledger's boundary hashes.
   (The warning block above the `prefix_len` computation in `get_backend_for_prefix`
-  states this.) **Violated** by the learn paths' index inserts when
-  `prefix_boundary > prefix_token_length` (finding I-2).
+  states this.) Both `apply_*_batch` learn paths now hash at `route.tokens.size()`
+  (the effective boundary the tokens were truncated to), matching the routing-side
+  uncapped `prefix_boundary` hash. Verified by
+  `tests/unit/prefix_hash_index_lifecycle_test.cpp` (finding I-2, fixed 2026-07-03).
 - **R3** ◻ Route learning pins the PLACEMENT winner (`original_selected` /
   `learn_target_backend`), never the transient dispatch target. Load/cost diverts are
   per-request; the learned route must follow the stable choice

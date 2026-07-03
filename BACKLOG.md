@@ -675,6 +675,15 @@ The section heading and anchor (`#7-strategic-assessment-2026-01-31`) are preser
   _Complexity:_ Trivial
   _Priority:_ P4 — Consistency with existing template patterns
 
+### 22.5 Deduplicate router_service.cpp Compilation Across Test Targets
+
+- [ ] **Stop recompiling router_service.cpp (and its gossip/telemetry companions) once per test executable**
+  _Justification:_ `router_service.cpp` is compiled five times per cold build — once into `libranvier_core.a` and once each for `router_service_test`, `cache_eviction_test`, `prefix_hash_index_lifecycle_test`, and `application_test`-class targets that list it as a source. Each instance costs ~1–2 GB of cc1plus RSS (Seastar + Abseil + coroutine headers), so a parallel cold build can OOM-kill the compiler on memory-constrained containers (observed 2026-07-03: `c++: fatal error: Killed signal terminated program cc1plus` during `make test`; retry succeeded once most objects existed). Every new RouterService-adjacent test suite makes this worse.
+  _What to change:_ Link Seastar-dependent test executables against `ranvier_core` (or introduce a CMake `OBJECT` library for the shared test source set: router_service, telemetry_service, node_slab, gossip_*, crypto_offloader, dtls_context) instead of relisting the .cpp files per target. Verify no per-target compile-definition differences before consolidating; zero behavioral change intended (`/refactor` scope).
+  _Location:_ `CMakeLists.txt` (test target definitions)
+  _Complexity:_ Low–Medium (mechanical, but touches every Seastar-dependent test target)
+  _Priority:_ P3 — Developer-experience/build-capacity; promote if cold-build OOMs recur in CI or dev containers
+
 ---
 
 
@@ -1023,8 +1032,10 @@ From `.dev-context/invariant-audit-2026-07-03.md` (semantic-correctness pass ove
 routing hot path; finding IDs I-1…I-8 and fix prompts live there; the invariant
 catalog it seeded is `.dev-context/invariants.md`).
 
-- [ ] [HIGH] Fix: prune `prefix_hash_index` on TTL expiry / LRU eviction / peer prune / unregister — its "bounded by max_routes" claim is currently false (invariant audit 2026-07-03, I-1)
-- [ ] [HIGH] Fix: learn-path index inserts must hash at the effective boundary (`tokens.size()`), not `min(len, prefix_token_length)` — boundary-learned entries are keyed at the wrong depth (I-2)
+- [x] [HIGH] Fix: prune `prefix_hash_index` on TTL expiry / LRU eviction / peer prune / unregister — its "bounded by max_routes" claim is currently false (invariant audit 2026-07-03, I-1)
+  _Completed:_ 2026-07-03 — `ttl_cleanup_on_shard` phase 3 rebuilds the index from live routes each TTL cycle (native-fresh entries preserved; counters recomputed); `router_prefix_hash_index_size` gauge added. Pinned by `tests/unit/prefix_hash_index_lifecycle_test.cpp`.
+- [x] [HIGH] Fix: learn-path index inserts must hash at the effective boundary (`tokens.size()`), not `min(len, prefix_token_length)` — boundary-learned entries are keyed at the wrong depth (I-2)
+  _Completed:_ 2026-07-03 — both `apply_*_batch` paths hash at `route.tokens.size()` (pre-truncated to the effective boundary). Pinned by the same test file.
 - [ ] [MEDIUM] Fix: O(1) per-origin LRU tails for `evict_lowest_trust` — remove the O(n) LRU scan per insert at capacity (reactor-stall risk on remote-batch apply) (I-3)
 - [ ] [MEDIUM] Fix: `run_ttl_cleanup` ships a shard-0-allocated `flat_hash_map` cross-shard without foreign_ptr (Rule #14; latent until compression_ratio > 1.0 is configured) (I-4)
 - [ ] [MEDIUM] Decide: gossip REMOTE routes overwrite LOCAL routes via plain `insert()` — enforce the documented trust ladder with `insert_if_trusted` or document latest-wins (I-5)
