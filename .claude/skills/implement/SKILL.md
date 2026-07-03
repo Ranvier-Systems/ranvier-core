@@ -83,3 +83,6 @@ For each modified file, provide:
 Document any trade-offs made:
 - Why this approach vs alternatives?
 - Any technical debt introduced? (Add to BACKLOG.md if so)
+
+### Next Steps
+Adding a whole new service? Use `/new-service` for the lifecycle scaffolding first. When all passes are done: `/review` (Hard Rules) → `/doc` (tests + docs) → `/validate` (Deferred Gate commands for the developer).

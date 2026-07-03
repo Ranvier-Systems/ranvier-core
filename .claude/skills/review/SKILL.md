@@ -53,6 +53,7 @@ Run through each of the Hard Rules. For each rule, provide one of:
 - [ ] All futures are awaited or explicitly discarded
 - [ ] No hidden blocking calls (file I/O, DNS, sleep)
 - [ ] Cross-shard calls use `smp::submit_to`
+- [ ] Any `seastar::async(` site carries a `// rule12-allow: <reason>` marker (CI enforces via `scripts/lint-seastar-async.sh`)
 
 ### Error Handling
 - [ ] All error paths are handled (no silent failures)
