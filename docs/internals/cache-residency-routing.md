@@ -138,6 +138,20 @@ the probabilistic path above with no operator action needed. See
 `src/kv_event_ledger.hpp` for how vLLM block hashes are bridged to Ranvier
 prefix hashes without sharing a hash function.
 
+`prefix_hash_index` has two producers with one hash identity: both learn
+paths publish `(hash, backend)` at the route's stored effective-boundary
+depth — the same depth routing lookups and push evictions hash at — and
+native `UPSERT`/`REMOVE` publish at the ledger's block boundaries. Its bound
+is enforced by lifecycle, not a MAX_SIZE: every TTL cycle,
+`ttl_cleanup_on_shard` rebuilds the learned portion from the live RadixTree
+(so routes removed by TTL expiry, LRU eviction, peer-death pruning, or
+backend unregistration cannot leave stale entries behind), while entries of
+backends with a fresh native stream are preserved across the rebuild — their
+lifecycle is owned exclusively by the stream's `UPSERT`/`REMOVE`/`CLEAR`/
+`RESET` ops, and the per-backend native entry counters are recomputed from
+what was preserved. Index growth is observable per shard via the
+`router_prefix_hash_index_size` gauge.
+
 Two extensions complete the native mode. **Route materialization**
 (`kv_events.materialize_routes`, default on): `BlockStored` token chains
 insert `RouteOrigin::PUSH` routes at every covered block boundary, so

@@ -846,6 +846,29 @@ public:
     // Get the number of routes in the shard-local RadixTree.
     static size_t get_route_count_for_testing();
 
+    // Apply a single route through the real learn batch-apply (tree insert +
+    // prefix_hash_index insert at the route's effective boundary), bypassing
+    // timers/broadcast so the learn-path index depth (invariant R2) is
+    // unit-testable without a reactor. Local and remote (gossip) variants.
+    static void learn_route_for_testing(std::vector<int32_t> tokens, BackendId backend);
+    static void learn_remote_route_for_testing(std::vector<int32_t> tokens, BackendId backend);
+
+    // Run the TTL cleanup phases (expire → compact → index rebuild)
+    // synchronously with a uniform cutoff — the reactor-free mirror of
+    // ttl_cleanup_on_shard for lifecycle tests. Returns routes expired.
+    static size_t ttl_cleanup_phases_for_testing(
+        std::chrono::steady_clock::time_point default_cutoff);
+
+    // Shard-local prefix_hash_index observers (index membership is otherwise
+    // visible only through eviction/load counters).
+    static bool prefix_hash_index_contains_for_testing(uint64_t prefix_hash,
+                                                       BackendId backend_id);
+    static size_t prefix_hash_index_size_for_testing();
+
+    // Per-backend native index-entry counter (the MAX_ENTRIES_PER_BACKEND
+    // backstop recomputed by the index rebuild).
+    static uint32_t native_index_entries_for_testing(BackendId id);
+
 private:
     // Thread-local metrics group
     // This holds the handle that keeps the metrics alive
@@ -891,6 +914,8 @@ private:
     void run_ttl_cleanup();
 
     // Rule #17: Yielding per-shard TTL cleanup coroutine.
+    // Phases: expire routes → compact tree → rebuild prefix_hash_index from
+    // live routes (invariant R1; native-fresh backends' entries preserved).
     // Named (not lambda) to avoid Rule #16 when called from smp::submit_to.
     // Compression-aware: each backend may have a different cutoff based on its
     // compression_ratio. default_cutoff applies to backends not in the map.
