@@ -980,6 +980,45 @@ TEST_F(RouterServiceTest, NativeVerifiedEvictedSingleBackendKeepsRoute) {
     EXPECT_EQ(result.backend_id.value(), 1);
 }
 
+// ----- Invariant R9/R11 (I-8): hits, downgrades, cold-honored are disjoint -----
+
+TEST_F(RouterServiceTest, NativeVerifiedColdSingleBackendCountsHonoredNotDowngrade) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    std::vector<int32_t> tokens = {761, 762, 763, 764};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_native_fresh_for_testing(1);
+    // Request hash absent from the fresh index: verified cold, but the only
+    // live backend serves it — one decision, counted once as an honored cold
+    // hit (cache_hit stays true), never also as a downgrade.
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.verified_cold_honored, 1u);
+    EXPECT_EQ(stats.verified_downgrades, 0u);
+}
+
+TEST_F(RouterServiceTest, NativeVerifiedColdTwoBackendsCountsDowngradeNotHonored) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {771, 772, 773, 774};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_native_fresh_for_testing(1);
+
+    // An alternative exists: the downgrade actually happens and is counted;
+    // the honored counter stays untouched.
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 2);
+    EXPECT_FALSE(result.cache_hit);
+
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.verified_downgrades, 1u);
+    EXPECT_EQ(stats.verified_cold_honored, 0u);
+}
+
 TEST_F(RouterServiceTest, FreshnessTtlZeroDisablesVerifiedPath) {
     cfg_.kv_residency_freshness_ttl = std::chrono::seconds(0);
     recreate_router(cfg_);
@@ -3633,6 +3672,46 @@ TEST_F(CapacityAwareHashTest, HeadroomPenalizesFullCacheBackend) {
 
     // Backend 2 (low pressure) should handle more requests than backend 1 (high pressure)
     EXPECT_GT(backend2_count, backend1_count);
+}
+
+// ----- Invariant R9: headroom_redirects counts diverts, not data-presence -----
+
+TEST_F(CapacityAwareHashTest, HeadroomRedirectNotCountedWhenSelectionCannotMove) {
+    // One live backend: pressure data is present (adjusted load != base load)
+    // but the selection cannot move off the primary bucket, so the divert
+    // counter must not increment.
+    register_backends(1);
+    RouterService::set_cache_headroom_for_testing(1, 0.5);
+
+    std::vector<int32_t> tokens(128, 7);
+    auto result = router_->get_backend_for_prefix(tokens, "i7-single", 0, 5000.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(*result.backend_id, 1);
+    EXPECT_EQ(RouterService::headroom_redirects_for_testing(), 0u);
+}
+
+TEST_F(CapacityAwareHashTest, HeadroomRedirectCountedWhenPressurePushesPrimaryOverCap) {
+    register_backends(2);
+
+    // Discover the primary hash bucket: with zero load and no headroom data,
+    // bounded-load returns the primary unchanged (and counts no divert).
+    std::vector<int32_t> tokens(128, 8);
+    auto probe = router_->get_backend_for_prefix(tokens, "i7-probe", 0, 5000.0);
+    ASSERT_TRUE(probe.backend_id.has_value());
+    BackendId primary = *probe.backend_id;
+    BackendId other = (primary == 1) ? 2 : 1;
+    EXPECT_EQ(RouterService::headroom_redirects_for_testing(), 0u);
+
+    // Pressure pushes the primary over the bounded-load cap (weight 10 *
+    // pressure 0.9 >= 9 vs cap = ceil(avg * 1.25)); the divert target keeps
+    // nonzero pressure so headroom stays part of the moved decision.
+    RouterService::set_cache_headroom_for_testing(primary, 0.9);
+    RouterService::set_cache_headroom_for_testing(other, 0.1);
+
+    auto result = router_->get_backend_for_prefix(tokens, "i7-divert", 0, 5000.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(*result.backend_id, other);
+    EXPECT_EQ(RouterService::headroom_redirects_for_testing(), 1u);
 }
 
 TEST_F(CapacityAwareHashTest, NoEffectWhenWeightIsZero) {

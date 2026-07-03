@@ -239,7 +239,7 @@ struct ShardLocalState {
         uint64_t cost_reserved_total = 0;           // Total cost reservations made
         uint64_t cost_released_total = 0;           // Total cost releases made
         // Capacity-aware hash fallback stats
-        uint64_t headroom_redirects = 0;            // Times cache headroom changed backend selection
+        uint64_t headroom_redirects = 0;            // Headroom-influenced diverts: pressure present on a selection that moved off the primary bucket
         // Cache-residency-aware routing stats
         uint64_t residency_downgrades = 0;          // ART hits downgraded due to low gossiped residency
         // Hardware-cost-aware routing stats
@@ -255,6 +255,7 @@ struct ShardLocalState {
         uint64_t native_index_overflow = 0;         // Upserts dropped at the per-backend index cap
         uint64_t native_verified_hits = 0;          // ART hits confirmed resident by the native index
         uint64_t native_verified_downgrades = 0;    // ART hits downgraded because the native index lacked the prefix
+        uint64_t native_verified_cold_honored = 0;  // Verified-cold ART hits honored (no alternative backend live)
         uint64_t native_routes_materialized = 0;    // PUSH routes inserted from BlockStored token chains
         uint64_t native_materialize_trust_skips = 0; // Materializations refused by a higher-trust route
 
@@ -298,6 +299,7 @@ struct ShardLocalState {
             native_index_overflow = 0;
             native_verified_hits = 0;
             native_verified_downgrades = 0;
+            native_verified_cold_honored = 0;
             native_routes_materialized = 0;
             native_materialize_trust_skips = 0;
         }
@@ -1972,6 +1974,10 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             [] { return g_shard_state ? g_shard_state->stats.native_verified_downgrades : 0UL; },
             seastar::metrics::description("ART hits whose prefix was verified ABSENT from the "
                                          "backend's KV cache via the native event stream")),
+        seastar::metrics::make_counter("router_native_verified_cold_honored_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_verified_cold_honored : 0UL; },
+            seastar::metrics::description("Verified-cold ART hits honored because no alternative "
+                                         "backend was live")),
         seastar::metrics::make_counter("router_native_stream_resets_total",
             [] { return g_shard_state ? g_shard_state->stats.native_resets : 0UL; },
             seastar::metrics::description("Native KV streams reset after a sequence gap or "
@@ -2269,17 +2275,21 @@ void RouterService::run_ttl_cleanup() {
     auto& config = shard_state().config;
     auto default_cutoff = now - config.ttl_seconds;
 
-    // Build per-backend cutoff map for compression-aware TTL.
-    // Backends with compression_ratio > 1.0 get proportionally longer TTLs,
-    // capped by max_ttl_multiplier. Only populated when overrides exist.
-    absl::flat_hash_map<BackendId, std::chrono::steady_clock::time_point> backend_cutoffs;
+    // Build per-backend cutoffs for compression-aware TTL as a flat vector of
+    // POD pairs — the cross-shard wire shape (Rule #14, same pattern as
+    // broadcast_load_snapshot; steady_clock::time_point is trivially
+    // copyable). Backends with compression_ratio > 1.0 get proportionally
+    // longer TTLs, capped by max_ttl_multiplier. Only populated when
+    // overrides exist, so the default config skips the foreign_ptr machinery.
+    using CutoffVec = std::vector<std::pair<BackendId, std::chrono::steady_clock::time_point>>;
+    CutoffVec backend_cutoffs;
     if (config.max_ttl_multiplier > 1.0) {
         for (const auto& [id, info] : shard_state().backends) {
             if (info.compression_ratio > 1.0) {
                 double multiplier = std::min(info.compression_ratio, config.max_ttl_multiplier);
                 auto effective_ttl_secs = static_cast<int64_t>(
                     config.ttl_seconds.count() * multiplier);
-                backend_cutoffs[id] = now - std::chrono::seconds(effective_ttl_secs);
+                backend_cutoffs.emplace_back(id, now - std::chrono::seconds(effective_ttl_secs));
             }
         }
     }
@@ -2292,10 +2302,27 @@ void RouterService::run_ttl_cleanup() {
             // Rule #17: ttl_cleanup_on_shard is a named coroutine that yields
             // between tree phases to avoid reactor stalls on large trees.
             // Using a named function (not a coroutine lambda) avoids Rule #16.
-            // Copy cutoffs per shard (typically <20 entries, once per 60s cycle).
-            auto shard_cutoffs = cutoffs;
-            return seastar::smp::submit_to(shard_id, [default_cutoff, shard_cutoffs = std::move(shard_cutoffs)] {
-                return RouterService::ttl_cleanup_on_shard(default_cutoff, shard_cutoffs);
+            if (cutoffs.empty()) {
+                // Fast path (default config): uniform cutoff only, nothing
+                // heap-owning crosses shards.
+                return seastar::smp::submit_to(shard_id, [default_cutoff] {
+                    return RouterService::ttl_cleanup_on_shard(default_cutoff, {});
+                });
+            }
+            // Rule #14: one foreign_ptr-wrapped copy per target shard
+            // (typically <20 entries, once per 60s cycle). The target rebuilds
+            // a local map, so no shard-0 heap is read or freed off-shard; the
+            // foreign_ptr destructor returns the copy to shard 0 for cleanup.
+            auto copy = std::make_unique<CutoffVec>(cutoffs);
+            auto foreign = seastar::make_foreign(std::move(copy));
+            return seastar::smp::submit_to(shard_id,
+                [default_cutoff, foreign = std::move(foreign)]() mutable {
+                absl::flat_hash_map<BackendId, std::chrono::steady_clock::time_point> local_cutoffs;
+                local_cutoffs.reserve(foreign->size());
+                for (const auto& [id, cutoff] : *foreign) {
+                    local_cutoffs.emplace(id, cutoff);
+                }
+                return RouterService::ttl_cleanup_on_shard(default_cutoff, std::move(local_cutoffs));
             });
         });
     }).handle_exception([](std::exception_ptr ep) {
@@ -2791,6 +2818,11 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 // freshness, fall back to the probabilistic gossiped estimate
                 // and its threshold gate (the engine-agnostic path).
                 bool cache_cold = false;
+                // Verified-cold verdicts are counted at the DECISION below,
+                // not here: with one live backend the cold route is honored,
+                // and counting a downgrade at the verdict would report the
+                // same decision as both a downgrade and a cache hit (I-8).
+                bool native_verified_cold = false;
                 if (state.config.kv_residency_freshness_ttl.count() > 0 &&
                     state.native_residency_fresh(art_backend)) {
                     uint64_t request_hash = hash_prefix(tokens.data(), prefix_len,
@@ -2804,7 +2836,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     } else {
                         anchor_residency = 0.0;
                         cache_cold = true;
-                        state.stats.native_verified_downgrades++;
+                        native_verified_cold = true;
                     }
                 } else {
                     if (state.config.cache_residency_threshold > 0.0 ||
@@ -2821,6 +2853,9 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     // this stat directly (registered in RouterService metrics).
                     residency_cold_backend = art_backend;
                     state.stats.residency_downgrades++;
+                    if (native_verified_cold) {
+                        state.stats.native_verified_downgrades++;
+                    }
                     log_router.debug("[{}] ART backend {} cache-cold (residency={:.2f} < {:.2f}); "
                                      "downgrading prefix hit to load-based selection",
                                      request_id, art_backend, anchor_residency,
@@ -2830,6 +2865,13 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     // ART cache hit - route to learned backend
                     state.stats.cache_hits++;
                     state.stats.prefix_affinity_routes++;
+                    if (native_verified_cold) {
+                        // Verified-cold but no alternative backend was live:
+                        // the route is honored, counted separately so hits,
+                        // downgrades, and cold-honored stay pairwise disjoint
+                        // per decision.
+                        state.stats.native_verified_cold_honored++;
+                    }
                     if (g_metrics) {
                         metrics().record_cache_hit();
                         // Record prefix hit by compression tier
@@ -2930,13 +2972,22 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
             break;
         }
 
-        // Track whether cache headroom influenced the selection.
-        // Compare capacity-adjusted load with base composite load for selected backend:
-        // if they differ, headroom data contributed to the decision.
-        if (estimated_cost > 0.0 && state.config.capacity_headroom_weight > 0.0) {
-            uint64_t base_load = get_composite_backend_load(selected);
-            uint64_t adj_load = get_capacity_adjusted_load(selected, estimated_cost);
-            if (adj_load != base_load) {
+        // Track headroom-influenced diverts: headroom pressure present on a
+        // decision that moved off the primary hash bucket. A primary-bucket
+        // selection cannot have been headroom-diverted; a moved selection
+        // with pressure present may still be load-driven — exact attribution
+        // would need a second selection pass without the headroom term,
+        // deliberately not paid on the hot path. Only BOUNDED_LOAD and P2C
+        // consume the capacity-adjusted load; both anchor on the same
+        // jump-hash primary bucket.
+        if (estimated_cost > 0.0 && state.config.capacity_headroom_weight > 0.0 &&
+            (state.config.hash_strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD ||
+             state.config.hash_strategy == RoutingConfig::HashStrategy::P2C)) {
+            BackendId primary = (*candidates)[jump_consistent_hash(
+                prefix_hash, static_cast<int32_t>(candidates->size()))];
+            if (selected != primary &&
+                get_capacity_adjusted_load(selected, estimated_cost) !=
+                    get_composite_backend_load(selected)) {
                 state.stats.headroom_redirects++;
                 if (g_metrics) {
                     metrics().record_headroom_redirect();
@@ -5501,6 +5552,7 @@ RouterService::NativeKvStatsSnapshot RouterService::get_native_kv_stats() {
     return {st.native_ops_applied, st.native_upserts, st.native_removes,
             st.native_clears, st.native_resets, st.native_index_overflow,
             st.native_verified_hits, st.native_verified_downgrades,
+            st.native_verified_cold_honored,
             st.native_routes_materialized, st.native_materialize_trust_skips};
 }
 
@@ -5553,6 +5605,11 @@ bool RouterService::prefix_hash_index_contains_for_testing(uint64_t prefix_hash,
 size_t RouterService::prefix_hash_index_size_for_testing() {
     if (!g_shard_state) return 0;
     return shard_state().prefix_hash_index.size();
+}
+
+uint64_t RouterService::headroom_redirects_for_testing() {
+    if (!g_shard_state) return 0;
+    return shard_state().stats.headroom_redirects;
 }
 
 uint32_t RouterService::native_index_entries_for_testing(BackendId id) {

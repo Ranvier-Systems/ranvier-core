@@ -756,6 +756,7 @@ public:
         uint64_t index_overflow = 0;
         uint64_t verified_hits = 0;
         uint64_t verified_downgrades = 0;
+        uint64_t verified_cold_honored = 0;
         uint64_t routes_materialized = 0;
         uint64_t materialize_trust_skips = 0;
     };
@@ -864,6 +865,9 @@ public:
     static bool prefix_hash_index_contains_for_testing(uint64_t prefix_hash,
                                                        BackendId backend_id);
     static size_t prefix_hash_index_size_for_testing();
+
+    // Shard-local headroom-divert counter observer (invariant R9).
+    static uint64_t headroom_redirects_for_testing();
 
     // Per-backend native index-entry counter (the MAX_ENTRIES_PER_BACKEND
     // backstop recomputed by the index rebuild).

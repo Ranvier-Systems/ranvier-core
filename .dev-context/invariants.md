@@ -97,8 +97,12 @@ Seeded from the 2026-07-03 invariant audit (`invariant-audit-2026-07-03.md`).
   was > 0 and dispatch ≠ placement).
 - **R9** ◻ Divert counters mean what they say: `load_aware_fallbacks`,
   `cost_redirects`, `hardware_cost_diverts` increment only when the decision actually
-  moved. (⚠️ `headroom_redirects` currently counts data-presence, not influence —
-  finding I-7.)
+  moved. `headroom_redirects` counts headroom-influenced diverts: headroom pressure
+  present on a BOUNDED_LOAD/P2C decision that moved off the primary hash bucket
+  (documented approximation — a moved decision with pressure present may still be
+  load-driven; exact attribution would need a second selection pass, deliberately
+  not paid). Pinned by `CapacityAwareHashTest.HeadroomRedirectNotCountedWhenSelectionCannotMove`
+  and `...CountedWhenPressurePushesPrimaryOverCap` in `tests/unit/router_service_test.cpp`.
 - **R10** ◻ Batching accounting: `local_routes_batched = applied + deduplicated +
   dropped_overflow` over any window (per shard); overflow drops are counted at the
   drop site, never silently.

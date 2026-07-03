@@ -1039,11 +1039,14 @@ catalog it seeded is `.dev-context/invariants.md`).
   _Completed:_ 2026-07-03 — both `apply_*_batch` paths hash at `route.tokens.size()` (pre-truncated to the effective boundary). Pinned by the same test file.
 - [x] [MEDIUM] Fix: O(1) per-origin LRU tails for `evict_lowest_trust` — remove the O(n) LRU scan per insert at capacity (reactor-stall risk on remote-batch apply) (I-3)
   _Completed:_ 2026-07-03 — `RadixTree` now keeps one intrusive LRU list per `RouteOrigin` (invariant T8); `evict_lowest_trust`/`evict_oldest` are O(1) tail pops with identical victim selection. Debug-only `validate_lru_lists()` asserts list integrity. Pinned by `PerOriginLruTest` in `tests/unit/cache_eviction_test.cpp` and eviction ops + per-op validation in `tests/fuzz/radix_tree_fuzz.cpp`.
-- [ ] [MEDIUM] Fix: `run_ttl_cleanup` ships a shard-0-allocated `flat_hash_map` cross-shard without foreign_ptr (Rule #14; latent until compression_ratio > 1.0 is configured) (I-4)
+- [x] [MEDIUM] Fix: `run_ttl_cleanup` ships a shard-0-allocated `flat_hash_map` cross-shard without foreign_ptr (Rule #14; latent until compression_ratio > 1.0 is configured) (I-4)
+  _Completed:_ 2026-07-03 — cutoffs now cross shards as a foreign_ptr-wrapped `vector<pair<BackendId, time_point>>` copy per target, rebuilt into a local map on the target shard (same shape as `broadcast_load_snapshot`); empty-cutoff default config keeps the no-foreign_ptr fast path. Behavior pinned by existing TTL suites; cross-shard allocation checked by the ASan Deferred Gate.
 - [ ] [MEDIUM] Decide: gossip REMOTE routes overwrite LOCAL routes via plain `insert()` — enforce the documented trust ladder with `insert_if_trusted` or document latest-wins (I-5)
 - [ ] [MEDIUM] Fix: fail-open mode only activates on shard 0 — broadcast the flag to per-shard state (I-6)
-- [ ] [LOW] Fix: `headroom_redirects` counts headroom-data-presence, not actual redirects (I-7)
-- [ ] [LOW] Fix: single-live-backend verified-cold ART hit counts both a cache hit and a verified downgrade (I-8)
+- [x] [LOW] Fix: `headroom_redirects` counts headroom-data-presence, not actual redirects (I-7)
+  _Completed:_ 2026-07-03 — increment now gated on the selection moving off the primary jump-hash bucket with pressure present (BOUNDED_LOAD/P2C only; documented approximation, no second selection pass). Metric name unchanged (sync-map safe); description updated. Pinned by two `CapacityAwareHashTest` cases in `tests/unit/router_service_test.cpp`; invariants.md R9 updated.
+- [x] [LOW] Fix: single-live-backend verified-cold ART hit counts both a cache hit and a verified downgrade (I-8)
+  _Completed:_ 2026-07-03 — `native_verified_downgrades` now counts at the actual downgrade decision (mirroring `residency_downgrades`); the single-backend honored path counts the new `native_verified_cold_honored` / `router_native_verified_cold_honored_total` instead, so hits, downgrades, and cold-honored are pairwise disjoint per decision. Pinned by two §1f cases in `tests/unit/router_service_test.cpp`.
 
 Section anchor (`#22-invariant-audit-findings-2026-07-03`) is the stable pointer for
 future in-source `// BACKLOG §22` cross-references.
