@@ -303,6 +303,76 @@ TEST_F(CacheEvictionTest, LoadThenStaleEvictRejected) {
 }
 
 // =============================================================================
+// Gossip Trust-Ladder Tests (invariant T7, finding I-5)
+// =============================================================================
+//
+// The gossip REMOTE batch-apply path enforces LOCAL > PUSH > REMOTE: a peer's
+// announcement never displaces a higher-trust route for a different backend.
+// These pin the batch-apply behavior through the real apply function
+// (learn_remote_route_for_testing → apply_route_batch_to_local_tree), including
+// the prefix_hash_index gate and the refusal counter.
+
+TEST_F(CacheEvictionTest, RemoteBatchRefusedByLocalRoute) {
+    auto [tokens, prefix_hash] = make_route(900);
+    BackendId local_backend = 1;
+    BackendId remote_backend = 2;
+
+    RouterService::register_backend_for_testing(local_backend, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8080));
+    RouterService::register_backend_for_testing(remote_backend, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8081));
+
+    // Learn K locally, then let a peer announce K → a different backend.
+    RouterService::learn_route_for_testing(tokens, local_backend);
+    ASSERT_EQ(RouterService::lookup_backend_for_testing(tokens), local_backend);
+
+    RouterService::learn_remote_route_for_testing(tokens, remote_backend);
+
+    // The LOCAL route holds; the announcement is refused and counted.
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens), local_backend);
+    EXPECT_EQ(RouterService::remote_routes_trust_refused_for_testing(), 1u);
+
+    // The refused (hash, backend) pair is NOT indexed; the LOCAL one remains.
+    EXPECT_FALSE(RouterService::prefix_hash_index_contains_for_testing(prefix_hash, remote_backend));
+    EXPECT_TRUE(RouterService::prefix_hash_index_contains_for_testing(prefix_hash, local_backend));
+}
+
+TEST_F(CacheEvictionTest, RemoteBatchSameBackendKeepsLocalRoute) {
+    auto [tokens, prefix_hash] = make_route(910);
+    BackendId backend = 3;
+
+    RouterService::register_backend_for_testing(backend, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8080));
+    RouterService::learn_route_for_testing(tokens, backend);
+
+    // A peer announces the SAME backend for K: re-confirmation (TOUCHED_SAME),
+    // not a conflict — no refusal, no duplicate leaf, route unchanged.
+    RouterService::learn_remote_route_for_testing(tokens, backend);
+
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens), backend);
+    EXPECT_EQ(RouterService::remote_routes_trust_refused_for_testing(), 0u);
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 1u);
+    EXPECT_TRUE(RouterService::prefix_hash_index_contains_for_testing(prefix_hash, backend));
+}
+
+TEST_F(CacheEvictionTest, RemoteBatchOverwritesExistingRemoteRoute) {
+    auto [tokens, prefix_hash] = make_route(920);
+    BackendId first = 4;
+    BackendId second = 5;
+
+    RouterService::register_backend_for_testing(first, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8080));
+    RouterService::register_backend_for_testing(second, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8081));
+
+    // First peer announces K → first; a second peer then announces K → second.
+    // REMOTE may replace REMOTE (equal trust), so the newer announcement wins.
+    RouterService::learn_remote_route_for_testing(tokens, first);
+    ASSERT_EQ(RouterService::lookup_backend_for_testing(tokens), first);
+
+    RouterService::learn_remote_route_for_testing(tokens, second);
+
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens), second);
+    EXPECT_EQ(RouterService::remote_routes_trust_refused_for_testing(), 0u);
+    EXPECT_TRUE(RouterService::prefix_hash_index_contains_for_testing(prefix_hash, second));
+}
+
+// =============================================================================
 // Per-Origin LRU Eviction Tests (RadixTree directly)
 // =============================================================================
 //
@@ -448,6 +518,35 @@ TEST_F(PerOriginLruTest, TrustedOverwriteRelinksNode) {
     ASSERT_TRUE(tree_->evict_lowest_trust());
     tree_->validate_lru_lists();
     EXPECT_FALSE(tree_->lookup(tokens({1, 1, 1})).has_value());
+}
+
+TEST_F(PerOriginLruTest, TrustedSameBackendRefreshesLruKeepingOrigin) {
+    // A REMOTE re-announcement of a higher-trust route for the SAME backend
+    // takes the TOUCHED_SAME path: origin stays LOCAL, only the LRU stamp moves
+    // (the gossip flap case that used to force a KV-cache miss).
+    insert_aged({1, 1, 1}, 1, RouteOrigin::LOCAL);   // K, oldest LOCAL
+    insert_aged({2, 2, 2}, 2, RouteOrigin::LOCAL);   // newer LOCAL
+    insert_aged({3, 3, 3}, 3, RouteOrigin::REMOTE);  // decoy for the origin check
+
+    advance_steady_clock();
+    auto result = tree_->insert_if_trusted(tokens({1, 1, 1}), 1, RouteOrigin::REMOTE);
+    EXPECT_EQ(result, TrustInsertResult::TOUCHED_SAME);
+    tree_->validate_lru_lists();
+    EXPECT_EQ(tree_->route_count(), 3u);
+
+    // Origin stayed LOCAL: evict_lowest_trust takes the REMOTE decoy first,
+    // never K — had TOUCHED_SAME flipped K to REMOTE, K could have been chosen.
+    ASSERT_TRUE(tree_->evict_lowest_trust());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({3, 3, 3})).has_value());
+    EXPECT_TRUE(tree_->lookup(tokens({1, 1, 1})).has_value());
+
+    // LRU refreshed: K was the oldest, but the touch moved it ahead of
+    // {2,2,2}, so evict_oldest now takes {2,2,2} first.
+    ASSERT_TRUE(tree_->evict_oldest());
+    tree_->validate_lru_lists();
+    EXPECT_FALSE(tree_->lookup(tokens({2, 2, 2})).has_value());
+    EXPECT_TRUE(tree_->lookup(tokens({1, 1, 1})).has_value());
 }
 
 TEST_F(PerOriginLruTest, SplitAndGrowthPreserveListMembership) {

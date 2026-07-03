@@ -285,6 +285,7 @@ Phase 3c upgrades the strict subset to true cold-start sync — a backend report
 2. **Load events are advisory**: A `loaded` event doesn't override a more recent local observation. If Ranvier just routed a request to backend B for prefix P (and got a successful response), that's a stronger signal than a `loaded` event from backend A for the same prefix.
 3. **Timestamp ordering**: Events include millisecond timestamps. Ranvier discards events with timestamps older than the last state change for that prefix+backend pair.
 4. **Distributed consistency**: Push events propagate to cluster peers via gossip. A peer receiving a gossip-relayed eviction applies the same precedence rules.
+5. **Trust ladder on write, not just eviction**: the `LOCAL < PUSH < REMOTE` ordering above governs *every* lower-trust insert, not only eviction victim selection. Both the PUSH materialization path (native KV `BlockStored`) and the gossip `RouteOrigin::REMOTE` batch-apply go through `insert_if_trusted`, so a lower-trust write for a *different* backend is refused — it never displaces a higher-trust route. A same-backend re-announcement is a plain LRU refresh (origin unchanged). Concretely, a gossip `ROUTE_ANNOUNCEMENT` (REMOTE) can overwrite another REMOTE route but can never overwrite a LOCAL or PUSH route pointing at a different backend; such refusals increment `router_remote_routes_trust_refused_total`. See `docs/internals/gossip-protocol.md` (Batch Broadcast Flow) for the per-outcome table.
 
 ### Staleness Budget
 

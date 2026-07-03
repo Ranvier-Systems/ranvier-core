@@ -34,11 +34,19 @@ Seeded from the 2026-07-03 invariant audit (`invariant-audit-2026-07-03.md`).
   `for_each_leaf_recursive`). Holds because all inserts enter via the TokenId-span API
   with block-aligned truncation.
 - **T6** ◻ No node prefix exceeds `MAX_PREFIX_LENGTH` (`split_long_prefix` chains).
-- **T7** ⚠️ Trust ladder LOCAL > PUSH > REMOTE: a higher-trust route is never displaced
+- **T7** ✅ Trust ladder LOCAL > PUSH > REMOTE: a higher-trust route is never displaced
   by a lower-trust write, and eviction prefers REMOTE, then PUSH, then LOCAL.
-  Enforced by `insert_if_trusted` (PUSH materialization) and `evict_lowest_trust`, but
-  **plain `insert()` bypasses it** — the gossip REMOTE apply path overwrites LOCAL
-  routes (finding I-5, invariant-audit-2026-07-03).
+  Enforced by `insert_if_trusted` on both lower-trust write paths — PUSH
+  materialization (native KV) and the gossip REMOTE batch apply
+  (`apply_route_batch_to_local_tree`) — plus `evict_lowest_trust`. A REMOTE
+  announcement for a DIFFERENT backend is REFUSED (route untouched, counted as
+  `remote_routes_trust_refused`); same-backend re-announcement is TOUCHED_SAME
+  (LRU refresh, origin unchanged); REMOTE-over-REMOTE is OVERWROTE. Finding I-5
+  (invariant-audit-2026-07-03) closed: operator chose the ladder, not latest-wins.
+  Pinned by `RemoteBatchRefusedByLocalRoute` / `RemoteBatchSameBackendKeepsLocalRoute`
+  / `RemoteBatchOverwritesExistingRemoteRoute` (RouterService path) and
+  `TrustedSameBackendRefreshesLruKeepingOrigin` (RadixTree LRU) in
+  `tests/unit/cache_eviction_test.cpp`.
 - **T8** ✅ Per-origin LRU membership/ordering: each leaf is linked in exactly the
   intrusive list matching its `origin` (`lru_head_`/`lru_tail_` arrays indexed by
   origin), each list is ordered by recency, and list lengths sum to `route_count_`.

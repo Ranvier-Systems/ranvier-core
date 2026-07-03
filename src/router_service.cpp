@@ -258,6 +258,7 @@ struct ShardLocalState {
         uint64_t native_verified_cold_honored = 0;  // Verified-cold ART hits honored (no alternative backend live)
         uint64_t native_routes_materialized = 0;    // PUSH routes inserted from BlockStored token chains
         uint64_t native_materialize_trust_skips = 0; // Materializations refused by a higher-trust route
+        uint64_t remote_routes_trust_refused = 0;    // Gossip REMOTE announcements refused by a higher-trust LOCAL/PUSH route
 
         void reset() {
             cache_hits = 0;
@@ -302,6 +303,7 @@ struct ShardLocalState {
             native_verified_cold_honored = 0;
             native_routes_materialized = 0;
             native_materialize_trust_skips = 0;
+            remote_routes_trust_refused = 0;
         }
     } stats;
 
@@ -1333,10 +1335,26 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
             }
         }
 
-        // Insert with REMOTE origin (learned from cluster gossip)
-        tree->insert(route.tokens, route.backend, RouteOrigin::REMOTE);
+        // Insert with REMOTE origin (learned from cluster gossip). The trust
+        // ladder (invariant T7) is enforced here, not latest-wins: a peer's
+        // announcement never displaces a higher-trust LOCAL/PUSH route for a
+        // DIFFERENT backend (REFUSED). REMOTE-over-REMOTE and same-backend
+        // re-confirmation still land (OVERWROTE / TOUCHED_SAME). This ends the
+        // route-flap where two peers serving the same prefix ping-pong the
+        // backend, each flip a KV-cache miss.
+        TrustInsertResult inserted =
+            tree->insert_if_trusted(route.tokens, route.backend, RouteOrigin::REMOTE);
+        if (inserted == TrustInsertResult::REFUSED) {
+            state.stats.remote_routes_trust_refused++;
+            continue;  // route untouched — do not index a backend it never claimed
+        }
 
-        // Update prefix hash reverse index for O(1) eviction lookup.
+        // Update prefix hash reverse index for O(1) eviction lookup. Gated on
+        // the insert result: a REFUSED route is not in the tree under this
+        // backend, so an index entry would be a phantom (the I-1 rebuild prunes
+        // it within a TTL cycle, but skipping keeps the index correct at write
+        // time). INSERTED_NEW / OVERWROTE / TOUCHED_SAME all route to
+        // route.backend, so their entry is valid.
         // Hash at the route's full stored depth (invariant R2): tokens are
         // pre-truncated to the effective boundary by the announcing peer, and
         // routing hashes requests at the uncapped prefix_boundary — re-capping
@@ -1992,7 +2010,13 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         seastar::metrics::make_counter("router_native_materialize_trust_skips_total",
             [] { return g_shard_state ? g_shard_state->stats.native_materialize_trust_skips : 0UL; },
             seastar::metrics::description("Materializations refused because a higher-trust "
-                                         "route holds the prefix"))
+                                         "route holds the prefix")),
+        seastar::metrics::make_counter("router_remote_routes_trust_refused_total",
+            [] { return g_shard_state ? g_shard_state->stats.remote_routes_trust_refused : 0UL; },
+            seastar::metrics::description("Gossip REMOTE route announcements refused because a "
+                                         "higher-trust LOCAL/PUSH route holds the prefix for a "
+                                         "different backend. A sustained cluster-wide rise means "
+                                         "peers disagree about prefix ownership"))
 
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
@@ -5610,6 +5634,19 @@ size_t RouterService::prefix_hash_index_size_for_testing() {
 uint64_t RouterService::headroom_redirects_for_testing() {
     if (!g_shard_state) return 0;
     return shard_state().stats.headroom_redirects;
+}
+
+uint64_t RouterService::remote_routes_trust_refused_for_testing() {
+    if (!g_shard_state) return 0;
+    return shard_state().stats.remote_routes_trust_refused;
+}
+
+std::optional<BackendId> RouterService::lookup_backend_for_testing(
+    const std::vector<int32_t>& tokens) {
+    if (!g_shard_state) return std::nullopt;
+    RadixTree* tree = shard_state().tree.get();
+    if (!tree) return std::nullopt;
+    return tree->lookup(tokens);
 }
 
 uint32_t RouterService::native_index_entries_for_testing(BackendId id) {
