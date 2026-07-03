@@ -51,7 +51,7 @@ flowchart TB
 | **Memory Efficiency** | Adaptive nodes grow only when needed |
 | **Cache Locality** | Path compression reduces pointer chasing |
 | **Lock-Free Reads** | Thread-local trees per Seastar shard |
-| **O(1) Eviction** | Intrusive doubly-linked LRU list on leaf nodes |
+| **O(1) Eviction** | Per-origin intrusive doubly-linked LRU lists on leaf nodes |
 
 ### Source Files
 
@@ -141,9 +141,9 @@ All node types inherit from `Node` (defined in `radix_tree.hpp`). The base struc
 | `type` | `NodeType` | Discriminator for polymorphic dispatch |
 | `prefix` | `absl::InlinedVector<uint8_t, 32>` | Byte-level path compression (inline for ≤32 bytes ≈ 8 tokens, heap beyond) |
 | `leaf_value` | `std::optional<BackendId>` | Route destination if this node is terminal |
-| `origin` | `RouteOrigin` | `LOCAL` (default) or `REMOTE` — controls eviction priority |
+| `origin` | `RouteOrigin` | `LOCAL` (default), `PUSH`, or `REMOTE` — selects the LRU list and eviction priority |
 | `last_accessed` | `steady_clock::time_point` | Timestamp for TTL expiration |
-| `lru_prev` / `lru_next` | `Node*` | Intrusive doubly-linked LRU list pointers |
+| `lru_prev` / `lru_next` | `Node*` | Intrusive doubly-linked LRU pointers (linked in the list matching `origin`) |
 
 The tree operates on raw bytes (big-endian `TokenId` encoding), so `prefix` is a byte vector, not a `TokenId` vector. The `InlinedVector` inline capacity of 32 bytes equals 8 logical tokens — enough to avoid heap allocation for the majority of nodes after path compression splits.
 
@@ -335,27 +335,31 @@ Each shard initializes its own tree at startup, receiving configuration (block a
 
 ## LRU Eviction
 
-The RadixTree maintains an **intrusive doubly-linked list** of all leaf nodes, ordered by access time. This provides O(1) eviction without scanning the tree.
+The RadixTree maintains **one intrusive doubly-linked list of leaf nodes per `RouteOrigin`** (`LOCAL`, `PUSH`, `REMOTE`), each ordered by access time and indexed by the origin's numeric value (`lru_head_`/`lru_tail_` are 3-element arrays). This provides O(1) eviction — including trust-ladder eviction — without scanning either the tree or a list.
 
 ### Design Rationale
 
-An external LRU structure (e.g., `std::list` + hash map) would add per-node heap allocations and cache misses. By embedding `lru_prev`/`lru_next` pointers directly in the `Node` struct, the LRU bookkeeping is free — no extra allocations, and the pointers are in the same cache line as the node's other hot fields.
+An external LRU structure (e.g., `std::list` + hash map) would add per-node heap allocations and cache misses. By embedding `lru_prev`/`lru_next` pointers directly in the `Node` struct, the LRU bookkeeping is free — no extra allocations, and the pointers are in the same cache line as the node's other hot fields. A node lives in exactly one list — the one matching its `origin` — so splitting the list per origin costs nothing per node; only the head/tail anchors multiply.
+
+Per-origin lists exist because `evict_lowest_trust()` runs once **per insert** inside synchronous batch application whenever the tree is at capacity. With a single list it had to scan for the oldest `REMOTE`/`PUSH` leaf (O(n) per call — a Rule #17 reactor stall on every remote-batch flush once the tree fills); with per-origin lists the trust-ladder victim is a tail pop.
+
+Because the list helpers derive the list from `node->origin`, any code path that changes a *linked* node's origin must unlink it **first**, then reassign origin, then re-link (see invariant T8 in `.dev-context/invariants.md`). The debug-only `validate_lru_lists()` asserts list/origin membership, ordering, and length-sum-equals-route-count; the unit tests and fuzz harness call it after every mutation.
 
 ### Operations
 
 | Function | Complexity | Description |
 |----------|------------|-------------|
-| `lru_push_front(node)` | O(1) | Insert node at head (most recently accessed) |
-| `lru_remove(node)` | O(1) | Unlink node from list (on eviction or deletion) |
-| `lru_touch(node)` | O(1) | Move node to head (called on every lookup hit) |
-| `evict_oldest()` | O(1) | Pop tail node, clear its `leaf_value` (tombstone) |
-| `evict_lowest_trust()` | O(n) worst | Scan from tail for `REMOTE`, then `PUSH`; falls back to `evict_oldest()` if neither found |
+| `lru_push_front(node)` | O(1) | Insert node at the head of its origin's list (most recently accessed) |
+| `lru_remove(node)` | O(1) | Unlink node from its origin's list (on eviction or deletion) |
+| `lru_touch(node)` | O(1) | Move node to its origin's head (called on every lookup hit) |
+| `evict_oldest()` | O(1) | Pop the oldest of the (up to 3) list tails, clear its `leaf_value` (tombstone) |
+| `evict_lowest_trust()` | O(1) | Pop the `REMOTE` tail, else the `PUSH` tail; falls back to `evict_oldest()` |
 
 ### Eviction Flow
 
-`evict_oldest()` pops the tail of the intrusive list, clears the node's `leaf_value` (tombstoning it), and decrements the route count. The node structure remains in the tree until [compaction](#tree-compaction-memory-reclamation) removes it.
+`evict_oldest()` compares the tails of the three per-origin lists by `last_accessed` and pops the globally oldest (ties evict the lower-trust route), clears the node's `leaf_value` (tombstoning it), and decrements the route count. The node structure remains in the tree until [compaction](#tree-compaction-memory-reclamation) removes it.
 
-`evict_lowest_trust()` evicts by the origin trust ladder: it scans backward from the tail for `RouteOrigin::REMOTE`, then for `RouteOrigin::PUSH` (backend-materialized routes), and only then falls back to `evict_oldest()` — making the enum's documented eviction precedence (REMOTE > PUSH > LOCAL) literal. The scans make this O(n) in the worst case, but in practice lower-trust routes cluster near the tail (they're accessed less frequently).
+`evict_lowest_trust()` evicts by the origin trust ladder: the tail of the `REMOTE` list, else the tail of the `PUSH` list (backend-materialized routes), and only then falls back to `evict_oldest()` — making the enum's documented eviction precedence (REMOTE > PUSH > LOCAL) literal. Victim selection is identical to the former tail-to-head scan, but each candidate is now a direct tail read.
 
 ### LRU Touch on Lookup
 
@@ -500,8 +504,8 @@ sequenceDiagram
 |-----------|------|-------|-------|
 | `lookup()` | O(k) | O(1) | k = tokens in prefix |
 | `insert()` | O(k) | O(k) amortized | May trigger node growth or prefix split |
-| `evict_oldest()` | O(1) | O(1) | Pops intrusive LRU tail |
-| `evict_lowest_trust()` | O(n) worst | O(1) | Scans for REMOTE, then PUSH; falls back to `evict_oldest()` |
+| `evict_oldest()` | O(1) | O(1) | Pops the oldest of the per-origin LRU tails |
+| `evict_lowest_trust()` | O(1) | O(1) | Pops the REMOTE tail, then PUSH; falls back to `evict_oldest()` |
 | `remove_expired()` | O(n) | O(1) | Scans all routes for TTL expiration |
 | `compact()` | O(n) | O(d) | Post-order traversal; d = tree depth |
 
