@@ -93,3 +93,7 @@ For CRITICAL/HIGH findings, generate one self-contained fix prompt each (PROBLEM
 
 ### Anti-Pattern Candidates
 If any issues are systemic, run `/extract-pattern` to formalize them into the Hard Rules.
+
+---
+
+This skill hunts crashes, leaks, and attack surface. For semantic-correctness bugs — code that never crashes but quietly produces wrong answers (counter drift, side-index divergence, trust/tie-break contract violations) — use `/invariant-audit`, which works from the invariant catalog in `.dev-context/invariants.md`.

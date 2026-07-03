@@ -46,6 +46,7 @@ Ranvier Core is a Layer 7+ LLM traffic controller: C++20 on Seastar (shared-noth
 | Restructuring without behavior change | `/refactor` |
 | Periodic health check of recent work | `/audit` |
 | Hostile security/robustness sweep | `/adversarial-audit` |
+| Hunting wrong-answer bugs (counter drift, side-index divergence, contract violations) | `/invariant-audit` |
 | Turning a bug class into a Hard Rule | `/extract-pattern` |
 | Assessing project direction | `/strategic-review` |
 

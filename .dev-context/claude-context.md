@@ -451,6 +451,7 @@ Workflows live as skills in `.claude/skills/` (invoked as `/name`). The former `
 | `/validate` | Choosing the verification ladder; emitting Deferred Gate commands |
 | `/audit` | Holistic system audit for architecture drift |
 | `/adversarial-audit` | Security-focused adversarial audit |
+| `/invariant-audit` | Semantic-correctness audit against `.dev-context/invariants.md` |
 | `/extract-pattern` | Formalizing new anti-patterns into Hard Rules |
 | `/strategic-review` | Strategic project assessment |
 

@@ -32,6 +32,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 19. [Heterogeneous Backend Support (2026-05-16)](#19-heterogeneous-backend-support-2026-05-16)
 20. [Routing Parity & Ecosystem Alignment](#20-routing-parity--ecosystem-alignment-2026-06-07)
 21. [Cache-Aware Autoscaling Telemetry (2026-06-18)](#21-cache-aware-autoscaling-telemetry-2026-06-18)
+22. [Invariant Audit Findings (2026-07-03)](#22-invariant-audit-findings-2026-07-03)
 
 ---
 
@@ -1013,6 +1014,26 @@ precision-vs-cost choice. See the architecture doc's as-built notes.
 
 Section anchor (`#21-cache-aware-autoscaling-telemetry-2026-06-18`) is the stable
 pointer for future in-source `// BACKLOG §21` cross-references.
+
+---
+
+## 22. Invariant Audit Findings (2026-07-03)
+
+From `.dev-context/invariant-audit-2026-07-03.md` (semantic-correctness pass over the
+routing hot path; finding IDs I-1…I-8 and fix prompts live there; the invariant
+catalog it seeded is `.dev-context/invariants.md`).
+
+- [ ] [HIGH] Fix: prune `prefix_hash_index` on TTL expiry / LRU eviction / peer prune / unregister — its "bounded by max_routes" claim is currently false (invariant audit 2026-07-03, I-1)
+- [ ] [HIGH] Fix: learn-path index inserts must hash at the effective boundary (`tokens.size()`), not `min(len, prefix_token_length)` — boundary-learned entries are keyed at the wrong depth (I-2)
+- [ ] [MEDIUM] Fix: O(1) per-origin LRU tails for `evict_lowest_trust` — remove the O(n) LRU scan per insert at capacity (reactor-stall risk on remote-batch apply) (I-3)
+- [ ] [MEDIUM] Fix: `run_ttl_cleanup` ships a shard-0-allocated `flat_hash_map` cross-shard without foreign_ptr (Rule #14; latent until compression_ratio > 1.0 is configured) (I-4)
+- [ ] [MEDIUM] Decide: gossip REMOTE routes overwrite LOCAL routes via plain `insert()` — enforce the documented trust ladder with `insert_if_trusted` or document latest-wins (I-5)
+- [ ] [MEDIUM] Fix: fail-open mode only activates on shard 0 — broadcast the flag to per-shard state (I-6)
+- [ ] [LOW] Fix: `headroom_redirects` counts headroom-data-presence, not actual redirects (I-7)
+- [ ] [LOW] Fix: single-live-backend verified-cold ART hit counts both a cache hit and a verified downgrade (I-8)
+
+Section anchor (`#22-invariant-audit-findings-2026-07-03`) is the stable pointer for
+future in-source `// BACKLOG §22` cross-references.
 
 ---
 
