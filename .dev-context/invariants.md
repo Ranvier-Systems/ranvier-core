@@ -70,7 +70,10 @@ Seeded from the 2026-07-03 invariant audit (`invariant-audit-2026-07-03.md`).
   native REMOVE/CLEAR/RESET) prune between cycles; membership converges within one
   cycle of any removal path (TTL expiry, LRU eviction, peer prune, unregister).
   Verified by `tests/unit/prefix_hash_index_lifecycle_test.cpp` (finding I-1, fixed
-  2026-07-03).
+  2026-07-03). Known caveat: the rebuild preserves ALL entries of fresh-native-stream
+  backends without provenance, so stale learn-derived entries for a continuously-fresh
+  backend persist until the stream lapses (residual V-1, verification note in
+  invariant-audit-2026-07-03.md; BACKLOG §22).
 - **R2** ✅ Hash-depth identity: every producer and consumer of a prefix hash for the
   same request must hash the same token count — routing lookup, BOTH learn paths'
   index inserts, the `X-Ranvier-Prefix-Hash` header, and the ledger's boundary hashes.

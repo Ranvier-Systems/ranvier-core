@@ -1049,6 +1049,7 @@ catalog it seeded is `.dev-context/invariants.md`).
   _Completed:_ 2026-07-03 — increment now gated on the selection moving off the primary jump-hash bucket with pressure present (BOUNDED_LOAD/P2C only; documented approximation, no second selection pass). Metric name unchanged (sync-map safe); description updated. Pinned by two `CapacityAwareHashTest` cases in `tests/unit/router_service_test.cpp`; invariants.md R9 updated.
 - [x] [LOW] Fix: single-live-backend verified-cold ART hit counts both a cache hit and a verified downgrade (I-8)
   _Completed:_ 2026-07-03 — `native_verified_downgrades` now counts at the actual downgrade decision (mirroring `residency_downgrades`); the single-backend honored path counts the new `native_verified_cold_honored` / `router_native_verified_cold_honored_total` instead, so hits, downgrades, and cold-honored are pairwise disjoint per decision. Pinned by two §1f cases in `tests/unit/router_service_test.cpp`.
+- [ ] [LOW] Harden: the I-1 index rebuild preserves ALL entries of fresh-native-stream backends without provenance or cap — stale learn-derived entries for a continuously-fresh backend persist until the stream lapses. Enforce `MAX_ENTRIES_PER_BACKEND` during preservation (drop + overflow counter), or add a per-entry provenance bit. (V-1, verification pass 2026-07-04 appended to the audit report)
 
 Section anchor (`#22-invariant-audit-findings-2026-07-03`) is the stable pointer for
 future in-source `// BACKLOG §22` cross-references.
