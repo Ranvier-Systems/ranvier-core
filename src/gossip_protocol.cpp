@@ -462,7 +462,7 @@ seastar::future<> GossipProtocol::stop() {
     }
 }
 
-seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& tokens, BackendId backend) {
+seastar::future<> GossipProtocol::broadcast_route(std::vector<TokenId> tokens, BackendId backend) {
     // Rule 22: coroutine converts any pre-future throw into a failed future
     if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
         co_return;
@@ -497,9 +497,13 @@ seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& to
     // This avoids N token vector copies and N serialization passes.
     RouteAnnouncementPacket pkt;
     pkt.backend_id = backend;
-    pkt.tokens = std::vector<TokenId>(tokens.begin(), tokens.end());
+    // Compute token_count before moving tokens (its size is read here); the move
+    // then avoids the copy the old begin/end pass made. tokens is a by-value
+    // param (Rule #21) unused after this, and pkt.tokens still receives the full
+    // set — token_count is separately capped, so the wire output is identical.
     pkt.token_count = static_cast<uint16_t>(std::min(tokens.size(),
                                                       static_cast<size_t>(RouteAnnouncementPacket::MAX_TOKENS)));
+    pkt.tokens = std::move(tokens);
     pkt.seq_num = 0;
     auto base_serialized = pkt.serialize();
 
