@@ -1398,7 +1398,10 @@ TEST_F(ConfigTest, AuthConfigValidKeyCount) {
     ApiKey key2;
     key2.key = "expired-key";
     key2.name = "expired";
-    key2.expires = "2020-01-01";  // Expired
+    key2.expires = "2020-01-01";  // retained for audit/display
+    // is_expired() reads the loader-parsed expires_at, not the raw string, so a
+    // hand-built key must set it directly (see ApiKeyIsExpiredForPastDate).
+    key2.expires_at = std::chrono::system_clock::now() - std::chrono::hours(48);
     auth.api_keys.push_back(key2);
     EXPECT_EQ(auth.valid_key_count(), 2u);  // Still 2, expired key doesn't count
 }
