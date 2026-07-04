@@ -462,7 +462,7 @@ seastar::future<> GossipProtocol::stop() {
     }
 }
 
-seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& tokens, BackendId backend) {
+seastar::future<> GossipProtocol::broadcast_route(std::vector<TokenId> tokens, BackendId backend) {
     // Rule 22: coroutine converts any pre-future throw into a failed future
     if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
         co_return;
@@ -497,9 +497,13 @@ seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& to
     // This avoids N token vector copies and N serialization passes.
     RouteAnnouncementPacket pkt;
     pkt.backend_id = backend;
-    pkt.tokens = std::vector<TokenId>(tokens.begin(), tokens.end());
+    // Compute token_count before moving tokens (its size is read here); the move
+    // then avoids the copy the old begin/end pass made. tokens is a by-value
+    // param (Rule #21) unused after this, and pkt.tokens still receives the full
+    // set — token_count is separately capped, so the wire output is identical.
     pkt.token_count = static_cast<uint16_t>(std::min(tokens.size(),
                                                       static_cast<size_t>(RouteAnnouncementPacket::MAX_TOKENS)));
+    pkt.tokens = std::move(tokens);
     pkt.seq_num = 0;
     auto base_serialized = pkt.serialize();
 
@@ -536,7 +540,9 @@ seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& to
             }
         }
 
-        return _transport->send(peer, serialized).then([this] {
+        // serialized is a dead per-peer local after this return, so move it into
+        // send's by-value data parameter (Rule #21) instead of copying.
+        return _transport->send(peer, std::move(serialized)).then([this] {
             ++_packets_sent;
         }).handle_exception([peer](auto ep) {
             try {
@@ -623,7 +629,9 @@ seastar::future<> GossipProtocol::broadcast_cache_eviction(uint64_t prefix_hash,
             }
         }
 
-        return _transport->send(peer, serialized).then([this] {
+        // serialized is a dead per-peer local after this return, so move it into
+        // send's by-value data parameter (Rule #21) instead of copying.
+        return _transport->send(peer, std::move(serialized)).then([this] {
             ++_packets_sent;
         }).handle_exception([peer](auto ep) {
             try {
@@ -983,19 +991,27 @@ seastar::future<> GossipProtocol::refresh_peers() {
             // multiple in-flight queries) and allocates a per-query promise on
             // the heap, with no shared mutable state -- but the contract is
             // not documented in dns.hh, so re-check on Seastar upgrade.
+            // Rule #16: the loop body is a lambda coroutine (it co_awaits), and
+            // max_concurrent_for_each is a continuation-based API, so the functor
+            // must be wrapped in seastar::coroutine::lambda() or its captures are
+            // freed at the first co_await. This is a functor-lifetime concern,
+            // distinct from the Rule #2 rationale above -- the &discovered_addresses
+            // capture is only safe because the wrapper keeps the functor alive for
+            // the whole loop (refresh_peers' frame owns discovered_addresses).
             co_await seastar::max_concurrent_for_each(
                 srv_records, MAX_CONCURRENT_DNS_RESOLUTIONS,
-                [this, &discovered_addresses](const auto& srv) -> seastar::future<> {
-                    try {
-                        auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
-                        for (const auto& addr : host_entry.addr_list) {
-                            discovered_addresses.emplace_back(addr, srv.port);
-                            log_gossip_protocol().debug("DNS SRV discovered peer: {}:{}", addr, srv.port);
+                seastar::coroutine::lambda(
+                    [this, &discovered_addresses](const auto& srv) -> seastar::future<> {
+                        try {
+                            auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
+                            for (const auto& addr : host_entry.addr_list) {
+                                discovered_addresses.emplace_back(addr, srv.port);
+                                log_gossip_protocol().debug("DNS SRV discovered peer: {}:{}", addr, srv.port);
+                            }
+                        } catch (const std::exception& e) {
+                            log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
                         }
-                    } catch (const std::exception& e) {
-                        log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
-                    }
-                });
+                    }));
         } else if (_config.discovery_type == DiscoveryType::A) {
             auto host_entry = co_await _dns_resolver.get_host_by_name(_config.discovery_dns_name);
 
@@ -1070,7 +1086,7 @@ seastar::future<> GossipProtocol::refresh_peers() {
     co_return;
 }
 
-seastar::future<> GossipProtocol::send_ack(const seastar::socket_address& peer, uint32_t seq_num) {
+seastar::future<> GossipProtocol::send_ack(seastar::socket_address peer, uint32_t seq_num) {
     // Rule 22: coroutine converts any pre-future throw into a failed future
     if (!_transport || !_transport->is_ready()) {
         co_return;
@@ -1083,7 +1099,8 @@ seastar::future<> GossipProtocol::send_ack(const seastar::socket_address& peer, 
     log_gossip_protocol().trace("Sending ACK: peer={}, seq_num={}", peer, seq_num);
 
     try {
-        co_await _transport->send(peer, serialized);
+        // peer is reused by the catch-path log below, so only the buffer moves.
+        co_await _transport->send(peer, std::move(serialized));
         ++_acks_sent;
     } catch (...) {
         try {

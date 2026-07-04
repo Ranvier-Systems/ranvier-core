@@ -273,7 +273,10 @@ public:
     }
 
     // Broadcast methods
-    seastar::future<> broadcast_route(const std::vector<TokenId>& tokens, BackendId backend);
+    // By value (coroutine — Rule #21). Reads tokens only before the per-peer
+    // parallel_for_each suspension today, but by-value removes the latent UAF a
+    // future post-suspension read would introduce; matches the by-value siblings.
+    seastar::future<> broadcast_route(std::vector<TokenId> tokens, BackendId backend);
     seastar::future<> broadcast_node_state(NodeState state, BackendId local_backend_id);
     seastar::future<> broadcast_cache_eviction(uint64_t prefix_hash, BackendId backend_id);
     seastar::future<> broadcast_cache_state(BackendId backend_id, double cache_usage, double residency_weight);
@@ -390,7 +393,10 @@ private:
     uint64_t _unknown_packet_types = 0;
 
     // Internal methods
-    seastar::future<> send_ack(const seastar::socket_address& peer, uint32_t seq_num);
+    // By value (coroutine — Rule #21). handle_packet is NOT a coroutine: its
+    // src_addr stack local dies when it returns this future, so a reference
+    // parameter would dangle once send_ack suspends on the transport send.
+    seastar::future<> send_ack(seastar::socket_address peer, uint32_t seq_num);
     void handle_ack(const seastar::socket_address& peer, uint32_t seq_num);
     bool is_duplicate(const seastar::socket_address& peer, uint32_t seq_num);
     seastar::future<> process_retries();
