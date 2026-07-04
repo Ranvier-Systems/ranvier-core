@@ -109,30 +109,19 @@ struct ApiKey {
     std::optional<std::string> expires;               // Optional ISO 8601 expiry date (e.g., "2025-12-31")
     std::vector<std::string> roles;                   // Future RBAC prep (e.g., ["admin"], ["viewer"])
 
+    // Instant at which the key becomes expired, parsed once by the config loader.
+    // Semantics: the expiry date is valid *through* the end of that UTC day, so
+    // this holds midnight UTC at the start of the following day. nullopt means
+    // "never expires" — no expiry configured, or an unparseable date (which the
+    // loader warns about and treats as non-expiring, matching legacy behavior).
+    // Parsing lives in the loader (its layer), off the per-request auth path —
+    // is_expired() is a lock-free, static-free comparison callable concurrently
+    // on every shard.
+    std::optional<std::chrono::system_clock::time_point> expires_at;
+
     // Check if this key has expired (returns false if no expiry set)
     bool is_expired() const {
-        if (!expires.has_value() || expires->empty()) {
-            return false;
-        }
-        // Parse expiry date (YYYY-MM-DD format) and compare with current date
-        auto now = std::chrono::system_clock::now();
-        auto now_time_t = std::chrono::system_clock::to_time_t(now);
-        std::tm now_tm = *std::gmtime(&now_time_t);
-
-        // Parse expiry date
-        std::tm expiry_tm = {};
-        std::istringstream iss(*expires);
-        iss >> std::get_time(&expiry_tm, "%Y-%m-%d");
-        if (iss.fail()) {
-            return false;  // Invalid date format, treat as non-expired
-        }
-
-        // Compare dates (expiry is valid until end of that day)
-        if (now_tm.tm_year < expiry_tm.tm_year) return false;
-        if (now_tm.tm_year > expiry_tm.tm_year) return true;
-        if (now_tm.tm_mon < expiry_tm.tm_mon) return false;
-        if (now_tm.tm_mon > expiry_tm.tm_mon) return true;
-        return now_tm.tm_mday > expiry_tm.tm_mday;
+        return expires_at.has_value() && std::chrono::system_clock::now() >= *expires_at;
     }
 
     // Get a safe prefix of the key for logging (first 8 chars or key name)
