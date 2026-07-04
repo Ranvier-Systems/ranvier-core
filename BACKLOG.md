@@ -1059,17 +1059,37 @@ future in-source `// BACKLOG §22` cross-references.
 
 ## 23. Holistic Audit Findings (2026-07-04)
 
-From `.dev-context/holistic-audit-2026-07-04.md` (async-integrity / coroutine-lifetime
-pass over the gossip layer; finding IDs V1…V7 and fix prompts live there). The three
-items below are the coroutine-lifetime hygiene fixes in the gossip protocol/transport
-(Hard Rules #16/#21); the remaining findings are tracked in the audit report.
+From `.dev-context/holistic-audit-2026-07-04.md` (Hard Rules / async-integrity / drift
+pass over the post-February churn not covered by the invariant audit: application,
+telemetry, config, metrics_service, gossip_protocol, http_controller delta).
 
-- [x] [HIGH] Fix: the reliable-delivery ACK path holds the destination `socket_address` by reference through a coroutine chain whose caller frame dies on return — `handle_packet` is not a coroutine, so its `src_addr` stack local is freed the moment it returns the `send_ack` future, and the DTLS send path then reads dead stack for the destination after `co_await encrypt_with_offloading` (a live UAF on DTLS-encrypted clusters) (holistic audit 2026-07-04, V1)
+Violations:
+
+- [x] [HIGH] Fix: `send_ack` + `GossipTransport::send` take `socket_address` by const-ref into coroutines; `handle_packet` passes a dying stack local — with DTLS the ACK destination is read from dead stack after the encrypt suspension. Take by value (Rule #21) (V1)
   _Completed:_ 2026-07-04 — `GossipProtocol::send_ack` and `GossipTransport::send` now take the peer `socket_address` (and `send`'s `data` buffer) by value, so each lives in its own coroutine frame; the destination is no longer read from freed stack after the encrypt suspension. `GossipTransport::broadcast` keeps `peers`/`data` by const-ref under a `// Rule #21` exception annotation (every caller co_awaits it with a buffer its own frame owns). The two per-peer `send` sites `std::move` the dead `serialized` local into the by-value parameter (copy-neutral); the plaintext-broadcast and retry paths incur one small copy of already-background traffic. Non-coroutine helpers `initiate_handshake`/`encrypt_with_offloading` annotated Rule #21 N/A. Regression: `GossipAckLifetimeTest.DestinationSurvivesCallerFrameDestruction` pins the by-value-across-suspension contract with a hand-driven coroutine (frees the source between suspend and resume; ASan probe for the pattern). The end-to-end reactor+DTLS UAF probe is the sanitizer/integration Deferred Gate (this unit target links no Seastar runtime).
-- [x] [MEDIUM] Fix: `refresh_peers` passes an unwrapped lambda coroutine to `max_concurrent_for_each` — a continuation-based API frees the functor's captures at the first `co_await` (Rule #16) (holistic audit 2026-07-04, V2)
+- [x] [MEDIUM] Fix: unwrapped lambda coroutine passed to `max_concurrent_for_each` in `refresh_peers` SRV branch — wrap with `seastar::coroutine::lambda()` (Rule #16) (V2)
   _Completed:_ 2026-07-04 — the SRV-resolution loop body is now wrapped in `seastar::coroutine::lambda(...)`, extending the functor's lifetime (and its `&discovered_addresses` capture) across the whole loop. The existing comment block was extended with the functor-lifetime rationale, kept explicitly distinct from the Rule #2 concurrency note it already carried.
-- [x] [LOW] Fix: `broadcast_route` takes `tokens` by const reference in a coroutine — latent today (every read precedes the first suspension) but a silent UAF the moment any refactor reads `tokens` after the `parallel_for_each` (Rule #21) (holistic audit 2026-07-04, V4)
+- [ ] [MEDIUM] Fix: `std::gmtime` static-buffer race in `ApiKey::is_expired()` on the per-shard auth path — use `gmtime_r` (re-flagged; was E9 in 2026-02-12 audit) (V3)
+- [x] [MEDIUM] Fix: `broadcast_route` coroutine takes tokens by const-ref (latent UAF; newer siblings are by-value with Rule #21 annotations) (V4)
   _Completed:_ 2026-07-04 — `GossipProtocol::broadcast_route` now takes `std::vector<TokenId> tokens` by value, matching the by-value `broadcast_hot_prefix_digest`/`HotPrefixDigestCallback` siblings; `token_count` is computed before the vector is `std::move`d into the packet, so the wire output is bit-identical. No `RouteBroadcast` callback typedef exists (nothing to update there); the `GossipService`/`RouterService` callers pass an lvalue into the by-value parameter, copying exactly where `broadcast_route` copied internally before — net copy count unchanged, so no cross-file caller churn was warranted.
+- [ ] [LOW] Fix: bound `cluster.peers` and `auth.api_keys` in config_loader and the `refresh_peers` DNS merge (Rule #4; was S11) (V5)
+- [ ] [LOW] Fix: gossip per-peer send-failure catches log at debug with no counter — promote to warn or annotate + count (Rule #9) (V6)
+- [ ] [DOC] Sync: `docs/internals/gossip-protocol.md` missing HOT_PREFIX_DIGEST (0x07) packet format + digest counters (V7)
+- [ ] [DOC] Sync: `docs/internals/per-api-key-attribution.md` missing `tokens_estimated` column + actual-vs-estimated preference (V8)
+- [x] [DOC] Sync: claude-context.md gossip packet enumeration missing CACHE_STATE / HOT_PREFIX_DIGEST (V9)
+  _Completed:_ 2026-07-04 in the audit-recording commit (one-line living-doc fix).
+
+Technical debt:
+
+- [ ] [TECH-DEBT] telemetry_schema.hpp carries non-trivial logic (merge_hot_prefixes, sole-held math, JSON emitter, lines 284-431) in a *_schema.hpp; move helpers out (from audit 2026-07-04)
+- [ ] [TECH-DEBT] http_controller handle_proxy detects non-streaming via `"stream":false` substring sniff — use the single-parse extraction (from audit 2026-07-04)
+- [ ] [TECH-DEBT] `GossipProtocol::next_seq_num` at-capacity eviction sweeps up to MAX_DEDUP_PEERS=10000 entries synchronously on the broadcast path; amortize (Rule #17 marginal) (from audit 2026-07-04)
+- [ ] [TECH-DEBT] `TelemetryService::snapshot_and_reset` iterates up to the 65536 max_buckets ceiling with no yield; mirror the emit merge loop's yield or lower the ceiling (from audit 2026-07-04)
+- [ ] [TECH-DEBT] `Application::load_persisted_state` replays routes with sequential `co_await learn_route_global` per record (startup-only; O(routes × shards) cold start); batch (from audit 2026-07-04)
+- [ ] [TECH-DEBT] application.cpp includes `<fstream>` with no use — stale include invites Rule #12 misuse (from audit 2026-07-04)
+- [ ] [TECH-DEBT] reload/init paths capture whole config structs by value into invoke_on_all lambdas (cross-shard free, accepted D4 posture) — consider a foreign_ptr broadcast helper (from audit 2026-07-04)
+- [ ] [TECH-DEBT] `setup_signal_handlers` fire-and-forget reload broadcast lacks a gate; route through `_lifecycle_gate` (Rule #18 hygiene) (from audit 2026-07-04)
+- [ ] [TECH-DEBT] `ApiKey::is_expired()` re-parses the expiry date per call; parse once at config load into a time_point (also fixes V3) (from audit 2026-07-04)
 
 Section anchor (`#23-holistic-audit-findings-2026-07-04`) is the stable pointer for
 future in-source `// BACKLOG §23` cross-references.
