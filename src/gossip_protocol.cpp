@@ -536,7 +536,9 @@ seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& to
             }
         }
 
-        return _transport->send(peer, serialized).then([this] {
+        // serialized is a dead per-peer local after this return, so move it into
+        // send's by-value data parameter (Rule #21) instead of copying.
+        return _transport->send(peer, std::move(serialized)).then([this] {
             ++_packets_sent;
         }).handle_exception([peer](auto ep) {
             try {
@@ -623,7 +625,9 @@ seastar::future<> GossipProtocol::broadcast_cache_eviction(uint64_t prefix_hash,
             }
         }
 
-        return _transport->send(peer, serialized).then([this] {
+        // serialized is a dead per-peer local after this return, so move it into
+        // send's by-value data parameter (Rule #21) instead of copying.
+        return _transport->send(peer, std::move(serialized)).then([this] {
             ++_packets_sent;
         }).handle_exception([peer](auto ep) {
             try {
@@ -1070,7 +1074,7 @@ seastar::future<> GossipProtocol::refresh_peers() {
     co_return;
 }
 
-seastar::future<> GossipProtocol::send_ack(const seastar::socket_address& peer, uint32_t seq_num) {
+seastar::future<> GossipProtocol::send_ack(seastar::socket_address peer, uint32_t seq_num) {
     // Rule 22: coroutine converts any pre-future throw into a failed future
     if (!_transport || !_transport->is_ready()) {
         co_return;
@@ -1083,7 +1087,8 @@ seastar::future<> GossipProtocol::send_ack(const seastar::socket_address& peer, 
     log_gossip_protocol().trace("Sending ACK: peer={}, seq_num={}", peer, seq_num);
 
     try {
-        co_await _transport->send(peer, serialized);
+        // peer is reused by the catch-path log below, so only the buffer moves.
+        co_await _transport->send(peer, std::move(serialized));
         ++_acks_sent;
     } catch (...) {
         try {

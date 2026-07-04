@@ -67,11 +67,21 @@ public:
     // Check if transport is ready
     bool is_ready() const { return _channel.has_value(); }
 
-    // Send data to a peer (handles encryption transparently)
-    seastar::future<> send(const seastar::socket_address& peer,
-                           const std::vector<uint8_t>& data);
+    // Send data to a peer (handles encryption transparently).
+    // By value (coroutine — Rule #21): the DTLS path reads peer AFTER
+    // co_await encrypt_with_offloading, and callers (e.g. broadcast_route's
+    // per-peer parallel_for_each lambda, send_ack) hand it a stack local that
+    // dies before this coroutine resumes. data is likewise by value — the same
+    // per-peer lambdas own it only until they return the send future.
+    seastar::future<> send(seastar::socket_address peer, std::vector<uint8_t> data);
 
-    // Broadcast data to multiple peers (optimized for large fan-out)
+    // Broadcast data to multiple peers (optimized for large fan-out).
+    // Rule #21 exception: peers/data stay by const-ref. broadcast is a coroutine
+    // and does read both after its first suspension (get_units / the async
+    // batch), but every caller is a broadcast_* coroutine in gossip_protocol that
+    // co_awaits broadcast with a buffer (*_peer_addresses, a serialized packet)
+    // owned by its own frame, which provably outlives the await. By-value here
+    // would copy the whole peer set and payload on every fan-out — pure waste.
     seastar::future<> broadcast(const std::vector<seastar::socket_address>& peers,
                                 const std::vector<uint8_t>& data);
 

@@ -33,6 +33,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 20. [Routing Parity & Ecosystem Alignment](#20-routing-parity--ecosystem-alignment-2026-06-07)
 21. [Cache-Aware Autoscaling Telemetry (2026-06-18)](#21-cache-aware-autoscaling-telemetry-2026-06-18)
 22. [Invariant Audit Findings (2026-07-03)](#22-invariant-audit-findings-2026-07-03)
+23. [Holistic Audit Findings (2026-07-04)](#23-holistic-audit-findings-2026-07-04)
 
 ---
 
@@ -1053,6 +1054,21 @@ catalog it seeded is `.dev-context/invariants.md`).
 
 Section anchor (`#22-invariant-audit-findings-2026-07-03`) is the stable pointer for
 future in-source `// BACKLOG §22` cross-references.
+
+---
+
+## 23. Holistic Audit Findings (2026-07-04)
+
+From `.dev-context/holistic-audit-2026-07-04.md` (async-integrity / coroutine-lifetime
+pass over the gossip layer; finding IDs V1…V7 and fix prompts live there). The three
+items below are the coroutine-lifetime hygiene fixes in the gossip protocol/transport
+(Hard Rules #16/#21); the remaining findings are tracked in the audit report.
+
+- [x] [HIGH] Fix: the reliable-delivery ACK path holds the destination `socket_address` by reference through a coroutine chain whose caller frame dies on return — `handle_packet` is not a coroutine, so its `src_addr` stack local is freed the moment it returns the `send_ack` future, and the DTLS send path then reads dead stack for the destination after `co_await encrypt_with_offloading` (a live UAF on DTLS-encrypted clusters) (holistic audit 2026-07-04, V1)
+  _Completed:_ 2026-07-04 — `GossipProtocol::send_ack` and `GossipTransport::send` now take the peer `socket_address` (and `send`'s `data` buffer) by value, so each lives in its own coroutine frame; the destination is no longer read from freed stack after the encrypt suspension. `GossipTransport::broadcast` keeps `peers`/`data` by const-ref under a `// Rule #21` exception annotation (every caller co_awaits it with a buffer its own frame owns). The two per-peer `send` sites `std::move` the dead `serialized` local into the by-value parameter (copy-neutral); the plaintext-broadcast and retry paths incur one small copy of already-background traffic. Non-coroutine helpers `initiate_handshake`/`encrypt_with_offloading` annotated Rule #21 N/A. Regression: `GossipAckLifetimeTest.DestinationSurvivesCallerFrameDestruction` pins the by-value-across-suspension contract with a hand-driven coroutine (frees the source between suspend and resume; ASan probe for the pattern). The end-to-end reactor+DTLS UAF probe is the sanitizer/integration Deferred Gate (this unit target links no Seastar runtime).
+
+Section anchor (`#23-holistic-audit-findings-2026-07-04`) is the stable pointer for
+future in-source `// BACKLOG §23` cross-references.
 
 ---
 

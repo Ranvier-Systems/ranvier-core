@@ -150,8 +150,8 @@ void GossipTransport::initialize_crypto_offloader() {
     log_gossip_transport().info("Crypto offloader initialized (seastar::async mode)");
 }
 
-seastar::future<> GossipTransport::send(const seastar::socket_address& peer,
-                                         const std::vector<uint8_t>& data) {
+seastar::future<> GossipTransport::send(seastar::socket_address peer,
+                                         std::vector<uint8_t> data) {
     // Rule 22: coroutine converts any pre-future throw into a failed future
     if (!_channel) {
         co_return;
@@ -354,6 +354,8 @@ std::optional<std::vector<uint8_t>> GossipTransport::decrypt(const seastar::sock
 }
 
 seastar::future<> GossipTransport::initiate_handshake(const seastar::socket_address& peer) {
+    // Rule #21 N/A: not a coroutine (no co_await; returns a ready future). peer is
+    // read synchronously before the future is returned, so it never dangles.
     if (!_dtls_context || !_channel) {
         return seastar::make_ready_future<>();
     }
@@ -471,6 +473,10 @@ seastar::future<std::vector<uint8_t>> GossipTransport::encrypt_with_offloading(
     DtlsSession* session,
     const std::vector<uint8_t>& plaintext,
     const seastar::socket_address& peer) {
+    // Rule #21 N/A: not a coroutine (continuation-based .then chain, no co_await).
+    // plaintext/peer are read synchronously and copied (plaintext_copy, peer_copy)
+    // into the offloaded closure before any returned future can suspend, so the
+    // reference parameters never outlive the caller's frame.
 
     if (!session || !session->is_established()) {
         return seastar::make_ready_future<std::vector<uint8_t>>(std::vector<uint8_t>{});

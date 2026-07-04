@@ -4,7 +4,10 @@
 // These tests don't require Seastar runtime.
 
 #include <gtest/gtest.h>
+#include <coroutine>
 #include <cstdint>
+#include <cstring>
+#include <memory>
 #include <vector>
 #include <optional>
 
@@ -1197,6 +1200,93 @@ TEST_F(PendingAcksBoundTest, OverloadedPeerScenario) {
 
     // Count stays at limit
     EXPECT_EQ(tracker.pending_acks_count, MAX_PENDING_ACKS);
+}
+
+// =============================================================================
+// ACK-path coroutine-lifetime regression (holistic-audit V1, 2026-07-04)
+//
+// The reliable-delivery ACK path is handle_packet -> send_ack -> GossipTransport::send.
+// handle_packet is NOT a coroutine: its src_addr is a stack local that dies the
+// instant handle_packet returns the send_ack future. send_ack and send ARE
+// coroutines that read the destination address AFTER suspending (the DTLS path
+// reads it after `co_await encrypt_with_offloading`). If either took the address
+// by reference, it would read freed stack once resumed -- a use-after-free whose
+// live exposure is DTLS-encrypted clusters. The fix takes the destination by
+// value so it lives in each coroutine's own frame.
+//
+// The true end-to-end probe is the reactor + DTLS integration suite under ASan
+// (a Deferred Gate: this target links no Seastar runtime and the sandbox cannot
+// build Seastar). Here we pin the exact lifetime contract the fix relies on with
+// a hand-driven std::coroutine_handle -- no reactor needed -- by freeing the
+// source address between the coroutine's suspension and its resume. A by-value
+// parameter survives (its own frame copy); regress the model below to a
+// `const&` parameter and this test reads freed memory, which ASan flags.
+// =============================================================================
+namespace {
+
+struct FakeSockAddr {
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    bool operator==(const FakeSockAddr&) const = default;
+};
+
+// Minimal manually-driven coroutine: runs to an explicit co_await, suspends, and
+// resumes only when the driver calls resume(). suspend_never at initial_suspend
+// means the body (and the by-value parameter copy into the frame) runs on call.
+struct ManualCoro {
+    struct promise_type {
+        ManualCoro get_return_object() {
+            return ManualCoro{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        void unhandled_exception() { std::terminate(); }
+    };
+
+    std::coroutine_handle<promise_type> handle;
+
+    explicit ManualCoro(std::coroutine_handle<promise_type> h) : handle(h) {}
+    ManualCoro(ManualCoro&& o) noexcept : handle(o.handle) { o.handle = nullptr; }
+    ManualCoro& operator=(ManualCoro&&) = delete;
+    ManualCoro(const ManualCoro&) = delete;
+    ManualCoro& operator=(const ManualCoro&) = delete;
+    ~ManualCoro() { if (handle) handle.destroy(); }
+
+    bool done() const { return handle.done(); }
+    void resume() { handle.resume(); }
+};
+
+// Mirrors GossipProtocol::send_ack's fixed signature: destination BY VALUE, read
+// after a suspension. Regressing `peer` to `const FakeSockAddr&` turns the test
+// below into a use-after-free (caught by ASan) -- exactly the V1 defect.
+ManualCoro record_dest_by_value(FakeSockAddr peer, FakeSockAddr* out) {
+    co_await std::suspend_always{};  // caller's source storage may be freed here
+    *out = peer;                     // reads the frame copy, never the caller's source
+}
+
+}  // namespace
+
+TEST(GossipAckLifetimeTest, DestinationSurvivesCallerFrameDestruction) {
+    constexpr FakeSockAddr kSrc{0x0A000001u, 4321};  // 10.0.0.1:4321
+
+    // Source address in its own heap block, standing in for handle_packet's
+    // short-lived src_addr frame.
+    auto src = std::make_unique<FakeSockAddr>(kSrc);
+
+    FakeSockAddr recorded{};
+    ManualCoro coro = record_dest_by_value(*src, &recorded);
+    ASSERT_FALSE(coro.done());  // suspended at co_await; peer already frame-copied
+
+    // Destroy + poison the source before resuming. A surviving reference into it
+    // would now read freed memory.
+    std::memset(src.get(), 0xFF, sizeof(FakeSockAddr));
+    src.reset();
+
+    coro.resume();
+    ASSERT_TRUE(coro.done());
+
+    EXPECT_EQ(recorded, kSrc);  // by-value copy preserved the true destination
 }
 
 int main(int argc, char** argv) {

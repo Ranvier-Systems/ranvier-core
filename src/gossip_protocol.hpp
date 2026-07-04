@@ -390,7 +390,10 @@ private:
     uint64_t _unknown_packet_types = 0;
 
     // Internal methods
-    seastar::future<> send_ack(const seastar::socket_address& peer, uint32_t seq_num);
+    // By value (coroutine — Rule #21). handle_packet is NOT a coroutine: its
+    // src_addr stack local dies when it returns this future, so a reference
+    // parameter would dangle once send_ack suspends on the transport send.
+    seastar::future<> send_ack(seastar::socket_address peer, uint32_t seq_num);
     void handle_ack(const seastar::socket_address& peer, uint32_t seq_num);
     bool is_duplicate(const seastar::socket_address& peer, uint32_t seq_num);
     seastar::future<> process_retries();
