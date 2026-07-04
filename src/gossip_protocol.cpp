@@ -987,19 +987,27 @@ seastar::future<> GossipProtocol::refresh_peers() {
             // multiple in-flight queries) and allocates a per-query promise on
             // the heap, with no shared mutable state -- but the contract is
             // not documented in dns.hh, so re-check on Seastar upgrade.
+            // Rule #16: the loop body is a lambda coroutine (it co_awaits), and
+            // max_concurrent_for_each is a continuation-based API, so the functor
+            // must be wrapped in seastar::coroutine::lambda() or its captures are
+            // freed at the first co_await. This is a functor-lifetime concern,
+            // distinct from the Rule #2 rationale above -- the &discovered_addresses
+            // capture is only safe because the wrapper keeps the functor alive for
+            // the whole loop (refresh_peers' frame owns discovered_addresses).
             co_await seastar::max_concurrent_for_each(
                 srv_records, MAX_CONCURRENT_DNS_RESOLUTIONS,
-                [this, &discovered_addresses](const auto& srv) -> seastar::future<> {
-                    try {
-                        auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
-                        for (const auto& addr : host_entry.addr_list) {
-                            discovered_addresses.emplace_back(addr, srv.port);
-                            log_gossip_protocol().debug("DNS SRV discovered peer: {}:{}", addr, srv.port);
+                seastar::coroutine::lambda(
+                    [this, &discovered_addresses](const auto& srv) -> seastar::future<> {
+                        try {
+                            auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
+                            for (const auto& addr : host_entry.addr_list) {
+                                discovered_addresses.emplace_back(addr, srv.port);
+                                log_gossip_protocol().debug("DNS SRV discovered peer: {}:{}", addr, srv.port);
+                            }
+                        } catch (const std::exception& e) {
+                            log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
                         }
-                    } catch (const std::exception& e) {
-                        log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
-                    }
-                });
+                    }));
         } else if (_config.discovery_type == DiscoveryType::A) {
             auto host_entry = co_await _dns_resolver.get_host_by_name(_config.discovery_dns_name);
 
