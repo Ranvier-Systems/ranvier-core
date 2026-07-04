@@ -354,6 +354,8 @@ seastar::future<> GossipProtocol::start(GossipTransport* transport, GossipConsen
         try {
             timer_holder = _transport->timer_gate().hold();
         } catch (const seastar::gate_closed_exception&) {
+            // Rule #9: gate closed => shutdown in progress; stop scheduling.
+            // Expected control flow (Rule #5 timer safety), nothing to count.
             return;
         }
 
@@ -410,6 +412,8 @@ seastar::future<> GossipProtocol::start(GossipTransport* transport, GossipConsen
             try {
                 timer_holder = _transport->timer_gate().hold();
             } catch (const seastar::gate_closed_exception&) {
+                // Rule #9: gate closed => shutdown in progress; stop scheduling.
+                // Expected control flow (Rule #5 timer safety), nothing to count.
                 return;
             }
 
@@ -452,6 +456,9 @@ seastar::future<> GossipProtocol::stop() {
     try {
         co_await std::move(_discovery_future);
     } catch (...) {
+        // Rule #9: expected shutdown noise (timers cancelled, gates closing) —
+        // debug, not an error condition. Not counted: a torn-down discovery
+        // fiber is normal teardown, not a send/network failure.
         log_gossip_protocol().debug("Discovery future completed with exception during shutdown");
     }
 
@@ -459,6 +466,7 @@ seastar::future<> GossipProtocol::stop() {
     try {
         co_await _dns_resolver.close();
     } catch (...) {
+        // Rule #9: expected shutdown noise — debug, not an error condition.
         log_gossip_protocol().debug("DNS resolver closed with exception during shutdown");
     }
 }
@@ -545,10 +553,14 @@ seastar::future<> GossipProtocol::broadcast_route(std::vector<TokenId> tokens, B
         // send's by-value data parameter (Rule #21) instead of copying.
         return _transport->send(peer, std::move(serialized)).then([this] {
             ++_packets_sent;
-        }).handle_exception([peer](auto ep) {
+        }).handle_exception([this, peer](auto ep) {
             try {
                 std::rethrow_exception(ep);
             } catch (const std::exception& e) {
+                // Rule #9: expected UDP loss to down peers (peer state owns
+                // visibility) — debug avoids per-heartbeat log floods; counted
+                // in _sends_failed (cluster_sends_failed metric).
+                ++_sends_failed;
                 log_gossip_protocol().debug("Failed to send to peer {}: {}", peer, e.what());
             }
         });
@@ -634,10 +646,14 @@ seastar::future<> GossipProtocol::broadcast_cache_eviction(uint64_t prefix_hash,
         // send's by-value data parameter (Rule #21) instead of copying.
         return _transport->send(peer, std::move(serialized)).then([this] {
             ++_packets_sent;
-        }).handle_exception([peer](auto ep) {
+        }).handle_exception([this, peer](auto ep) {
             try {
                 std::rethrow_exception(ep);
             } catch (const std::exception& e) {
+                // Rule #9: expected UDP loss to down peers (peer state owns
+                // visibility) — debug avoids per-broadcast log floods; counted
+                // in _sends_failed (cluster_sends_failed metric).
+                ++_sends_failed;
                 log_gossip_protocol().debug("Failed to send cache eviction to peer {}: {}", peer, e.what());
             }
         });
@@ -709,6 +725,8 @@ seastar::future<> GossipProtocol::broadcast_heartbeat() {
             timer_holder = _transport->timer_gate().hold();
         }
     } catch (const seastar::gate_closed_exception&) {
+        // Rule #9: gate closed => shutdown in progress; stop broadcasting.
+        // Expected control flow (Rule #5 timer safety), nothing to count.
         co_return;
     }
 
@@ -1119,6 +1137,10 @@ seastar::future<> GossipProtocol::send_ack(seastar::socket_address peer, uint32_
         try {
             throw;
         } catch (const std::exception& e) {
+            // Rule #9: expected UDP loss to down peers (peer state owns
+            // visibility) — debug avoids per-ack log floods; counted in
+            // _sends_failed (cluster_sends_failed metric).
+            ++_sends_failed;
             log_gossip_protocol().debug("Failed to send ACK to peer {}: {}", peer, e.what());
         }
     }
@@ -1197,6 +1219,8 @@ seastar::future<> GossipProtocol::process_retries() {
             timer_holder = _transport->timer_gate().hold();
         }
     } catch (const seastar::gate_closed_exception&) {
+        // Rule #9: gate closed => shutdown in progress; skip this retry pass.
+        // Expected control flow (Rule #5 timer safety), nothing to count.
         co_return;
     }
 
@@ -1240,10 +1264,14 @@ seastar::future<> GossipProtocol::process_retries() {
             send_futures.push_back(
                 _transport->send(peer, pending.serialized_packet).then([this] {
                     ++_retries_sent;
-                }).handle_exception([peer, seq_num](auto ep) {
+                }).handle_exception([this, peer, seq_num](auto ep) {
                     try {
                         std::rethrow_exception(ep);
                     } catch (const std::exception& e) {
+                        // Rule #9: expected UDP loss to down peers (peer state
+                        // owns visibility) — debug avoids per-retry log floods;
+                        // counted in _sends_failed (cluster_sends_failed metric).
+                        ++_sends_failed;
                         log_gossip_protocol().debug("Failed to retry to peer {}: {}", peer, e.what());
                     }
                 })
@@ -1354,6 +1382,9 @@ std::optional<seastar::socket_address> GossipProtocol::parse_peer_address(const 
         seastar::net::inet_address addr(host);
         return seastar::socket_address(addr, *port_opt);
     } catch (const std::exception& e) {
+        // Rule #9: malformed operator-supplied peer host — debug (not warn) to
+        // avoid a per-refresh log flood for a persistently bad static peer;
+        // the caller skips the entry (returns nullopt). Not a runtime failure.
         log_gossip_protocol().debug("Failed to parse peer '{}': {}", peer, e.what());
         return std::nullopt;
     }

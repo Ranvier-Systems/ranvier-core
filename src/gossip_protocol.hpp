@@ -316,6 +316,7 @@ public:
     uint64_t hot_prefix_digests_sent() const { return _hot_prefix_digests_sent; }
     uint64_t hot_prefix_digests_received() const { return _hot_prefix_digests_received; }
     uint64_t unknown_packet_types() const { return _unknown_packet_types; }
+    uint64_t sends_failed() const { return _sends_failed; }
     uint64_t peers_dropped_capacity() const { return _peers_dropped_capacity; }
 
     // Clear reliable delivery state (used during resync/shutdown)
@@ -392,6 +393,9 @@ private:
     uint64_t _hot_prefix_digests_sent = 0;
     uint64_t _hot_prefix_digests_received = 0;
     uint64_t _unknown_packet_types = 0;
+    // Rule #9: per-peer UDP send failures (expected against down peers; peer
+    // state owns visibility). Counts route/eviction/ack/retry send exceptions.
+    uint64_t _sends_failed = 0;
     // Rule #4: discovered/static addresses dropped by refresh_peers() because
     // the merged peer set hit ClusterConfig::MAX_PEERS.
     uint64_t _peers_dropped_capacity = 0;

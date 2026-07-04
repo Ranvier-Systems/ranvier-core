@@ -192,6 +192,10 @@ void GossipService::register_metrics() {
             [this] { return _protocol->peers_dropped_capacity(); },
             seastar::metrics::description("Discovered/static peer addresses dropped because the merged "
                                           "peer set hit the cap (Rule #4)")),
+        seastar::metrics::make_counter("cluster_sends_failed",
+            [this] { return _protocol->sends_failed(); },
+            seastar::metrics::description("Per-peer gossip UDP send failures (route/eviction/ack/retry); "
+                                          "expected against down peers, peer state owns visibility (Rule #9)")),
         seastar::metrics::make_counter("cluster_dtls_sessions_rejected",
             [this] { return _transport->dtls_sessions_rejected(); },
             seastar::metrics::description("Times DTLS session limit was reached (Rule #4)"))
