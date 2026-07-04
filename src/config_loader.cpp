@@ -442,13 +442,24 @@ void RanvierConfig::apply_env_overrides() {
         cluster.peers.clear();
         std::istringstream iss(*v);
         std::string peer;
+        bool truncated = false;
         while (std::getline(iss, peer, ',')) {
             // Trim whitespace
             size_t start = peer.find_first_not_of(" \t");
             size_t end = peer.find_last_not_of(" \t");
             if (start != std::string::npos && end != std::string::npos) {
+                // Rule #4: bound the peer list (was S11 / audit V5).
+                if (cluster.peers.size() >= ClusterConfig::MAX_PEERS) {
+                    truncated = true;
+                    break;
+                }
                 cluster.peers.push_back(peer.substr(start, end - start + 1));
             }
+        }
+        if (truncated) {
+            std::cerr << "[WARN] RANVIER_CLUSTER_PEERS has more than "
+                      << ClusterConfig::MAX_PEERS
+                      << " entries, truncating (Rule #4)\n";
         }
     }
     if (auto v = get_env_as<int>("RANVIER_CLUSTER_GOSSIP_INTERVAL_MS")) {
@@ -1268,6 +1279,13 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             if (a["api_keys"]) {
                 config.auth.api_keys.clear();
                 for (const auto& key_node : a["api_keys"]) {
+                    // Rule #4: bound the credential store (was S11 / audit V5).
+                    if (config.auth.api_keys.size() >= AuthConfig::MAX_AUTH_API_KEYS) {
+                        std::cerr << "[WARN] auth.api_keys has more than "
+                                  << AuthConfig::MAX_AUTH_API_KEYS
+                                  << " entries, truncating (Rule #4)\n";
+                        break;
+                    }
                     ApiKey api_key;
                     if (key_node["key"]) api_key.key = key_node["key"].as<std::string>();
                     if (key_node["name"]) api_key.name = key_node["name"].as<std::string>();
@@ -1404,6 +1422,13 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             if (c["peers"]) {
                 config.cluster.peers.clear();
                 for (const auto& peer : c["peers"]) {
+                    // Rule #4: bound the peer list (was S11 / audit V5).
+                    if (config.cluster.peers.size() >= ClusterConfig::MAX_PEERS) {
+                        std::cerr << "[WARN] cluster.peers has more than "
+                                  << ClusterConfig::MAX_PEERS
+                                  << " entries, truncating (Rule #4)\n";
+                        break;
+                    }
                     config.cluster.peers.push_back(peer.as<std::string>());
                 }
             }

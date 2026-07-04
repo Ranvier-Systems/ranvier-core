@@ -4,6 +4,7 @@
 
 #include "gossip_protocol.hpp"
 #include "byte_order.hpp"
+#include "gossip_peer_merge.hpp"
 #include "parse_utils.hpp"
 
 #include <algorithm>
@@ -1027,21 +1028,33 @@ seastar::future<> GossipProtocol::refresh_peers() {
             co_return;
         }
 
-        // Merge with static peers
-        std::unordered_set<seastar::socket_address> new_peer_set;
-
+        // Merge configured/static peers with discovered addresses under a hard
+        // cap (Rule #4). Static peers are admitted first, so a compromised or
+        // misconfigured resolver flooding addresses can neither evict configured
+        // peers nor inflate the peer containers past ClusterConfig::MAX_PEERS.
+        std::vector<seastar::socket_address> static_addresses;
         for (const auto& peer : _config.peers) {
             auto addr = parse_peer_address(peer);
             if (addr) {
-                new_peer_set.insert(*addr);
+                static_addresses.push_back(*addr);
             }
         }
 
-        for (const auto& addr : discovered_addresses) {
-            new_peer_set.insert(addr);
+        size_t dropped = 0;
+        std::vector<seastar::socket_address> new_peer_addresses = merge_and_cap_peers(
+            static_addresses, discovered_addresses, ClusterConfig::MAX_PEERS, dropped);
+        if (dropped > 0) {
+            _peers_dropped_capacity += dropped;
+            // Rate-limited by design: one warn per refresh, not per address.
+            log_gossip_protocol().warn(
+                "Peer set exceeded cap ({}): dropped {} discovered/static address(es) "
+                "this refresh (configured peers kept first); counted in "
+                "cluster_peers_dropped_capacity",
+                ClusterConfig::MAX_PEERS, dropped);
         }
 
-        std::vector<seastar::socket_address> new_peer_addresses(new_peer_set.begin(), new_peer_set.end());
+        std::unordered_set<seastar::socket_address> new_peer_set(
+            new_peer_addresses.begin(), new_peer_addresses.end());
 
         // Update consensus peer table and get newly added peers
         std::vector<seastar::socket_address> new_peers_for_handshake;

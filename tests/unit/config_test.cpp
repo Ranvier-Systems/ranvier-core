@@ -1236,6 +1236,33 @@ auth:
     EXPECT_FALSE(config.auth.api_keys[1].is_expired());
 }
 
+// --- Bounded config lists (audit V5 / Rule #4): the loader truncates over-cap
+//     cluster.peers and auth.api_keys with a warning, mirroring allowed_ips. ---
+
+TEST_F(ConfigTest, LoadTruncatesOverCapClusterPeers) {
+    unsetenv("RANVIER_CLUSTER_PEERS");
+    std::string yaml = "cluster:\n  enabled: true\n  peers:\n";
+    const size_t over = ClusterConfig::MAX_PEERS + 50;
+    for (size_t i = 0; i < over; ++i) {
+        yaml += "    - \"10." + std::to_string(i / 65536) + "." +
+                std::to_string((i / 256) % 256) + "." + std::to_string(i % 256) +
+                ":9190\"\n";
+    }
+    auto config = RanvierConfig::load_from_string(yaml);
+    EXPECT_EQ(config.cluster.peers.size(), ClusterConfig::MAX_PEERS);
+}
+
+TEST_F(ConfigTest, LoadTruncatesOverCapApiKeys) {
+    std::string yaml = "auth:\n  api_keys:\n";
+    const size_t over = AuthConfig::MAX_AUTH_API_KEYS + 100;
+    for (size_t i = 0; i < over; ++i) {
+        yaml += "    - key: \"rnv_key_" + std::to_string(i) + "\"\n";
+        yaml += "      name: \"k" + std::to_string(i) + "\"\n";
+    }
+    auto config = RanvierConfig::load_from_string(yaml);
+    EXPECT_EQ(config.auth.api_keys.size(), AuthConfig::MAX_AUTH_API_KEYS);
+}
+
 TEST_F(ConfigTest, ApiKeyGetLogIdentifierReturnsName) {
     ApiKey key;
     key.key = "rnv_prod_abc123def456ghi789jkl012mno345pqr";

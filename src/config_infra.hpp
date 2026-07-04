@@ -141,6 +141,11 @@ struct AuthConfig {
     std::string admin_api_key = "";           // Legacy: single API key for admin endpoints (empty = no auth)
     std::vector<ApiKey> api_keys;             // New: multiple API keys with metadata
 
+    // Rule #4: Bounded container — the loader truncates over-cap api_keys lists.
+    // Distinct from ShardLocalState::MAX_API_KEYS (router_service), which caps
+    // per-backend upstream credentials; this caps operator auth keys.
+    static constexpr size_t MAX_AUTH_API_KEYS = 1000;
+
     // Constant-time string comparison to prevent timing attacks
     static bool secure_compare(const std::string& a, const std::string& b) {
         if (a.length() != b.length()) {
@@ -332,6 +337,12 @@ struct ClusterConfig {
     bool enabled = false;                                  // Enable distributed mode
     uint16_t gossip_port = 9190;                          // UDP port for gossip protocol
     std::vector<std::string> peers;                       // Static list of peer addresses (IP:Port)
+
+    // Rule #4: Bounded container — caps configured peers (loader, YAML + env) and
+    // the DNS-discovered merge in gossip_protocol::refresh_peers(). Must stay
+    // well below GossipProtocol::MAX_DEDUP_PEERS (10000) so the per-peer dedup
+    // maps keyed off this set never approach their own ceiling.
+    static constexpr size_t MAX_PEERS = 256;
     std::chrono::milliseconds gossip_interval{1000};      // Interval between gossip rounds
     std::chrono::seconds gossip_heartbeat_interval{5};    // Interval between heartbeat broadcasts
     std::chrono::seconds gossip_peer_timeout{15};         // Time before marking a peer as dead
