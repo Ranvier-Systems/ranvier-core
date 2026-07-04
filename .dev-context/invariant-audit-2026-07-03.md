@@ -146,3 +146,39 @@ cmake -DCMAKE_BUILD_TYPE=Debug -DSANITIZE=address .. && make -j && ctest --outpu
   add but not on every remove. If a third instance appears, promote via
   `/extract-pattern`: *every side-index must name the removal path that prunes it, per
   removal path of the primary structure.*
+
+---
+
+*Verification pass appended 2026-07-04 — post-fix review of PRs #598, #599, #601, #602, #603 (diff `b7e1127..4e6cf12`). Static analysis only; unit/fuzz/sanitizer gates run in the developer's Docker container via CI.*
+
+## Verification of fixes (2026-07-04)
+
+| # | Status | Verified against |
+|---|--------|------------------|
+| I-1 | **FIXED** | `ttl_cleanup_on_shard` phase 3 (`collect_live_route_index` + `swap_in_rebuilt_index`), yield between sub-phases; new `router_prefix_hash_index_size` gauge; bound comment rewritten to name the mechanism. Pinned by `tests/unit/prefix_hash_index_lifecycle_test.cpp`. One residual — see V-1 below. |
+| I-2 | **FIXED** | Both `apply_*_batch_to_local_tree` paths hash at `route.tokens.size()`; consistency rationale documented at both sites. Same test file pins the boundary-depth case. |
+| I-3 | **FIXED** | Per-origin LRU lists (`lru_head_`/`lru_tail_` arrays, `origin_index`); `evict_lowest_trust`/`evict_oldest` are O(1) tail pops; the origin-reassignment ordering hazard is handled (overwrite branch of `insert_recursive` unlinks BEFORE reassigning origin); all four splice sites origin-indexed; `validate_lru_lists()` debug validator wired into unit tests and the fuzz harness. Bonus not in the prompt: `evict_oldest` breaks `last_accessed` ties toward lower trust (deterministic). |
+| I-4 | **FIXED** | Cutoffs ship as a POD-pair vector via one foreign_ptr per target shard with local map rebuild; empty-map fast path keeps the default config allocation-free. No heap-owning type crosses shards outside foreign_ptr in `run_ttl_cleanup`. |
+| I-5 | **FIXED** | `apply_route_batch_to_local_tree` uses `insert_if_trusted(..., REMOTE)`; REFUSED skips the index insert and increments the new `remote_routes_trust_refused` counter/metric. Trust semantics (REFUSED / TOUCHED_SAME / OVERWROTE) pinned in `cache_eviction_test.cpp`. |
+| I-6 | **FIXED** | Quorum-owned seam (`GossipConsensus::maybe_broadcast_fail_open`, change-gated, gate-held with holder moved into `.finally()`, fires on enter AND exit incl. initially-degraded convergence) → `RouterService::broadcast_fail_open(bool)` → shard-local `fail_open_active` read by `route_request`. Cross-shard read removed. Pinned in `quorum_test.cpp` + `router_service_test.cpp`. |
+| I-7 | **FIXED** | Increment now requires BOUNDED_LOAD/P2C, selection off the primary jump-hash bucket, AND pressure present; JUMP/MODULAR correctly excluded (they never consume capacity-adjusted load). Approximation documented in code and metric description; metric NOT renamed (sync-map safe). |
+| I-8 | **FIXED** | Verdict and decision decoupled (`native_verified_cold` flag); `native_verified_downgrades` counted only at an actual downgrade; new `native_verified_cold_honored` counter/metric on the single-backend honored path; hits/downgrades/cold-honored pairwise disjoint. Snapshot, `Stats::reset()`, and `NativeKvStatsSnapshot` all extended. |
+
+Catalog flips verified: T7 ✅, T8 ✅ (new), R1 ✅, R2 ✅, R12 ✅; R9 text updated with the
+documented approximation (left ◻ — only the headroom counter is test-pinned).
+
+### V-1 (LOW, residual of I-1): fresh-backend index preservation is not provenance-aware
+
+`swap_in_rebuilt_index` preserves ALL existing index entries of backends whose native
+stream is fresh — it cannot distinguish native-created entries (correctly owned by
+UPSERT/REMOVE/CLEAR/RESET) from learn-derived entries for the same backend. A
+learn-derived entry whose depth is block-*alignment*-aligned but not a block-*size*
+boundary will never receive a native REMOVE, so under heavy prefix churn on a backend
+with a continuously fresh stream, stale learn-derived entries accumulate for as long
+as freshness holds (they drop the first cycle the stream goes stale, or on
+CLEAR/RESET). Bounded in practice by churn × freshness duration, not by a hard cap:
+the recomputed `preserved_counts` tracks but does not limit preservation
+(`MAX_ENTRIES_PER_BACKEND` gates only native UPSERTs). Not a regression — strictly
+better than the pre-fix behavior. Cheap hardening: enforce `MAX_ENTRIES_PER_BACKEND`
+during preservation (drop oldest-hash excess + count overflow). Structural fix if it
+ever bites: a per-entry provenance bit. Tracked in BACKLOG §22.
