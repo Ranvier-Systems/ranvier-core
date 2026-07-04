@@ -139,8 +139,8 @@ src/
   cache_topology_index.hpp    # Shard-0 reverse index: prefix fingerprint -> cluster nodes
                               #   reporting it in their hot-prefix top-K
   gossip_protocol.{hpp,cpp}   # Wire format, reliable delivery (ACKs), DNS discovery;
-                              #   ROUTE_ANNOUNCEMENT, HEARTBEAT, ROUTE_ACK,
-                              #   NODE_STATE, CACHE_EVICTION (big-endian)
+                              #   ROUTE_ANNOUNCEMENT, HEARTBEAT, ROUTE_ACK, NODE_STATE,
+                              #   CACHE_EVICTION, CACHE_STATE, HOT_PREFIX_DIGEST (big-endian)
   gossip_transport.{hpp,cpp}  # UDP channel, DTLS encryption
   gossip_consensus.{hpp,cpp}  # Peer table, quorum, split-brain detection
   crypto_offloader.{hpp,cpp}  # Adaptive DTLS crypto offload (symmetric on-shard,

@@ -33,6 +33,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 20. [Routing Parity & Ecosystem Alignment](#20-routing-parity--ecosystem-alignment-2026-06-07)
 21. [Cache-Aware Autoscaling Telemetry (2026-06-18)](#21-cache-aware-autoscaling-telemetry-2026-06-18)
 22. [Invariant Audit Findings (2026-07-03)](#22-invariant-audit-findings-2026-07-03)
+23. [Holistic Audit Findings (2026-07-04)](#23-holistic-audit-findings-2026-07-04)
 
 ---
 
@@ -1053,6 +1054,42 @@ catalog it seeded is `.dev-context/invariants.md`).
 
 Section anchor (`#22-invariant-audit-findings-2026-07-03`) is the stable pointer for
 future in-source `// BACKLOG §22` cross-references.
+
+---
+
+## 23. Holistic Audit Findings (2026-07-04)
+
+From `.dev-context/holistic-audit-2026-07-04.md` (Hard Rules / async-integrity / drift
+pass over the post-February churn not covered by the invariant audit: application,
+telemetry, config, metrics_service, gossip_protocol, http_controller delta).
+
+Violations:
+
+- [ ] [HIGH] Fix: `send_ack` + `GossipTransport::send` take `socket_address` by const-ref into coroutines; `handle_packet` passes a dying stack local — with DTLS the ACK destination is read from dead stack after the encrypt suspension. Take by value (Rule #21) (V1)
+- [ ] [MEDIUM] Fix: unwrapped lambda coroutine passed to `max_concurrent_for_each` in `refresh_peers` SRV branch — wrap with `seastar::coroutine::lambda()` (Rule #16) (V2)
+- [ ] [MEDIUM] Fix: `std::gmtime` static-buffer race in `ApiKey::is_expired()` on the per-shard auth path — use `gmtime_r` (re-flagged; was E9 in 2026-02-12 audit) (V3)
+- [ ] [MEDIUM] Fix: `broadcast_route` coroutine takes tokens by const-ref (latent UAF; newer siblings are by-value with Rule #21 annotations) (V4)
+- [ ] [LOW] Fix: bound `cluster.peers` and `auth.api_keys` in config_loader and the `refresh_peers` DNS merge (Rule #4; was S11) (V5)
+- [ ] [LOW] Fix: gossip per-peer send-failure catches log at debug with no counter — promote to warn or annotate + count (Rule #9) (V6)
+- [ ] [DOC] Sync: `docs/internals/gossip-protocol.md` missing HOT_PREFIX_DIGEST (0x07) packet format + digest counters (V7)
+- [ ] [DOC] Sync: `docs/internals/per-api-key-attribution.md` missing `tokens_estimated` column + actual-vs-estimated preference (V8)
+- [x] [DOC] Sync: claude-context.md gossip packet enumeration missing CACHE_STATE / HOT_PREFIX_DIGEST (V9)
+  _Completed:_ 2026-07-04 in the audit-recording commit (one-line living-doc fix).
+
+Technical debt:
+
+- [ ] [TECH-DEBT] telemetry_schema.hpp carries non-trivial logic (merge_hot_prefixes, sole-held math, JSON emitter, lines 284-431) in a *_schema.hpp; move helpers out (from audit 2026-07-04)
+- [ ] [TECH-DEBT] http_controller handle_proxy detects non-streaming via `"stream":false` substring sniff — use the single-parse extraction (from audit 2026-07-04)
+- [ ] [TECH-DEBT] `GossipProtocol::next_seq_num` at-capacity eviction sweeps up to MAX_DEDUP_PEERS=10000 entries synchronously on the broadcast path; amortize (Rule #17 marginal) (from audit 2026-07-04)
+- [ ] [TECH-DEBT] `TelemetryService::snapshot_and_reset` iterates up to the 65536 max_buckets ceiling with no yield; mirror the emit merge loop's yield or lower the ceiling (from audit 2026-07-04)
+- [ ] [TECH-DEBT] `Application::load_persisted_state` replays routes with sequential `co_await learn_route_global` per record (startup-only; O(routes × shards) cold start); batch (from audit 2026-07-04)
+- [ ] [TECH-DEBT] application.cpp includes `<fstream>` with no use — stale include invites Rule #12 misuse (from audit 2026-07-04)
+- [ ] [TECH-DEBT] reload/init paths capture whole config structs by value into invoke_on_all lambdas (cross-shard free, accepted D4 posture) — consider a foreign_ptr broadcast helper (from audit 2026-07-04)
+- [ ] [TECH-DEBT] `setup_signal_handlers` fire-and-forget reload broadcast lacks a gate; route through `_lifecycle_gate` (Rule #18 hygiene) (from audit 2026-07-04)
+- [ ] [TECH-DEBT] `ApiKey::is_expired()` re-parses the expiry date per call; parse once at config load into a time_point (also fixes V3) (from audit 2026-07-04)
+
+Section anchor (`#23-holistic-audit-findings-2026-07-04`) is the stable pointer for
+future in-source `// BACKLOG §23` cross-references.
 
 ---
 
