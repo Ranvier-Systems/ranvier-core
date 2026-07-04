@@ -1077,8 +1077,10 @@ Violations:
   _Completed:_ 2026-07-04. `ClusterConfig::MAX_PEERS` (256) enforced in the YAML + env peer paths; `AuthConfig::MAX_AUTH_API_KEYS` (1000) in the YAML api_keys path — truncate + warn, matching the allowed_ips pattern. `refresh_peers()` caps the merged set via the pure `merge_and_cap_peers()` helper (static peers first, then discovered), bumping the new `cluster_peers_dropped_capacity` counter. yaml example documents both caps.
 - [x] [LOW] Fix: gossip per-peer send-failure catches log at debug with no counter — promote to warn or annotate + count (Rule #9) (V6)
   _Completed:_ 2026-07-04. Counter+annotation approach (not blanket warn-promotion — a down peer would flood logs the consensus layer already surfaces). New `cluster_sends_failed` counter incremented in the route/eviction/ack/retry send catches, each annotated `// Rule #9: expected UDP loss to down peers ...`; the two `stop()` shutdown catches and the gate-closed timer catches carry matching justifications.
-- [ ] [DOC] Sync: `docs/internals/gossip-protocol.md` missing HOT_PREFIX_DIGEST (0x07) packet format + digest counters (V7)
-- [ ] [DOC] Sync: `docs/internals/per-api-key-attribution.md` missing `tokens_estimated` column + actual-vs-estimated preference (V8)
+- [x] [DOC] Sync: `docs/internals/gossip-protocol.md` missing HOT_PREFIX_DIGEST (0x07) packet format + digest counters (V7)
+  _Completed:_ 2026-07-04 — packet-table row + full "Hot Prefix Digest" wire-format section (v2 verified-resident bitmap tail incl. LSB-first packing and tail-less v1 equivalence, MAX_HASHES bound, unreliable latest-value-wins semantics, sender/receiver paths, both counters), format-verified against `HotPrefixDigestPacket::serialize/deserialize`.
+- [x] [DOC] Sync: `docs/internals/per-api-key-attribution.md` missing `tokens_estimated` column + actual-vs-estimated preference (V8)
+  _Completed:_ 2026-07-04 — schema block gained the `tokens_estimated` column, migration note covers the idempotent ALTER back-fill, and a new "Actual vs. estimated usage" section documents the engine-usage preference, the `stream_options.include_usage` caveat, and points to `docs/architecture/response-usage-accounting.md`.
 - [x] [DOC] Sync: claude-context.md gossip packet enumeration missing CACHE_STATE / HOT_PREFIX_DIGEST (V9)
   _Completed:_ 2026-07-04 in the audit-recording commit (one-line living-doc fix).
 

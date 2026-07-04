@@ -22,6 +22,7 @@ Ranvier uses a custom UDP-based gossip protocol to propagate route announcements
 | `NODE_STATE` | `0x04` | Backend lifecycle change (e.g. `ACTIVE` → `DRAINING`) |
 | `CACHE_EVICTION` | `0x05` | Cluster-wide cache eviction notification |
 | `CACHE_STATE` | `0x06` | Per-backend KV-cache residency state (residency-aware routing) |
+| `HOT_PREFIX_DIGEST` | `0x07` | Per-node hot-prefix membership digest + verified-resident bitmap (cache-topology index) |
 
 **Unknown packet types (rolling-upgrade safety).** A node that receives a type
 tag it does not recognize — e.g. a newer peer emitting a packet type this binary
@@ -204,6 +205,61 @@ cycle adds `B` CACHE_STATE packets (10 bytes payload each, plus DTLS framing
 when enabled) per peer. For a typical node (`B ≤ 16`) at the default 5 s health
 interval this is well under 200 bytes/peer/cycle — negligible against the
 heartbeat and route-announcement traffic already on the wire.
+
+### Hot Prefix Digest
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type      |    Version    |          Backend ID           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Backend ID (cont)         |            Count              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Prefix Hash × Count (8 bytes each)        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|        Verified-Resident Bitmap (v2 tail, ceil(Count/8) B)    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| Field | Offset | Size | Description |
+|-------|--------|------|-------------|
+| Type | 0 | 1 byte | `0x07` (HOT_PREFIX_DIGEST) |
+| Version | 1 | 1 byte | Protocol version (current `0x02`) |
+| Backend ID | 2 | 4 bytes | Node the digest describes (sender's `self_backend_id`) |
+| Count | 6 | 2 bytes | Number of prefix hashes, capped at `MAX_HASHES` (128) |
+| Prefix Hashes | 8 | 8 × Count | This node's hot-prefix top-K for the window, membership order |
+| Verified Bitmap | 8 + 8·Count | ⌈Count/8⌉ bytes | v2 tail: bit *i* (LSB-first within each byte) set ⇔ `prefix_hashes[i]` is verified-resident on the sender |
+
+**Packet size**: 8-byte header + 8 bytes per hash + optional bitmap tail;
+maximum 8 + 128×8 + 16 = 1048 bytes — under a 1500 B MTU before DTLS overhead.
+`Count` is bounded by `MAX_HASHES` on **both** serialize and deserialize
+(Rule #4); an over-cap count is rejected before any allocation.
+
+**Verified-resident tail (v2, BACKLOG §21 P3).** The bitmap marks the subset of
+the membership hashes the sender has *verified* resident in its own KV cache —
+present in its `prefix_hash_index` while its native KV-event stream is fresh.
+The tail is emitted only when the verified subset is non-empty, so a
+membership-only digest is byte-identical to a v1 packet. Receivers detect the
+tail by length, not version: a v1 reader ignores trailing bytes, a v2 reader of
+a tail-less packet treats the digest as membership-only.
+
+**Extensibility.** `deserialize()` accepts `len >= HEADER_SIZE + Count×8` (not
+`==`), reading the hashes and — if present — the bitmap, ignoring anything a
+future version appends after them. `Version` is recorded but never a rejection
+boundary; the *type tag* is (see unknown-packet-type handling above).
+
+**Reliability.** Broadcast unreliably (no sequence number, no ACK): the digest
+is periodic, idempotent, latest-value-wins per node — receivers replace that
+node's previous digest wholesale, and a dropped packet self-heals on the next
+telemetry window.
+
+Sent once per telemetry window by the shard-0 telemetry emitter via
+`RouterService::broadcast_hot_prefix_digest_global`. Receivers feed
+`TelemetryService::apply_peer_digest` (shard 0), which maintains the
+cache-topology index (`cache_topology_index.hpp`) behind the sole-held /
+verified-sole-held telemetry tiers. Counters: `hot_prefix_digests_sent` /
+`hot_prefix_digests_received` on `GossipProtocol`.
 
 ## DTLS Encryption
 
