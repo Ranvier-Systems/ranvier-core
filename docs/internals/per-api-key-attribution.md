@@ -250,7 +250,8 @@ CREATE TABLE IF NOT EXISTS request_attribution (
     latency_ms    INTEGER NOT NULL,
     input_tokens  INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
-    cost_units    REAL    NOT NULL
+    cost_units    REAL    NOT NULL,
+    tokens_estimated INTEGER NOT NULL DEFAULT 1  -- 1 = pre-flight estimates, 0 = engine-reported usage
 );
 CREATE INDEX IF NOT EXISTS idx_request_attribution_key_ts
     ON request_attribution(api_key_id, timestamp_ms);
@@ -261,7 +262,26 @@ CREATE INDEX IF NOT EXISTS idx_request_attribution_ts
 The migration is additive (`CREATE TABLE IF NOT EXISTS`) and runs on
 every `SqlitePersistence::open()`. Older databases gain the table on
 the next boot with no data loss; corrupted databases that the existing
-recovery path rebuilds also get the new table.
+recovery path rebuilds also get the new table. The
+`tokens_estimated` column (added 2026-06-15) is carried by the CREATE for
+fresh databases and back-filled onto existing tables by an idempotent
+`ALTER TABLE ... ADD COLUMN` with `DEFAULT 1` — pre-existing rows were all
+estimates, so the default is honest.
+
+### Actual vs. estimated usage
+
+`input_tokens` / `output_tokens` / `cost_units` are the engine's
+authoritative response `usage` whenever it was available (snooped from the
+response during streaming), and otherwise the pre-flight estimates the
+attribution path computes (input from tokenized/char heuristics, output
+from the request's `max_tokens` or a multiplier). `tokens_estimated` says
+which: `0` means engine-reported, `1` means estimated. A streaming response
+without `stream_options.include_usage` carries no usage block, so those
+rows fall back to estimates — billing consumers should branch on
+`tokens_estimated` rather than assume either. The preference is applied in
+the terminal attribution block of `http_controller.cpp`, feeding this table
+and the usage-ledger sink from one computed value set; the full design
+rationale lives in `docs/architecture/response-usage-accounting.md`.
 
 ### Status code mapping
 
