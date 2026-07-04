@@ -12,9 +12,12 @@
 #include "config_loader.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -24,6 +27,35 @@
 #include <unordered_set>
 
 namespace ranvier {
+
+namespace {
+
+// Parse an ISO 8601 date (YYYY-MM-DD) into the instant the key becomes expired:
+// midnight UTC at the *start of the following day* (the date is valid through the
+// end of that UTC day — preserving the day-granularity semantics of the former
+// ApiKey::is_expired()). Returns nullopt for an unparseable or out-of-range date,
+// which the caller treats as "never expires", matching the legacy malformed-date
+// behavior. Runs once at config load, off the request path — no gmtime/localtime
+// process-wide static buffer, no per-request re-parse (audit V3 + §23 tech-debt).
+std::optional<std::chrono::system_clock::time_point>
+parse_expiry_utc(const std::string& date) {
+    std::tm tm{};
+    std::istringstream iss(date);
+    iss >> std::get_time(&tm, "%Y-%m-%d");
+    if (iss.fail()) {
+        return std::nullopt;
+    }
+    const std::chrono::year_month_day ymd{
+        std::chrono::year{tm.tm_year + 1900},
+        std::chrono::month{static_cast<unsigned>(tm.tm_mon + 1)},
+        std::chrono::day{static_cast<unsigned>(tm.tm_mday)}};
+    if (!ymd.ok()) {
+        return std::nullopt;
+    }
+    return std::chrono::sys_days{ymd} + std::chrono::hours{24};
+}
+
+}  // namespace
 
 // =============================================================================
 // Environment Variable Helpers
@@ -410,13 +442,24 @@ void RanvierConfig::apply_env_overrides() {
         cluster.peers.clear();
         std::istringstream iss(*v);
         std::string peer;
+        bool truncated = false;
         while (std::getline(iss, peer, ',')) {
             // Trim whitespace
             size_t start = peer.find_first_not_of(" \t");
             size_t end = peer.find_last_not_of(" \t");
             if (start != std::string::npos && end != std::string::npos) {
+                // Rule #4: bound the peer list (was S11 / audit V5).
+                if (cluster.peers.size() >= ClusterConfig::MAX_PEERS) {
+                    truncated = true;
+                    break;
+                }
                 cluster.peers.push_back(peer.substr(start, end - start + 1));
             }
+        }
+        if (truncated) {
+            std::cerr << "[WARN] RANVIER_CLUSTER_PEERS has more than "
+                      << ClusterConfig::MAX_PEERS
+                      << " entries, truncating (Rule #4)\n";
         }
     }
     if (auto v = get_env_as<int>("RANVIER_CLUSTER_GOSSIP_INTERVAL_MS")) {
@@ -1236,11 +1279,34 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             if (a["api_keys"]) {
                 config.auth.api_keys.clear();
                 for (const auto& key_node : a["api_keys"]) {
+                    // Rule #4: bound the credential store (was S11 / audit V5).
+                    if (config.auth.api_keys.size() >= AuthConfig::MAX_AUTH_API_KEYS) {
+                        std::cerr << "[WARN] auth.api_keys has more than "
+                                  << AuthConfig::MAX_AUTH_API_KEYS
+                                  << " entries, truncating (Rule #4)\n";
+                        break;
+                    }
                     ApiKey api_key;
                     if (key_node["key"]) api_key.key = key_node["key"].as<std::string>();
                     if (key_node["name"]) api_key.name = key_node["name"].as<std::string>();
                     if (key_node["created"]) api_key.created = key_node["created"].as<std::string>();
-                    if (key_node["expires"]) api_key.expires = key_node["expires"].as<std::string>();
+                    if (key_node["expires"]) {
+                        api_key.expires = key_node["expires"].as<std::string>();
+                        // Parse the expiry once here, off the request path (audit V3).
+                        if (!api_key.expires->empty()) {
+                            api_key.expires_at = parse_expiry_utc(*api_key.expires);
+                            if (!api_key.expires_at) {
+                                // Identify by name (and the non-secret date string) —
+                                // never log key material.
+                                const std::string id =
+                                    api_key.name.empty() ? "(unnamed)" : api_key.name;
+                                std::cerr << "[WARN] auth.api_keys entry " << id
+                                          << " has an unparseable expires date '"
+                                          << *api_key.expires
+                                          << "', treating the key as non-expiring\n";
+                            }
+                        }
+                    }
                     if (key_node["roles"]) {
                         for (const auto& role : key_node["roles"]) {
                             api_key.roles.push_back(role.as<std::string>());
@@ -1356,6 +1422,13 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             if (c["peers"]) {
                 config.cluster.peers.clear();
                 for (const auto& peer : c["peers"]) {
+                    // Rule #4: bound the peer list (was S11 / audit V5).
+                    if (config.cluster.peers.size() >= ClusterConfig::MAX_PEERS) {
+                        std::cerr << "[WARN] cluster.peers has more than "
+                                  << ClusterConfig::MAX_PEERS
+                                  << " entries, truncating (Rule #4)\n";
+                        break;
+                    }
                     config.cluster.peers.push_back(peer.as<std::string>());
                 }
             }

@@ -210,6 +210,7 @@ auth:
   # ============================================================
   # Supports key rotation, expiry, and audit logging
   # If both admin_api_key and api_keys are configured, api_keys takes precedence
+  # Capped at 1000 entries (excess is truncated with a warning)
   #
   # Key format convention:
   #   Prefix: rnv_ (Ranvier)
@@ -353,6 +354,8 @@ cluster:
 
   # Static list of peer addresses (RANVIER_CLUSTER_PEERS - comma-separated)
   # Format: "IP:Port" for each peer
+  # Capped at 256 entries (excess is truncated with a warning); the same cap
+  # bounds the DNS-discovered peer set below.
   peers:
     # - "192.168.1.100:9190"
     # - "192.168.1.101:9190"

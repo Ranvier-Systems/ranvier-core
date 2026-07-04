@@ -8,11 +8,14 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 #include <optional>
 
 // Include only the types we need (avoid Seastar headers)
 #include "types.hpp"
+// Pure, reactor-free peer-merge helper used by refresh_peers().
+#include "gossip_peer_merge.hpp"
 
 using namespace ranvier;
 
@@ -1287,6 +1290,75 @@ TEST(GossipAckLifetimeTest, DestinationSurvivesCallerFrameDestruction) {
     ASSERT_TRUE(coro.done());
 
     EXPECT_EQ(recorded, kSrc);  // by-value copy preserved the true destination
+}
+
+// =============================================================================
+// merge_and_cap_peers — DNS/static peer merge cap (audit V5, Rule #4)
+// Reactor-free: exercises the pure helper with std::string stand-in addresses.
+// =============================================================================
+
+TEST(GossipPeerMergeTest, KeepsAllWhenUnderCap) {
+    std::vector<std::string> static_peers = {"a", "b"};
+    std::vector<std::string> discovered = {"c", "d"};
+    size_t dropped = 0;
+    auto merged = merge_and_cap_peers(static_peers, discovered, 10, dropped);
+    EXPECT_EQ(dropped, 0u);
+    ASSERT_EQ(merged.size(), 4u);
+    EXPECT_EQ(merged[0], "a");
+    EXPECT_EQ(merged[1], "b");
+    EXPECT_EQ(merged[2], "c");
+    EXPECT_EQ(merged[3], "d");
+}
+
+TEST(GossipPeerMergeTest, DedupesAcrossStaticAndDiscovered) {
+    std::vector<std::string> static_peers = {"a", "b"};
+    std::vector<std::string> discovered = {"b", "c", "a"};  // b, a duplicate static
+    size_t dropped = 0;
+    auto merged = merge_and_cap_peers(static_peers, discovered, 10, dropped);
+    EXPECT_EQ(dropped, 0u);  // duplicates collapse, they are not drops
+    ASSERT_EQ(merged.size(), 3u);
+    EXPECT_EQ(merged[0], "a");
+    EXPECT_EQ(merged[1], "b");
+    EXPECT_EQ(merged[2], "c");
+}
+
+TEST(GossipPeerMergeTest, CapsAndKeepsStaticFirst) {
+    // 2 static + 5 discovered, cap 4 -> both static + 2 discovered, drop 3.
+    std::vector<std::string> static_peers = {"s0", "s1"};
+    std::vector<std::string> discovered = {"d0", "d1", "d2", "d3", "d4"};
+    size_t dropped = 0;
+    auto merged = merge_and_cap_peers(static_peers, discovered, 4, dropped);
+    ASSERT_EQ(merged.size(), 4u);
+    EXPECT_EQ(merged[0], "s0");
+    EXPECT_EQ(merged[1], "s1");
+    EXPECT_EQ(merged[2], "d0");
+    EXPECT_EQ(merged[3], "d1");
+    EXPECT_EQ(dropped, 3u);  // d2, d3, d4 refused
+}
+
+TEST(GossipPeerMergeTest, StaticPeersSurviveDiscoveredFlood) {
+    // A resolver flooding addresses must never evict configured peers.
+    std::vector<std::string> static_peers = {"keep0", "keep1"};
+    std::vector<std::string> discovered;
+    for (int i = 0; i < 1000; ++i) {
+        discovered.push_back("flood" + std::to_string(i));
+    }
+    size_t dropped = 0;
+    auto merged = merge_and_cap_peers(static_peers, discovered, 256, dropped);
+    ASSERT_EQ(merged.size(), 256u);
+    EXPECT_EQ(merged[0], "keep0");
+    EXPECT_EQ(merged[1], "keep1");
+    EXPECT_EQ(dropped, 1000u - 254u);  // 254 discovered admitted, rest dropped
+}
+
+TEST(GossipPeerMergeTest, DuplicateOverCapCountedOnce) {
+    // The same over-cap address appearing twice counts as a single drop.
+    std::vector<std::string> static_peers = {"s0", "s1"};
+    std::vector<std::string> discovered = {"x", "x"};
+    size_t dropped = 0;
+    auto merged = merge_and_cap_peers(static_peers, discovered, 2, dropped);
+    ASSERT_EQ(merged.size(), 2u);
+    EXPECT_EQ(dropped, 1u);  // x refused once; second occurrence is a duplicate
 }
 
 int main(int argc, char** argv) {

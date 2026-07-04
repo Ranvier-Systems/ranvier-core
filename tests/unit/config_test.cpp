@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -1123,10 +1124,13 @@ routing:
 // =============================================================================
 
 TEST_F(ConfigTest, ApiKeyIsExpiredForPastDate) {
+    // is_expired() is now a pure comparison against the loader-parsed instant;
+    // the loader-parse path is covered by the LoadParsesApiKeyExpiry* tests.
     ApiKey key;
     key.key = "test-key";
     key.name = "test";
-    key.expires = "2020-01-01";  // Past date
+    key.expires = "2020-01-01";  // retained for audit/display
+    key.expires_at = std::chrono::system_clock::now() - std::chrono::hours(48);
 
     EXPECT_TRUE(key.is_expired());
 }
@@ -1135,7 +1139,8 @@ TEST_F(ConfigTest, ApiKeyIsNotExpiredForFutureDate) {
     ApiKey key;
     key.key = "test-key";
     key.name = "test";
-    key.expires = "2099-12-31";  // Far future date
+    key.expires = "2099-12-31";
+    key.expires_at = std::chrono::system_clock::now() + std::chrono::hours(48);
 
     EXPECT_FALSE(key.is_expired());
 }
@@ -1156,6 +1161,106 @@ TEST_F(ConfigTest, ApiKeyIsNotExpiredWithEmptyExpiry) {
     key.expires = "";  // Empty string
 
     EXPECT_FALSE(key.is_expired());
+}
+
+// --- Expiry parsed once at config load (audit V3: no gmtime static-buffer race
+//     on the request path, no per-request re-parse). Exercises the loader, not a
+//     hand-built struct. ---
+
+TEST_F(ConfigTest, LoadParsesApiKeyExpiryToTimePoint) {
+    const std::string yaml = R"(
+auth:
+  api_keys:
+    - key: "rnv_future"
+      name: "future"
+      expires: "2099-12-31"
+    - key: "rnv_past"
+      name: "past"
+      expires: "2000-01-01"
+    - key: "rnv_none"
+      name: "none"
+)";
+    auto config = RanvierConfig::load_from_string(yaml);
+    ASSERT_EQ(config.auth.api_keys.size(), 3u);
+
+    // Future expiry: parsed, not expired.
+    EXPECT_TRUE(config.auth.api_keys[0].expires_at.has_value());
+    EXPECT_FALSE(config.auth.api_keys[0].is_expired());
+
+    // Past expiry: parsed, expired.
+    EXPECT_TRUE(config.auth.api_keys[1].expires_at.has_value());
+    EXPECT_TRUE(config.auth.api_keys[1].is_expired());
+
+    // No expiry: never expires.
+    EXPECT_FALSE(config.auth.api_keys[2].expires_at.has_value());
+    EXPECT_FALSE(config.auth.api_keys[2].is_expired());
+}
+
+TEST_F(ConfigTest, LoadApiKeyExpiryBoundaryIsStartOfNextUtcDay) {
+    // Pins the day-granularity semantics preserved from the former is_expired():
+    // the expiry date is valid THROUGH the end of that UTC day, so the parsed
+    // instant is midnight UTC at the start of the following day.
+    const std::string yaml = R"(
+auth:
+  api_keys:
+    - key: "rnv_key"
+      name: "boundary"
+      expires: "2099-12-31"
+)";
+    auto config = RanvierConfig::load_from_string(yaml);
+    ASSERT_EQ(config.auth.api_keys.size(), 1u);
+    ASSERT_TRUE(config.auth.api_keys[0].expires_at.has_value());
+
+    using namespace std::chrono;
+    const auto expected = system_clock::time_point{sys_days{year{2100} / 1 / 1}};
+    EXPECT_EQ(*config.auth.api_keys[0].expires_at, expected);
+}
+
+TEST_F(ConfigTest, LoadMalformedApiKeyExpiryTreatedAsNonExpiring) {
+    const std::string yaml = R"(
+auth:
+  api_keys:
+    - key: "rnv_bad"
+      name: "bad-date"
+      expires: "not-a-date"
+    - key: "rnv_empty"
+      name: "empty-date"
+      expires: ""
+)";
+    auto config = RanvierConfig::load_from_string(yaml);
+    ASSERT_EQ(config.auth.api_keys.size(), 2u);
+    // Malformed / empty expiry -> nullopt -> never expires (legacy behavior).
+    EXPECT_FALSE(config.auth.api_keys[0].expires_at.has_value());
+    EXPECT_FALSE(config.auth.api_keys[0].is_expired());
+    EXPECT_FALSE(config.auth.api_keys[1].expires_at.has_value());
+    EXPECT_FALSE(config.auth.api_keys[1].is_expired());
+}
+
+// --- Bounded config lists (audit V5 / Rule #4): the loader truncates over-cap
+//     cluster.peers and auth.api_keys with a warning, mirroring allowed_ips. ---
+
+TEST_F(ConfigTest, LoadTruncatesOverCapClusterPeers) {
+    unsetenv("RANVIER_CLUSTER_PEERS");
+    std::string yaml = "cluster:\n  enabled: true\n  peers:\n";
+    const size_t over = ClusterConfig::MAX_PEERS + 50;
+    for (size_t i = 0; i < over; ++i) {
+        yaml += "    - \"10." + std::to_string(i / 65536) + "." +
+                std::to_string((i / 256) % 256) + "." + std::to_string(i % 256) +
+                ":9190\"\n";
+    }
+    auto config = RanvierConfig::load_from_string(yaml);
+    EXPECT_EQ(config.cluster.peers.size(), ClusterConfig::MAX_PEERS);
+}
+
+TEST_F(ConfigTest, LoadTruncatesOverCapApiKeys) {
+    std::string yaml = "auth:\n  api_keys:\n";
+    const size_t over = AuthConfig::MAX_AUTH_API_KEYS + 100;
+    for (size_t i = 0; i < over; ++i) {
+        yaml += "    - key: \"rnv_key_" + std::to_string(i) + "\"\n";
+        yaml += "      name: \"k" + std::to_string(i) + "\"\n";
+    }
+    auto config = RanvierConfig::load_from_string(yaml);
+    EXPECT_EQ(config.auth.api_keys.size(), AuthConfig::MAX_AUTH_API_KEYS);
 }
 
 TEST_F(ConfigTest, ApiKeyGetLogIdentifierReturnsName) {
@@ -1249,6 +1354,7 @@ TEST_F(ConfigTest, AuthConfigRejectsExpiredKey) {
     key.key = "rnv_expired_key";
     key.name = "expired-key";
     key.expires = "2020-01-01";  // Past date
+    key.expires_at = std::chrono::system_clock::now() - std::chrono::hours(48);
     auth.api_keys.push_back(key);
 
     auto [valid, name] = auth.validate_token("rnv_expired_key");
