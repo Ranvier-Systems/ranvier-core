@@ -34,6 +34,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 21. [Cache-Aware Autoscaling Telemetry (2026-06-18)](#21-cache-aware-autoscaling-telemetry-2026-06-18)
 22. [Invariant Audit Findings (2026-07-03)](#22-invariant-audit-findings-2026-07-03)
 23. [Holistic Audit Findings (2026-07-04)](#23-holistic-audit-findings-2026-07-04)
+24. [Adversarial Audit Findings — Pass A (2026-07-04)](#24-adversarial-audit-findings-pass-a-2026-07-04)
 
 ---
 
@@ -1099,6 +1100,23 @@ Technical debt:
 
 Section anchor (`#23-holistic-audit-findings-2026-07-04`) is the stable pointer for
 future in-source `// BACKLOG §23` cross-references.
+
+---
+
+## 24. Adversarial Audit Findings — Pass A (2026-07-04)
+
+From `.dev-context/adversarial-audit-2026-07-04.md` (edge-case/scale sweep over the
+unfuzzed untrusted-input surfaces: vLLM KV-event msgpack decoder, its ZMQ subscriber,
+and the build-gated GIE EPP gRPC bridge). Headline artifact:
+`tests/fuzz/kv_event_decoder_fuzz.cpp`, wired into `fuzz-ci` / `fuzz-run-all` and the
+CMake `fuzz_harnesses` target — the decoder's first fuzz coverage.
+
+- [ ] [MEDIUM] Fix: guard the float64 KV-event timestamp cast — `+inf`/out-of-range double is UB in the `uint64_t` conversion (`kv_event_decoder.hpp`, A1); fold in the INT-path overflow cap (A2). Fix prompt in the report; pinned by the new fuzz harness under UBSan + unit cases.
+- [ ] [MEDIUM] Fix: bound EPP ext_proc in-flight `Process` RPCs (ingress semaphore + 503 shed) and add a deadline to the reactor-bridge `fut.get()` — unbounded gRPC handler threads block on shard 0 under load (`gie_epp_server.cpp`, S1). Deployed risk limited: `WITH_GIE_EPP` is default-OFF.
+- [ ] [LOW] Harden: clamp the decoder array `reserve()` to remaining payload bytes — reserve-before-validate allows a ~1 MB transient alloc from a tiny payload (A2/S2).
+
+Section anchor (`#24-adversarial-audit-findings-pass-a-2026-07-04`) is the stable
+pointer for future in-source `// BACKLOG §24` cross-references.
 
 ---
 

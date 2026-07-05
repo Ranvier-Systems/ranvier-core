@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean gie-epp-build gie-epp-test gie-epp-clean test-epp bench-epp bench-inline-vs-sidecar bench-hot-prefix
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-kv-decoder fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean gie-epp-build gie-epp-test gie-epp-clean test-epp bench-epp bench-inline-vs-sidecar bench-hot-prefix
 
 # Default target
 all: build
@@ -90,6 +90,15 @@ fuzz-run-request-rewriter: fuzz-build
 	    -max_len=$(FUZZ_MAX_LEN) \
 	    -print_final_stats=1
 
+fuzz-run-kv-decoder: fuzz-build
+	@mkdir -p tests/fuzz/corpus/kv_event_decoder
+	@UBSAN_OPTIONS="$(FUZZ_UBSAN_OPTIONS)" \
+	    $(FUZZ_BUILD_DIR)/kv_event_decoder_fuzz \
+	    tests/fuzz/corpus/kv_event_decoder \
+	    -max_total_time=$(FUZZ_TIME) \
+	    -max_len=$(FUZZ_MAX_LEN) \
+	    -print_final_stats=1
+
 fuzz-run-stream-parser: fuzz-build
 	@if [ ! -x $(FUZZ_BUILD_DIR)/stream_parser_fuzz ]; then \
 	    echo "stream_parser_fuzz not built — Seastar likely not found at configure time."; \
@@ -141,7 +150,7 @@ fuzz-run-stream-parser: fuzz-build
 # sets SEASTAR_DEFAULT_ALLOCATOR=1).
 fuzz-run-stream-parser-default-alloc: fuzz-run-stream-parser
 
-fuzz-run-all: fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser
+fuzz-run-all: fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-kv-decoder fuzz-run-stream-parser
 
 # Short fuzz pass for CI post-merge regression checks. Defaults to 60s
 # per harness; override with FUZZ_CI_TIME for longer scheduled runs.
@@ -158,6 +167,7 @@ FUZZ_CI_TIME ?= 60
 fuzz-ci:
 	@$(MAKE) fuzz-run-radix-tree FUZZ_TIME=$(FUZZ_CI_TIME)
 	@$(MAKE) fuzz-run-request-rewriter FUZZ_TIME=$(FUZZ_CI_TIME)
+	@$(MAKE) fuzz-run-kv-decoder FUZZ_TIME=$(FUZZ_CI_TIME)
 
 fuzz-clean:
 	@rm -rf $(FUZZ_BUILD_DIR)

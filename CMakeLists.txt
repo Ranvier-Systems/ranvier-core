@@ -1643,6 +1643,18 @@ if(RANVIER_BUILD_FUZZERS)
     target_compile_options(radix_tree_fuzz PRIVATE ${_fuzz_flags})
     target_link_options(radix_tree_fuzz PRIVATE ${_fuzz_flags})
 
+    # KV-event decoder fuzzer (pure C++, types.hpp only — no Seastar, no ZMQ).
+    # Drives arbitrary msgpack at decode_kv_event_batch(), the widest-exposure
+    # untrusted-input surface (vLLM KV-event stream over ZMQ). UBSan is
+    # load-bearing here: finding A1 (float→uint64 timestamp cast) is UB the
+    # sanitizer catches, not a logic error.
+    add_executable(kv_event_decoder_fuzz
+      tests/fuzz/kv_event_decoder_fuzz.cpp
+    )
+    target_include_directories(kv_event_decoder_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_options(kv_event_decoder_fuzz PRIVATE ${_fuzz_flags})
+    target_link_options(kv_event_decoder_fuzz PRIVATE ${_fuzz_flags})
+
     # RequestRewriter fuzzer (pure C++, RapidJSON only)
     add_executable(request_rewriter_fuzz
       tests/fuzz/request_rewriter_fuzz.cpp
@@ -1686,7 +1698,7 @@ if(RANVIER_BUILD_FUZZERS)
     endif()
 
     add_custom_target(fuzz_harnesses
-      DEPENDS radix_tree_fuzz request_rewriter_fuzz)
+      DEPENDS radix_tree_fuzz request_rewriter_fuzz kv_event_decoder_fuzz)
     if(Seastar_FOUND)
         add_dependencies(fuzz_harnesses stream_parser_fuzz)
     endif()
