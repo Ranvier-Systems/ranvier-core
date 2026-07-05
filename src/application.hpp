@@ -15,6 +15,7 @@
 
 #include "async_persistence.hpp"
 #include "config.hpp"
+#include "downstream_service.hpp"
 #include "health_service.hpp"
 #include "http_controller.hpp"
 #include "k8s_discovery_service.hpp"
@@ -228,6 +229,12 @@ private:
     // Local backend discovery (local mode only)
     std::unique_ptr<LocalDiscoveryService> _local_discovery;
 
+    // Embedder-owned downstream service (embeddability series). Instantiated once
+    // on shard 0 via the process-wide factory after core services are up; stopped
+    // first at teardown. Null in stock builds — the whole hook is then inert. See
+    // src/downstream_service.hpp for the lifecycle contract.
+    std::unique_ptr<DownstreamService> _downstream_service;
+
     // HTTP servers (owned during run())
     std::unique_ptr<seastar::httpd::http_server_control> _api_server;
     std::unique_ptr<seastar::httpd::http_server_control> _metrics_server;
@@ -340,6 +347,11 @@ private:
 
     // Stop all services in reverse order
     seastar::future<> stop_services();
+
+    // Core-service teardown chain (steps 1-6). Split out of stop_services() so
+    // the downstream service can stop first; phase_start threads through for the
+    // final timing log.
+    seastar::future<> stop_core_services(std::chrono::steady_clock::time_point phase_start);
 
     // Cleanup on final shutdown
     void cleanup();
