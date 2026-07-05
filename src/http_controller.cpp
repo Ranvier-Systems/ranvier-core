@@ -2597,6 +2597,13 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                 ev.output_tokens = output_tokens;
                 ev.cost_units    = cost_units;
                 ev.tokens_estimated = tokens_estimated;
+                // Intent was classified pre-routing (ctx->intent); reuse it — no
+                // hot-path re-computation. UNSPECIFIED when classification was
+                // disabled so the ledger never reports the default CHAT as a real
+                // classification. Wire ordinals pinned in usage_ledger_schema.hpp.
+                ev.intent_class = _config.intent_classification_enabled
+                                      ? to_usage_intent_class(ctx->intent)
+                                      : UsageIntentClass::UNSPECIFIED;
                 // Contract: record() must not throw. Guard defensively and log
                 // at warn (Rule #9) so a misbehaving sink can never corrupt
                 // request completion.
