@@ -219,4 +219,38 @@ inline GossipExtensionHandler get_gossip_extension_handler() {
     return gossip_extension_handler_slot();
 }
 
+// Send-side counterpart to the handler slot above: a broadcaster a downstream can
+// reach WITHOUT a GossipService handle (which it cannot obtain). Unlike the
+// handler slot — written by a downstream, read by core — this slot is owned by
+// the GossipService lifecycle: written in start() (shard 0, gossip live) and
+// cleared in stop() before the transport is torn down. Downstream code only reads
+// it via get_gossip_extension_broadcaster(). Payload by value (Rule #21).
+//
+// An EMPTY function is the not-running signal (before start, gossip disabled, or
+// after stop). Callers MUST check before invoking:
+//     if (auto b = get_gossip_extension_broadcaster()) co_await b(std::move(payload));
+// Invoke on shard 0 — like the inbound handler and every broadcast_*, the
+// EXTENSION channel is a shard-0 affair.
+//
+// Not racy runtime state (cf. Hard Rule #11, same reasoning as the handler slot):
+// written once at start and cleared once at stop, both on shard 0 in the
+// single-threaded lifecycle sequence; only read in between. The function-local
+// static supplies the standard thread-safe one-time init of the slot itself.
+using GossipExtensionBroadcaster = std::function<seastar::future<>(std::vector<uint8_t>)>;
+
+inline GossipExtensionBroadcaster& gossip_extension_broadcaster_slot() {
+    static GossipExtensionBroadcaster slot;  // empty until GossipService::start()
+    return slot;
+}
+
+// Written by GossipService::start()/stop() only; an empty function clears it.
+inline void set_gossip_extension_broadcaster(GossipExtensionBroadcaster broadcaster) {
+    gossip_extension_broadcaster_slot() = std::move(broadcaster);
+}
+
+// The live broadcaster, or an empty std::function when gossip is not running.
+inline GossipExtensionBroadcaster get_gossip_extension_broadcaster() {
+    return gossip_extension_broadcaster_slot();
+}
+
 }  // namespace ranvier

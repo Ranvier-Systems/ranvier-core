@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -202,4 +203,62 @@ TEST_F(GossipExtensionTest, DeserializeFailsWrongType) {
 TEST_F(GossipExtensionTest, DeserializeFailsEmptyBuffer) {
     auto result = ExtensionPacket::deserialize(nullptr, 0);
     EXPECT_FALSE(result.has_value());
+}
+
+// =============================================================================
+// Broadcaster slot semantics (faked)
+//
+// Mirrors the process-wide send-side slot in gossip_service.hpp
+// (gossip_extension_broadcaster_slot / set / get). That header can't be included
+// reactor-free — it drags in Seastar's dns / socket / metrics headers — so the
+// function-local-static slot mechanism is replicated here to lock its semantics:
+// default empty (not running), set-at-start makes get non-empty (running), and
+// clear-on-stop returns get to empty. Production's std::function returns
+// seastar::future<>; the fake returns bool to stay Seastar-free — only the
+// emptiness transitions are under test. The real start/stop wiring (capturing
+// the GossipService and calling broadcast_extension) verifies in the dev
+// container.
+// =============================================================================
+
+namespace {
+
+using FakeBroadcaster = std::function<bool(std::vector<uint8_t>)>;
+
+FakeBroadcaster& fake_broadcaster_slot() {
+    static FakeBroadcaster slot;  // empty until "start" writes it
+    return slot;
+}
+void fake_set_broadcaster(FakeBroadcaster b) { fake_broadcaster_slot() = std::move(b); }
+FakeBroadcaster fake_get_broadcaster() { return fake_broadcaster_slot(); }
+
+}  // namespace
+
+TEST_F(GossipExtensionTest, BroadcasterSlotDefaultsToEmpty) {
+    fake_set_broadcaster(nullptr);  // clean slate
+    EXPECT_FALSE(static_cast<bool>(fake_get_broadcaster()))
+        << "unset slot must read empty — the not-running signal";
+}
+
+TEST_F(GossipExtensionTest, BroadcasterSlotSetAtStartIsInvocable) {
+    bool called = false;
+    fake_set_broadcaster([&called](std::vector<uint8_t>) {
+        called = true;
+        return true;
+    });
+
+    auto b = fake_get_broadcaster();
+    ASSERT_TRUE(static_cast<bool>(b)) << "after start the slot must read non-empty";
+    EXPECT_TRUE(b({0x01, 0x02}));
+    EXPECT_TRUE(called);
+
+    fake_set_broadcaster(nullptr);  // reset for other tests
+}
+
+TEST_F(GossipExtensionTest, BroadcasterSlotClearedOnStopReadsEmpty) {
+    fake_set_broadcaster([](std::vector<uint8_t>) { return true; });
+    ASSERT_TRUE(static_cast<bool>(fake_get_broadcaster()));
+
+    fake_set_broadcaster(nullptr);  // stop() clears the slot
+    EXPECT_FALSE(static_cast<bool>(fake_get_broadcaster()))
+        << "after stop the slot must read empty again — back to not-running";
 }
