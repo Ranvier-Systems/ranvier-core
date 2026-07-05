@@ -14,6 +14,7 @@ already mitigated).
 | `radix_tree_fuzz.cpp` | `RadixTree::insert` / `RadixTree::lookup` | H8 (split_long_prefix off-by-one), L9 (recursive subspan) |
 | `request_rewriter_fuzz.cpp` | `RequestRewriter::extract_*` (JSON body parsing) | M6 (RapidJSON nesting), M4 (large allocations), L5 (vocab ID validation) |
 | `stream_parser_fuzz.cpp` | `StreamParser::push` (chunked HTTP / SSE) | H10 (chunk trailer length), M11 (status snoop split), M12 (Content-Length cast) |
+| `kv_event_decoder_fuzz.cpp` | `decode_kv_event_batch` (vLLM KV-event msgpack over ZMQ) | A1 (float64 timestamp → uint64 UB), adversarial-audit 2026-07-04 |
 
 ## Building
 
@@ -111,8 +112,9 @@ deeper paths the audit was concerned about.
 ## CI integration
 
 `make fuzz-ci` runs the post-merge regression check used by
-`.github/workflows/fuzz-tests.yml`: 60 seconds × the two working
-harnesses (`radix_tree_fuzz`, `request_rewriter_fuzz`). The workflow
+`.github/workflows/fuzz-tests.yml`: 60 seconds × the three pure-C++
+harnesses (`radix_tree_fuzz`, `request_rewriter_fuzz`,
+`kv_event_decoder_fuzz`). The workflow
 fires after Docker Publish completes and on `workflow_dispatch`; it
 does not run on PRs (fuzz is too noisy and corpus-dependent for the PR
 feedback loop).
