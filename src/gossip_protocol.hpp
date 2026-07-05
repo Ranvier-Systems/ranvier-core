@@ -49,6 +49,7 @@ enum class GossipPacketType : uint8_t {
     CACHE_EVICTION = 0x05,
     CACHE_STATE = 0x06,
     HOT_PREFIX_DIGEST = 0x07,
+    EXTENSION = 0x08,
 };
 
 // Rolling-upgrade safety contract: a node that receives a type tag it does not
@@ -66,6 +67,7 @@ inline constexpr bool is_known_packet_type(GossipPacketType type) {
         case GossipPacketType::CACHE_EVICTION:
         case GossipPacketType::CACHE_STATE:
         case GossipPacketType::HOT_PREFIX_DIGEST:
+        case GossipPacketType::EXTENSION:
             return true;
     }
     return false;
@@ -91,6 +93,10 @@ using CacheStateCallback =
 using HotPrefixDigestCallback =
     std::function<seastar::future<>(BackendId backend_id, std::vector<uint64_t> prefix_hashes,
                                     std::vector<uint64_t> verified_hashes)>;
+// Handler for a received EXTENSION packet's opaque payload. Payload by value —
+// the callback is a coroutine (Rule #21). The payload is fully opaque to core;
+// its shape is entirely the downstream's concern.
+using GossipExtensionHandler = std::function<seastar::future<>(std::vector<uint8_t> payload)>;
 
 // Wire format for route announcements (v2 with sequence numbers)
 struct RouteAnnouncementPacket {
@@ -231,6 +237,42 @@ struct HotPrefixDigestPacket {
     static std::optional<HotPrefixDigestPacket> deserialize(const uint8_t* data, size_t len);
 };
 
+// Wire format for an opaque, downstream-defined extension payload. Core neither
+// produces nor interprets the payload: an embedder broadcasts its own node-state
+// blob (discovery, peer table, whatever) over the existing gossip transport
+// without forking the packet registry. Core's only responsibilities are the
+// bound and the transport.
+//
+// Format: [type:1][version:1][payload_len:u16][payload bytes]
+//   HEADER_SIZE = 4; total = 4 + payload_len, capped at MAX_PAYLOAD bytes.
+//
+// payload_len is bounded by MAX_PAYLOAD on BOTH serialize (send side rejects
+// oversize before this struct is built) and deserialize (Rule #4) —
+// MAX_PAYLOAD + HEADER_SIZE = 1028 bytes stays under the ~1400B MTU before DTLS
+// overhead, same discipline as HotPrefixDigestPacket.
+//
+// FORWARD COMPATIBILITY (mirrors CacheStatePacket): deserialize accepts
+// len >= HEADER_SIZE + payload_len (not ==), reading the declared payload and
+// ignoring any trailing bytes a future version appends. `version` is the
+// downstream's own payload-schema version — recorded, never a rejection boundary
+// here; an unrecognized *type* is (see is_known_packet_type).
+//
+// Broadcast unreliably (no ACK / seq_num): the periodic-idempotent-state
+// convention — a dropped payload self-heals on the sender's next broadcast.
+struct ExtensionPacket {
+    static constexpr uint8_t PROTOCOL_VERSION = 1;
+    static constexpr size_t HEADER_SIZE = 4;
+    static constexpr size_t MAX_PAYLOAD = 1024;
+    static constexpr size_t MAX_PACKET_SIZE = HEADER_SIZE + MAX_PAYLOAD;
+
+    GossipPacketType type = GossipPacketType::EXTENSION;
+    uint8_t version = PROTOCOL_VERSION;
+    std::vector<uint8_t> payload;
+
+    std::vector<uint8_t> serialize() const;
+    static std::optional<ExtensionPacket> deserialize(const uint8_t* data, size_t len);
+};
+
 // GossipProtocol: Manages message handling and reliable delivery
 //
 // This class handles the protocol logic:
@@ -271,6 +313,12 @@ public:
     void set_hot_prefix_digest_callback(HotPrefixDigestCallback callback) {
         _hot_prefix_digest_callback = std::move(callback);
     }
+    // Installed once at gossip start from the process-wide slot (see
+    // gossip_service.hpp). Unset => received EXTENSION packets are counted and
+    // dropped in handle_packet.
+    void set_extension_callback(GossipExtensionHandler callback) {
+        _extension_callback = std::move(callback);
+    }
 
     // Broadcast methods
     // By value (coroutine — Rule #21). Reads tokens only before the per-peer
@@ -284,6 +332,11 @@ public:
     seastar::future<> broadcast_hot_prefix_digest(BackendId backend_id,
                                                   std::vector<uint64_t> prefix_hashes,
                                                   std::vector<uint64_t> verified_hashes);
+    // Broadcast an opaque downstream payload. By value (coroutine — Rule #21).
+    // Unreliable (no ACK/seq), like the cache-state / digest broadcasts. Rejects
+    // a payload larger than ExtensionPacket::MAX_PAYLOAD without sending (Rule #4;
+    // counts _extensions_rejected_oversize) — opaque data is never truncated.
+    seastar::future<> broadcast_extension(std::vector<uint8_t> payload);
     seastar::future<> broadcast_heartbeat();
 
     // Handle incoming packet (called from receive loop)
@@ -315,6 +368,10 @@ public:
     uint64_t cache_states_received() const { return _cache_states_received; }
     uint64_t hot_prefix_digests_sent() const { return _hot_prefix_digests_sent; }
     uint64_t hot_prefix_digests_received() const { return _hot_prefix_digests_received; }
+    uint64_t extensions_sent() const { return _extensions_sent; }
+    uint64_t extensions_received() const { return _extensions_received; }
+    uint64_t extensions_dropped_no_handler() const { return _extensions_dropped_no_handler; }
+    uint64_t extensions_rejected_oversize() const { return _extensions_rejected_oversize; }
     uint64_t unknown_packet_types() const { return _unknown_packet_types; }
     uint64_t sends_failed() const { return _sends_failed; }
     uint64_t peers_dropped_capacity() const { return _peers_dropped_capacity; }
@@ -341,6 +398,7 @@ private:
     CacheEvictionCallback _cache_eviction_callback;
     CacheStateCallback _cache_state_callback;
     HotPrefixDigestCallback _hot_prefix_digest_callback;
+    GossipExtensionHandler _extension_callback;
 
     // Timers
     seastar::timer<> _heartbeat_timer;
@@ -392,6 +450,15 @@ private:
     uint64_t _cache_states_received = 0;
     uint64_t _hot_prefix_digests_sent = 0;
     uint64_t _hot_prefix_digests_received = 0;
+    uint64_t _extensions_sent = 0;
+    uint64_t _extensions_received = 0;
+    // Dedicated no-handler drop counter: EXTENSION packets received while no
+    // downstream handler is installed. Distinct from _packets_invalid (malformed)
+    // and _unknown_packet_types (unrecognized tag) — a well-formed EXTENSION with
+    // nowhere to go.
+    uint64_t _extensions_dropped_no_handler = 0;
+    // Rule #4: outbound payloads rejected for exceeding MAX_PAYLOAD (never sent).
+    uint64_t _extensions_rejected_oversize = 0;
     uint64_t _unknown_packet_types = 0;
     // Rule #9: per-peer UDP send failures (expected against down peers; peer
     // state owns visibility). Counts route/eviction/ack/retry send exceptions.

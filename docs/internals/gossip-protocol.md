@@ -23,6 +23,7 @@ Ranvier uses a custom UDP-based gossip protocol to propagate route announcements
 | `CACHE_EVICTION` | `0x05` | Cluster-wide cache eviction notification |
 | `CACHE_STATE` | `0x06` | Per-backend KV-cache residency state (residency-aware routing) |
 | `HOT_PREFIX_DIGEST` | `0x07` | Per-node hot-prefix membership digest + verified-resident bitmap (cache-topology index) |
+| `EXTENSION` | `0x08` | Opaque, downstream-defined payload (core neither produces nor interprets it) |
 
 **Unknown packet types (rolling-upgrade safety).** A node that receives a type
 tag it does not recognize — e.g. a newer peer emitting a packet type this binary
@@ -260,6 +261,55 @@ Sent once per telemetry window by the shard-0 telemetry emitter via
 cache-topology index (`cache_topology_index.hpp`) behind the sole-held /
 verified-sole-held telemetry tiers. Counters: `hot_prefix_digests_sent` /
 `hot_prefix_digests_received` on `GossipProtocol`.
+
+### Extension (opaque downstream payload)
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type      |    Version    |          Payload Length       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Payload (Payload Length bytes)            ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| Field | Offset | Size | Description |
+|-------|--------|------|-------------|
+| Type | 0 | 1 byte | `0x08` (EXTENSION) |
+| Version | 1 | 1 byte | Downstream's own payload-schema version (recorded, never a rejection boundary in core) |
+| Payload Length | 2 | 2 bytes | Length of the opaque payload, capped at `MAX_PAYLOAD` (1024) |
+| Payload | 4 | Payload Length | Opaque bytes; core neither produces nor interprets them |
+
+**Purpose.** Lets a downstream build broadcast its own node-state payloads
+(discovery, peer table, whatever) over the existing gossip transport (peers,
+DTLS) without forking the packet registry. The payload stays fully opaque to
+core — nothing payload-shape-specific lives here.
+
+**Packet size**: 4-byte header + payload; maximum 4 + 1024 = 1028 bytes, under
+the ~1400 B MTU before DTLS overhead (same discipline as HOT_PREFIX_DIGEST).
+`Payload Length` is bounded by `MAX_PAYLOAD` on **both** sides — the sender
+rejects an oversize payload before broadcasting (never truncating opaque data;
+`gossip_extensions_rejected_oversize_total`), and `deserialize()` rejects an
+over-cap length before allocating (Rule #4).
+
+**Extensibility.** `deserialize()` accepts `len >= HEADER_SIZE + Payload Length`
+(not `==`), reading the declared payload and ignoring any trailing bytes a future
+version appends. `Version` is recorded but never a rejection boundary; the *type
+tag* is (see unknown-packet-type handling above).
+
+**Reliability.** Broadcast unreliably (no sequence number, no ACK): the
+periodic-idempotent-state convention — a dropped payload self-heals on the
+sender's next broadcast.
+
+**Handler.** `GossipService::broadcast_extension()` sends; on receipt, core hands
+the payload to the process-wide handler installed via
+`set_gossip_extension_handler()` (read once at gossip start, Hard Rule #11). With
+no handler installed, a well-formed EXTENSION packet is counted
+(`gossip_extensions_dropped_no_handler_total`) and dropped — behaviour is
+otherwise bit-for-bit unchanged. Counters: `extensions_sent` /
+`extensions_received` / `extensions_dropped_no_handler` /
+`extensions_rejected_oversize` on `GossipProtocol`.
 
 ## DTLS Encryption
 
@@ -826,6 +876,10 @@ for development; they are marked **(debug-only)** in the tables below.
 | `ranvier_gossip_cache_states_sent_total` | Counter | CACHE_STATE packets broadcast |
 | `ranvier_gossip_cache_states_received_total` | Counter | CACHE_STATE packets received from peers |
 | `ranvier_cluster_unknown_packet_types` | Counter | Packets ignored due to an unrecognized type tag (rolling-upgrade safety; peer stays healthy) |
+| `ranvier_gossip_extensions_sent_total` | Counter | Opaque EXTENSION payloads broadcast to peers |
+| `ranvier_gossip_extensions_received_total` | Counter | Opaque EXTENSION payloads received from peers |
+| `ranvier_gossip_extensions_dropped_no_handler_total` | Counter | Received EXTENSION payloads dropped because no downstream handler is installed |
+| `ranvier_gossip_extensions_rejected_oversize_total` | Counter | Outbound EXTENSION payloads rejected for exceeding `MAX_PAYLOAD` (never sent) |
 
 The router-side counter `ranvier_router_residency_route_downgrades_total` (on
 port 9180 under the `ranvier_router` group) tracks how often a CACHE_STATE

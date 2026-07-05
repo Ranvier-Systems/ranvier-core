@@ -108,6 +108,12 @@ public:
                                                   std::vector<uint64_t> verified_hashes);
     void set_hot_prefix_digest_callback(HotPrefixDigestCallback callback);
 
+    // Broadcast an opaque, downstream-defined payload to all peers over the
+    // existing gossip transport (unreliable, no ACK). The payload is fully opaque
+    // to core; oversize payloads are rejected in the protocol layer (Rule #4). No
+    // handler installed on the receiving side => peers count and drop it.
+    seastar::future<> broadcast_extension(std::vector<uint8_t> payload);
+
     // Check if gossip is enabled
     bool is_enabled() const { return _config.enabled; }
 
@@ -187,5 +193,30 @@ private:
     // Parse peer address string "IP:Port" to socket_address
     static std::optional<seastar::socket_address> parse_peer_address(const std::string& peer);
 };
+
+// Process-wide seam for the handler that receives opaque EXTENSION payloads.
+// OSS leaves it unset and received EXTENSION packets are counted and dropped; a
+// downstream build installs a handler via set_gossip_extension_handler() during
+// its own start-up, BEFORE GossipService::start() reads it. An empty handler
+// resets to "drop".
+//
+// Not racy runtime state (cf. Hard Rule #11, mirroring the telemetry_sink factory
+// seam): the slot is written once and read once — read on shard 0 during
+// GossipService::start(), where it is installed on the protocol — and is never
+// touched afterwards. The function-local static supplies the standard thread-safe
+// one-time init of the slot itself.
+inline GossipExtensionHandler& gossip_extension_handler_slot() {
+    static GossipExtensionHandler slot;  // empty until a build installs one
+    return slot;
+}
+
+inline void set_gossip_extension_handler(GossipExtensionHandler handler) {
+    gossip_extension_handler_slot() = std::move(handler);
+}
+
+// The installed handler, or an empty std::function when unset (=> drop).
+inline GossipExtensionHandler get_gossip_extension_handler() {
+    return gossip_extension_handler_slot();
+}
 
 }  // namespace ranvier

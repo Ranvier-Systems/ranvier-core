@@ -894,6 +894,19 @@ target_link_libraries(gossip_hot_prefix_digest_test
 )
 gtest_discover_tests(gossip_hot_prefix_digest_test)
 
+# Gossip Extension Packet Unit Tests (opaque downstream payload channel;
+# wire-format only, packet replicated in-test, no Seastar — mirrors
+# gossip_cache_state_test).
+add_executable(gossip_extension_test
+  tests/unit/gossip_extension_test.cpp
+)
+target_include_directories(gossip_extension_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(gossip_extension_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(gossip_extension_test)
+
 # Cache-Topology Index Unit Tests (BACKLOG §21 P2; pure structure, no Seastar).
 # Per-node set-replace, peer-death eviction, TTL age-out, self-clean, bounds.
 add_executable(cache_topology_index_test
