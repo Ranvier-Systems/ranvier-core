@@ -254,6 +254,15 @@ seastar::future<> GossipService::start() {
         _protocol->set_extension_callback(std::move(handler));
     }
 
+    // Publish the send-side seam: the inverse of the handler slot. A downstream
+    // build cannot reach a GossipService handle, so hand it a broadcaster here,
+    // now that gossip is live on shard 0. `this` is safe to capture — the slot is
+    // cleared in stop() before this GossipService (and its transport) go away.
+    // Payload by value (Rule #21); invoked on shard 0 like every broadcast_*.
+    set_gossip_extension_broadcaster([this](std::vector<uint8_t> payload) {
+        return broadcast_extension(std::move(payload));
+    });
+
     // Initiate DTLS handshakes with all configured peers
     if (_transport->is_dtls_enabled()) {
         log_gossip.info("Initiating DTLS handshakes with {} peers", _peer_addresses.size());
@@ -290,6 +299,14 @@ seastar::future<> GossipService::stop() {
 
     // Only shard 0 has modules to stop
     if (seastar::this_shard_id() == 0) {
+        // Clear the send-side seam FIRST, before the protocol/transport are torn
+        // down, so no later call can reach a broadcast_extension whose transport
+        // is gone (and no captured `this` outlives us). Safe end to end: the
+        // downstream-service hook (#615) stops downstream users before core
+        // services stop, so by here nothing is still calling the broadcaster.
+        // Empty function => get returns "not running", per the slot's contract.
+        set_gossip_extension_broadcaster(nullptr);
+
         // Stop protocol layer first (timers, DNS)
         co_await _protocol->stop();
         log_gossip.debug("Protocol module stopped");

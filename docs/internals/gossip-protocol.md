@@ -302,14 +302,25 @@ tag* is (see unknown-packet-type handling above).
 periodic-idempotent-state convention — a dropped payload self-heals on the
 sender's next broadcast.
 
-**Handler.** `GossipService::broadcast_extension()` sends; on receipt, core hands
-the payload to the process-wide handler installed via
-`set_gossip_extension_handler()` (read once at gossip start, Hard Rule #11). With
-no handler installed, a well-formed EXTENSION packet is counted
-(`gossip_extensions_dropped_no_handler_total`) and dropped — behaviour is
-otherwise bit-for-bit unchanged. Counters: `extensions_sent` /
-`extensions_received` / `extensions_dropped_no_handler` /
-`extensions_rejected_oversize` on `GossipProtocol`.
+**Handler (receive side).** On receipt, core hands the payload to the process-wide
+handler installed via `set_gossip_extension_handler()` (read once at gossip start,
+Hard Rule #11). With no handler installed, a well-formed EXTENSION packet is
+counted (`gossip_extensions_dropped_no_handler_total`) and dropped — behaviour is
+otherwise bit-for-bit unchanged.
+
+**Broadcaster (send side).** A downstream build cannot reach a `GossipService`
+handle, so the inverse seam publishes one: `GossipService::start()` writes a
+broadcaster into a process-wide slot readable via
+`get_gossip_extension_broadcaster()`, and `stop()` clears it before the transport
+is torn down. An empty function is the not-running signal (before start, gossip
+disabled, or after stop) — callers must check before invoking, and invoke on
+shard 0 (like every `broadcast_*`). This is end-to-end safe because the
+downstream-service lifecycle hook stops downstream users before core services
+stop.
+
+Counters: `extensions_sent` / `extensions_received` /
+`extensions_dropped_no_handler` / `extensions_rejected_oversize` on
+`GossipProtocol`.
 
 ## DTLS Encryption
 
