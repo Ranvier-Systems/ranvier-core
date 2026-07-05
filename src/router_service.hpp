@@ -246,6 +246,15 @@ double get_backend_gpu_count(BackendId id);
 // with max/min, never sum.
 double get_backend_gpu_seconds(BackendId id);
 
+// Get the operator-declared GPU hardware tier for a backend (shard-local read).
+// Observe-only; resolves backend_id -> hardware label for hardware-normalized
+// views and ledger sinks. Returns "" when the backend isn't registered on this
+// shard, or when it registered without a tier (an unset tier and an unknown
+// backend are indistinguishable here — both mean "no label"). Like gpu_count
+// this is a per-backend constant replicated to every shard, so any one shard's
+// value is authoritative — read it locally, never combine across shards.
+std::string get_backend_gpu_tier(BackendId id);
+
 // ============================================================================
 // Cost Budget Tracking Functions (shard-local, lock-free)
 // ============================================================================
@@ -850,6 +859,11 @@ public:
     // BackendInfo. Bypasses set_backend_gpu_count_global's broadcast so the
     // backend_gpu_count gauge accessor can be unit-tested without a reactor.
     static void set_backend_gpu_count_for_testing(BackendId id, double gpu_count);
+
+    // Write the operator-declared GPU tier directly into shard-local BackendInfo.
+    // Bypasses set_backend_hardware_cost_global's broadcast so the gpu_tier
+    // accessor can be unit-tested without a running reactor.
+    static void set_backend_gpu_tier_for_testing(BackendId id, std::string gpu_tier);
 
     // Remove a backend from shard-local state (bypasses async cross-shard broadcast).
     static void unregister_backend_for_testing(BackendId id);

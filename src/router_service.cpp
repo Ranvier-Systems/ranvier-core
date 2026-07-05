@@ -1024,6 +1024,19 @@ double get_backend_gpu_seconds(BackendId id) {
                                         in_progress_seconds);
 }
 
+// Operator-declared GPU hardware tier for backend `id` on this shard
+// (observe-only). Shard-local, lock-free read; mirrors get_backend_gpu_count. A
+// per-backend constant replicated to every shard, so any shard's value is
+// authoritative. Returns "" for an unregistered backend, matching BackendInfo's
+// default for a backend registered without a tier — both are "no label".
+std::string get_backend_gpu_tier(BackendId id) {
+    if (!g_shard_state) {
+        return "";
+    }
+    auto it = g_shard_state->backends.find(id);
+    return it == g_shard_state->backends.end() ? std::string() : it->second.gpu_tier;
+}
+
 uint64_t get_backend_load(BackendId id) {
     if (!g_shard_state) {
         return 0;
@@ -5820,6 +5833,13 @@ void RouterService::set_backend_gpu_count_for_testing(BackendId id, double gpu_c
     auto it = g_shard_state->backends.find(id);
     if (it == g_shard_state->backends.end()) return;
     it->second.gpu_count = gpu_count;
+}
+
+void RouterService::set_backend_gpu_tier_for_testing(BackendId id, std::string gpu_tier) {
+    if (!g_shard_state) return;
+    auto it = g_shard_state->backends.find(id);
+    if (it == g_shard_state->backends.end()) return;
+    it->second.gpu_tier = std::move(gpu_tier);
 }
 
 } // namespace ranvier

@@ -2157,6 +2157,30 @@ TEST_F(RouterServiceTest, GetBackendGpuCountReflectsSetter) {
     EXPECT_DOUBLE_EQ(get_backend_gpu_count(2), 0.5);
 }
 
+// Observe-only GPU-tier accessor: resolves backend_id -> hardware label. Unlike
+// the gpu_count gauge (1.0 default), an unregistered or tier-less backend reads
+// back as "" — there is no numeric series to skew, so empty is the honest "no
+// label" value.
+TEST_F(RouterServiceTest, GetBackendGpuTierEmptyForUnknown) {
+    EXPECT_EQ(get_backend_gpu_tier(999), "");
+}
+
+TEST_F(RouterServiceTest, GetBackendGpuTierEmptyForRegisteredUnset) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    EXPECT_EQ(get_backend_gpu_tier(1), "");
+}
+
+TEST_F(RouterServiceTest, GetBackendGpuTierReflectsSetter) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+
+    RouterService::set_backend_gpu_tier_for_testing(1, "h100");
+    RouterService::set_backend_gpu_tier_for_testing(2, "a10g");
+
+    EXPECT_EQ(get_backend_gpu_tier(1), "h100");
+    EXPECT_EQ(get_backend_gpu_tier(2), "a10g");
+}
+
 TEST_F(RouterServiceTest, GetLeastLoadedBackend) {
     RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
     RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
