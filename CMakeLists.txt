@@ -675,6 +675,22 @@ target_link_libraries(usage_ledger_test
 )
 gtest_discover_tests(usage_ledger_test)
 
+# Downstream-service seam unit tests: the process-wide factory slot semantics
+# (unset => none, install, reset-to-null). Reactor-free by construction — the
+# stubbed start()/stop() futures are constructed but never driven.
+add_executable(downstream_service_test
+  tests/unit/downstream_service_test.cpp
+)
+target_include_directories(downstream_service_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/stubs
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(downstream_service_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(downstream_service_test)
+
 # GIE Endpoint-Picker plan unit tests: the pure endpoint-formatting + the
 # set-endpoint-vs-503 decision (src/gie_epp_plan.hpp). No gRPC / Seastar deps —
 # the gRPC server itself is integration-verified. Always built (independent of

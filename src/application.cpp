@@ -1298,6 +1298,25 @@ seastar::future<> Application::startup() {
             }
             return seastar::make_ready_future<>();
         }).then([this] {
+            // 17. Downstream service lifecycle hook (embeddability series):
+            // instantiate the embedder-installed service ONCE on shard 0, now
+            // that every core service is up, and start it. The factory is the
+            // write-once pre-reactor slot (Hard Rule #11, mirroring the telemetry
+            // / usage-ledger sink factories). No factory installed => nothing
+            // starts and startup is bit-for-bit unchanged. A failed start()
+            // aborts startup via the chain's handle_exception, like a core service.
+            auto factory = get_downstream_service_factory();
+            if (!factory) {
+                return seastar::make_ready_future<>();
+            }
+            _downstream_service = factory();
+            if (!_downstream_service) {
+                log_main.warn("Downstream service factory returned null; hook inert");
+                return seastar::make_ready_future<>();
+            }
+            log_main.info("Starting downstream service");
+            return _downstream_service->start();
+        }).then([this] {
             _state = ApplicationState::RUNNING;
             _startup_time = std::chrono::steady_clock::now();
             log_main.info("Application startup complete");
@@ -1738,6 +1757,25 @@ seastar::future<> Application::stop_services() {
     log_main.info("Phase 3/3: Stopping services in reverse order...");
     _state = ApplicationState::STOPPING;
 
+    // Downstream service stops FIRST — the reverse of startup(), where it came up
+    // after all core services (pitfalls-reference #7 reverse-order discipline). It
+    // quiesces while routing / gossip / HTTP are still live, so an embedder
+    // endpoint or job can shut down before the core it leans on goes away. Stop
+    // errors are logged at warn (Rule #9) and swallowed so teardown proceeds. No
+    // service installed => straight to core teardown, bit-for-bit unchanged.
+    if (_downstream_service) {
+        log_main.info("Stopping downstream service...");
+        return _downstream_service->stop()
+            .handle_exception([](std::exception_ptr) {
+                log_main.warn("  Downstream service stop error (ignored)");
+            })
+            .then([this, phase_start] { return stop_core_services(phase_start); });
+    }
+    return stop_core_services(phase_start);
+}
+
+seastar::future<> Application::stop_core_services(
+    std::chrono::steady_clock::time_point phase_start) {
     // -------------------------------------------------------------------------
     // Step 1: Stop services that don't need request handling (parallel)
     // Health checker and K8s discovery can stop independently
