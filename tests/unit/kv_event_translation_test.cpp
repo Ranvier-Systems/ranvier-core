@@ -15,7 +15,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <string_view>
 #include <vector>
@@ -241,6 +244,74 @@ TEST(KvDecoder, RejectsTruncatedAndGarbage) {
     EXPECT_FALSE(decode_kv_event_batch(garbage.data(), garbage.size()).has_value());
     EXPECT_FALSE(decode_kv_event_batch(nullptr, 10).has_value());
     EXPECT_FALSE(decode_kv_event_batch(good.data(), 0).has_value());
+}
+
+// Builds a single-BlockStored batch whose leading timestamp is written by
+// `pack_ts` (so tests can inject adversarial float/int timestamp encodings).
+template <typename PackTs>
+std::vector<uint8_t> stored_batch_with_ts(PackTs&& pack_ts,
+                                          const std::vector<int32_t>& tokens) {
+    Packer p;
+    p.arr(2);  // [ts, events]
+    pack_ts(p);
+    p.arr(1);
+    p.arr(6);  // [tag, hashes, parent, tokens, block_size, lora_id]
+    p.str("BlockStored");
+    p.int_arr_u64({0x1});
+    p.nil();
+    p.token_arr(tokens);
+    p.fixint(16);
+    p.nil();
+    return p.buf;
+}
+
+// A1: +inf float64 timestamp. The float→uint64 cast of +inf is UB; the decoder
+// must treat a non-finite timestamp as 0, still accept the batch (a clamped
+// timestamp is a usable ordering key), and never nullopt on it.
+TEST(KvDecoder, InfFloatTimestampClampsToZeroNoUB) {
+    auto tokens = make_tokens(16);
+    auto buf = stored_batch_with_ts(
+        [](Packer& p) { p.f64(std::numeric_limits<double>::infinity()); }, tokens);
+
+    auto batch = decode_kv_event_batch(buf.data(), buf.size());
+    ASSERT_TRUE(batch.has_value());
+    EXPECT_EQ(batch->ts_ms, 0u);
+    ASSERT_EQ(batch->stored.size(), 1u);
+}
+
+// A1: a finite-but-huge float64 timestamp (1e300 * 1000 ≥ 2^64) overflows the
+// uint64 range — the cast is UB. Must clamp to UINT64_MAX, not abort/wrap.
+TEST(KvDecoder, HugeFloatTimestampClampsToMaxNoUB) {
+    auto tokens = make_tokens(16);
+    auto buf = stored_batch_with_ts([](Packer& p) { p.f64(1e300); }, tokens);
+
+    auto batch = decode_kv_event_batch(buf.data(), buf.size());
+    ASSERT_TRUE(batch.has_value());
+    EXPECT_EQ(batch->ts_ms, UINT64_MAX);
+    ASSERT_EQ(batch->stored.size(), 1u);
+}
+
+// A2: a UINT64_MAX integer timestamp. `ts.uval * 1000` wraps (defined, but a
+// wrong ordering key); the cap must yield UINT64_MAX instead.
+TEST(KvDecoder, MaxIntTimestampCapsNoWrap) {
+    auto tokens = make_tokens(16);
+    auto buf = stored_batch_with_ts([](Packer& p) { p.u64(UINT64_MAX); }, tokens);
+
+    auto batch = decode_kv_event_batch(buf.data(), buf.size());
+    ASSERT_TRUE(batch.has_value());
+    EXPECT_EQ(batch->ts_ms, UINT64_MAX);
+    ASSERT_EQ(batch->stored.size(), 1u);
+}
+
+// The clamp must not perturb a timestamp vLLM actually emits (well under 2^63 ms).
+TEST(KvDecoder, NormalIntTimestampUnchanged) {
+    auto tokens = make_tokens(16);
+    auto buf = stored_batch_with_ts([](Packer& p) { p.u64(1711000000ULL); }, tokens);
+
+    auto batch = decode_kv_event_batch(buf.data(), buf.size());
+    ASSERT_TRUE(batch.has_value());
+    EXPECT_EQ(batch->ts_ms, 1711000000000ULL);
+    ASSERT_EQ(batch->stored.size(), 1u);
 }
 
 // =============================================================================

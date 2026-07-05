@@ -52,11 +52,35 @@ of reimplementing it off-reactor.
 The reactor-side work is a **named coroutine** (`route_on_reactor`, taking the
 body by value — Rules #16/#21) invoked by a *plain* `submit_to` lambda that
 copies the body reactor-side from a `string_view` into the gRPC thread's buffer
-(alive across `fut.get()`). That sidesteps both a cross-thread free of the body
-and the coroutine-lambda lifetime trap. The decision crosses back as a
+(alive across the bridge wait). That sidesteps both a cross-thread free of the
+body and the coroutine-lambda lifetime trap. The decision crosses back as a
 trivially-copyable POD (a `socket_address` + an "ok" flag), so no Seastar-shard
 heap is ever freed on a gRPC thread (Rules #14/#15); the `<ip:port>` string is
 formatted on the gRPC thread from that POD.
+
+### Ingress backpressure (cap + deadline)
+
+gRPC's sync API grows its handler-thread pool with concurrent RPCs, so an
+unbounded `Process` flood (or a slow client opening many streams) would park an
+unbounded number of handler threads on `fut.get()`, each blocked awaiting shard
+0 — flooding shard 0's task queue. The inline HTTP ingress has a concurrency
+cap; this alternate ingress bounds itself two ways (both `gie_epp.*` config):
+
+- **Ingress admission cap** (`max_inflight_requests`, default 1024): a plain
+  atomic counter on the gRPC side (never the reactor, so no Seastar primitive is
+  needed) admits at most N concurrent bridges onto shard 0. Over-cap requests
+  shed immediately down the same `ImmediateResponse` **503** path as "no ready
+  endpoint" — they never reach the reactor. `0` disables the cap.
+- **Bridge deadline** (`bridge_deadline_ms`, default 2000): the handler waits on
+  the routing future with `wait_for(deadline)` rather than an unbounded
+  `get()`. A wedged or overloaded shard 0 sheds load (503) instead of parking
+  the handler thread forever. The abandoned reactor task still completes and
+  sets the now-unobserved shared state; `std::future`'s destructor does not
+  block on it, so no handler thread leaks. `0` disables the deadline.
+
+Both shed reasons increment a cumulative counter logged at drain. This is the
+503 load-shedding backstop; the GIE-native **429** shed (below) is a separate,
+still-open follow-up.
 
 ```
 GIE gateway ──gRPC──► ExternalProcessor::Process       (gRPC sync thread pool)
@@ -114,6 +138,8 @@ gie_epp:
   enabled: false          # RANVIER_GIE_EPP_ENABLED; toggling requires restart
   port: 9002              # RANVIER_GIE_EPP_PORT
   listen_address: "0.0.0.0"  # RANVIER_GIE_EPP_LISTEN_ADDRESS
+  max_inflight_requests: 1024  # RANVIER_GIE_EPP_MAX_INFLIGHT_REQUESTS; 0 disables the cap
+  bridge_deadline_ms: 2000     # RANVIER_GIE_EPP_BRIDGE_DEADLINE_MS; 0 disables the deadline
 ```
 
 Requires a binary built with `-DWITH_GIE_EPP=ON` (which adds gRPC + protobuf and
@@ -171,7 +197,10 @@ the configure step fails fast with a `FATAL_ERROR` naming what to install.
 - **429 request-shedding.** GIE allows an `ImmediateResponse` 429 under load.
   Deferred pending a real overload signal — there is no global "shed now" today
   (only per-backend `get_composite_backend_load`); a meaningful policy is its
-  own design rather than a blunt all-backends-over-threshold heuristic.
+  own design rather than a blunt all-backends-over-threshold heuristic. Note the
+  ingress cap + bridge deadline above already shed genuine overload/stall as
+  **503**; a 429 would be the GIE-preferred "retry me" signal for the same
+  condition once a policy exists.
 - **Inline-vs-sidecar overhead benchmark.** The published proof point comparing
   inline routing to a sidecar ext_proc EPP hop (needs real cluster/hardware).
 - **Per-model chat-template selection** for heterogeneous fleets (see the

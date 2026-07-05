@@ -528,6 +528,16 @@ struct GieEppConfig {
     uint16_t port = 9002;
     // Listen address for the gRPC server.
     std::string listen_address = "0.0.0.0";
+    // Ingress admission cap: max concurrent Process decisions bridged onto the
+    // reactor (shard 0) at once. gRPC's sync API grows its handler-thread pool
+    // with concurrent RPCs, so without this cap a flood parks unbounded threads
+    // blocked on shard 0's task queue; over-cap requests shed as an
+    // ImmediateResponse 503 instead (adversarial audit Pass A, S1). 0 disables.
+    uint32_t max_inflight_requests = 1024;
+    // Deadline (ms) for the reactor-bridge routing decision. A wedged shard 0
+    // sheds load (503) instead of parking the gRPC handler thread forever on the
+    // std::future. 0 disables the deadline (blocks indefinitely — legacy behavior).
+    uint32_t bridge_deadline_ms = 2000;
 };
 
 // =============================================================================
