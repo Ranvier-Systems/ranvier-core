@@ -155,3 +155,20 @@ None systemic to this pass. A1 is a single-site UB, not a repeated pattern — b
 one-line grep worth running across `src/` if a second instance ever appears
 (`response_usage_parser.hpp`, `prometheus_parser.hpp`, and the metrics scrapers
 all parse numbers from external text — spot-checked clean here, but not the focus).
+
+---
+
+*Resolution note appended 2026-07-05 — post-fix record. Static analysis only; UBSan fuzz / sanitizer / gie-epp gates ran in the developer's Docker container. Lets the BACKLOG §24 entry collapse to a pointer (mirrors §20's closeout and the §22 verification pass).*
+
+## Resolution (2026-07-05)
+
+All findings fixed and merged (PRs #611 scope + #612); §24 fully closed.
+
+| # | Disposition |
+|---|-------------|
+| A1 (MEDIUM) | FIXED — `decode_kv_event_batch` float path gates on `std::isfinite(ts.fval) && ts.fval > 0.0` and clamps `ts.fval * 1000.0` on the largest double `< 2^64` (`18446744073709549568.0`) → `UINT64_MAX` before the cast; no `[conv.fpint]` UB. Pinned by four `KvDecoder` unit cases and by `kv_event_decoder_fuzz` under UBSan (aborted within seconds pre-fix). |
+| A2 (LOW) | FIXED — INT timestamp path caps `ts.uval > UINT64_MAX/1000` to `UINT64_MAX` instead of wrapping. |
+| S1 (MEDIUM) | FIXED — EPP `decide()` admits at most `gie_epp.max_inflight_requests` (default 1024) concurrent bridges via an atomic counter, shedding over-cap down the existing 503 path; the reactor-bridge wait is now `fut.wait_for(gie_epp.bridge_deadline_ms)` (default 2000ms) so a wedged shard 0 sheds load instead of parking gRPC threads. Config plumbed (env + YAML + example); `docs/internals/gie-epp.md` "Ingress backpressure" section added. `WITH_GIE_EPP`-gated (default OFF). |
+| S2 (LOW) | FIXED — decoder array `reserve()` clamped to remaining payload bytes. |
+
+Headline artifact `tests/fuzz/kv_event_decoder_fuzz.cpp` is wired into `fuzz-ci` / `fuzz-run-all` and runs on every push — the decoder's permanent coverage.
