@@ -130,6 +130,20 @@ void GossipService::register_metrics() {
             [this] { return _protocol->unknown_packet_types(); },
             seastar::metrics::description("Total number of gossip packets ignored due to an unrecognized type tag "
                                           "(rolling-upgrade safety; peer stays healthy)")),
+        seastar::metrics::make_counter("gossip_extensions_sent_total",
+            [this] { return _protocol->extensions_sent(); },
+            seastar::metrics::description("Total number of opaque EXTENSION payloads broadcast to cluster peers")),
+        seastar::metrics::make_counter("gossip_extensions_received_total",
+            [this] { return _protocol->extensions_received(); },
+            seastar::metrics::description("Total number of opaque EXTENSION payloads received from cluster peers")),
+        seastar::metrics::make_counter("gossip_extensions_dropped_no_handler_total",
+            [this] { return _protocol->extensions_dropped_no_handler(); },
+            seastar::metrics::description("Total number of received EXTENSION payloads dropped because no downstream "
+                                          "handler is installed")),
+        seastar::metrics::make_counter("gossip_extensions_rejected_oversize_total",
+            [this] { return _protocol->extensions_rejected_oversize(); },
+            seastar::metrics::description("Total number of outbound EXTENSION payloads rejected for exceeding "
+                                          "the max payload size (never sent)")),
 
         // Transport metrics (DTLS)
         seastar::metrics::make_counter("cluster_dtls_handshakes_started",
@@ -232,6 +246,13 @@ seastar::future<> GossipService::start() {
 
     // Start protocol layer (message handling, reliable delivery)
     co_await _protocol->start(_transport.get(), _consensus.get(), &_peer_addresses);
+
+    // Install the downstream EXTENSION handler from the process-wide slot ONCE
+    // here (Hard Rule #11 write-once/read-once). Unset => received EXTENSION
+    // packets are counted and dropped in handle_packet.
+    if (auto handler = get_gossip_extension_handler()) {
+        _protocol->set_extension_callback(std::move(handler));
+    }
 
     // Initiate DTLS handshakes with all configured peers
     if (_transport->is_dtls_enabled()) {
@@ -413,6 +434,28 @@ seastar::future<> GossipService::broadcast_cache_state(BackendId backend_id, dou
     }
 
     return _protocol->broadcast_cache_state(backend_id, cache_usage, residency_weight)
+        .finally([gate_holder = std::move(gate_holder)] {});
+}
+
+seastar::future<> GossipService::broadcast_extension(std::vector<uint8_t> payload) {
+    if (!_config.enabled || !_protocol || _peer_addresses.empty()) {
+        return seastar::make_ready_future<>();
+    }
+
+    if (!is_accepting_tasks()) {
+        log_gossip.debug("Extension broadcast rejected: gossip service not accepting tasks");
+        return seastar::make_ready_future<>();
+    }
+
+    seastar::gate::holder gate_holder;
+    try {
+        gate_holder = _gossip_task_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        log_gossip.debug("Extension broadcast rejected: gossip gate closed");
+        return seastar::make_ready_future<>();
+    }
+
+    return _protocol->broadcast_extension(std::move(payload))
         .finally([gate_holder = std::move(gate_holder)] {});
 }
 

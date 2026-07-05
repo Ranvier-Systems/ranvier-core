@@ -325,6 +325,56 @@ std::optional<HotPrefixDigestPacket> HotPrefixDigestPacket::deserialize(const ui
     return pkt;
 }
 
+std::vector<uint8_t> ExtensionPacket::serialize() const {
+    // Send side (broadcast_extension) rejects an oversize payload before building
+    // the packet, so payload.size() <= MAX_PAYLOAD here and fits a u16 length.
+    const uint16_t payload_len = static_cast<uint16_t>(
+        std::min(payload.size(), static_cast<size_t>(MAX_PAYLOAD)));
+
+    std::vector<uint8_t> buffer;
+    buffer.reserve(HEADER_SIZE + payload_len);
+
+    buffer.push_back(static_cast<uint8_t>(type));
+    buffer.push_back(version);
+    be_write_u16(buffer, payload_len);
+    buffer.insert(buffer.end(), payload.begin(), payload.begin() + payload_len);
+
+    return buffer;
+}
+
+std::optional<ExtensionPacket> ExtensionPacket::deserialize(const uint8_t* data, size_t len) {
+    // Forward compatibility: accept len >= HEADER_SIZE + payload_len (not ==) so a
+    // future version appending fields stays readable — parse the declared payload
+    // and ignore any trailing bytes.
+    if (len < HEADER_SIZE) {
+        return std::nullopt;
+    }
+
+    ExtensionPacket pkt;
+    pkt.type = static_cast<GossipPacketType>(data[0]);
+    pkt.version = data[1];
+
+    if (pkt.type != GossipPacketType::EXTENSION) {
+        return std::nullopt;
+    }
+    // version intentionally not range-checked: it is the downstream's own
+    // payload-schema version, recorded and handed through opaquely. Type — not
+    // version — is the rejection boundary (see is_known_packet_type).
+
+    uint16_t payload_len = be_read_u16(data + 2);
+
+    // Rule #4: reject an over-cap length from the wire rather than allocate for it.
+    if (payload_len > MAX_PAYLOAD) {
+        return std::nullopt;
+    }
+    if (len < HEADER_SIZE + static_cast<size_t>(payload_len)) {
+        return std::nullopt;  // truncated
+    }
+
+    pkt.payload.assign(data + HEADER_SIZE, data + HEADER_SIZE + payload_len);
+    return pkt;
+}
+
 //------------------------------------------------------------------------------
 // GossipProtocol Implementation
 //------------------------------------------------------------------------------
@@ -716,6 +766,39 @@ seastar::future<> GossipProtocol::broadcast_hot_prefix_digest(BackendId backend_
     ++_hot_prefix_digests_sent;
 }
 
+seastar::future<> GossipProtocol::broadcast_extension(std::vector<uint8_t> payload) {
+    // Rule #22: coroutine converts any pre-future throw into a failed future.
+    if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses ||
+        _peer_addresses->empty()) {
+        co_return;
+    }
+    if (_consensus && !_consensus->is_accepting_tasks()) {
+        co_return;
+    }
+
+    // Rule #4: never truncate opaque downstream data — reject an oversize payload
+    // outright so the downstream sees a dropped broadcast (counter + warn) rather
+    // than a silently corrupted one.
+    if (payload.size() > ExtensionPacket::MAX_PAYLOAD) {
+        ++_extensions_rejected_oversize;
+        log_gossip_protocol().warn("Extension payload {} B exceeds MAX_PAYLOAD {} B; not broadcast",
+                                   payload.size(), ExtensionPacket::MAX_PAYLOAD);
+        co_return;
+    }
+
+    ExtensionPacket pkt;
+    pkt.payload = std::move(payload);
+    auto serialized = pkt.serialize();
+
+    log_gossip_protocol().trace("Broadcasting extension payload: {} B to {} peers",
+                                pkt.payload.size(), _peer_addresses->size());
+
+    // Unreliable broadcast (no ACK): the periodic-idempotent-state convention — a
+    // dropped payload self-heals on the sender's next broadcast.
+    co_await _transport->broadcast(*_peer_addresses, serialized);
+    ++_extensions_sent;
+}
+
 seastar::future<> GossipProtocol::broadcast_heartbeat() {
     // Rule 22: coroutine converts any pre-future throw into a failed future
     // RAII Timer Safety: Holder must outlive the work — coroutine frame keeps it alive
@@ -849,6 +932,28 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
                                                std::move(hp_pkt->prefix_hashes),
                                                std::move(hp_pkt->verified_hashes));
         }
+        return seastar::make_ready_future<>();
+    }
+
+    // Handle opaque extension packets (downstream-defined; unreliable). Core does
+    // not interpret the payload — hand it to the installed handler, or count and
+    // drop cleanly when none is installed.
+    if (type == GossipPacketType::EXTENSION) {
+        auto ext_pkt = ExtensionPacket::deserialize(ptr, len);
+        if (!ext_pkt) {
+            ++_packets_invalid;
+            return seastar::make_ready_future<>();
+        }
+
+        ++_extensions_received;
+        log_gossip_protocol().trace("Received EXTENSION from {}: {} B payload",
+                                    src_addr, ext_pkt->payload.size());
+
+        // Rule #16: return the callback's future directly (no lambda-coroutine).
+        if (_extension_callback) {
+            return _extension_callback(std::move(ext_pkt->payload));
+        }
+        ++_extensions_dropped_no_handler;
         return seastar::make_ready_future<>();
     }
 
