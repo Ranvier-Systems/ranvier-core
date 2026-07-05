@@ -28,6 +28,7 @@
 
 #include "types.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -79,6 +80,7 @@ struct Reader {
     const uint8_t* end;
 
     bool ok(size_t n) const { return static_cast<size_t>(end - p) >= n; }
+    size_t remaining() const { return static_cast<size_t>(end - p); }
 
     bool u8(uint8_t& out) {
         if (!ok(1)) return false;
@@ -207,7 +209,12 @@ inline bool read_str(Reader& r, std::string_view& out, size_t max_len = 64) {
 inline bool read_u64_array(Reader& r, std::vector<uint64_t>& out, size_t max_n) {
     Header h;
     if (!read_header(r, h) || h.kind != Kind::ARR || h.uval > max_n) return false;
-    out.reserve(out.size() + h.uval);
+    // Reserve at most what the remaining payload can encode: every element is
+    // ≥1 wire byte, so a tiny payload claiming a huge array (h.uval up to max_n)
+    // can't actually deliver more than r.remaining() elements — clamp the
+    // reserve to that bound rather than eagerly allocating for the claim (Rule #4).
+    const size_t fits = r.remaining();
+    out.reserve(out.size() + (h.uval < fits ? h.uval : fits));
     for (uint64_t i = 0; i < h.uval; ++i) {
         Header e;
         if (!read_header(r, e) || e.kind != Kind::INT) return false;
@@ -219,7 +226,10 @@ inline bool read_u64_array(Reader& r, std::vector<uint64_t>& out, size_t max_n) 
 inline bool read_token_array(Reader& r, std::vector<int32_t>& out, size_t max_n) {
     Header h;
     if (!read_header(r, h) || h.kind != Kind::ARR || h.uval > max_n) return false;
-    out.reserve(out.size() + h.uval);
+    // See read_u64_array: clamp the reserve to the bytes actually remaining so a
+    // small payload's inflated array length can't force a large transient alloc.
+    const size_t fits = r.remaining();
+    out.reserve(out.size() + (h.uval < fits ? h.uval : fits));
     for (uint64_t i = 0; i < h.uval; ++i) {
         Header e;
         if (!read_header(r, e) || e.kind != Kind::INT) return false;
@@ -246,9 +256,22 @@ inline std::optional<KvEventBatch> decode_kv_event_batch(const uint8_t* data, si
     Header ts;
     if (!read_header(r, ts)) return std::nullopt;
     if (ts.kind == Kind::F64) {
-        out.ts_ms = ts.fval > 0.0 ? static_cast<uint64_t>(ts.fval * 1000.0) : 0;
+        // ts.fval is memcpy'd raw from a hostile-controllable 0xcb wire double.
+        // A float→unsigned cast of +inf or any value ≥ 2^64 is UB ([conv.fpint]);
+        // clamp on the largest double strictly below 2^64 (2^64 itself is not
+        // representable, so it is the correct in-range ceiling). NaN/+inf and
+        // non-positive timestamps collapse to 0.
+        if (std::isfinite(ts.fval) && ts.fval > 0.0) {
+            const double ms = ts.fval * 1000.0;
+            out.ts_ms = ms >= 18446744073709549568.0 ? UINT64_MAX
+                                                     : static_cast<uint64_t>(ms);
+        } else {
+            out.ts_ms = 0;
+        }
     } else if (ts.kind == Kind::INT && !ts.negative) {
-        out.ts_ms = ts.uval * 1000;
+        // ts.uval * 1000 wraps for a hostile ts.uval > 2^64/1000 (defined, but a
+        // wrong ordering key); cap it the same way the float path clamps.
+        out.ts_ms = ts.uval > UINT64_MAX / 1000 ? UINT64_MAX : ts.uval * 1000;
     } else {
         return std::nullopt;
     }
