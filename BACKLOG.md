@@ -1031,61 +1031,44 @@ pointer for future in-source `// BACKLOG §21` cross-references.
 
 ## 22. Invariant Audit Findings (2026-07-03)
 
-From `.dev-context/invariant-audit-2026-07-03.md` (semantic-correctness pass over the
-routing hot path; finding IDs I-1…I-8 and fix prompts live there; the invariant
-catalog it seeded is `.dev-context/invariants.md`).
+**Findings: CLOSED (2026-07-04).** All eight (I-1 HIGH unpruned prefix_hash_index
+through I-8 LOW counter drift) fixed, merged, and verified; the one hardening
+follow-up (V-1) is open below. Semantic-correctness pass over the routing hot path;
+this audit also seeded the living invariant catalog `.dev-context/invariants.md`.
 
-- [x] [HIGH] Fix: prune `prefix_hash_index` on TTL expiry / LRU eviction / peer prune / unregister — its "bounded by max_routes" claim is currently false (invariant audit 2026-07-03, I-1)
-  _Completed:_ 2026-07-03 — `ttl_cleanup_on_shard` phase 3 rebuilds the index from live routes each TTL cycle (native-fresh entries preserved; counters recomputed); `router_prefix_hash_index_size` gauge added. Pinned by `tests/unit/prefix_hash_index_lifecycle_test.cpp`.
-- [x] [HIGH] Fix: learn-path index inserts must hash at the effective boundary (`tokens.size()`), not `min(len, prefix_token_length)` — boundary-learned entries are keyed at the wrong depth (I-2)
-  _Completed:_ 2026-07-03 — both `apply_*_batch` paths hash at `route.tokens.size()` (pre-truncated to the effective boundary). Pinned by the same test file.
-- [x] [MEDIUM] Fix: O(1) per-origin LRU tails for `evict_lowest_trust` — remove the O(n) LRU scan per insert at capacity (reactor-stall risk on remote-batch apply) (I-3)
-  _Completed:_ 2026-07-03 — `RadixTree` now keeps one intrusive LRU list per `RouteOrigin` (invariant T8); `evict_lowest_trust`/`evict_oldest` are O(1) tail pops with identical victim selection. Debug-only `validate_lru_lists()` asserts list integrity. Pinned by `PerOriginLruTest` in `tests/unit/cache_eviction_test.cpp` and eviction ops + per-op validation in `tests/fuzz/radix_tree_fuzz.cpp`.
-- [x] [MEDIUM] Fix: `run_ttl_cleanup` ships a shard-0-allocated `flat_hash_map` cross-shard without foreign_ptr (Rule #14; latent until compression_ratio > 1.0 is configured) (I-4)
-  _Completed:_ 2026-07-03 — cutoffs now cross shards as a foreign_ptr-wrapped `vector<pair<BackendId, time_point>>` copy per target, rebuilt into a local map on the target shard (same shape as `broadcast_load_snapshot`); empty-cutoff default config keeps the no-foreign_ptr fast path. Behavior pinned by existing TTL suites; cross-shard allocation checked by the ASan Deferred Gate.
-- [x] [MEDIUM] Decide: gossip REMOTE routes overwrite LOCAL routes via plain `insert()` — enforce the documented trust ladder with `insert_if_trusted` or document latest-wins (I-5)
-  _Completed:_ 2026-07-03 — operator chose the ladder (LOCAL > PUSH > REMOTE), not latest-wins. `apply_route_batch_to_local_tree` now uses `insert_if_trusted(..., REMOTE)`: a REMOTE announcement for a different backend is REFUSED (route untouched, `prefix_hash_index` insert gated so no phantom entry), same-backend is TOUCHED_SAME (LRU refresh), REMOTE-over-REMOTE OVERWRITES. New counter `remote_routes_trust_refused` + metric `router_remote_routes_trust_refused_total` (a sustained fleet-wide rise flags peer disagreement over prefix ownership). Invariant T7 flipped ⚠️→✅. Pinned by four cases in `tests/unit/cache_eviction_test.cpp`; docs updated (`gossip-protocol.md`, `push-cache-eviction-notifications.md`).
-- [x] [MEDIUM] Fix: fail-open mode only activates on shard 0 — broadcast the flag to per-shard state (I-6)
-  _Completed:_ 2026-07-03 — `GossipConsensus::check_quorum` now fires a fail-open transition seam (`set_fail_open_callback`, mirroring `set_node_state_callback`) on BOTH quorum-degraded enter and recovery exit, gate-guarded via the consensus `_timer_gate` like `broadcast_prune`. `RouterService::broadcast_fail_open(bool)` mirrors the posture onto every shard's `ShardLocalState::fail_open_active` (plain-bool `smp::invoke_on_all`, no foreign_ptr — same shape as `broadcast_gpu_load`); `route_request` reads the flag shard-locally, so the fail-open decision performs zero cross-shard reads on the hot path. Invariant R12 flipped ⚠️→✅. Pinned by `RouterServiceTest.FailOpenFlagForcesRandomRoutingOverArtHit` and `QuorumTest.FailOpenSeam_*` (enter/exit, disabled-config, initially-degraded convergence); `gossip-protocol.md` fail-open section updated. This closes out §22.
-- [x] [LOW] Fix: `headroom_redirects` counts headroom-data-presence, not actual redirects (I-7)
-  _Completed:_ 2026-07-03 — increment now gated on the selection moving off the primary jump-hash bucket with pressure present (BOUNDED_LOAD/P2C only; documented approximation, no second selection pass). Metric name unchanged (sync-map safe); description updated. Pinned by two `CapacityAwareHashTest` cases in `tests/unit/router_service_test.cpp`; invariants.md R9 updated.
-- [x] [LOW] Fix: single-live-backend verified-cold ART hit counts both a cache hit and a verified downgrade (I-8)
-  _Completed:_ 2026-07-03 — `native_verified_downgrades` now counts at the actual downgrade decision (mirroring `residency_downgrades`); the single-backend honored path counts the new `native_verified_cold_honored` / `router_native_verified_cold_honored_total` instead, so hits, downgrades, and cold-honored are pairwise disjoint per decision. Pinned by two §1f cases in `tests/unit/router_service_test.cpp`.
+Detail lives in the frozen audit report, kept out of this backlog so it stays focused:
+
+- [`.dev-context/invariant-audit-2026-07-03.md`](.dev-context/invariant-audit-2026-07-03.md)
+  — findings I-1…I-8 with fix prompts, the "checked and found sound" record, and the
+  2026-07-04 verification pass (per-finding disposition, PRs, tests; catalog flips).
+- [`.dev-context/invariants.md`](.dev-context/invariants.md) — the invariant catalog
+  (T/R/P/L/A entries) this audit seeded; the status source of truth going forward.
+
+Open follow-up:
+
 - [ ] [LOW] Harden: the I-1 index rebuild preserves ALL entries of fresh-native-stream backends without provenance or cap — stale learn-derived entries for a continuously-fresh backend persist until the stream lapses. Enforce `MAX_ENTRIES_PER_BACKEND` during preservation (drop + overflow counter), or add a per-entry provenance bit. (V-1, verification pass 2026-07-04 appended to the audit report)
 
-Section anchor (`#22-invariant-audit-findings-2026-07-03`) is the stable pointer for
-future in-source `// BACKLOG §22` cross-references.
+The section heading and anchor (`#22-invariant-audit-findings-2026-07-03`) are
+preserved as the stable pointer for in-source `// BACKLOG §22` cross-references.
 
 ---
 
 ## 23. Holistic Audit Findings (2026-07-04)
 
-From `.dev-context/holistic-audit-2026-07-04.md` (Hard Rules / async-integrity / drift
-pass over the post-February churn not covered by the invariant audit: application,
-telemetry, config, metrics_service, gossip_protocol, http_controller delta).
+**Violations: CLOSED (2026-07-04).** All nine (V1 HIGH gossip-ACK dangling ref through
+V9 doc-sync) fixed and merged; the nine tech-debt items below are separate and mostly
+open. Hard Rules / async-integrity / drift pass over the post-February churn not
+covered by the invariant audit (application, telemetry, config, metrics_service,
+gossip_protocol, http_controller delta).
 
-Violations:
+Detail lives in the frozen audit report, kept out of this backlog so it stays focused:
 
-- [x] [HIGH] Fix: `send_ack` + `GossipTransport::send` take `socket_address` by const-ref into coroutines; `handle_packet` passes a dying stack local — with DTLS the ACK destination is read from dead stack after the encrypt suspension. Take by value (Rule #21) (V1)
-  _Completed:_ 2026-07-04 — `GossipProtocol::send_ack` and `GossipTransport::send` now take the peer `socket_address` (and `send`'s `data` buffer) by value, so each lives in its own coroutine frame; the destination is no longer read from freed stack after the encrypt suspension. `GossipTransport::broadcast` keeps `peers`/`data` by const-ref under a `// Rule #21` exception annotation (every caller co_awaits it with a buffer its own frame owns). The two per-peer `send` sites `std::move` the dead `serialized` local into the by-value parameter (copy-neutral); the plaintext-broadcast and retry paths incur one small copy of already-background traffic. Non-coroutine helpers `initiate_handshake`/`encrypt_with_offloading` annotated Rule #21 N/A. Regression: `GossipAckLifetimeTest.DestinationSurvivesCallerFrameDestruction` pins the by-value-across-suspension contract with a hand-driven coroutine (frees the source between suspend and resume; ASan probe for the pattern). The end-to-end reactor+DTLS UAF probe is the sanitizer/integration Deferred Gate (this unit target links no Seastar runtime).
-- [x] [MEDIUM] Fix: unwrapped lambda coroutine passed to `max_concurrent_for_each` in `refresh_peers` SRV branch — wrap with `seastar::coroutine::lambda()` (Rule #16) (V2)
-  _Completed:_ 2026-07-04 — the SRV-resolution loop body is now wrapped in `seastar::coroutine::lambda(...)`, extending the functor's lifetime (and its `&discovered_addresses` capture) across the whole loop. The existing comment block was extended with the functor-lifetime rationale, kept explicitly distinct from the Rule #2 concurrency note it already carried.
-- [x] [MEDIUM] Fix: `std::gmtime` static-buffer race in `ApiKey::is_expired()` on the per-shard auth path — use `gmtime_r` (re-flagged; was E9 in 2026-02-12 audit) (V3)
-  _Completed:_ 2026-07-04. Structural fix (preferred over `gmtime_r`): expiry is parsed once in `config_loader` into `ApiKey::expires_at` (`std::optional<system_clock::time_point>`); `is_expired()` is now a static-free, parse-free comparison. Kills the race and the per-request re-parse together; hot-reload inherits it via the shared YAML parse. No non-`_r` `gmtime`/`localtime` remain in `src/`.
-- [x] [MEDIUM] Fix: `broadcast_route` coroutine takes tokens by const-ref (latent UAF; newer siblings are by-value with Rule #21 annotations) (V4)
-  _Completed:_ 2026-07-04 — `GossipProtocol::broadcast_route` now takes `std::vector<TokenId> tokens` by value, matching the by-value `broadcast_hot_prefix_digest`/`HotPrefixDigestCallback` siblings; `token_count` is computed before the vector is `std::move`d into the packet, so the wire output is bit-identical. No `RouteBroadcast` callback typedef exists (nothing to update there); the `GossipService`/`RouterService` callers pass an lvalue into the by-value parameter, copying exactly where `broadcast_route` copied internally before — net copy count unchanged, so no cross-file caller churn was warranted.
-- [x] [LOW] Fix: bound `cluster.peers` and `auth.api_keys` in config_loader and the `refresh_peers` DNS merge (Rule #4; was S11) (V5)
-  _Completed:_ 2026-07-04. `ClusterConfig::MAX_PEERS` (256) enforced in the YAML + env peer paths; `AuthConfig::MAX_AUTH_API_KEYS` (1000) in the YAML api_keys path — truncate + warn, matching the allowed_ips pattern. `refresh_peers()` caps the merged set via the pure `merge_and_cap_peers()` helper (static peers first, then discovered), bumping the new `cluster_peers_dropped_capacity` counter. yaml example documents both caps.
-- [x] [LOW] Fix: gossip per-peer send-failure catches log at debug with no counter — promote to warn or annotate + count (Rule #9) (V6)
-  _Completed:_ 2026-07-04. Counter+annotation approach (not blanket warn-promotion — a down peer would flood logs the consensus layer already surfaces). New `cluster_sends_failed` counter incremented in the route/eviction/ack/retry send catches, each annotated `// Rule #9: expected UDP loss to down peers ...`; the two `stop()` shutdown catches and the gate-closed timer catches carry matching justifications.
-- [x] [DOC] Sync: `docs/internals/gossip-protocol.md` missing HOT_PREFIX_DIGEST (0x07) packet format + digest counters (V7)
-  _Completed:_ 2026-07-04 — packet-table row + full "Hot Prefix Digest" wire-format section (v2 verified-resident bitmap tail incl. LSB-first packing and tail-less v1 equivalence, MAX_HASHES bound, unreliable latest-value-wins semantics, sender/receiver paths, both counters), format-verified against `HotPrefixDigestPacket::serialize/deserialize`.
-- [x] [DOC] Sync: `docs/internals/per-api-key-attribution.md` missing `tokens_estimated` column + actual-vs-estimated preference (V8)
-  _Completed:_ 2026-07-04 — schema block gained the `tokens_estimated` column, migration note covers the idempotent ALTER back-fill, and a new "Actual vs. estimated usage" section documents the engine-usage preference, the `stream_options.include_usage` caveat, and points to `docs/architecture/response-usage-accounting.md`.
-- [x] [DOC] Sync: claude-context.md gossip packet enumeration missing CACHE_STATE / HOT_PREFIX_DIGEST (V9)
-  _Completed:_ 2026-07-04 in the audit-recording commit (one-line living-doc fix).
+- [`.dev-context/holistic-audit-2026-07-04.md`](.dev-context/holistic-audit-2026-07-04.md)
+  — compliance summary, V1–V9 findings, the "checked and found sound" record, and the
+  2026-07-05 Resolution note (per-violation disposition, PRs, tests).
 
-Technical debt:
+Technical debt (from the same audit — folded into whatever PR next touches each file;
+`ApiKey::is_expired()` re-parse was resolved together with V3):
 
 - [ ] [TECH-DEBT] telemetry_schema.hpp carries non-trivial logic (merge_hot_prefixes, sole-held math, JSON emitter, lines 284-431) in a *_schema.hpp; move helpers out (from audit 2026-07-04)
 - [ ] [TECH-DEBT] http_controller handle_proxy detects non-streaming via `"stream":false` substring sniff — use the single-parse extraction (from audit 2026-07-04)
@@ -1095,8 +1078,6 @@ Technical debt:
 - [ ] [TECH-DEBT] application.cpp includes `<fstream>` with no use — stale include invites Rule #12 misuse (from audit 2026-07-04)
 - [ ] [TECH-DEBT] reload/init paths capture whole config structs by value into invoke_on_all lambdas (cross-shard free, accepted D4 posture) — consider a foreign_ptr broadcast helper (from audit 2026-07-04)
 - [ ] [TECH-DEBT] `setup_signal_handlers` fire-and-forget reload broadcast lacks a gate; route through `_lifecycle_gate` (Rule #18 hygiene) (from audit 2026-07-04)
-- [x] [TECH-DEBT] `ApiKey::is_expired()` re-parses the expiry date per call; parse once at config load into a time_point (also fixes V3) (from audit 2026-07-04)
-  _Completed:_ 2026-07-04. Resolved by the V3 structural fix — expiry parsed once into `ApiKey::expires_at`; `is_expired()` no longer builds an `istringstream` or calls `get_time` on the request path.
 
 Section anchor (`#23-holistic-audit-findings-2026-07-04`) is the stable pointer for
 future in-source `// BACKLOG §23` cross-references.
@@ -1105,21 +1086,24 @@ future in-source `// BACKLOG §23` cross-references.
 
 ## 24. Adversarial Audit Findings — Pass A (2026-07-04)
 
-From `.dev-context/adversarial-audit-2026-07-04.md` (edge-case/scale sweep over the
-unfuzzed untrusted-input surfaces: vLLM KV-event msgpack decoder, its ZMQ subscriber,
-and the build-gated GIE EPP gRPC bridge). Headline artifact:
-`tests/fuzz/kv_event_decoder_fuzz.cpp`, wired into `fuzz-ci` / `fuzz-run-all` and the
-CMake `fuzz_harnesses` target — the decoder's first fuzz coverage.
+**Status: CLOSED (2026-07-05).** All findings (A1/A2 decoder timestamp UB, S1 EPP
+ingress backpressure, S2 decoder reserve) fixed and merged. Edge-case/scale sweep of
+the unfuzzed untrusted surfaces (vLLM KV-event msgpack decoder, its ZMQ subscriber,
+the build-gated GIE EPP gRPC bridge).
 
-- [x] [MEDIUM] Fix: guard the float64 KV-event timestamp cast — `+inf`/out-of-range double is UB in the `uint64_t` conversion (`kv_event_decoder.hpp`, A1); fold in the INT-path overflow cap (A2). Fix prompt in the report; pinned by the new fuzz harness under UBSan + unit cases.
-  _Completed:_ 2026-07-05 — `decode_kv_event_batch`'s float path now gates on `std::isfinite(ts.fval) && ts.fval > 0.0` and clamps `ts.fval * 1000.0` on the largest double `< 2^64` (`18446744073709549568.0`) before the cast → `UINT64_MAX`, so `+inf`/NaN/huge doubles yield a finite `ts_ms` (0 or `UINT64_MAX`) with no `[conv.fpint]` UB. The INT path (A2) caps `ts.uval > UINT64_MAX/1000` to `UINT64_MAX` instead of wrapping. Neither path nullopts — a clamped timestamp is still a usable conflict-resolution ordering key. Pinned by four `KvDecoder` cases (`InfFloatTimestampClampsToZeroNoUB`, `HugeFloatTimestampClampsToMaxNoUB`, `MaxIntTimestampCapsNoWrap`, `NormalIntTimestampUnchanged`) in `tests/unit/kv_event_translation_test.cpp` and by `tests/fuzz/kv_event_decoder_fuzz.cpp` under UBSan (the money gate: `make fuzz-run-kv-decoder`, which aborted within seconds on an inf timestamp before the fix).
-- [x] [MEDIUM] Fix: bound EPP ext_proc in-flight `Process` RPCs (ingress semaphore + 503 shed) and add a deadline to the reactor-bridge `fut.get()` — unbounded gRPC handler threads block on shard 0 under load (`gie_epp_server.cpp`, S1). Deployed risk limited: `WITH_GIE_EPP` is default-OFF.
-  _Completed:_ 2026-07-05 — `ExtProcServiceImpl::decide()` now admits at most `gie_epp.max_inflight_requests` (default 1024) concurrent bridges onto shard 0 via a plain atomic counter (the gRPC handler runs off-reactor, so no Seastar semaphore is needed/usable); over-cap requests shed down the existing `ImmediateResponse` 503 path (`ok=false` → `fill_decision`'s no-endpoint branch) without ever reaching the reactor. The reactor-bridge wait is now `fut.wait_for(gie_epp.bridge_deadline_ms)` (default 2000ms) instead of an unbounded `fut.get()`, so a wedged/overloaded shard 0 sheds load (503) rather than parking gRPC handler threads forever — the abandoned reactor task completes into the now-unobserved shared state, and `std::future`'s non-blocking destructor means no thread leaks. Both shed reasons increment a cumulative counter logged at drain; `0` disables either guard. Config plumbed through `config_infra.hpp` + `config_loader.cpp` (env + YAML) + `ranvier.yaml.example`; `docs/internals/gie-epp.md` gained an "Ingress backpressure" section. `WITH_GIE_EPP`-gated (default OFF); verified via the `gie-epp-test` target (Deferred Gate — gRPC TU not compiled in-sandbox).
-- [x] [LOW] Harden: clamp the decoder array `reserve()` to remaining payload bytes — reserve-before-validate allows a ~1 MB transient alloc from a tiny payload (A2/S2).
-  _Completed:_ 2026-07-05 — `read_u64_array`/`read_token_array` now clamp the pre-loop `reserve()` to `min(h.uval, r.remaining())` via a new `Reader::remaining()` helper. Every array element is ≥1 wire byte, so a tiny payload claiming a `kKvMaxTokensPerEvent` (256K) array can no longer force a ~1 MB transient reserve before the element loop fails — the reserve is bounded by the bytes actually left in the payload. Behavior otherwise unchanged (well-formed arrays reserve exactly as before). Covered by the existing decoder suite + the fuzz harness.
+Detail lives in the frozen audit report (findings + per-finding resolution note),
+kept out of this backlog so it stays focused on active work:
 
-Section anchor (`#24-adversarial-audit-findings-pass-a-2026-07-04`) is the stable
-pointer for future in-source `// BACKLOG §24` cross-references.
+- [`.dev-context/adversarial-audit-2026-07-04.md`](.dev-context/adversarial-audit-2026-07-04.md)
+  — findings A1/A2/S1/S2, the "checked and found sound" record, and the
+  2026-07-05 Resolution note (per-finding disposition, PRs, tests).
+
+Durable artifact: `tests/fuzz/kv_event_decoder_fuzz.cpp` — the KV-event decoder's
+first fuzz coverage, wired into `fuzz-ci` / `fuzz-run-all` and the CMake
+`fuzz_harnesses` target, running on every push.
+
+The section heading and anchor (`#24-adversarial-audit-findings-pass-a-2026-07-04`)
+are preserved as the stable pointer for in-source `// BACKLOG §24` cross-references.
 
 ---
 

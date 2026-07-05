@@ -97,3 +97,25 @@ validation ceiling; startup route replay serial `co_await` per record; stale
 - **config_loader:** every env `std::stod/stoul` wrapped with warn (Rule #10); YAML throws funnel to the `YAML::Exception` handler; `validate()` covers scoring weights, kv_events cross-field constraints, NaN/inf rejection; `std::ifstream` confined to the documented pre-reactor path.
 - **http_controller post-Feb delta:** usage-ledger sink per-shard owned, `record()` try/catch-warn, `flush()` awaited in `stop()` after `_request_gate.close()`; attribution terminal block computes one value set behind a single null-check; `pool_role` admin param validated with 400 rejection; GenAI semconv attributes gated and honest about omitting estimated usage.
 - **Source Code Layout** in claude-context.md lists every current `src/` file.
+
+---
+
+*Resolution note appended 2026-07-05 — post-fix record. Static analysis only; unit / sanitizer / integration gates ran in the developer's Docker container via CI. The findings above are the frozen point-in-time analysis; this note records their disposition so the BACKLOG §23 entry can collapse to a pointer (mirrors §20's closeout pattern and the §22 verification pass).*
+
+## Resolution (2026-07-05)
+
+All nine violations (V1–V9) fixed and merged; the nine tech-debt items are tracked open in BACKLOG §23.
+
+| # | Disposition |
+|---|-------------|
+| V1 (HIGH) | FIXED — `send_ack` / `GossipTransport::send` take `socket_address` by value (Rule #21); gossip coroutine-lifetime sweep (PRs #606, #608). |
+| V2 | FIXED — `refresh_peers` SRV lambda wrapped / hoisted (Rule #16). |
+| V3 | FIXED — `ApiKey::is_expired()` no longer calls `gmtime`; expiry parsed once at config load into a `time_point` (also closes the per-call re-parse tech-debt item) (V3/V5/V6 batch, PR #607). |
+| V4 | FIXED — `broadcast_route` takes tokens by value (Rule #21). |
+| V5 | FIXED — `cluster.peers` / `auth.api_keys` bounded in the loader; `refresh_peers` DNS merge capped + counter. |
+| V6 | FIXED — gossip per-peer send-failure catches counted + annotated (Rule #9). |
+| V7 | FIXED — `gossip-protocol.md` gained the HOT_PREFIX_DIGEST (0x07) section (PR #609). |
+| V8 | FIXED — `per-api-key-attribution.md` gained the `tokens_estimated` column + actual-vs-estimated section (PR #609). |
+| V9 | FIXED — claude-context.md gossip packet enumeration updated inline. |
+
+Tech-debt: `ApiKey::is_expired()` re-parse resolved with V3; the remaining eight items (telemetry_schema logic-in-schema, `"stream":false` sniff, `next_seq_num` sweep, `snapshot_and_reset` no-yield, startup route replay, stale `<fstream>`, config by-value cross-shard captures, signal-handler gate) remain open in BACKLOG §23, to be folded into PRs that next touch those files.
