@@ -24,6 +24,7 @@ The former `claude-*-prompt.md` templates were converted into skills (2026-07-03
 | `adversarial-audit-2026-07-04.md` | Pass A: edge-case/scale sweep of the unfuzzed untrusted surfaces (KV-event msgpack decoder, ZMQ subscriber, GIE EPP bridge): findings A1/A2/S1/S2 → BACKLOG §24; produced `tests/fuzz/kv_event_decoder_fuzz.cpp` |
 | `audit-fix-prompts.md` | Self-contained fix prompts generated from the 2026-01-14 audit — the template `/adversarial-audit` follows for new findings |
 | `investigation-289-routing-regression.md` → `investigation-may22-affinity-thrashing-reproduction.md` → `next-benchmark-checklist.md` | The affinity-thrashing investigation arc, in reading order. `next-benchmark-checklist.md` also documents the bench.sh flag gotchas `/benchmark` cites |
+| `benchmark-tooling-review-2026-07-05.md` | Planning review of the benchmark tooling/methodology (bench.sh, bench-runner, 8xA100 guide + ecosystem): findings F1–F7 and the prioritized P0–P3 change plan, incl. the 50-prefix re-baseline campaign |
 | `investigations/` | Long-running investigation write-ups (one file per topic). **New investigations go here** — see the post-incident section of `/incident` for the expected structure |
 | `http-controller-review.md`, `router-service-review.md` | Deep component reviews (point-in-time) |
 
