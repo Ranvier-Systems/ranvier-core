@@ -674,6 +674,18 @@ gie_epp:
   # Listen address for the gRPC server. (RANVIER_GIE_EPP_LISTEN_ADDRESS)
   listen_address: "0.0.0.0"
 
+  # Ingress admission cap: max concurrent Process decisions bridged onto the
+  # reactor (shard 0) at once. gRPC's sync API grows its handler-thread pool
+  # with load, so without this cap a flood parks unbounded threads on shard 0;
+  # over-cap requests shed as an ImmediateResponse 503. 0 disables.
+  # (RANVIER_GIE_EPP_MAX_INFLIGHT_REQUESTS)
+  max_inflight_requests: 1024
+
+  # Deadline (ms) for the reactor-bridge routing decision. A wedged shard 0
+  # sheds load (503) instead of parking the gRPC handler thread forever. 0
+  # disables the deadline. (RANVIER_GIE_EPP_BRIDGE_DEADLINE_MS)
+  bridge_deadline_ms: 2000
+
 # =============================================================================
 # =============================================================================
 # Per-API-Key Attribution Configuration

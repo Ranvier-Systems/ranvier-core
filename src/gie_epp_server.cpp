@@ -21,6 +21,9 @@
 
 #include <fmt/format.h>
 
+#include <atomic>
+#include <chrono>
+#include <future>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -61,11 +64,19 @@ public:
     ExtProcServiceImpl(RouterService* router,
                        seastar::sharded<TokenizerService>* tokenizer,
                        ChatTemplate chat_template,
-                       seastar::alien::instance* alien)
+                       seastar::alien::instance* alien,
+                       uint32_t max_inflight,
+                       uint32_t bridge_deadline_ms)
         : _router(router),
           _tokenizer(tokenizer),
           _chat_template(std::move(chat_template)),
-          _alien(alien) {}
+          _alien(alien),
+          _max_inflight(max_inflight),
+          _bridge_deadline(std::chrono::milliseconds(bridge_deadline_ms)) {}
+
+    // Cumulative requests shed by the ingress cap or the bridge deadline. Read
+    // off the reactor (from the gRPC drain thread) — a relaxed atomic load.
+    uint64_t shed_total() const { return _shed_total.load(std::memory_order_relaxed); }
 
     grpc::Status Process(
         grpc::ServerContext* /*context*/,
@@ -166,15 +177,40 @@ private:
             .set_string_value(endpoint);
     }
 
-    // Run the routing decision on the reactor (shard 0) and block this gRPC
-    // handler thread for the result. `body` is the raw request body (empty for
-    // bodyless requests). Reuses the entire reactor-side tokenize+route pipeline
-    // rather than reimplementing routing off-reactor.
+    // Run the routing decision on the reactor (shard 0) and wait — bounded by the
+    // ingress cap and bridge deadline below — on this gRPC handler thread for the
+    // result. `body` is the raw request body (empty for bodyless requests). Reuses
+    // the entire reactor-side tokenize+route pipeline rather than reimplementing
+    // routing off-reactor.
     EppDecision decide(const std::string& body) {
+        // Ingress admission (adversarial audit S1): bound concurrent bridges onto
+        // shard 0. gRPC's sync API grows its handler-thread pool with concurrent
+        // RPCs, so an uncapped flood parks unbounded handler threads blocked on
+        // shard 0's task queue. A plain atomic is the correct admission primitive
+        // here — this runs on gRPC's own threads, never the reactor. Over-cap
+        // requests shed as ImmediateResponse 503 (ok=false). _max_inflight==0
+        // disables the cap.
+        if (_max_inflight != 0 &&
+            _inflight.fetch_add(1, std::memory_order_relaxed) >= _max_inflight) {
+            _inflight.fetch_sub(1, std::memory_order_relaxed);
+            _shed_total.fetch_add(1, std::memory_order_relaxed);
+            log_epp.debug("EPP ingress at capacity ({} in-flight); shedding as 503",
+                          _max_inflight);
+            return EppDecision{};  // ok=false -> 503
+        }
+        // Return the admitted slot on every exit path (throw included).
+        struct InflightGuard {
+            std::atomic<uint32_t>& counter;
+            bool active;
+            ~InflightGuard() {
+                if (active) counter.fetch_sub(1, std::memory_order_relaxed);
+            }
+        } guard{_inflight, _max_inflight != 0};
+
         try {
             // The submit_to callable is a PLAIN lambda (not a coroutine): it
             // copies the body reactor-side from a view into `body` (alive across
-            // fut.get() below) and hands it to the named coroutine by value. This
+            // the wait below) and hands it to the named coroutine by value. This
             // avoids both a cross-thread free of the body and the Rule #16
             // coroutine-lambda lifetime trap.
             std::future<EppDecision> fut = seastar::alien::submit_to(
@@ -182,6 +218,20 @@ private:
                 [this, bv = std::string_view(body)]() -> seastar::future<EppDecision> {
                     return route_on_reactor(std::string(bv));
                 });
+            // Deadline (adversarial audit S1): a wedged or overloaded shard 0
+            // sheds load (503) instead of blocking this handler thread on the
+            // future forever. The abandoned reactor task still runs to completion
+            // and sets the (now unobserved) shared state; std::future's
+            // destructor does not block on it, so no handler thread leaks.
+            // _bridge_deadline==0 disables the deadline (block indefinitely).
+            if (_bridge_deadline.count() != 0 &&
+                fut.wait_for(_bridge_deadline) != std::future_status::ready) {
+                _shed_total.fetch_add(1, std::memory_order_relaxed);
+                log_epp.warn("EPP routing bridge exceeded {}ms deadline "
+                             "(shard 0 stalled?); shedding as 503",
+                             _bridge_deadline.count());
+                return EppDecision{};  // ok=false -> 503
+            }
             return fut.get();
         } catch (const std::exception& e) {
             log_epp.warn("EPP routing bridge failed: {}", e.what());
@@ -224,6 +274,10 @@ private:
     seastar::sharded<TokenizerService>* _tokenizer;
     const ChatTemplate _chat_template;
     seastar::alien::instance* _alien;
+    const uint32_t _max_inflight;
+    const std::chrono::milliseconds _bridge_deadline;
+    std::atomic<uint32_t> _inflight{0};
+    std::atomic<uint64_t> _shed_total{0};
 };
 
 }  // namespace
@@ -273,7 +327,8 @@ void GieEppServer::start(seastar::alien::instance& alien) {
     }
     _impl->alien = &alien;
     _impl->service = std::make_unique<ExtProcServiceImpl>(
-        _impl->router, _impl->tokenizer, _impl->chat_template, _impl->alien);
+        _impl->router, _impl->tokenizer, _impl->chat_template, _impl->alien,
+        _impl->cfg.max_inflight_requests, _impl->cfg.bridge_deadline_ms);
 
     const std::string addr =
         fmt::format("{}:{}", _impl->cfg.listen_address, _impl->cfg.port);
@@ -307,6 +362,11 @@ seastar::future<> GieEppServer::stop() {
     _impl->shutdown_thread = std::thread([server, alien, impl]() {
         server->Shutdown();
         server->Wait();
+        const uint64_t shed = impl->service ? impl->service->shed_total() : 0;
+        if (shed > 0) {
+            log_epp.info("GIE EPP shed {} request(s) over the ingress cap / "
+                         "bridge deadline over this run", shed);
+        }
         seastar::alien::run_on(*alien, 0, [impl]() noexcept {
             impl->shutdown_promise.set_value();
         });

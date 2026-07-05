@@ -670,6 +670,12 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_GIE_EPP_LISTEN_ADDRESS")) {
         gie_epp.listen_address = *v;
     }
+    if (auto v = get_env_as<int>("RANVIER_GIE_EPP_MAX_INFLIGHT_REQUESTS")) {
+        if (*v >= 0) gie_epp.max_inflight_requests = static_cast<uint32_t>(*v);
+    }
+    if (auto v = get_env_as<int>("RANVIER_GIE_EPP_BRIDGE_DEADLINE_MS")) {
+        if (*v >= 0) gie_epp.bridge_deadline_ms = static_cast<uint32_t>(*v);
+    }
 
     // Cost estimation overrides
     if (auto v = get_env("RANVIER_COST_ESTIMATION_ENABLED")) {
@@ -1613,6 +1619,14 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             }
             if (ge["listen_address"]) {
                 config.gie_epp.listen_address = ge["listen_address"].as<std::string>();
+            }
+            if (ge["max_inflight_requests"]) {
+                int m = ge["max_inflight_requests"].as<int>();
+                if (m >= 0) config.gie_epp.max_inflight_requests = static_cast<uint32_t>(m);
+            }
+            if (ge["bridge_deadline_ms"]) {
+                int d = ge["bridge_deadline_ms"].as<int>();
+                if (d >= 0) config.gie_epp.bridge_deadline_ms = static_cast<uint32_t>(d);
             }
         }
         // Cost estimation section
