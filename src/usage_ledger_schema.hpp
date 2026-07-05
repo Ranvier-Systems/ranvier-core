@@ -44,7 +44,8 @@
 
 #pragma once
 
-#include "types.hpp"   // BackendId, BackendType
+#include "intent_classifier.hpp"   // RequestIntent
+#include "types.hpp"               // BackendId, BackendType
 
 #include <cstdint>
 #include <optional>
@@ -57,6 +58,34 @@ namespace ranvier {
 //
 //   v1: initial usage-event schema.
 inline constexpr uint16_t kUsageEventFormatVersion = 1;
+
+// Request-intent attribution for a usage event. Lets ledger sinks bucket usage
+// by request type (autocomplete vs chat vs edit) without any content.
+//
+// WIRE INVARIANT: ordinals are pinned, append-only, and NEVER renumbered — same
+// discipline as BackendType (see types.hpp). They are DELIBERATELY independent
+// of RequestIntent's ordinals: 0 is reserved for UNSPECIFIED, the "not reported"
+// value an older event (or one built before intent classification ran) decodes
+// to. Append new classes at the end; never reuse or renumber an ordinal.
+enum class UsageIntentClass : uint8_t {
+    UNSPECIFIED  = 0,  // not reported — the append-only decode default
+    AUTOCOMPLETE = 1,
+    CHAT         = 2,
+    EDIT         = 3,
+};
+
+// Map the request's classified intent to the ledger's pinned wire ordinal. Sole
+// source of truth for the RequestIntent -> UsageIntentClass correspondence; a
+// future RequestIntent with no case here decodes to UNSPECIFIED rather than a
+// wrong class (and the switch keeps -Wreturn-type honest).
+inline UsageIntentClass to_usage_intent_class(RequestIntent intent) {
+    switch (intent) {
+        case RequestIntent::AUTOCOMPLETE: return UsageIntentClass::AUTOCOMPLETE;
+        case RequestIntent::CHAT:         return UsageIntentClass::CHAT;
+        case RequestIntent::EDIT:         return UsageIntentClass::EDIT;
+    }
+    return UsageIntentClass::UNSPECIFIED;
+}
 
 // =============================================================================
 // UsageEvent
@@ -100,6 +129,12 @@ struct UsageEvent {
     // this rather than assume — estimates and actuals can both appear depending
     // on whether the response carried usage.
     bool tokens_estimated = true;
+
+    // Classified request intent (forward-compat append; see the CONTRACT above).
+    // UNSPECIFIED when intent classification was disabled for the request or the
+    // event predates this field — a sink attributing by intent should treat
+    // UNSPECIFIED as "not reported", not as a fourth class.
+    UsageIntentClass intent_class = UsageIntentClass::UNSPECIFIED;
 };
 
 }  // namespace ranvier

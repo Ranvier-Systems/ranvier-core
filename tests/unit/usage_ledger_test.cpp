@@ -73,6 +73,35 @@ TEST(UsageEvent, FieldsRemainReadableWhenVersionBumped) {
     EXPECT_DOUBLE_EQ(ev.cost_units, 51.5);
 }
 
+// =============================================================================
+// Intent-class attribution
+// =============================================================================
+
+TEST(UsageEvent, DefaultIntentClassIsUnspecified) {
+    // The append-only "not reported" decode default (see the wire invariant in
+    // usage_ledger_schema.hpp) — an older event, or one built with intent
+    // classification disabled, reads back as UNSPECIFIED.
+    UsageEvent ev;
+    EXPECT_EQ(ev.intent_class, UsageIntentClass::UNSPECIFIED);
+}
+
+TEST(UsageIntentClass, MapsEachRequestIntentToPinnedOrdinal) {
+    EXPECT_EQ(to_usage_intent_class(RequestIntent::AUTOCOMPLETE),
+              UsageIntentClass::AUTOCOMPLETE);
+    EXPECT_EQ(to_usage_intent_class(RequestIntent::CHAT), UsageIntentClass::CHAT);
+    EXPECT_EQ(to_usage_intent_class(RequestIntent::EDIT), UsageIntentClass::EDIT);
+}
+
+// Wire discipline: ledger ordinals are pinned, append-only, and independent of
+// RequestIntent's ordinals (0 is reserved for UNSPECIFIED). A drift here silently
+// misattributes usage for sinks already deployed against the current numbering.
+TEST(UsageIntentClass, OrdinalsArePinned) {
+    EXPECT_EQ(static_cast<uint8_t>(UsageIntentClass::UNSPECIFIED), 0u);
+    EXPECT_EQ(static_cast<uint8_t>(UsageIntentClass::AUTOCOMPLETE), 1u);
+    EXPECT_EQ(static_cast<uint8_t>(UsageIntentClass::CHAT), 2u);
+    EXPECT_EQ(static_cast<uint8_t>(UsageIntentClass::EDIT), 3u);
+}
+
 TEST(UsageEvent, UnauthenticatedKeyIsEmptyNotSentinel) {
     // "" is a valid, meaningful api_key_id — "usage that arrived without a key".
     // The seam carries it verbatim; it does not substitute a sentinel.
@@ -160,6 +189,7 @@ TEST(UsageLedgerSink, RecordDeliversEventVerbatim) {
     ev.input_tokens = 100;
     ev.output_tokens = 200;
     ev.cost_units = 12.5;
+    ev.intent_class = UsageIntentClass::EDIT;
 
     sink.record(std::move(ev));
 
@@ -177,4 +207,5 @@ TEST(UsageLedgerSink, RecordDeliversEventVerbatim) {
     EXPECT_EQ(got.input_tokens, 100);
     EXPECT_EQ(got.output_tokens, 200);
     EXPECT_DOUBLE_EQ(got.cost_units, 12.5);
+    EXPECT_EQ(got.intent_class, UsageIntentClass::EDIT);
 }
