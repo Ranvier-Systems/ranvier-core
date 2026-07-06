@@ -52,6 +52,7 @@ SUITE="high"
 CUSTOM_FILE=""
 STOP_ON_FAILURE=false
 SKIP_RUNS_RAW=""   # comma-separated list from --skip
+REPEAT=1           # --repeat N: run each config N times, then aggregate (median/IQR)
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -244,6 +245,10 @@ OPTIONS:
     --pause SECONDS     Pause between runs for GPU cooldown (default: 60)
     --stop-on-failure   Stop the suite if any run fails (default: continue)
     --output-dir DIR    Output directory (default: benchmark-reports)
+    --repeat N          Run each config N times, then aggregate median/IQR per
+                        config and print a verdict (default: 1). Variance is the
+                        top benchmark confound; a single run is not a result.
+                        Aggregates are written to <output-dir>/aggregates/.
     -h, --help          Show this help
 
 BUILT-IN SUITES:
@@ -315,6 +320,7 @@ while [[ $# -gt 0 ]]; do
         --pause)            PAUSE_BETWEEN_RUNS="$2"; shift 2 ;;
         --stop-on-failure)  STOP_ON_FAILURE=true; shift ;;
         --output-dir)       RUNNER_OUTPUT_DIR="$2"; shift 2 ;;
+        --repeat)           REPEAT="$2"; shift 2 ;;
         -h|--help)          print_help; exit 0 ;;
         *)                  log_error "Unknown option: $1"; echo "Run with --help for usage."; exit 1 ;;
     esac
@@ -427,6 +433,38 @@ define_runs() {
 }
 
 define_runs
+
+# --repeat N: expand each defined config into N consecutive runs. We expand the
+# flat RUNS/LABELS arrays (rather than adding an inner loop) so all existing
+# machinery — adaptive ETA, --skip/--resume numbering, the SIGINT summary — works
+# unchanged. GROUP_OF[i] records which original config an expanded run belongs to,
+# so the post-suite aggregation can gather each config's repeats. See BACKLOG §25.
+if ! [[ "$REPEAT" =~ ^[0-9]+$ ]] || [[ "$REPEAT" -lt 1 ]]; then
+    log_error "--repeat must be a positive integer (got: $REPEAT)"
+    exit 1
+fi
+
+GROUP_OF=()        # group index (0-based, over original configs) per expanded run
+GROUP_LABELS=()    # one label per group
+if [[ "$REPEAT" -gt 1 ]]; then
+    BASE_RUNS=("${RUNS[@]}")
+    BASE_LABELS=("${LABELS[@]}")
+    RUNS=()
+    LABELS=()
+    for ((g=0; g<${#BASE_RUNS[@]}; g++)); do
+        GROUP_LABELS+=("${BASE_LABELS[$g]}")
+        for ((r=1; r<=REPEAT; r++)); do
+            RUNS+=("${BASE_RUNS[$g]}")
+            LABELS+=("${BASE_LABELS[$g]} [rep ${r}/${REPEAT}]")
+            GROUP_OF+=("$g")
+        done
+    done
+else
+    for ((g=0; g<${#RUNS[@]}; g++)); do
+        GROUP_LABELS+=("${LABELS[$g]}")
+        GROUP_OF+=("$g")
+    done
+fi
 
 TOTAL_RUNS=${#RUNS[@]}
 
@@ -842,6 +880,63 @@ log_info "Runner log: $RUNNER_LOG"
 } > "$RUNNER_SUMMARY"
 
 log_ok "Summary report: $RUNNER_SUMMARY"
+
+# -----------------------------------------------------------------------------
+# Repeat aggregation (median/IQR + refuse-to-conclude verdict) — only --repeat > 1
+# -----------------------------------------------------------------------------
+# For each original config, gather the report dirs of its passing repeats, split
+# them into the round-robin (baseline) and prefix (treatment) arms by dir name,
+# and hand them to results_parser.py aggregate. A/B configs (--compare) produce a
+# paired verdict; single-arm configs get median/IQR. This is what turns N runs
+# into one defensible number instead of a hand-picked best run (BACKLOG §25).
+if [[ "$REPEAT" -gt 1 ]]; then
+    PARSER="${SCRIPT_DIR}/../tests/integration/results_parser.py"
+    AGG_DIR="${RUNNER_OUTPUT_DIR}/aggregates"
+    mkdir -p "$AGG_DIR"
+    echo ""
+    log_header "Repeat Aggregation (${REPEAT}× per config)"
+
+    NUM_GROUPS=${#GROUP_LABELS[@]}
+    for ((g=0; g<NUM_GROUPS; g++)); do
+        PREFIX_DIRS=()
+        RR_DIRS=()
+        SINGLE_DIRS=()
+        for ((i=0; i<TOTAL_RUNS; i++)); do
+            [[ "${GROUP_OF[$i]}" == "$g" ]] || continue
+            [[ "${RESULTS[$i]}" == "pass" ]] || continue
+            rdir_csv="${REPORT_DIRS[$i]}"
+            [[ -z "$rdir_csv" || "$rdir_csv" == "-" ]] && continue
+            IFS=',' read -ra _dirs <<< "$rdir_csv" || true
+            for d in "${_dirs[@]}"; do
+                base="$(basename "$d")"
+                if echo "$base" | grep -qE 'round_robin|random'; then
+                    RR_DIRS+=("$d")
+                elif echo "$base" | grep -qE 'prefix'; then
+                    PREFIX_DIRS+=("$d")
+                else
+                    SINGLE_DIRS+=("$d")
+                fi
+            done
+        done
+
+        glabel="${GROUP_LABELS[$g]}"
+        safe="$(echo "$glabel" | tr -c 'A-Za-z0-9._-' '_')"
+        out_json="${AGG_DIR}/agg_$(printf '%02d' "$g")_${safe}.json"
+
+        if [[ ${#PREFIX_DIRS[@]} -ge 2 && ${#RR_DIRS[@]} -ge 2 ]]; then
+            log_info "A/B aggregate: $glabel (${#PREFIX_DIRS[@]} prefix vs ${#RR_DIRS[@]} rr)"
+            python3 "$PARSER" aggregate "${PREFIX_DIRS[@]}" --baseline "${RR_DIRS[@]}" \
+                --json "$out_json" || log_warn "aggregate failed for: $glabel"
+        elif [[ ${#SINGLE_DIRS[@]} -ge 2 ]]; then
+            log_info "Single-arm aggregate: $glabel (${#SINGLE_DIRS[@]} runs)"
+            python3 "$PARSER" aggregate "${SINGLE_DIRS[@]}" \
+                --json "$out_json" || log_warn "aggregate failed for: $glabel"
+        else
+            log_warn "No aggregation for '$glabel': need >=2 passing repeats per arm (prefix=${#PREFIX_DIRS[@]}, rr=${#RR_DIRS[@]}, single=${#SINGLE_DIRS[@]})"
+        fi
+    done
+    log_info "Aggregate JSON under: $AGG_DIR"
+fi
 
 # Final status
 echo ""
