@@ -271,6 +271,12 @@ private:
     // Must run after the controller is started. See src/usage_ledger_sink.hpp.
     seastar::future<> init_usage_ledger();
 
+    // Install the per-shard admission policy via the process-wide factory. No
+    // config gate (embedder-installed, not YAML): unset factory => no policy
+    // object on any shard and the proxy path stays a single null check. Must run
+    // after the controller is started. See src/admission_policy.hpp.
+    seastar::future<> init_admission_policy();
+
     // Build a snapshot of the routing-strategy parameters currently in effect.
     // Used by the telemetry emitter to attach a strategy view to each window
     // report (so operators correlating outcome shifts with config changes

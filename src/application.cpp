@@ -1,6 +1,7 @@
 // Ranvier Core - Application Bootstrap and Lifecycle Implementation
 
 #include "application.hpp"
+#include "admission_policy.hpp"
 #include "config_loader_async.hpp"
 #include "dashboard_resource.hpp"
 #include "gossip_service.hpp"
@@ -896,6 +897,28 @@ seastar::future<> Application::init_usage_ledger() {
     log_main.info("Usage-ledger sink initialised (enabled=true, per-shard sink installed)");
 }
 
+seastar::future<> Application::init_admission_policy() {
+    // No config gate: admission policies are installed by embedder code (a
+    // process-wide factory), not by YAML. Unset factory => no policy object on
+    // any shard, and the proxy path stays a single null check.
+    auto factory = get_admission_policy_factory();
+    if (!factory) {
+        log_main.info("Admission policy hook not installed");
+        co_return;
+    }
+
+    // Each shard installs its OWN policy instance (decisions happen on every
+    // shard; a shard-0-only policy would force a cross-shard hop per request),
+    // so decide() is always a shard-local call. Capture the factory by value so
+    // each shard copies it. Runs after the controller is started so
+    // set_admission_policy lands on a live per-shard instance.
+    co_await _controller.invoke_on_all([factory](HttpController& c) {
+        c.set_admission_policy(factory());
+    });
+
+    log_main.info("Admission policy installed (per-shard)");
+}
+
 void Application::init_k8s_discovery() {
     if (!_config.k8s_discovery.enabled) {
         return;
@@ -1196,6 +1219,12 @@ seastar::future<> Application::startup() {
             // controller is started so set_usage_ledger_sink lands on a live
             // per-shard instance.
             return init_usage_ledger();
+        }).then([this] {
+            // Install the per-shard admission policy (embeddability seam). No
+            // config gate — inert unless a downstream build installed a factory.
+            // Runs after the controller is started so set_admission_policy lands
+            // on a live per-shard instance.
+            return init_admission_policy();
         }).then([this] {
             // Initialise per-API-key attribution on every shard. This
             // pre-registers the three sentinel labels and any pre-configured

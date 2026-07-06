@@ -7,6 +7,7 @@
 #include "circuit_breaker.hpp"
 #include "config.hpp"
 #include "connection_pool.hpp"
+#include "admission_policy.hpp"
 #include "cross_shard_request.hpp"
 #include "intent_classifier.hpp"
 #include "metrics_service.hpp"
@@ -427,6 +428,17 @@ public:
         _usage_sink = std::move(sink);
     }
 
+    // Install this shard's admission policy (owned). When set, the proxy path
+    // consults decide() once per request after priority classification and
+    // before backpressure/scheduler admission. When unset (the default, and
+    // whenever no factory was installed), the consult is skipped — one null
+    // check, behaviour bit-for-bit unchanged. Called once per shard at startup
+    // (Application::init_admission_policy) via the process-wide factory.
+    // See src/admission_policy.hpp for the policy contract.
+    void set_admission_policy(std::unique_ptr<AdmissionPolicy> policy) {
+        _admission_policy = std::move(policy);
+    }
+
     // Set config reload callback (for /admin/keys/reload endpoint)
     // Callback returns true on success, false on failure
     // The callback is synchronous as it should just trigger the reload process
@@ -513,6 +525,12 @@ private:
     // usage_ledger.enabled installed one at startup. Drained in stop().
     // See src/usage_ledger_sink.hpp.
     std::unique_ptr<UsageLedgerSink> _usage_sink;
+
+    // Per-shard admission policy (owned, nullable). Null unless a downstream
+    // build installed a factory (no config gate — installed by embedder code).
+    // Consulted once per request on the proxy path; decide() is synchronous and
+    // shard-local. See src/admission_policy.hpp.
+    std::unique_ptr<AdmissionPolicy> _admission_policy;
 
     // Graceful shutdown state
     // Plain bool: set/read only from this shard's reactor via invoke_on_all/local handler
