@@ -161,9 +161,18 @@ class BenchmarkResults:
     cache_states_sent_total: Optional[int] = None
     cache_states_received_total: Optional[int] = None
     residency_cache_size: Optional[int] = None
-    # Per-backend in-flight request gauge — printed as a sorted list so prefix-
+    # Per-backend request distribution — printed as a sorted list so prefix-
     # concentration hot-spotting shows up directly in the comparison output.
+    # Aggregated across ALL ranvier nodes (see parse_prometheus_report).
     backend_active_requests: Optional[Dict[str, float]] = None
+    # Gini coefficient of that distribution: 0 = perfectly even, →1 = concentrated.
+    # A high Gini on a uniform workload is the prefix-concentration hot-spot signal;
+    # promoted to a first-class field so it flows to CSV/JSON and aggregation.
+    backend_request_gini: Optional[float] = None
+    # Number of ranvier nodes whose /metrics were actually scraped and merged.
+    # Effectively 1 before the 3-node scrape fix; surfaced so a partial capture
+    # is visible instead of silently undercounting the cluster.
+    prometheus_nodes_scraped: Optional[int] = None
 
     # Validation
     sync_errors: int = 0
@@ -706,6 +715,76 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
     return out
 
 
+def _gini_coefficient(values: List[float]) -> Optional[float]:
+    """Gini of a non-negative distribution: 0 = perfectly even, →1 = concentrated.
+
+    None if there are no values; 0.0 if every value is zero (an idle/undrained
+    scrape). Used as the per-backend prefix-concentration hot-spot signal.
+    """
+    xs = [float(v) for v in values if v is not None and v >= 0]
+    n = len(xs)
+    if n == 0:
+        return None
+    total = sum(xs)
+    if total == 0:
+        return 0.0
+    xs.sort()
+    cum = sum((i + 1) * v for i, v in enumerate(xs))
+    return (2.0 * cum) / (n * total) - (n + 1.0) / n
+
+
+def parse_prometheus_report(report_dir: str) -> Dict[str, Any]:
+    """Aggregate /metrics across ALL ranvier nodes in a report dir.
+
+    Prefers the per-node dumps (`prometheus_metrics_node*.txt`, written by
+    bench.sh's fixed scrape loop); falls back to a single `prometheus_metrics.txt`
+    for older or one-node runs. Scalar counters are summed across nodes, per-backend
+    dicts merged per backend_id, `residency_cache_size` taken as the max, and the
+    number of nodes actually scraped is recorded so a partial capture is visible.
+    """
+    d = Path(report_dir)
+    node_files = sorted(d.glob("prometheus_metrics_node*.txt"))
+    if not node_files:
+        single = d / "prometheus_metrics.txt"
+        node_files = [single] if single.exists() else []
+    if not node_files:
+        return {}
+
+    sum_keys = ("load_aware_fallbacks_total", "residency_route_downgrades_total",
+                "cache_states_sent_total", "cache_states_received_total")
+    sums: Dict[str, int] = {}
+    active: Dict[str, float] = {}
+    routed: Dict[str, float] = {}
+    res_size: Optional[int] = None
+    nodes = 0
+    for nf in node_files:
+        part = parse_prometheus_dump(str(nf))
+        if not part:
+            continue
+        nodes += 1
+        for k in sum_keys:
+            if k in part:
+                sums[k] = sums.get(k, 0) + int(part[k])
+        if "residency_cache_size" in part:
+            v = int(part["residency_cache_size"])
+            res_size = v if res_size is None else max(res_size, v)
+        for bid, val in (part.get("backend_active_requests") or {}).items():
+            active[bid] = active.get(bid, 0.0) + val
+        for bid, val in (part.get("backend_routed_total") or {}).items():
+            routed[bid] = routed.get(bid, 0.0) + val
+
+    merged: Dict[str, Any] = dict(sums)
+    if res_size is not None:
+        merged["residency_cache_size"] = res_size
+    if active:
+        merged["backend_active_requests"] = active
+    if routed:
+        merged["backend_routed_total"] = routed
+    if nodes:
+        merged["nodes_scraped"] = nodes
+    return merged
+
+
 def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> BenchmarkResults:
     """Parse a benchmark log file and return structured results."""
     with open(filepath, "r") as f:
@@ -878,12 +957,11 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         if mode_match:
             results.benchmark_mode = mode_match.group(1)
 
-    # Prometheus dump (optional; sibling file in report dir). Missing dump is
-    # fine — the comparison output will show "N/A" and the load_aware_fallbacks
-    # row will be absent, which is itself a signal to the operator that the
-    # counter wasn't captured.
-    prom_path = Path(filepath).parent / "prometheus_metrics.txt"
-    prom = parse_prometheus_dump(str(prom_path))
+    # Prometheus dump (optional; sibling files in report dir). Aggregated across
+    # ALL ranvier nodes — see parse_prometheus_report. Missing dump is fine — the
+    # comparison output will show "N/A" and the load_aware_fallbacks row will be
+    # absent, which is itself a signal that the counter wasn't captured.
+    prom = parse_prometheus_report(str(Path(filepath).parent))
     if "load_aware_fallbacks_total" in prom:
         results.load_aware_fallbacks_total = prom["load_aware_fallbacks_total"]
     if "residency_route_downgrades_total" in prom:
@@ -894,13 +972,16 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.cache_states_received_total = prom["cache_states_received_total"]
     if "residency_cache_size" in prom:
         results.residency_cache_size = prom["residency_cache_size"]
+    if "nodes_scraped" in prom:
+        results.prometheus_nodes_scraped = prom["nodes_scraped"]
     # Prefer per-backend histogram counts (cumulative dispatched requests) if
     # available; fall back to the active-requests gauge (instantaneous in-flight)
-    # otherwise. Either is usable for spotting hot-spotting.
-    if "backend_routed_total" in prom:
-        results.backend_active_requests = prom["backend_routed_total"]
-    elif "backend_active_requests" in prom:
-        results.backend_active_requests = prom["backend_active_requests"]
+    # otherwise. Either is usable for spotting hot-spotting. Compute its Gini as a
+    # first-class field so concentration flows to CSV/JSON, not just the compare view.
+    dist = prom.get("backend_routed_total") or prom.get("backend_active_requests")
+    if dist:
+        results.backend_active_requests = dist
+        results.backend_request_gini = _gini_coefficient(list(dist.values()))
 
     # Sync errors
     sync_match = re.search(r"(\d+) new sync errors", content)
@@ -1524,6 +1605,17 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
         def _fmt_count(v):
             return "N/A" if v is None else str(int(v))
 
+        # How many ranvier nodes were actually scraped (counters are summed across
+        # them). A "1" here on a multi-node cluster means a partial capture —
+        # surfaced so undercounted counters are not mistaken for low activity.
+        ns_b = baseline.prometheus_nodes_scraped
+        ns_n = new.prometheus_nodes_scraped
+        if ns_b is not None or ns_n is not None:
+            lines.append(
+                f"  nodes scraped: baseline={ns_b if ns_b is not None else 'N/A'} "
+                f"new={ns_n if ns_n is not None else 'N/A'} (counters summed across nodes)"
+            )
+
         # Load-aware fallback counter (cumulative since process start). High
         # values relative to total_requests indicate the load-aware logic is
         # firing constantly — investigation #289's "30u" or "flapping" failure
@@ -1578,16 +1670,8 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
         # Per-backend request distribution. Print as sorted list with min/max
         # and a Gini coefficient — hot-spotting from prefix concentration
         # shows up as a high Gini (>0.3 is suspicious on a uniform workload).
-        def _gini(vals):
-            n = len(vals)
-            if n == 0:
-                return None
-            s = sum(vals)
-            if s == 0:
-                return 0.0
-            srt = sorted(vals)
-            cum = sum((i + 1) * v for i, v in enumerate(srt))
-            return (2.0 * cum) / (n * s) - (n + 1.0) / n
+        # Uses the module-level _gini_coefficient (also stored on the result).
+        _gini = _gini_coefficient
 
         def _render_dist(label, dist):
             if not dist:

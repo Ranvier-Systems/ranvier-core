@@ -1291,7 +1291,12 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
   hardware, vLLM version) into every report + warm-up dir; `results_parser.py compare`/
   `aggregate` load it and print a loud `WORKLOAD MISMATCH` warning (advisory, non-blocking)
   when the workload knobs differ across the runs being combined. 11 pure-Python unit tests.
-- [ ] Item 9 — scrape all 3 nodes (fix the `break` bug); per-backend distribution + Gini + diversion counters.
+- [x] **Item 9 — 3-node scrape + distribution/Gini/diversion counters** (branch
+  `claude/benchmark-p1-scrape-3node`, 2026-07-06): `bench.sh` scrapes every ranvier node to
+  `prometheus_metrics_node{N}.txt` (no more `break`-after-first — the F5 single-node undercount
+  is fixed) plus a concatenated file for back-compat; `results_parser.py parse_prometheus_report`
+  sums across nodes and promotes the per-backend distribution, its Gini, both diversion counters,
+  and `nodes_scraped` to first-class fields (surfaced in `compare`). 10 pure-Python unit tests.
 - [ ] Item 10 — A/B fairness: `--order` alternation, warm-up per-arm, document vLLM cache carry-over.
 
 ---
