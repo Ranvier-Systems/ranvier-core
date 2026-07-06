@@ -6,6 +6,7 @@ Commands:
   parse      Parse a benchmark log file to CSV/JSON
   summary    Show human-readable summary of results
   compare    Compare two benchmark results (baseline vs new)
+  aggregate  Aggregate N repeat runs (median/IQR + refuse-to-conclude verdict)
   export     Export results to different formats
 
 Usage:
@@ -38,6 +39,7 @@ import argparse
 import csv
 import json
 import re
+import statistics
 import sys
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -1647,6 +1649,240 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
 # CLI Commands
 # =============================================================================
 
+# =============================================================================
+# Repeat-run aggregation
+# =============================================================================
+# The #1 documented confound in the benchmark history is run-to-run variance
+# (identical back-to-back configs giving P99 -37% vs +31%; transient hot-spotting
+# in 2-of-4 runs). A single run is not a result. These helpers aggregate N repeat
+# runs of the SAME config into median/IQR and, crucially, REFUSE TO CONCLUDE when
+# the middle 50% of the effect straddles zero — so the tooling reports "no reliable
+# effect" instead of letting a human cherry-pick the best run into a markdown table.
+# See .dev-context/benchmark-tooling-review-2026-07-05.md (F3) and BACKLOG §25.
+
+# Metrics where a smaller value is better (orients the improvement/regression verdict).
+_LOWER_IS_BETTER = {
+    "p50_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
+    "ttft_cache_hit_p50_ms", "ttft_cache_hit_p99_ms",
+    "ttft_cache_miss_p50_ms", "ttft_cache_miss_p99_ms",
+    "avg_response_time_ms", "incomplete_rate_pct", "failure_rate_pct",
+}
+
+# Numeric metrics summarized per repeat set. Explicit (not "every numeric field")
+# so the table stays readable and stable across schema growth.
+_AGG_METRICS = [
+    "p50_ttft_ms", "p90_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
+    "cache_hit_rate_pct", "ttft_cache_miss_p99_ms", "tokens_per_second",
+    "requests_per_sec", "incomplete_rate_pct", "failure_rate_pct",
+    "total_requests",
+]
+
+# Affinity-thrash hot-spot signature (paired A/B): the prefix arm's P99 is much
+# worse than round-robin's DESPITE a high cache-hit rate — routing concentrated
+# load onto a hot backend. Thresholds are deliberately loose flags, not gates.
+_HOTSPOT_P99_FACTOR = 1.25      # prefix P99 > 1.25x the RR P99
+_HOTSPOT_MIN_HIT_RATE = 80.0    # ...while cache hit rate >= 80%
+# Single-arm outlier: a repeat whose value sits above Q3 by more than this many IQRs.
+_OUTLIER_IQR_MULT = 1.5
+
+
+def _quartiles(xs: List[float]):
+    """(Q1, Q3) via the inclusive method. Degenerate but well-defined for n<=1."""
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return (None, None)
+    if n == 1:
+        return (s[0], s[0])
+    q1, _q2, q3 = statistics.quantiles(s, n=4, method="inclusive")
+    return (q1, q3)
+
+
+def _summarize_metric(values: List[Optional[float]]) -> Optional[Dict[str, Any]]:
+    """median/IQR/min/max/n over the non-None values, or None if nothing present."""
+    xs = [float(v) for v in values if v is not None]
+    if not xs:
+        return None
+    q1, q3 = _quartiles(xs)
+    return {
+        "n": len(xs),
+        "median": statistics.median(xs),
+        "q1": q1,
+        "q3": q3,
+        "iqr": (q3 - q1) if (q1 is not None and q3 is not None) else None,
+        "min": min(xs),
+        "max": max(xs),
+    }
+
+
+def _pct_change(baseline: Optional[float], new: Optional[float]) -> Optional[float]:
+    """Signed percent change new-vs-baseline; None if not computable."""
+    if baseline is None or new is None or baseline == 0:
+        return None
+    return (new - baseline) / abs(baseline) * 100.0
+
+
+def aggregate_runs(runs: List[BenchmarkResults],
+                   metrics: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Single-arm aggregation: per-metric median/IQR across N repeats of one config.
+
+    Also flags per-repeat P99 outliers (value > Q3 + 1.5*IQR) — the transient
+    hot-spot signature when repeats of the *same* arm disagree wildly.
+    """
+    metrics = metrics or _AGG_METRICS
+    per_metric: Dict[str, Any] = {}
+    for m in metrics:
+        summ = _summarize_metric([getattr(r, m, None) for r in runs])
+        if summ is not None:
+            per_metric[m] = summ
+
+    outliers = []
+    p99s = [getattr(r, "p99_ttft_ms", None) for r in runs]
+    p99_summ = per_metric.get("p99_ttft_ms")
+    if p99_summ and p99_summ["n"] >= 3 and p99_summ["iqr"]:
+        threshold = p99_summ["q3"] + _OUTLIER_IQR_MULT * p99_summ["iqr"]
+        for i, v in enumerate(p99s):
+            if v is not None and v > threshold:
+                outliers.append({"repeat": i + 1, "p99_ttft_ms": v, "threshold": threshold})
+
+    return {
+        "mode": "single-arm",
+        "n_repeats": len(runs),
+        "metrics": per_metric,
+        "p99_outliers": outliers,
+    }
+
+
+def aggregate_compare(baseline_runs: List[BenchmarkResults],
+                      treatment_runs: List[BenchmarkResults],
+                      discriminating_metric: str = "p99_ttft_ms") -> Dict[str, Any]:
+    """Paired A/B aggregation: baseline[i] vs treatment[i] over N repeats.
+
+    Computes the per-pair percent change of the discriminating metric, then the
+    median and IQR of that change across repeats, and a verdict:
+      - < 2 pairs                -> INSUFFICIENT DATA
+      - IQR straddles zero       -> NO RELIABLE EFFECT (report, do not cherry-pick)
+      - otherwise                -> improvement / regression by the median change
+    Also flags per-pair affinity-thrash hot-spots (treatment P99 >> baseline P99
+    at high hit rate).
+    """
+    n = min(len(baseline_runs), len(treatment_runs))
+    pairs = list(zip(baseline_runs[:n], treatment_runs[:n]))
+
+    deltas: List[float] = []
+    per_pair = []
+    hotspots = []
+    for i, (base, treat) in enumerate(pairs):
+        b = getattr(base, discriminating_metric, None)
+        t = getattr(treat, discriminating_metric, None)
+        d = _pct_change(b, t)
+        per_pair.append({"repeat": i + 1, "baseline": b, "treatment": t, "pct_change": d})
+        if d is not None:
+            deltas.append(d)
+
+        # Hot-spot: prefix (treatment) P99 much worse than RR (baseline) at high hit rate.
+        bp99 = getattr(base, "p99_ttft_ms", None)
+        tp99 = getattr(treat, "p99_ttft_ms", None)
+        thit = getattr(treat, "cache_hit_rate_pct", None)
+        if (bp99 and tp99 and thit is not None
+                and tp99 > bp99 * _HOTSPOT_P99_FACTOR and thit >= _HOTSPOT_MIN_HIT_RATE):
+            hotspots.append({"repeat": i + 1, "baseline_p99_ms": bp99,
+                             "treatment_p99_ms": tp99, "cache_hit_rate_pct": thit})
+
+    lower_better = discriminating_metric in _LOWER_IS_BETTER
+    delta_summ = _summarize_metric(deltas)
+
+    if delta_summ is None or delta_summ["n"] < 2:
+        verdict = "INSUFFICIENT DATA (need >= 2 valid repeats)"
+        reliable = False
+    else:
+        q1, q3 = delta_summ["q1"], delta_summ["q3"]
+        if q1 <= 0 <= q3:
+            verdict = "NO RELIABLE EFFECT (IQR spans zero)"
+            reliable = False
+        else:
+            med = delta_summ["median"]
+            improved = (med < 0) if lower_better else (med > 0)
+            verdict = (f"{'IMPROVEMENT' if improved else 'REGRESSION'}: "
+                       f"median {med:+.1f}% on {discriminating_metric}")
+            reliable = True
+
+    return {
+        "mode": "paired-ab",
+        "discriminating_metric": discriminating_metric,
+        "lower_is_better": lower_better,
+        "n_pairs": n,
+        "delta_pct": delta_summ,
+        "per_pair": per_pair,
+        "hotspots": hotspots,
+        "verdict": verdict,
+        "reliable": reliable,
+        "baseline": aggregate_runs(baseline_runs)["metrics"],
+        "treatment": aggregate_runs(treatment_runs)["metrics"],
+    }
+
+
+def _fmt_stat(s: Optional[Dict[str, Any]]) -> str:
+    if not s:
+        return "n/a"
+    iqr = "" if s["iqr"] is None else f", IQR {s['iqr']:.1f}"
+    return f"median {s['median']:.1f} [{s['min']:.1f}..{s['max']:.1f}]{iqr} (n={s['n']})"
+
+
+def format_aggregate(agg: Dict[str, Any]) -> str:
+    """Human-readable rendering of an aggregate_runs / aggregate_compare result."""
+    lines = []
+    if agg["mode"] == "paired-ab":
+        lines.append("=" * 72)
+        lines.append(f"A/B AGGREGATE over {agg['n_pairs']} repeat(s) — "
+                     f"discriminating metric: {agg['discriminating_metric']}")
+        lines.append("=" * 72)
+        lines.append(f"VERDICT: {agg['verdict']}")
+        ds = agg["delta_pct"]
+        if ds:
+            lines.append(f"  {agg['discriminating_metric']} %change: {_fmt_stat(ds)}")
+        lines.append("")
+        lines.append("Per-repeat %change (treatment vs baseline):")
+        for p in agg["per_pair"]:
+            d = "n/a" if p["pct_change"] is None else f"{p['pct_change']:+.1f}%"
+            lines.append(f"  repeat {p['repeat']}: {d}  "
+                         f"(baseline={p['baseline']}, treatment={p['treatment']})")
+        if agg["hotspots"]:
+            lines.append("")
+            lines.append(f"⚠ HOT-SPOT (affinity-thrash) flagged in {len(agg['hotspots'])} repeat(s):")
+            for h in agg["hotspots"]:
+                lines.append(f"  repeat {h['repeat']}: treatment P99 {h['treatment_p99_ms']:.0f}ms "
+                             f"≫ baseline {h['baseline_p99_ms']:.0f}ms at "
+                             f"{h['cache_hit_rate_pct']:.0f}% hit rate")
+    else:
+        lines.append("=" * 72)
+        lines.append(f"AGGREGATE over {agg['n_repeats']} repeat(s)")
+        lines.append("=" * 72)
+        for m, s in agg["metrics"].items():
+            lines.append(f"  {m:24s} {_fmt_stat(s)}")
+        if agg["p99_outliers"]:
+            lines.append("")
+            lines.append(f"⚠ P99 OUTLIER in {len(agg['p99_outliers'])} repeat(s) "
+                         f"(> Q3 + {_OUTLIER_IQR_MULT}·IQR):")
+            for o in agg["p99_outliers"]:
+                lines.append(f"  repeat {o['repeat']}: P99 {o['p99_ttft_ms']:.0f}ms "
+                             f"(> {o['threshold']:.0f}ms)")
+    return "\n".join(lines)
+
+
+def _resolve_run_input(path: str) -> BenchmarkResults:
+    """Accept a report DIR (uses <dir>/benchmark.log), a .csv, or a log file."""
+    p = Path(path)
+    if p.is_dir():
+        log = p / "benchmark.log"
+        if not log.exists():
+            raise FileNotFoundError(f"no benchmark.log in report dir: {path}")
+        return parse_benchmark_log(str(log))
+    if path.endswith(".csv"):
+        return load_csv_results(path)
+    return parse_benchmark_log(path)
+
+
 def cmd_parse(args):
     """Parse command: Parse a benchmark log file."""
     try:
@@ -1736,6 +1972,38 @@ def cmd_compare(args):
     return 0
 
 
+def cmd_aggregate(args):
+    """Aggregate command: median/IQR across N repeat runs, with a refuse-to-conclude verdict."""
+    try:
+        treatment = [_resolve_run_input(p) for p in args.inputs]
+        if args.baseline:
+            baseline = [_resolve_run_input(p) for p in args.baseline]
+            if len(baseline) != len(treatment):
+                print(f"Error: --baseline count ({len(baseline)}) must match "
+                      f"inputs count ({len(treatment)}) for paired A/B aggregation",
+                      file=sys.stderr)
+                return 1
+            agg = aggregate_compare(baseline, treatment, args.metric)
+        else:
+            agg = aggregate_runs(treatment)
+
+        print(format_aggregate(agg))
+
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump(agg, f, indent=2)
+            print(f"\nWrote structured aggregate: {args.json}")
+
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Error aggregating: {e}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
 def cmd_export(args):
     """Export command: Export results to different formats."""
     try:
@@ -1801,6 +2069,9 @@ Examples:
     # Compare two results
     %(prog)s compare baseline.csv optimized.csv
 
+    # Aggregate 3 A/B repeats (RR baseline vs prefix), median-of-3 verdict
+    %(prog)s aggregate prefix_rep{1,2,3}/ --baseline rr_rep{1,2,3}/ --metric p99_ttft_ms
+
     # Export to markdown
     %(prog)s export stats.csv --format markdown
 """,
@@ -1826,6 +2097,26 @@ Examples:
     compare_parser.add_argument("baseline", help="Baseline result file (CSV or log)")
     compare_parser.add_argument("new", help="New result file (CSV or log)")
 
+    # Aggregate command
+    aggregate_parser = subparsers.add_parser(
+        "aggregate",
+        help="Aggregate N repeat runs (median/IQR, hot-spot flag, refuse-to-conclude verdict)",
+    )
+    aggregate_parser.add_argument(
+        "inputs", nargs="+",
+        help="Repeat runs of one config: report dirs, .csv, or benchmark.log files "
+             "(the treatment arm when --baseline is given)",
+    )
+    aggregate_parser.add_argument(
+        "--baseline", nargs="+",
+        help="Paired control-arm repeats (same count as inputs) for A/B aggregation",
+    )
+    aggregate_parser.add_argument(
+        "--metric", default="p99_ttft_ms",
+        help="Discriminating metric for the A/B verdict (default: p99_ttft_ms)",
+    )
+    aggregate_parser.add_argument("--json", help="Write structured aggregate JSON to this path")
+
     # Export command
     export_parser = subparsers.add_parser("export", help="Export results to different formats")
     export_parser.add_argument("input", help="Input file (CSV or log)")
@@ -1845,6 +2136,8 @@ Examples:
         return cmd_summary(args)
     elif args.command == "compare":
         return cmd_compare(args)
+    elif args.command == "aggregate":
+        return cmd_aggregate(args)
     elif args.command == "export":
         return cmd_export(args)
 
