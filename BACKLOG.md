@@ -35,6 +35,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 22. [Invariant Audit Findings (2026-07-03)](#22-invariant-audit-findings-2026-07-03)
 23. [Holistic Audit Findings (2026-07-04)](#23-holistic-audit-findings-2026-07-04)
 24. [Adversarial Audit Findings — Pass A (2026-07-04)](#24-adversarial-audit-findings-pass-a-2026-07-04)
+25. [Benchmark Tooling P0 — Re-anchor the Truth (2026-07-06)](#25-benchmark-tooling-p0--re-anchor-the-truth-2026-07-06)
 
 ---
 
@@ -1104,6 +1105,176 @@ first fuzz coverage, wired into `fuzz-ci` / `fuzz-run-all` and the CMake
 
 The section heading and anchor (`#24-adversarial-audit-findings-pass-a-2026-07-04`)
 are preserved as the stable pointer for in-source `// BACKLOG §24` cross-references.
+
+---
+
+## 25. Benchmark Tooling P0 — Re-anchor the Truth (2026-07-06)
+
+Source: [`.dev-context/benchmark-tooling-review-2026-07-05.md`](../.dev-context/benchmark-tooling-review-2026-07-05.md),
+recommended plan **P0 — Re-anchor the truth (cheap; mostly no GPU time)**. Addresses
+findings F1 (headline anchored to deprecated 5-prefix workload), F2 (5-prefix trap live
+everywhere except `bench.sh`), and the doc half of F6 (deprecated scripts still shipped).
+
+**Scope note — no Seastar / hot-path surface.** Every step touches Python (locust harness),
+Bash (wrapper scripts), or Markdown (docs) only. No C++, no cross-shard `submit_to`, no new
+container/timer/gate, no `router_service`/`http_controller`/`request_rewriter` change → the
+`claude-locust-sync-map.md` server↔locust contract is **not** affected (we change default
+*values*, not the request shape). No Deferred Gate build is required for correctness; the
+verification ladder is lint + a dry-run of the affected commands, not `make` (see below).
+
+**Verified pre-conditions (2026-07-06):**
+- CI (`benchmark.yml:197`) and `make benchmark` (`Makefile:588`) run the **mock**
+  `locustfile.py`, which has **no** `NUM_LARGE_PREFIXES` → changing `locustfile_real.py`'s
+  default is **CI-safe** and cannot shift the gated mock p99/throughput baseline. Only
+  real-GPU runs are affected.
+- Both deprecated scripts already print a `[DEPRECATED]` banner but still **execute**
+  (`run-multi-gpu-benchmark.sh:48`, `setup-lambda-benchmark.sh:43`); the latter
+  heredoc-generates a repo-root `run-benchmark.sh` (`setup-lambda-benchmark.sh:113-114`)
+  that name-collides with `tests/integration/run-benchmark.sh`. Both are referenced in
+  `scripts/README.md` and `tests/integration/README.md`.
+
+### Prerequisites
+- [x] Read `locustfile_real.py`, `run_benchmark_comparison.py`, `bench.sh`,
+  `bench-residency-ab.sh`, the two deprecated scripts, and the guide's section map.
+- [x] Confirm the mock-CI decoupling above.
+- [ ] Two open decisions to confirm before implementing (see **Decisions** at end).
+
+### Implementation Steps
+
+#### Step 1: Kill the 5-prefix default in the locustfile (single source of truth)
+- **Files:** `tests/integration/locustfile_real.py`
+- **Description:** `NUM_LARGE_PREFIXES` default `5→50` (line 592); `SHARED_PREFIX_RATIO`
+  default `0.7→0.9` (line 634). Add a comment on each mirroring the pigeonhole rationale
+  already in `bench.sh:1665-1670` (with 8 backends, 5 prefixes ≤ backend count pins all
+  prefixes under pure affinity → manufactured false regression; 50 ≥ backend count is
+  representative). This makes the locustfile the authoritative default so every direct
+  `locust`/harness invocation stops silently reproducing the deprecated workload.
+- **Concerns:** None Seastar. Churn knobs (200/24/20/8/seed 42) are already the intended
+  defaults — leave them; they become authoritative once wrappers stop shadowing them (Step 3).
+- **Done:** `NUM_LARGE_PREFIXES = int(... "50")`, `SHARED_PREFIX_RATIO = float(... "0.9")`.
+- **Status:** [ ] Pending
+
+#### Step 2: Kill the 5-prefix default in the comparison driver
+- **Files:** `tests/integration/run_benchmark_comparison.py`
+- **Description:** `--num-prefixes` default `5→50` (line 639) + help text; fix the module
+  docstring example (line 38, `--num-prefixes 5`) and the reporting fallbacks
+  (`config.get('num_prefixes', 5)` line 314). The driver already forwards
+  `NUM_LARGE_PREFIXES` (line 702) but does **not** set `SHARED_PREFIX_RATIO` → it now inherits
+  the locustfile's 0.9 automatically (desired). Decision: do **not** add a `--prefix-ratio`
+  flag here — inheriting keeps the single source of truth (revisit under P1/P2 if a sweep
+  needs it).
+- **Concerns:** `make benchmark-comparison` uses this driver against real vLLM only — no CI gate.
+- **Done:** default 50 everywhere in the file; help/docstring/report consistent.
+- **Status:** [ ] Pending
+
+#### Step 3: Make `bench.sh` a pass-through, not a second source of defaults
+- **Files:** `scripts/bench.sh`
+- **Description:** Today `bench.sh` *always* injects `-e NUM_LARGE_PREFIXES=${…:-50}` and the
+  churn/ratio knobs with hardcoded defaults that **duplicate** the locustfile (lines
+  1671/1675 main path, 1838/1842 warm-up path; `SHARED_PREFIX_RATIO` at 1609/1716/1851).
+  Change to inject `-e VAR=…` **only when the caller explicitly set the var** (`[[ -n "$VAR" ]]`),
+  otherwise omit it and let the locustfile default apply. Keep the effective-config banner
+  (1441-1446) — relabel its fallback from `50 (bench default)` to `50 (locust default)` and
+  keep the pigeonhole warning (1442-1443) working against the resolved value. This removes the
+  drift class where the two files' defaults silently diverge.
+- **Concerns:** Preserve `>&2` discipline and the `$()`-capture return pattern in the touched
+  `run_benchmark()` / warm-up blocks (do not de-duplicate the warm-up block here — that's F6/P2).
+  The banner keeps ONE labeled fallback constant with a `# must match locustfile_real.py` comment
+  (accepted minor duplication, for auditability).
+- **Done:** grep shows no unconditional `-e NUM_LARGE_PREFIXES=`/`-e CHURN_*=`/`-e SHARED_PREFIX_RATIO=`
+  with a hardcoded default; banner still prints effective values.
+- **Status:** [ ] Pending
+
+#### Step 4: Same pass-through treatment for `bench-residency-ab.sh`
+- **Files:** `scripts/bench-residency-ab.sh`
+- **Description:** The residency A/B wrapper `export`s churn knobs with hardcoded fallbacks
+  (77-81 → 210-214). Make each `export` conditional on the var being set (or on an explicit
+  `--churn-*` flag), so the locustfile stays authoritative; keep the run-summary echo
+  (417/661) reporting the effective values. (Do **not** touch `setup-lambda-benchmark.sh:229`
+  — that script is removed in Step 7.)
+- **Concerns:** Keep the byte-identical-universe A/B guarantee (CHURN_SEED must still be pinned
+  across the ON/OFF legs — pin it in the script, since seed reproducibility is a correctness
+  property of the A/B, not a default to defer to the locustfile).
+- **Status:** [ ] Pending
+
+#### Step 5: Extract `benchmark-methodology.md` from the guide
+- **Files:** NEW `docs/benchmarks/benchmark-methodology.md`; edit
+  `docs/benchmarks/benchmark-guide-8xA100.md`
+- **Description:** Move the *how-to* sections **verbatim** out of the 2,536-line guide: Quick
+  Start, Warm-up Mode, Benchmark Parameters Reference, Prompt Distribution, Prefix Ratio, Token
+  Buckets, Custom Prompt Files, Client Tokenization, Test Scenarios, Validation Checklist,
+  Expected Metrics Reference, Live Monitoring, Troubleshooting, Cleanup & Restarts, Exporting
+  Results, Recommended Test Sequence (guide lines ~156-475, 764-885, 2061-2536). Fold in the
+  `/benchmark` skill gotchas and a pointer to `interpreting-benchmark-numbers.md`. Correct the
+  `--prompt-dist` naming (`large-prefix`, document `churn`) while moving — but keep the
+  numbers-fixing to Step 7 so this stays a clean move.
+- **Concerns:** Pure content move; verify no internal anchor (e.g. `#sse-flush-regression-c70f0c1`)
+  is orphaned — retarget cross-links in Step 7.
+- **Status:** [ ] Pending
+
+#### Step 6: Archive the lab-notebook into `docs/benchmarks/history/`
+- **Files:** NEW `docs/benchmarks/history/` (e.g. `benchmark-history-8xA100.md`); edit
+  `docs/benchmarks/benchmark-guide-8xA100.md`
+- **Description:** Move **verbatim, append-only** the dated instance tables and closed
+  investigations: "Detailed Results by Instance", "Real Benchmark Results" (Instances 1-9),
+  "Recommended Next Benchmarks", "Benchmark Validity Status", "Post-Fix Re-Run Plan", "SSE
+  Flush Regression (c70f0c1)" (guide lines ~47-155, 886-2060). This is the historical record;
+  it stays quotable-with-context but out of the load-bearing docs.
+- **Concerns:** Append-only archive — do not edit the moved numbers (their invalidity is the
+  point). Preserve heading anchors referenced by investigations in `.dev-context/`.
+- **Status:** [ ] Pending
+
+#### Step 7: Author `benchmark-results-current.md` + convert the guide into an index
+- **Files:** NEW `docs/benchmarks/benchmark-results-current.md`; edit
+  `docs/benchmarks/benchmark-guide-8xA100.md`; update cross-links in
+  `docs/benchmarks/kv-cache-prefix-routing-benchmark.md` and any `.dev-context/*` that deep-link
+  the guide's moved anchors.
+- **Description:**
+  - `benchmark-results-current.md`: only numbers valid on **current defaults** (50 prefixes,
+    20ms flush, residency 0.2), each stamped commit + manifest. Until the re-baseline campaign
+    (P0/P1 items 4-6) runs, the representative-workload headline honestly reads **"TBD."**
+  - Convert `benchmark-guide-8xA100.md` into a thin **index/landing page** that links to
+    methodology / results-current / history (keeps the well-known filename and inbound links
+    alive). Rewrite the **TL;DR** to state plainly that every pre-June headline (-80…-85%) was
+    measured on the now-deprecated **5-prefix** workload and is not citable on current defaults;
+    remove/relocate the stale May 22 "unresolved" note (the thrashing was closed 2026-05-26 as a
+    workload artifact).
+  - **Reconcile the 10ms/20ms flush contradiction:** 20ms **shipped**
+    (`src/config_schema.hpp:182`, `docker-compose.benchmark-real.yml:171`); mark the "10ms
+    confirmed as the correct default" line (guide ~1102) as superseded in the history archive and
+    state 20ms as current in results-current/methodology.
+- **Concerns:** This is the one judgment-heavy step; keep prose edits surgical and cite commits.
+- **Status:** [ ] Pending
+
+#### Step 8: Neutralize the two deprecated scripts
+- **Files:** `scripts/run-multi-gpu-benchmark.sh`, `scripts/setup-lambda-benchmark.sh`;
+  `scripts/README.md`, `tests/integration/README.md`
+- **Description:** Per the **Decisions** below, either delete both or replace their bodies with
+  a 3-line stub that prints the `bench.sh` pointer and `exit 1` (kills the silent-fallthrough and
+  the `run-benchmark.sh` name-collision either way). Update the two READMEs that reference them.
+- **Concerns:** Confirm no Makefile target invokes them (verified: none).
+- **Status:** [ ] Pending
+
+### Decisions (confirm before implementing)
+1. **Deprecated scripts — delete vs. `exit 1` stub?** Review lists delete first;
+   *recommendation: `exit 1` stub with a `bench.sh` pointer* — a hard error is more discoverable
+   for anyone with the old command in muscle memory than a missing file, and it still removes the
+   name-collision. (Delete is fine if you prefer a clean tree.)
+2. **Guide file — keep `benchmark-guide-8xA100.md` as an index vs. remove/redirect?**
+   *Recommendation: keep it as a thin index* to preserve the many inbound links from
+   investigations and the sibling benchmark docs.
+
+### Post-Implementation
+- [ ] `/review` — Hard Rules compliance (light here: no C++; check doc-sync + naming consistency).
+- [ ] `/doc` — sync `scripts/README.md`, `tests/integration/README.md`, the `/benchmark` skill,
+  and `.dev-context/claude-locust-sync-map.md`/`README.md` index to the new doc layout.
+- [ ] **Verification ladder (no `make` build needed):** `python -m py_compile
+  tests/integration/{locustfile_real,run_benchmark_comparison}.py`; `bash -n
+  scripts/{bench,bench-residency-ab}.sh` (+ the stubs if used); `bench.sh --help`/a
+  `--dry-run`-equivalent grep to confirm the banner prints effective 50/0.9 with knobs unset;
+  markdown link-check across `docs/benchmarks/` for orphaned anchors. See `/validate`.
+- [ ] Follow-on (out of scope here): P0/P1 re-baseline campaign (items 4-6) and the P1
+  statistics/manifest/3-node-scrape machinery (items 7-10).
 
 ---
 
