@@ -900,6 +900,16 @@ curl -s http://localhost:9181/metrics | grep -E "ranvier_response_latency"
 curl -s http://localhost:9181/metrics | grep -E "ranvier_active_requests"
 ```
 
+**End-of-run scrape (all nodes).** `bench.sh` scrapes `/metrics` from **every** ranvier
+node into `prometheus_metrics_node{1,2,3}.txt` (plus a concatenated
+`prometheus_metrics.txt`) — earlier it captured only one node of three, undercounting the
+routing counters. `results_parser.py` sums across nodes and surfaces, as first-class fields:
+the two diversion counters (`load_aware_fallbacks_total`, `residency_route_downgrades_total`),
+the per-backend request distribution, and its **Gini coefficient** (0 = even, →1 =
+concentrated). The `compare` output prints `nodes scraped: …` so a partial capture is
+visible. High fallbacks-% **and** a high prefix-arm Gini together are the affinity-thrash
+fingerprint — read them alongside the P99 tail, not instead of it.
+
 ---
 
 ## Troubleshooting

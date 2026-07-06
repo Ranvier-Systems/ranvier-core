@@ -1837,19 +1837,31 @@ run_benchmark() {
                    --format=csv > "$REPORT_DIR/nvidia_smi_end.csv" 2>/dev/null || true
     fi
 
-    # Scrape Prometheus /metrics so the parser can surface
-    # routing_load_aware_fallbacks_total and per-backend distribution. The
-    # parser reads $REPORT_DIR/prometheus_metrics.txt as a sibling of
-    # benchmark.log. Best-effort: missing file just leaves the counters blank.
-    # Container names must match docker-compose.benchmark-real.yml
-    # (container_name: ranvier-bench1..3).
+    # Scrape Prometheus /metrics from EVERY ranvier node so the parser sees the
+    # whole cluster. Previously this loop wrote all nodes to the SAME file and
+    # broke on the first success, so diversion counters and the per-backend
+    # distribution came from ranvier-bench1 only — undercounting on a 3-node
+    # cluster (review F5). Now each node lands in prometheus_metrics_node{N}.txt
+    # and the parser sums across them; a concatenated prometheus_metrics.txt is
+    # also written so older single-file readers still get cluster totals.
+    # Container names must match docker-compose.benchmark-real.yml (ranvier-bench1..3).
     if command -v docker &> /dev/null; then
+        node_idx=0
+        : > "$REPORT_DIR/prometheus_metrics.txt"
         for node in ranvier-bench1 ranvier-bench2 ranvier-bench3; do
+            node_idx=$((node_idx + 1))
+            node_file="$REPORT_DIR/prometheus_metrics_node${node_idx}.txt"
             if docker exec "$node" curl -sf http://localhost:9180/metrics \
-                    > "$REPORT_DIR/prometheus_metrics.txt" 2>/dev/null; then
-                break
+                    > "$node_file" 2>/dev/null; then
+                cat "$node_file" >> "$REPORT_DIR/prometheus_metrics.txt"
+            else
+                # Drop the empty file a failed curl left behind so the parser's
+                # node count reflects only nodes actually scraped.
+                rm -f "$node_file"
             fi
         done
+        # If nothing scraped at all, remove the empty combined file too.
+        [[ -s "$REPORT_DIR/prometheus_metrics.txt" ]] || rm -f "$REPORT_DIR/prometheus_metrics.txt"
     fi
 
     log_ok "Results saved to: $REPORT_DIR/" >&2
