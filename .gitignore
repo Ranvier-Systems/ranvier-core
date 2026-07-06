@@ -17,3 +17,4 @@ __pycache__/
 tests/integration/data/lmsys/lmsys_10k.jsonl
 tests/integration/data/lmsys/lmsys_10k_filtered.jsonl
 tests/integration/data/lmsys/lmsys_incremental.jsonl
+.pytest_cache/

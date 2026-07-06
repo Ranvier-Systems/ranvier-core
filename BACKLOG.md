@@ -1275,8 +1275,20 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
   scripts/{bench,bench-residency-ab}.sh` (+ the stubs if used); `bench.sh --help`/a
   `--dry-run`-equivalent grep to confirm the banner prints effective 50/0.9 with knobs unset;
   markdown link-check across `docs/benchmarks/` for orphaned anchors. See `/validate`.
-- [ ] Follow-on (out of scope here): P0/P1 re-baseline campaign (items 4-6) and the P1
-  statistics/manifest/3-node-scrape machinery (items 7-10).
+- [ ] Follow-on: P0/P1 re-baseline campaign (items 4-6, needs 8×A100) and P1
+  capture machinery (items 8-10: manifest, 3-node scrape, A/B order fairness).
+
+### P1 progress (follow-on branches)
+- [x] **Item 7 — `--repeat` + aggregation** (branch `claude/benchmark-p1-repeat-aggregate`,
+  2026-07-06): `results_parser.py aggregate` computes median/IQR across repeat runs with a
+  pre-registered verdict (INSUFFICIENT DATA / NO RELIABLE EFFECT when the IQR spans zero /
+  signed IMPROVEMENT-REGRESSION by the median) plus an affinity-thrash hot-spot flag;
+  `bench-runner.sh --repeat N` runs each config N× and aggregates per config. 12 pure-Python
+  unit tests. This is the prerequisite for a trustworthy re-baseline (items 4-6) — run it
+  **before** the GPU campaign so results carry variance stats, not a hand-picked best run.
+- [ ] Item 8 — `manifest.json` per report dir; `compare`/`aggregate` warn on workload-knob mismatch.
+- [ ] Item 9 — scrape all 3 nodes (fix the `break` bug); per-backend distribution + Gini + diversion counters.
+- [ ] Item 10 — A/B fairness: `--order` alternation, warm-up per-arm, document vLLM cache carry-over.
 
 ---
 
