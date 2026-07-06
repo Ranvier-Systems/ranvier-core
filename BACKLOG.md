@@ -1297,7 +1297,21 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
   is fixed) plus a concatenated file for back-compat; `results_parser.py parse_prometheus_report`
   sums across nodes and promotes the per-backend distribution, its Gini, both diversion counters,
   and `nodes_scraped` to first-class fields (surfaced in `compare`). 10 pure-Python unit tests.
-- [ ] Item 10 — A/B fairness: `--order` alternation, warm-up per-arm, document vLLM cache carry-over.
+- [x] **Item 10 — A/B fairness** (branch `claude/benchmark-p1-ab-fairness`, 2026-07-06):
+  `bench.sh --order rr-first|prefix-first` picks the A/B arm order; the warm-up is now a
+  `run_warmup(mode)` function run **per-arm after each mode restart** (both arms identically
+  primed); the vLLM-cache-carry-over caveat (Ranvier-only restart) is logged and written into
+  the compare report header. `bench-runner.sh` **alternates the order across `--repeat`** runs
+  (rr-first/prefix-first) for `--compare` configs that don't pin `--order`, cancelling order
+  bias for free. Verified via `bash -n`, `--order` validation, stubbed arm-order/report-mapping
+  logic test, and dry-run alternation (incl. pinned-order preserved, non-compare untouched).
+
+**P1 "statistical + capture machinery" (items 7–10) is complete.** The benchmark tooling now
+does repeats + median/IQR verdicts, self-describing manifests with mismatch guards, full-cluster
+telemetry with Gini, and fair A/B ordering — the prerequisites for a trustworthy re-baseline.
+**Next: the P0/P1 50-prefix re-baseline campaign (items 4–6), which needs 8×A100 GPU time** and
+produces the first citable headline under the representative workload (fills the current TBD in
+`benchmark-results-current.md`).
 
 ---
 

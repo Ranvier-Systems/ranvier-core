@@ -249,6 +249,9 @@ OPTIONS:
                         config and print a verdict (default: 1). Variance is the
                         top benchmark confound; a single run is not a result.
                         Aggregates are written to <output-dir>/aggregates/.
+                        For --compare configs, the A/B arm order alternates across
+                        repeats (rr-first / prefix-first) to cancel order bias,
+                        unless the config already pins --order.
     -h, --help          Show this help
 
 BUILT-IN SUITES:
@@ -454,7 +457,19 @@ if [[ "$REPEAT" -gt 1 ]]; then
     for ((g=0; g<${#BASE_RUNS[@]}; g++)); do
         GROUP_LABELS+=("${BASE_LABELS[$g]}")
         for ((r=1; r<=REPEAT; r++)); do
-            RUNS+=("${BASE_RUNS[$g]}")
+            run_args="${BASE_RUNS[$g]}"
+            # A/B fairness: alternate the arm order across repeats so thermal drift
+            # and vLLM cache carry-over cancel out instead of always favoring one
+            # side (review F4). Only for --compare configs that don't already pin
+            # --order; odd repeats rr-first, even repeats prefix-first.
+            if [[ "$run_args" == *"--compare"* && "$run_args" != *"--order"* ]]; then
+                if (( r % 2 == 1 )); then
+                    run_args+=" --order rr-first"
+                else
+                    run_args+=" --order prefix-first"
+                fi
+            fi
+            RUNS+=("$run_args")
             LABELS+=("${BASE_LABELS[$g]} [rep ${r}/${REPEAT}]")
             GROUP_OF+=("$g")
         done
