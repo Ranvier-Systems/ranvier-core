@@ -390,6 +390,16 @@ With client tokenization, **cache misses also get faster** because the server sk
   --prefix-ratio 0.9
 ```
 
+**A/B fairness.** `--compare` restarts Ranvier per arm and, if `--warmup` is set, warms
+**each arm after its own restart** in that arm's mode — so both arms are identically primed
+(previously only the first cluster was warmed). Arm order is `--order rr-first` (default) or
+`--order prefix-first`; a fixed order lets thermal drift and cache carry-over always favor one
+side, so `bench-runner.sh --repeat N` **alternates the order across repeats** to cancel that
+bias. The comparison always treats round-robin as the baseline regardless of which arm ran
+first. **Caveat:** only the Ranvier containers restart between arms — the **vLLM KV cache is
+not reset**, so the second arm can start vLLM-warm; per-arm warm-up equalizes the dose, but
+for strict isolation restart vLLM between arms. This is recorded in the compare report header.
+
 **Expected Results (8B model, 8x A100, 08ba984+ post-fix):**
 
 | Metric | Round-Robin | Prefix-Aware | Notes |

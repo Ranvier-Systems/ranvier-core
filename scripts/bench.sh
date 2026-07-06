@@ -262,7 +262,13 @@ BENCHMARK OPTIONS:
     --compare           Run A/B comparison (prefix vs round-robin). Restarts Ranvier
                         with the correct routing mode for each run and resets Prometheus
                         histograms. Total runtime is ~2x duration + ~90s (restarts).
-    --warmup            Run a 1-minute warm-up before the main benchmark (adds ~1m 10s)
+    --order ORD         A/B arm order for --compare: rr-first (default) or prefix-first.
+                        A fixed order lets thermal drift / cache carry-over always
+                        favor one side; bench-runner alternates this across --repeat
+                        runs. Comparison always treats round-robin as the baseline.
+    --warmup            Run a short warm-up before the main benchmark (adds ~1m 10s).
+                        With --compare, warm-up runs PER ARM after each mode restart so
+                        both arms are identically primed.
     --output-dir DIR    Custom output directory (default: benchmark-reports)
     --client-tokenize   Tokenize on client (locust) instead of Ranvier server
     --multi-depth       Enable multi-depth route storage (Option C). Stores routes at
@@ -458,6 +464,7 @@ PREFIX_RATIO="$DEFAULT_PREFIX_RATIO"
 PREFIX_MAX_TOKENS=""
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 COMPARE=false
+ORDER="rr-first"   # --order: arm order in --compare (rr-first | prefix-first)
 SKIP_SETUP=false
 SKIP_VLLM=false
 VLLM_HOST="localhost"
@@ -497,6 +504,7 @@ while [[ $# -gt 0 ]]; do
         --prefix-max-tokens) PREFIX_MAX_TOKENS="$2"; shift 2 ;;
         --output-dir)     OUTPUT_DIR="$2"; shift 2 ;;
         --compare)        COMPARE=true; shift ;;
+        --order)          ORDER="$2"; shift 2 ;;
         --skip-setup)     SKIP_SETUP=true; shift ;;
         --skip-vllm)      SKIP_VLLM=true; shift ;;
         --vllm-host)      VLLM_HOST="$2"; shift 2 ;;
@@ -538,6 +546,12 @@ fi
 # If prompt file is specified, automatically set distribution to "file"
 if [[ -n "$PROMPT_FILE" ]]; then
     PROMPT_DIST="file"
+fi
+
+# Validate --order (only meaningful with --compare; harmless otherwise).
+if [[ "$ORDER" != "rr-first" && "$ORDER" != "prefix-first" ]]; then
+    log_error "--order must be rr-first or prefix-first (got: $ORDER)"
+    exit 1
 fi
 
 # -----------------------------------------------------------------------------
@@ -1087,6 +1101,8 @@ if [[ "$DRY_RUN" = true ]]; then
     if [[ "$WARMUP" = true ]]; then
         WARMUP_SECS=$(parse_duration "$DEFAULT_WARMUP_DURATION")
         TOTAL_SECS=$((TOTAL_SECS + WARMUP_SECS + 10))  # +10s pause after warmup
+        # --compare warms each arm, so a second warm-up run.
+        [[ "$COMPARE" = true ]] && TOTAL_SECS=$((TOTAL_SECS + WARMUP_SECS + 10))
     fi
     if [[ "$COMPARE" = true ]]; then
         TOTAL_SECS=$((TOTAL_SECS + DURATION_SECS + 30))  # Second benchmark + 30s pause
@@ -1871,29 +1887,32 @@ run_benchmark() {
 }
 
 # -----------------------------------------------------------------------------
-# Warm-up run (optional)
+# Warm-up run (optional), as a function so --compare can prime EACH arm after its
+# mode restart — otherwise only the first cluster is warmed and the two arms are
+# not identically primed (review F4). Takes the routing mode to warm in.
 # -----------------------------------------------------------------------------
 
-if [[ "$WARMUP" = true ]]; then
-    log_header "Warm-up Run"
+run_warmup() {
+    local WARMUP_MODE="${1:-prefix}"
+    log_header "Warm-up Run (${WARMUP_MODE})"
     log_info "Running short warm-up to prime KV caches and model weights..."
     log_info "Duration: $DEFAULT_WARMUP_DURATION, Users: $DEFAULT_WARMUP_USERS"
     echo ""
 
     # Save original values
-    ORIG_DURATION="$DURATION"
-    ORIG_USERS="$USERS"
+    local ORIG_DURATION="$DURATION"
+    local ORIG_USERS="$USERS"
 
     # Run warm-up with reduced params
     DURATION="$DEFAULT_WARMUP_DURATION"
     USERS="$DEFAULT_WARMUP_USERS"
 
-    # Create warmup directory
-    WARMUP_DIR="${OUTPUT_DIR}/warmup_$(date +%Y%m%d_%H%M%S)"
+    # Create warmup directory (mode-tagged so per-arm warm-ups don't collide)
+    WARMUP_DIR="${OUTPUT_DIR}/warmup_${WARMUP_MODE}_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$WARMUP_DIR"
 
-    # Manifest for the warm-up dir too (always prefix mode).
-    write_manifest "$WARMUP_DIR" "prefix"
+    # Manifest for the warm-up dir too (in the arm's routing mode).
+    write_manifest "$WARMUP_DIR" "$WARMUP_MODE"
 
     # Build backend env args
     BACKEND_ARGS=""
@@ -1946,7 +1965,7 @@ if [[ "$WARMUP" = true ]]; then
         --profile benchmark run --rm \
         -e NUM_BACKENDS="$NUM_BACKENDS" \
         -e VLLM_MODEL="$MODEL" \
-        -e RANVIER_ROUTING_MODE="prefix" \
+        -e RANVIER_ROUTING_MODE="$WARMUP_MODE" \
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
@@ -1974,7 +1993,7 @@ if [[ "$WARMUP" = true ]]; then
     # Restore original values
     DURATION="$ORIG_DURATION"
     USERS="$ORIG_USERS"
-fi
+}
 
 # -----------------------------------------------------------------------------
 # Restart Ranvier with a specific routing mode (used in --compare)
@@ -2035,15 +2054,40 @@ if [[ "$COMPARE" = true ]]; then
     log_info "Running two benchmarks: Round-Robin (baseline) vs Prefix-Aware (optimized)"
     log_info "Each benchmark: $DURATION | Total estimated time: ${COMPARE_TOTAL_MINS}m ${COMPARE_TOTAL_SECS_REM}s"
 
-    # Restart Ranvier in round_robin mode for baseline
-    restart_ranvier_with_mode "round_robin"
+    # Arm order (review F4): a fixed order lets thermal drift and cache carry-over
+    # always land on the same side. --order picks it; bench-runner alternates it
+    # across --repeat runs to cancel the bias. The comparison below always treats
+    # round_robin as the baseline regardless of which arm physically ran first.
+    if [[ "$ORDER" == "prefix-first" ]]; then
+        ARMS=("prefix" "round_robin")
+    else
+        ARMS=("round_robin" "prefix")
+    fi
+    log_info "Arm order: ${ARMS[0]} → ${ARMS[1]} (--order $ORDER)"
 
-    REPORT_RR=$(run_benchmark "round_robin" "Round-Robin (Baseline)" "[1/2]")
+    # vLLM KV cache carry-over (review F4): only the Ranvier containers are
+    # restarted between arms — the vLLM processes keep their KV cache, so the
+    # second arm can start vLLM-warm. Per-arm warm-up (below) gives both arms an
+    # equal warm dose; for stricter isolation, restart vLLM between arms.
+    log_warn "vLLM KV cache is NOT reset between arms (only Ranvier restarts). Per-arm warm-up equalizes the warm dose; restart vLLM between arms for strict isolation."
 
-    # Restart Ranvier in prefix mode for optimized run (also resets Prometheus histograms)
-    restart_ranvier_with_mode "prefix"
-
-    REPORT_PREFIX=$(run_benchmark "prefix" "Prefix-Aware (Optimized)" "[2/2]")
+    declare -A ARM_REPORT
+    arm_i=0
+    for arm in "${ARMS[@]}"; do
+        arm_i=$((arm_i + 1))
+        # Restart Ranvier in this arm's mode (also resets its Prometheus histograms)
+        restart_ranvier_with_mode "$arm"
+        # Warm THIS arm's freshly-restarted cluster in its own mode so both arms
+        # are identically primed (was previously warmed once, before the restart).
+        [[ "$WARMUP" = true ]] && run_warmup "$arm"
+        if [[ "$arm" == "round_robin" ]]; then
+            ARM_REPORT[round_robin]=$(run_benchmark "round_robin" "Round-Robin (Baseline)" "[${arm_i}/2]")
+        else
+            ARM_REPORT[prefix]=$(run_benchmark "prefix" "Prefix-Aware (Optimized)" "[${arm_i}/2]")
+        fi
+    done
+    REPORT_RR="${ARM_REPORT[round_robin]}"
+    REPORT_PREFIX="${ARM_REPORT[prefix]}"
 
     log_header "A/B Comparison Complete"
     echo ""
@@ -2059,6 +2103,8 @@ if [[ "$COMPARE" = true ]]; then
         echo "Command: $ORIGINAL_CMD"
         echo "Git Commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
         echo "vLLM Version: $VLLM_VERSION"
+        echo "Arm order: ${ARMS[0]} -> ${ARMS[1]} (--order $ORDER); warm-up per-arm: $WARMUP"
+        echo "vLLM KV cache NOT reset between arms (Ranvier-only restart)"
         echo "Ranvier Env: $(env | grep '^RANVIER_' | sort | tr '\n' ' ')"
         echo ""
     } > "$COMPARE_OUTPUT"
@@ -2080,6 +2126,8 @@ if [[ "$COMPARE" = true ]]; then
         log_info "Compare TTFT improvements in the benchmark logs"
     fi
 else
+    # Single-arm run: warm the (already-running, prefix-mode) cluster if requested.
+    [[ "$WARMUP" = true ]] && run_warmup "prefix"
     run_benchmark "prefix" "Prefix-Aware Routing"
 fi
 
