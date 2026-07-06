@@ -457,6 +457,14 @@ Or aggregate report dirs by hand (e.g. an A/B: prefix arm vs round-robin baselin
 Pre-registered rule for the re-baseline campaign: **report median-of-3; if the IQR
 spans zero on the discriminating metric, the verdict is "no reliable effect."**
 
+**Run manifests (comparability guard).** `bench.sh` writes a `manifest.json` into every
+report dir recording the commit, argv, effective routing config, workload knobs, hardware,
+and vLLM version — so a run is self-describing instead of reconstructed from log prose. When
+`results_parser.py compare` / `aggregate` are asked to combine runs whose **workload knobs**
+differ (e.g. a baseline captured at 20 users vs a treatment at 30), they print a loud
+`WORKLOAD MISMATCH` warning listing the differing knobs. Runs without a manifest (predating
+this) are noted but not blocked. Always stamp a citable number with its manifest.
+
 ---
 
 ### Scenario 3: High Concurrency Stress Test

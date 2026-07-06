@@ -1286,7 +1286,11 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
   `bench-runner.sh --repeat N` runs each config N× and aggregates per config. 12 pure-Python
   unit tests. This is the prerequisite for a trustworthy re-baseline (items 4-6) — run it
   **before** the GPU campaign so results carry variance stats, not a hand-picked best run.
-- [ ] Item 8 — `manifest.json` per report dir; `compare`/`aggregate` warn on workload-knob mismatch.
+- [x] **Item 8 — run manifests** (branch `claude/benchmark-p1-manifest`, 2026-07-06):
+  `bench.sh` writes `manifest.json` (commit, argv, effective routing config, workload knobs,
+  hardware, vLLM version) into every report + warm-up dir; `results_parser.py compare`/
+  `aggregate` load it and print a loud `WORKLOAD MISMATCH` warning (advisory, non-blocking)
+  when the workload knobs differ across the runs being combined. 11 pure-Python unit tests.
 - [ ] Item 9 — scrape all 3 nodes (fix the `break` bug); per-backend distribution + Gini + diversion counters.
 - [ ] Item 10 — A/B fairness: `--order` alternation, warm-up per-arm, document vLLM cache carry-over.
 

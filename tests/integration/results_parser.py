@@ -1883,6 +1883,80 @@ def _resolve_run_input(path: str) -> BenchmarkResults:
     return parse_benchmark_log(path)
 
 
+# =============================================================================
+# Run manifests (comparability guard)
+# =============================================================================
+# bench.sh writes manifest.json into every report dir (commit, argv, effective
+# routing config, workload knobs, hardware, vLLM version). compare/aggregate read
+# the WORKLOAD block and warn loudly when it differs across the runs being
+# combined — otherwise two runs measured on different workloads get silently
+# averaged into a meaningless "result" (F5 / the hand-copied-table failure mode).
+
+def _manifest_path_for(path: str) -> Optional[Path]:
+    p = Path(path)
+    m = (p / "manifest.json") if p.is_dir() else (p.parent / "manifest.json")
+    return m if m.exists() else None
+
+
+def load_manifest(path: str) -> Optional[Dict[str, Any]]:
+    """Load manifest.json beside a report dir / log file, or None if absent/bad."""
+    mp = _manifest_path_for(path)
+    if mp is None:
+        return None
+    try:
+        with open(mp) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def workload_mismatches(manifests: List[Dict[str, Any]]) -> List[str]:
+    """Workload keys that are NOT identical across all given manifests."""
+    workloads = [m.get("workload", {}) for m in manifests if m]
+    if len(workloads) < 2:
+        return []
+    keys = set()
+    for w in workloads:
+        keys.update(w.keys())
+    diffs = []
+    for k in sorted(keys):
+        vals = {json.dumps(w.get(k), sort_keys=True) for w in workloads}
+        if len(vals) > 1:
+            diffs.append(k)
+    return diffs
+
+
+def warn_on_workload_mismatch(paths: List[str]) -> bool:
+    """Print a loud stderr warning if the runs' workload knobs differ.
+
+    Returns True if a mismatch was reported. Missing manifests (older runs) are
+    noted once but never block — the check is advisory, comparability-focused.
+    """
+    manifests = [load_manifest(p) for p in paths]
+    present = [m for m in manifests if m]
+    if len(present) < len(paths):
+        print(f"Note: {len(paths) - len(present)}/{len(paths)} run(s) have no "
+              f"manifest.json — workload comparability is unverified for those.",
+              file=sys.stderr)
+    if len(present) < 2:
+        return False
+    diffs = workload_mismatches(present)
+    if not diffs:
+        return False
+    print("=" * 72, file=sys.stderr)
+    print("⚠ WORKLOAD MISMATCH — these runs were NOT measured on the same workload;",
+          file=sys.stderr)
+    print("  comparing/aggregating them may be meaningless.", file=sys.stderr)
+    print(f"  Differing knobs: {', '.join(diffs)}", file=sys.stderr)
+    for i, (p, m) in enumerate(zip(paths, manifests)):
+        if m:
+            w = m.get("workload", {})
+            print(f"  [{i + 1}] {p}: " + ", ".join(f"{k}={w.get(k)}" for k in diffs),
+                  file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    return True
+
+
 def cmd_parse(args):
     """Parse command: Parse a benchmark log file."""
     try:
@@ -1958,6 +2032,9 @@ def cmd_compare(args):
         else:
             new = parse_benchmark_log(args.new)
 
+        # Comparability guard: loudly warn if the two runs' workload knobs differ.
+        warn_on_workload_mismatch([args.baseline, args.new])
+
         # Compare and print
         comparison = compare_results(baseline, new)
         print(comparison)
@@ -1976,6 +2053,8 @@ def cmd_aggregate(args):
     """Aggregate command: median/IQR across N repeat runs, with a refuse-to-conclude verdict."""
     try:
         treatment = [_resolve_run_input(p) for p in args.inputs]
+        # Comparability guard: warn if the runs being aggregated differ on workload.
+        warn_on_workload_mismatch(list(args.inputs) + list(args.baseline or []))
         if args.baseline:
             baseline = [_resolve_run_input(p) for p in args.baseline]
             if len(baseline) != len(treatment):
