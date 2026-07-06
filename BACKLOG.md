@@ -1152,7 +1152,7 @@ verification ladder is lint + a dry-run of the affected commands, not `make` (se
 - **Concerns:** None Seastar. Churn knobs (200/24/20/8/seed 42) are already the intended
   defaults — leave them; they become authoritative once wrappers stop shadowing them (Step 3).
 - **Done:** `NUM_LARGE_PREFIXES = int(... "50")`, `SHARED_PREFIX_RATIO = float(... "0.9")`.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-07-06)
 
 #### Step 2: Kill the 5-prefix default in the comparison driver
 - **Files:** `tests/integration/run_benchmark_comparison.py`
@@ -1165,7 +1165,7 @@ verification ladder is lint + a dry-run of the affected commands, not `make` (se
   needs it).
 - **Concerns:** `make benchmark-comparison` uses this driver against real vLLM only — no CI gate.
 - **Done:** default 50 everywhere in the file; help/docstring/report consistent.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-07-06)
 
 #### Step 3: Make `bench.sh` a pass-through, not a second source of defaults
 - **Files:** `scripts/bench.sh`
@@ -1183,7 +1183,7 @@ verification ladder is lint + a dry-run of the affected commands, not `make` (se
   (accepted minor duplication, for auditability).
 - **Done:** grep shows no unconditional `-e NUM_LARGE_PREFIXES=`/`-e CHURN_*=`/`-e SHARED_PREFIX_RATIO=`
   with a hardcoded default; banner still prints effective values.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-07-06)
 
 #### Step 4: Same pass-through treatment for `bench-residency-ab.sh`
 - **Files:** `scripts/bench-residency-ab.sh`
@@ -1195,7 +1195,7 @@ verification ladder is lint + a dry-run of the affected commands, not `make` (se
 - **Concerns:** Keep the byte-identical-universe A/B guarantee (CHURN_SEED must still be pinned
   across the ON/OFF legs — pin it in the script, since seed reproducibility is a correctness
   property of the A/B, not a default to defer to the locustfile).
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-07-06)
 
 #### Step 5: Extract `benchmark-methodology.md` from the guide
 - **Files:** NEW `docs/benchmarks/benchmark-methodology.md`; edit
@@ -1210,7 +1210,7 @@ verification ladder is lint + a dry-run of the affected commands, not `make` (se
   numbers-fixing to Step 7 so this stays a clean move.
 - **Concerns:** Pure content move; verify no internal anchor (e.g. `#sse-flush-regression-c70f0c1`)
   is orphaned — retarget cross-links in Step 7.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-07-06)
 
 #### Step 6: Archive the lab-notebook into `docs/benchmarks/history/`
 - **Files:** NEW `docs/benchmarks/history/` (e.g. `benchmark-history-8xA100.md`); edit
@@ -1222,7 +1222,7 @@ verification ladder is lint + a dry-run of the affected commands, not `make` (se
   it stays quotable-with-context but out of the load-bearing docs.
 - **Concerns:** Append-only archive — do not edit the moved numbers (their invalidity is the
   point). Preserve heading anchors referenced by investigations in `.dev-context/`.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-07-06)
 
 #### Step 7: Author `benchmark-results-current.md` + convert the guide into an index
 - **Files:** NEW `docs/benchmarks/benchmark-results-current.md`; edit
@@ -1244,7 +1244,7 @@ verification ladder is lint + a dry-run of the affected commands, not `make` (se
     confirmed as the correct default" line (guide ~1102) as superseded in the history archive and
     state 20ms as current in results-current/methodology.
 - **Concerns:** This is the one judgment-heavy step; keep prose edits surgical and cite commits.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-07-06)
 
 #### Step 8: Neutralize the two deprecated scripts
 - **Files:** `scripts/run-multi-gpu-benchmark.sh`, `scripts/setup-lambda-benchmark.sh`;
@@ -1253,16 +1253,18 @@ verification ladder is lint + a dry-run of the affected commands, not `make` (se
   a 3-line stub that prints the `bench.sh` pointer and `exit 1` (kills the silent-fallthrough and
   the `run-benchmark.sh` name-collision either way). Update the two READMEs that reference them.
 - **Concerns:** Confirm no Makefile target invokes them (verified: none).
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-07-06)
 
-### Decisions (confirm before implementing)
-1. **Deprecated scripts — delete vs. `exit 1` stub?** Review lists delete first;
-   *recommendation: `exit 1` stub with a `bench.sh` pointer* — a hard error is more discoverable
-   for anyone with the old command in muscle memory than a missing file, and it still removes the
-   name-collision. (Delete is fine if you prefer a clean tree.)
-2. **Guide file — keep `benchmark-guide-8xA100.md` as an index vs. remove/redirect?**
-   *Recommendation: keep it as a thin index* to preserve the many inbound links from
-   investigations and the sibling benchmark docs.
+### Decisions (resolved 2026-07-06)
+1. **Deprecated scripts — delete vs. `exit 1` stub?** → **`exit 1` stub** with a `bench.sh`
+   pointer (more discoverable than a missing file; still removes the `run-benchmark.sh`
+   name-collision).
+2. **Guide file — keep `benchmark-guide-8xA100.md` as an index vs. remove/redirect?** →
+   **kept as a thin index** at the same path, so all inbound links stay valid.
+
+**Implemented** across three commits on `claude/benchmark-tooling-p0-ui6dtp`:
+code (steps 1–4), doc restructure + script stubs (steps 5–8), and this status update.
+Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) remains open.
 
 ### Post-Implementation
 - [ ] `/review` — Hard Rules compliance (light here: no C++; check doc-sync + naming consistency).
