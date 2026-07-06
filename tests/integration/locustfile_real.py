@@ -589,7 +589,14 @@ PROMPT_SAMPLING = os.environ.get("PROMPT_SAMPLING", "random")
 # Large prefix configuration
 LARGE_PREFIX_MIN_TOKENS = int(os.environ.get("LARGE_PREFIX_MIN_TOKENS", "2000"))
 LARGE_PREFIX_MAX_TOKENS = int(os.environ.get("LARGE_PREFIX_MAX_TOKENS", "8000"))
-NUM_LARGE_PREFIXES = int(os.environ.get("NUM_LARGE_PREFIXES", "5"))
+# Default 50, NOT the historical 5. With N backends, a prefix pool <= N pins every
+# prefix to <= N backends under pure affinity (pigeonhole), which manufactured a false
+# "regression" in the May 2026 affinity-thrashing investigation (concentration, not a
+# routing defect). A pool >= backend count is the representative workload. Set
+# NUM_LARGE_PREFIXES=5 explicitly only to deliberately stress prefix concentration.
+# This locustfile is the single source of truth for the default; wrapper scripts
+# (bench.sh, bench-residency-ab.sh) pass this through only when the caller sets it.
+NUM_LARGE_PREFIXES = int(os.environ.get("NUM_LARGE_PREFIXES", "50"))
 
 # Cache-churn workload configuration (PROMPT_DISTRIBUTION=churn)
 #
@@ -630,8 +637,10 @@ PREFIX_SIZE_BUCKETS = [
     ("xlarge", 4000, 8000),
 ]
 
-# Ratio of requests that should share a prefix (0.0-1.0)
-SHARED_PREFIX_RATIO = float(os.environ.get("SHARED_PREFIX_RATIO", "0.7"))
+# Ratio of requests that should share a prefix (0.0-1.0).
+# Default 0.9 to match the representative benchmark workload (was 0.7); wrapper
+# scripts pass SHARED_PREFIX_RATIO through only when the caller overrides it.
+SHARED_PREFIX_RATIO = float(os.environ.get("SHARED_PREFIX_RATIO", "0.9"))
 
 # Configurable thresholds
 P99_LATENCY_THRESHOLD_MS = float(os.environ.get("P99_LATENCY_THRESHOLD_MS", "5000"))
