@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Request-admission policy seam** (embeddability series) — A pluggable,
+  per-request decision hook so embedders can apply custom admission policies —
+  quota systems, tenant-tier products, priority rewriters — without forking the
+  controller. `src/admission_policy.hpp` defines the abstract `AdmissionPolicy`
+  with a single synchronous, non-throwing `decide()` (Hard Rule #22) and a
+  process-wide factory seam (`set_/get_admission_policy_factory`), instantiated
+  once per shard alongside the other per-shard seam consumers so `decide()` is
+  always a shard-local call. The policy sees the request's resolved `api_key_id`,
+  its classified `PriorityLevel` (CRITICAL included — the hook does not hard-code
+  that judgment), and the pre-route estimated cost units; it returns Allow or
+  Reject. Reject surfaces as a 429 with `Retry-After` (reusing the existing
+  rejection plumbing); Allow may carry a `PriorityLevel` override applied before
+  scheduler enqueue and an optional `X-Ranvier-Admission-Warning` response
+  header. The proxy path consults it after priority extraction and before
+  backpressure/scheduler admission, so an override participates in tier queueing
+  and a rejection short-circuits before any queue slot is consumed. No
+  config-file surface (installed by embedder code, not YAML); no factory
+  installed => no policy object, no per-request branch cost beyond a null check,
+  behaviour bit-for-bit unchanged.
+
 - **Response-side usage accounting — Phase 1: capture actuals** (§20.2
   P1.5/P1.6 follow-up) — The usage-ledger sink and the `request_attribution`
   SQLite row now record the engine's **authoritative** token counts when the

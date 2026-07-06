@@ -2142,6 +2142,42 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     PriorityLevel priority = PriorityLevel::NORMAL;
     if (_config.priority_tier_enabled) {
         priority = extract_priority(*req, cost.cost_units, body_view);
+    }
+
+    // Admission policy consult (embeddability seam): after priority
+    // classification and before backpressure/scheduler admission, so a Reject
+    // short-circuits before any queue slot is consumed and a priority override
+    // participates in tier queueing. CRITICAL requests are consulted too — the
+    // policy sees the priority and decides. Applied BEFORE the per-tier metrics
+    // below so increment/decrement stay balanced on the final tier. Inert (one
+    // null check) when no factory installed a policy. See src/admission_policy.hpp.
+    if (_admission_policy) {
+        const AdmissionDecision decision = _admission_policy->decide(
+            AdmissionRequest{api_key_attr.id, priority, cost.cost_units});
+        if (decision.action == AdmissionAction::Reject) {
+            log_proxy.debug("[{}] Rejected by admission policy (retry_after={}s)",
+                           request_id, decision.retry_after_seconds);
+            // Reuse the existing rejection plumbing, but 429 (policy decision)
+            // rather than the 503 used for overload backpressure. Returns before
+            // the priority-active metric is incremented, and backend_guard is
+            // still frame-owned here, so the co_return unwind balances the
+            // guards without an explicit decrement (same as the backpressure
+            // rejection after acquire_concurrency_slot).
+            rep->set_status(seastar::http::reply::status_type::too_many_requests);
+            rep->add_header("X-Request-ID", request_id);
+            rep->add_header("Retry-After", std::to_string(decision.retry_after_seconds));
+            rep->write_body("json", "{\"error\": \"request rejected by admission policy\"}");
+            co_return std::move(rep);
+        }
+        if (decision.priority_override) {
+            priority = *decision.priority_override;
+        }
+        if (!decision.warning_header_value.empty()) {
+            rep->add_header(kAdmissionWarningHeader, decision.warning_header_value);
+        }
+    }
+
+    if (_config.priority_tier_enabled) {
         log_proxy.debug("[{}] Priority tier: {}", request_id, priority_level_to_string(priority));
         // Per-priority metrics: count and track active
         auto tier = static_cast<uint8_t>(priority);
