@@ -1,0 +1,8 @@
+# 50-prefix re-baseline — THRESHOLD LEG, raised thresholds (BACKLOG §25 item 5)
+# Load-aware factor 3.0 / floor 4 (the raised thresholds D2 validated at 50 prefixes,
+# P99 -6%). This leg decides whether 3.0/4 should replace the shipped 2.0/2 default.
+# Run into its OWN output dir:
+#   ./scripts/bench-runner.sh --suite custom \
+#       --file docs/benchmarks/rebaseline/threshold-3.0-4.runs \
+#       --repeat 3 --output-dir benchmark-reports/rebaseline/thr_3.0_4
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress --load-imbalance-factor 3.0 --load-imbalance-floor 4

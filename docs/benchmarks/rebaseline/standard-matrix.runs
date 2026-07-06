@@ -1,0 +1,21 @@
+# 50-prefix re-baseline — STANDARD MATRIX (BACKLOG §25 items 4/6)
+#
+# One bench.sh --compare config per line. Run with:
+#   ./scripts/bench-runner.sh --suite custom \
+#       --file docs/benchmarks/rebaseline/standard-matrix.runs \
+#       --repeat 3 --output-dir benchmark-reports/rebaseline/matrix
+#
+# --repeat 3 runs each config 3x, alternates the A/B arm order across repeats,
+# and writes per-config median/IQR aggregates to <output-dir>/aggregates/.
+#
+# Everything here rides the CURRENT SHIPPED DEFAULTS on purpose (this is the point
+# of the re-baseline): 50 large prefixes, prefix-ratio 0.9, stress distribution,
+# load-aware 2.0/floor 2, cache-residency 0.2, 20ms route-batch flush. Only the
+# values that are NOT the default (model, users, duration, max-model-len) are set.
+# Confirm the "Effective Routing Config" banner shows 50 / 0.9 / 2.0 / 2 / 0.2 /
+# 20ms before trusting any run.
+
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 10 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress
+--compare --model meta-llama/Llama-3.1-8B-Instruct --warmup --duration 10m --users 20 --prefix-ratio 0.9 --prompt-dist stress

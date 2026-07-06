@@ -1,0 +1,7 @@
+# 50-prefix re-baseline — THRESHOLD LEG, shipped defaults (BACKLOG §25 item 5)
+# Load-aware factor 2.0 / floor 2 (the SHIPPED defaults, never tested at 50 prefixes).
+# Run into its OWN output dir so the prefix arms glob cleanly for the comparison:
+#   ./scripts/bench-runner.sh --suite custom \
+#       --file docs/benchmarks/rebaseline/threshold-2.0-2.runs \
+#       --repeat 3 --output-dir benchmark-reports/rebaseline/thr_2.0_2
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress --load-imbalance-factor 2.0 --load-imbalance-floor 2
