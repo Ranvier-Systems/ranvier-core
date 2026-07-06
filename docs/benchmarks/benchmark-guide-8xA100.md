@@ -10,6 +10,7 @@ single-file guide (~2,500 lines, ~60% dated lab notebook) was split on 2026-07-0
 |------------|------|
 | Run a benchmark — setup, knobs, warm-up, A/B scenarios, validation, monitoring, export | **[benchmark-methodology.md](benchmark-methodology.md)** |
 | See results valid on the **current** defaults | **[benchmark-results-current.md](benchmark-results-current.md)** |
+| Run the 50-prefix re-baseline campaign (fills the TBD headline) | **[benchmark-rebaseline-campaign.md](benchmark-rebaseline-campaign.md)** |
 | Read the dated per-instance runs, invalidated sections, and re-run plans (append-only) | **[history/benchmark-history-8xA100.md](history/benchmark-history-8xA100.md)** |
 | Understand how to read TTFT / cache-hit numbers honestly | [interpreting-benchmark-numbers.md](interpreting-benchmark-numbers.md) |
 

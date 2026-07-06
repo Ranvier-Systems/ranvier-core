@@ -34,7 +34,11 @@ defaults** and are not quoted here.
 The headline will be filled in by the **50-prefix re-baseline campaign** (BACKLOG §25, items
 4–6): the standard matrix (13B 30u/30m, 13B 20u/10m, 13B 10u/10m, 8B 20u/10m — each
 `--compare`, ×3 repeats), reported as median-of-3 with an explicit "no reliable effect"
-verdict when the IQR spans zero on the discriminating metric.
+verdict when the IQR spans zero on the discriminating metric. The turnkey procedure —
+copy-paste commands, run files, pre-registered decision rules, and validity gates — is in the
+**[re-baseline campaign runbook](benchmark-rebaseline-campaign.md)**. All the supporting tooling
+(repeats + verdicts, manifests, 3-node telemetry, fair A/B ordering) is in place; only GPU time
+remains.
 
 ## Only current-workload data points we have so far
 

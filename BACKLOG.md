@@ -1275,8 +1275,8 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
   scripts/{bench,bench-residency-ab}.sh` (+ the stubs if used); `bench.sh --help`/a
   `--dry-run`-equivalent grep to confirm the banner prints effective 50/0.9 with knobs unset;
   markdown link-check across `docs/benchmarks/` for orphaned anchors. See `/validate`.
-- [ ] Follow-on: P0/P1 re-baseline campaign (items 4-6, needs 8×A100) and P1
-  capture machinery (items 8-10: manifest, 3-node scrape, A/B order fairness).
+- [ ] Follow-on: P0/P1 re-baseline campaign (items 4-6, needs 8×A100) — turnkey runbook +
+  run files ready at `docs/benchmarks/benchmark-rebaseline-campaign.md`; only GPU time remains.
 
 ### P1 progress (follow-on branches)
 - [x] **Item 7 — `--repeat` + aggregation** (branch `claude/benchmark-p1-repeat-aggregate`,
@@ -1311,7 +1311,10 @@ does repeats + median/IQR verdicts, self-describing manifests with mismatch guar
 telemetry with Gini, and fair A/B ordering — the prerequisites for a trustworthy re-baseline.
 **Next: the P0/P1 50-prefix re-baseline campaign (items 4–6), which needs 8×A100 GPU time** and
 produces the first citable headline under the representative workload (fills the current TBD in
-`benchmark-results-current.md`).
+`benchmark-results-current.md`). A **turnkey runbook** — copy-paste commands, committed run
+files, pre-registered decision rules, GPU budget, and validity gates — is ready at
+[`docs/benchmarks/benchmark-rebaseline-campaign.md`](docs/benchmarks/benchmark-rebaseline-campaign.md)
+with run files under `docs/benchmarks/rebaseline/`. Nothing blocks it but the GPU box.
 
 ---
 
