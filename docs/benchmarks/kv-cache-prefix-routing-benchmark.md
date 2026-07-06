@@ -5,7 +5,7 @@
 **Models:** Llama-3.1-8B, CodeLlama-13b, Llama-3.1-70B
 **vLLM:** Prefix caching enabled (`--enable-prefix-caching`)
 
-> **For the comprehensive, authoritative benchmark results** (including 13B, 70B, prefix ratio sweeps, client tokenization, stress tests, and 30-minute validated runs), see: **[Benchmark Guide for 8x A100](benchmark-guide-8xA100.md)**
+> **For the full 8x A100 benchmark docs**, start at the **[Benchmark Guide index](benchmark-guide-8xA100.md)**: how to run in **[benchmark-methodology.md](benchmark-methodology.md)**, results valid on current defaults in **[benchmark-results-current.md](benchmark-results-current.md)** (representative-workload headline currently TBD pending the 50-prefix re-baseline), and the dated per-run lab notebook (13B/70B, prefix-ratio sweeps, client tokenization, stress tests — measured on the deprecated 5-prefix workload) in **[history/benchmark-history-8xA100.md](history/benchmark-history-8xA100.md)**.
 >
 > This document contains the original 8B benchmarks from January 2026 plus updated summary data.
 

@@ -457,8 +457,8 @@ Mock backends respond instantly, which is useful for measuring router latency bu
 ### Quick Start
 
 ```bash
-# Using the helper script (recommended)
-./scripts/run-multi-gpu-benchmark.sh 129.213.118.109 123.45.67.89
+# Using the consolidated benchmark runner (recommended)
+./scripts/bench.sh --skip-vllm --vllm-endpoints 129.213.118.109:8000,123.45.67.89:8000
 
 # Single-GPU sanity check (recommended starting point)
 HF_TOKEN=your_token make benchmark-single-gpu
@@ -668,8 +668,8 @@ curl http://<instance-ip>:8000/health
 With two Lambda instances running vLLM:
 
 ```bash
-# Using the helper script
-./scripts/run-multi-gpu-benchmark.sh <gpu1-ip> <gpu2-ip>
+# Using the consolidated benchmark runner
+./scripts/bench.sh --skip-vllm --vllm-endpoints <gpu1-ip>:8000,<gpu2-ip>:8000
 
 # Or manually
 VLLM_ENDPOINT_1=http://<gpu1-ip>:8000 \
