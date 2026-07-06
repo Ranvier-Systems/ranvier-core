@@ -1548,6 +1548,73 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# Run manifest
+# -----------------------------------------------------------------------------
+# Write manifest.json into a report dir so a run is self-describing: commit, argv,
+# the effective routing config (the same values as the "Effective Routing Config"
+# banner), the workload knobs, hardware, and vLLM version. results_parser.py reads
+# this to loudly warn when it is asked to compare or aggregate runs whose WORKLOAD
+# knobs differ — the mechanism that ends the hand-copied-table failure mode.
+# See BACKLOG §25 (item 8) and the benchmark review F5.
+_json_escape() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+write_manifest() {
+    local dir="$1"
+    local mode="$2"   # routing arm for this dir (prefix / round_robin / random)
+    [[ -z "$dir" || ! -d "$dir" ]] && return 0
+
+    local commit host ts client_tok
+    commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    host="$(hostname 2>/dev/null || echo unknown)"
+    ts="$(date -Iseconds 2>/dev/null || date)"
+    client_tok=false
+    [[ "$CLIENT_TOKENIZE" = true ]] && client_tok=true
+
+    {
+        printf '{\n'
+        printf '  "schema_version": 1,\n'
+        printf '  "timestamp": "%s",\n' "$(_json_escape "$ts")"
+        printf '  "commit": "%s",\n' "$(_json_escape "$commit")"
+        printf '  "host": "%s",\n' "$(_json_escape "$host")"
+        printf '  "command": "%s",\n' "$(_json_escape "$ORIGINAL_CMD")"
+        printf '  "vllm_version": "%s",\n' "$(_json_escape "$VLLM_VERSION")"
+        printf '  "hardware": { "gpu_name": "%s", "gpu_count": "%s" },\n' \
+            "$(_json_escape "${GPU_NAME:-unknown}")" "${TOTAL_GPUS:-0}"
+        printf '  "routing": {\n'
+        printf '    "mode": "%s",\n' "$(_json_escape "$mode")"
+        printf '    "load_aware_routing": "%s",\n' "$(_json_escape "${RANVIER_LOAD_AWARE_ROUTING:-}")"
+        printf '    "load_imbalance_factor": "%s",\n' "$(_json_escape "${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}")"
+        printf '    "load_imbalance_floor": "%s",\n' "$(_json_escape "${RANVIER_LOAD_IMBALANCE_FLOOR:-2}")"
+        printf '    "cache_residency_threshold": "%s"\n' "$(_json_escape "${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}")"
+        printf '  },\n'
+        # workload knobs — the block results_parser.py compares for comparability.
+        printf '  "workload": {\n'
+        printf '    "model": "%s",\n' "$(_json_escape "$MODEL")"
+        printf '    "num_backends": "%s",\n' "$(_json_escape "${NUM_BACKENDS:-0}")"
+        printf '    "users": "%s",\n' "$(_json_escape "$USERS")"
+        printf '    "duration": "%s",\n' "$(_json_escape "$DURATION")"
+        printf '    "spawn_rate": "%s",\n' "$(_json_escape "${SPAWN_RATE:-}")"
+        printf '    "prompt_distribution": "%s",\n' "$(_json_escape "$PROMPT_DIST")"
+        printf '    "shared_prefix_ratio": "%s",\n' "$(_json_escape "$PREFIX_RATIO")"
+        printf '    "num_large_prefixes": "%s",\n' "$(_json_escape "${NUM_LARGE_PREFIXES:-50}")"
+        printf '    "max_output_tokens": "%s",\n' "$(_json_escape "${MAX_TOKENS:-}")"
+        printf '    "client_tokenize": "%s"' "$client_tok"
+        if [[ "$PROMPT_DIST" == "churn" ]]; then
+            printf ',\n    "churn": { "universe": "%s", "active": "%s", "rotation_step": "%s", "rotation_seconds": "%s", "seed": "%s" }\n' \
+                "$(_json_escape "${CHURN_PREFIX_UNIVERSE:-200}")" \
+                "$(_json_escape "${CHURN_ACTIVE_PREFIXES:-24}")" \
+                "$(_json_escape "${CHURN_ROTATION_STEP:-8}")" \
+                "$(_json_escape "${CHURN_ROTATION_SECONDS:-20}")" \
+                "$(_json_escape "${CHURN_SEED:-42}")"
+        else
+            printf '\n'
+        fi
+        printf '  }\n'
+        printf '}\n'
+    } > "$dir/manifest.json"
+}
+
+# -----------------------------------------------------------------------------
 # Run benchmark function
 # -----------------------------------------------------------------------------
 
@@ -1602,6 +1669,9 @@ run_benchmark() {
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     REPORT_DIR="${OUTPUT_DIR}/${TIMESTAMP}_${TOTAL_GPUS}gpu_${ROUTING_MODE}"
     mkdir -p "$REPORT_DIR"
+
+    # Self-describing run manifest (commit, argv, effective config, workload knobs).
+    write_manifest "$REPORT_DIR" "$ROUTING_MODE"
 
     # Set environment for locust
     export NUM_BACKENDS="$NUM_BACKENDS"
@@ -1809,6 +1879,9 @@ if [[ "$WARMUP" = true ]]; then
     # Create warmup directory
     WARMUP_DIR="${OUTPUT_DIR}/warmup_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$WARMUP_DIR"
+
+    # Manifest for the warm-up dir too (always prefix mode).
+    write_manifest "$WARMUP_DIR" "prefix"
 
     # Build backend env args
     BACKEND_ARGS=""
