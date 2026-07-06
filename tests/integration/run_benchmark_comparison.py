@@ -35,7 +35,7 @@ For large-prefix stress testing that demonstrates measurable KV cache improvemen
 
     # Customize large prefix settings
     python3 tests/integration/run_benchmark_comparison.py --stress \
-        --large-prefix-min 2000 --large-prefix-max 8000 --num-prefixes 5
+        --large-prefix-min 2000 --large-prefix-max 8000 --num-prefixes 50
 
 Expected Results with Large Prefixes:
     - Cache hits: 50-100ms TTFT (cached prefill)
@@ -311,7 +311,7 @@ def format_stress_test_report(
     lines.append(f"  Prompt Distribution: {config.get('prompt_distribution', 'large-prefix')}")
     lines.append(f"  Large Prefix Min Tokens: {config.get('large_prefix_min', 2000)}")
     lines.append(f"  Large Prefix Max Tokens: {config.get('large_prefix_max', 8000)}")
-    lines.append(f"  Number of Prefixes: {config.get('num_prefixes', 5)}")
+    lines.append(f"  Number of Prefixes: {config.get('num_prefixes', 50)}")
     lines.append(f"  Expected Random Cache Hit Rate: {expected_random_hit:.1f}% (1/{num_backends})")
     lines.append("")
 
@@ -636,8 +636,11 @@ def main():
     parser.add_argument(
         "--num-prefixes",
         type=int,
-        default=5,
-        help="Number of large prefixes to generate (default: 5)",
+        default=50,
+        help="Number of large prefixes to generate (default: 50). Keep >= backend "
+        "count; a pool <= backends pigeonholes affinity onto too few backends "
+        "(the deprecated 5-prefix workload). Use a small value only to stress "
+        "prefix concentration.",
     )
     parser.add_argument(
         "--num-backends",

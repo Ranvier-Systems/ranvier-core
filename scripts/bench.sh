@@ -1438,7 +1438,9 @@ fi
 # pins all prefixes to <=5 backends under pure affinity (forced concentration,
 # Gini ~0.5). Raise (e.g. 50) to relax that. Auditable here because it changes
 # how to read the per-backend distribution.
-log_info "NUM_LARGE_PREFIXES            = ${NUM_LARGE_PREFIXES:-50 (bench default)}  [workload, not routing]"
+# Fallback literal must match locustfile_real.py's NUM_LARGE_PREFIXES default: it
+# is only a display/pigeonhole-check value here; bench.sh no longer injects it.
+log_info "NUM_LARGE_PREFIXES            = ${NUM_LARGE_PREFIXES:-50 (locust default)}  [workload, not routing]"
 if [[ "${NUM_LARGE_PREFIXES:-50}" -le "${NUM_BACKENDS:-0}" ]] 2>/dev/null; then
     log_warn "NUM_LARGE_PREFIXES (${NUM_LARGE_PREFIXES:-50}) <= backends (${NUM_BACKENDS:-?}): pure affinity cannot use all backends (pigeonhole concentration; intentional only for a stress test)."
 fi
@@ -1662,17 +1664,23 @@ run_benchmark() {
     PREFIX_MAX_ARGS=""
     [[ -n "$PREFIX_MAX_TOKENS" ]] && PREFIX_MAX_ARGS="-e LARGE_PREFIX_MAX_TOKENS=$PREFIX_MAX_TOKENS"
 
-    # Forward NUM_LARGE_PREFIXES so the workload's unique-prefix count is
-    # controllable (and auditable in the banner). We default to 50, NOT locust's
-    # default of 5: with 8 backends, 5 prefixes pins all prefixes to <=5 backends
-    # under pure affinity (pigeonhole), which manufactured a false "regression"
-    # in the May 2026 investigation. 50 (>= backend count) is representative.
-    # Pass NUM_LARGE_PREFIXES=5 explicitly only to stress prefix concentration.
-    NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-50}"
+    # Forward NUM_LARGE_PREFIXES to the workload ONLY when the caller set it.
+    # locustfile_real.py is the single source of truth for the default (50, chosen
+    # because with N backends a pool <= N pigeonholes every prefix onto <= N backends
+    # under pure affinity — the false "regression" of the May 2026 investigation).
+    # Not re-defaulting here avoids a second, drift-prone copy of that constant.
+    # Set NUM_LARGE_PREFIXES=5 in the environment only to stress prefix concentration.
+    NUM_PREFIXES_ARGS=""
+    [[ -n "$NUM_LARGE_PREFIXES" ]] && NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=$NUM_LARGE_PREFIXES"
 
-    # Forward churn-workload knobs (read by locustfile_real.py; only meaningful
-    # with --prompt-dist churn). Defaults mirror the locustfile's.
-    CHURN_ARGS="-e CHURN_PREFIX_UNIVERSE=${CHURN_PREFIX_UNIVERSE:-200} -e CHURN_ACTIVE_PREFIXES=${CHURN_ACTIVE_PREFIXES:-24} -e CHURN_ROTATION_SECONDS=${CHURN_ROTATION_SECONDS:-20} -e CHURN_ROTATION_STEP=${CHURN_ROTATION_STEP:-8} -e CHURN_SEED=${CHURN_SEED:-42}"
+    # Forward churn-workload knobs (read by locustfile_real.py; only meaningful with
+    # --prompt-dist churn) ONLY when explicitly set — the locustfile owns the defaults.
+    CHURN_ARGS=""
+    [[ -n "$CHURN_PREFIX_UNIVERSE" ]]  && CHURN_ARGS+=" -e CHURN_PREFIX_UNIVERSE=$CHURN_PREFIX_UNIVERSE"
+    [[ -n "$CHURN_ACTIVE_PREFIXES" ]]  && CHURN_ARGS+=" -e CHURN_ACTIVE_PREFIXES=$CHURN_ACTIVE_PREFIXES"
+    [[ -n "$CHURN_ROTATION_SECONDS" ]] && CHURN_ARGS+=" -e CHURN_ROTATION_SECONDS=$CHURN_ROTATION_SECONDS"
+    [[ -n "$CHURN_ROTATION_STEP" ]]    && CHURN_ARGS+=" -e CHURN_ROTATION_STEP=$CHURN_ROTATION_STEP"
+    [[ -n "$CHURN_SEED" ]]             && CHURN_ARGS+=" -e CHURN_SEED=$CHURN_SEED"
 
     # Run locust via docker compose
     # Mount report dir as volume so files persist after container exits
@@ -1833,13 +1841,20 @@ if [[ "$WARMUP" = true ]]; then
     PREFIX_MAX_ARGS=""
     [[ -n "$PREFIX_MAX_TOKENS" ]] && PREFIX_MAX_ARGS="-e LARGE_PREFIX_MAX_TOKENS=$PREFIX_MAX_TOKENS"
 
-    # Match the main run's prefix count so warm-up primes the same prefix set
-    # (default 50, see the main run block for rationale).
-    NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-50}"
+    # Match the main run's prefix count so warm-up primes the same prefix set.
+    # Forward only when set; unset means both warm-up and main run inherit the
+    # locustfile default (50), so the two stay identically primed either way.
+    NUM_PREFIXES_ARGS=""
+    [[ -n "$NUM_LARGE_PREFIXES" ]] && NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=$NUM_LARGE_PREFIXES"
 
     # Match the main run's churn knobs so warm-up exercises the same universe
-    # (CHURN_SEED makes the prefix content identical).
-    CHURN_ARGS="-e CHURN_PREFIX_UNIVERSE=${CHURN_PREFIX_UNIVERSE:-200} -e CHURN_ACTIVE_PREFIXES=${CHURN_ACTIVE_PREFIXES:-24} -e CHURN_ROTATION_SECONDS=${CHURN_ROTATION_SECONDS:-20} -e CHURN_ROTATION_STEP=${CHURN_ROTATION_STEP:-8} -e CHURN_SEED=${CHURN_SEED:-42}"
+    # (CHURN_SEED makes the prefix content identical). Forward only when set.
+    CHURN_ARGS=""
+    [[ -n "$CHURN_PREFIX_UNIVERSE" ]]  && CHURN_ARGS+=" -e CHURN_PREFIX_UNIVERSE=$CHURN_PREFIX_UNIVERSE"
+    [[ -n "$CHURN_ACTIVE_PREFIXES" ]]  && CHURN_ARGS+=" -e CHURN_ACTIVE_PREFIXES=$CHURN_ACTIVE_PREFIXES"
+    [[ -n "$CHURN_ROTATION_SECONDS" ]] && CHURN_ARGS+=" -e CHURN_ROTATION_SECONDS=$CHURN_ROTATION_SECONDS"
+    [[ -n "$CHURN_ROTATION_STEP" ]]    && CHURN_ARGS+=" -e CHURN_ROTATION_STEP=$CHURN_ROTATION_STEP"
+    [[ -n "$CHURN_SEED" ]]             && CHURN_ARGS+=" -e CHURN_SEED=$CHURN_SEED"
 
     # Run warm-up benchmark
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \

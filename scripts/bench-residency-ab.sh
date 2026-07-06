@@ -73,12 +73,25 @@ MAX_TOKENS_OPT=""            # bench.sh --max-tokens (default 100 there)
 BUILD_IMAGE=false
 EXTRA_BENCH_ARGS=""
 
-# Churn workload knobs (forwarded to bench.sh -> locust as env vars)
-CHURN_UNIVERSE="${CHURN_PREFIX_UNIVERSE:-200}"
-CHURN_ACTIVE="${CHURN_ACTIVE_PREFIXES:-24}"
-CHURN_ROT_SECS="${CHURN_ROTATION_SECONDS:-20}"
-CHURN_STEP="${CHURN_ROTATION_STEP:-8}"
-CHURN_SEED_VAL="${CHURN_SEED:-42}"
+# Churn workload knobs (forwarded to bench.sh -> locust as env vars).
+# Empty = "leave at the locustfile default". Populated from the environment if the
+# caller exported it, or from a --churn-* flag below. Exported to bench.sh only when
+# non-empty (see below), so locustfile_real.py stays the single source of truth for
+# the defaults instead of this script carrying a third, drift-prone copy of them.
+CHURN_UNIVERSE="${CHURN_PREFIX_UNIVERSE:-}"
+CHURN_ACTIVE="${CHURN_ACTIVE_PREFIXES:-}"
+CHURN_ROT_SECS="${CHURN_ROTATION_SECONDS:-}"
+CHURN_STEP="${CHURN_ROTATION_STEP:-}"
+CHURN_SEED_VAL="${CHURN_SEED:-}"
+
+# Locustfile defaults, mirrored here for the A/B report's churn line ONLY (shown when
+# a knob is left at default). Keep in sync with locustfile_real.py — a mismatch
+# changes only what the report prints, never the workload locust actually runs.
+CHURN_UNIVERSE_DEFAULT=200
+CHURN_ACTIVE_DEFAULT=24
+CHURN_ROT_SECS_DEFAULT=20
+CHURN_STEP_DEFAULT=8
+CHURN_SEED_DEFAULT=42
 
 print_help() {
     cat << 'EOF'
@@ -206,12 +219,16 @@ if [[ ! -x "$BENCH" ]]; then
     exit 1
 fi
 
-# Churn knobs flow: wrapper -> env -> bench.sh -> locust container
-export CHURN_PREFIX_UNIVERSE="$CHURN_UNIVERSE"
-export CHURN_ACTIVE_PREFIXES="$CHURN_ACTIVE"
-export CHURN_ROTATION_SECONDS="$CHURN_ROT_SECS"
-export CHURN_ROTATION_STEP="$CHURN_STEP"
-export CHURN_SEED="$CHURN_SEED_VAL"
+# Churn knobs flow: wrapper -> env -> bench.sh -> locust container.
+# Export only the knobs the caller actually overrode (env or --churn-*); the rest
+# fall through to the locustfile default. Because both A/B legs run from this single
+# invocation under one environment, an unset knob resolves to the same locustfile
+# default in both legs, so the byte-identical prompt universe (incl. seed) holds.
+[[ -n "$CHURN_UNIVERSE" ]]  && export CHURN_PREFIX_UNIVERSE="$CHURN_UNIVERSE"
+[[ -n "$CHURN_ACTIVE" ]]    && export CHURN_ACTIVE_PREFIXES="$CHURN_ACTIVE"
+[[ -n "$CHURN_ROT_SECS" ]]  && export CHURN_ROTATION_SECONDS="$CHURN_ROT_SECS"
+[[ -n "$CHURN_STEP" ]]      && export CHURN_ROTATION_STEP="$CHURN_STEP"
+[[ -n "$CHURN_SEED_VAL" ]]  && export CHURN_SEED="$CHURN_SEED_VAL"
 
 mkdir -p "$OUTPUT_ROOT"
 
@@ -414,7 +431,7 @@ log_info "Threshold (ON):  $THRESHOLD_ON   (OFF leg: 0.0)"
 log_info "Load-aware:      $( [[ "$WITH_LOAD_AWARE" = true ]] && echo "ON in both legs" || echo "OFF in both legs (isolated residency delta)" )"
 log_info "RR baseline:     $( [[ "$WITH_RR_BASELINE" = true ]] && echo "yes (--compare per leg)" || echo "no (prefix legs only)" )"
 log_info "Leg order:       $ORDER"
-log_info "Churn workload:  universe=$CHURN_UNIVERSE active=$CHURN_ACTIVE step=$CHURN_STEP/${CHURN_ROT_SECS}s seed=$CHURN_SEED_VAL"
+log_info "Churn workload:  universe=${CHURN_UNIVERSE:-$CHURN_UNIVERSE_DEFAULT} active=${CHURN_ACTIVE:-$CHURN_ACTIVE_DEFAULT} step=${CHURN_STEP:-$CHURN_STEP_DEFAULT}/${CHURN_ROT_SECS:-$CHURN_ROT_SECS_DEFAULT}s seed=${CHURN_SEED_VAL:-$CHURN_SEED_DEFAULT}"
 [[ -n "$MAX_TOKENS_OPT" ]] && log_info "Max out tokens:  $MAX_TOKENS_OPT  (decode duration = sustained KV hold)"
 log_info "Output:          $OUTPUT_ROOT"
 echo ""
@@ -658,7 +675,7 @@ GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,
     echo "- **Hardware:** $GPU_INFO"
     echo "- **Model:** $MODEL"
     echo "- **Config:** ${USERS}u / $DURATION per leg, gpu-mem-util $GPU_MEM_UTIL, load-aware $( [[ "$WITH_LOAD_AWARE" = true ]] && echo on || echo off ), threshold ON=$THRESHOLD_ON"
-    echo "- **Churn:** universe=$CHURN_UNIVERSE active=$CHURN_ACTIVE step=$CHURN_STEP/${CHURN_ROT_SECS}s seed=$CHURN_SEED_VAL"
+    echo "- **Churn:** universe=${CHURN_UNIVERSE:-$CHURN_UNIVERSE_DEFAULT} active=${CHURN_ACTIVE:-$CHURN_ACTIVE_DEFAULT} step=${CHURN_STEP:-$CHURN_STEP_DEFAULT}/${CHURN_ROT_SECS:-$CHURN_ROT_SECS_DEFAULT}s seed=${CHURN_SEED_VAL:-$CHURN_SEED_DEFAULT}"
     echo "- **Validity:** $VALID (OFF downgrades=$OFF_DOWN, ON downgrades=$ON_DOWN)"
     echo ""
     echo "## Headline (fill from ab-summary.txt)"
