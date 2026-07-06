@@ -415,6 +415,48 @@ With client tokenization, **cache misses also get faster** because the server sk
 - Focus on **Large/XLarge buckets** where caching matters most
 - Results are instance-dependent; 13B benefits most under sustained load (30u 30m)
 
+> **A single A/B run is not a result.** Run-to-run variance is the top documented
+> confound (identical back-to-back configs have given P99 −37% vs +31%). Never quote
+> one run — use `--repeat` (below) and report the median with its verdict.
+
+---
+
+### Scenario 2b: Repeats & Aggregation (variance discipline)
+
+**Purpose:** Turn N repeats of a config into one defensible number, and refuse to
+conclude when the effect isn't reliable.
+
+Run the whole suite (or a config) N times and aggregate automatically:
+
+```bash
+# Each config runs 3x; per-config median/IQR + verdict land in
+# benchmark-reports/aggregates/
+./scripts/bench-runner.sh --suite high --repeat 3
+```
+
+Or aggregate report dirs by hand (e.g. an A/B: prefix arm vs round-robin baseline):
+
+```bash
+./tests/integration/results_parser.py aggregate \
+  benchmark-reports/*prefix*/ --baseline benchmark-reports/*round_robin*/ \
+  --metric p99_ttft_ms --json agg.json
+```
+
+**How to read the verdict** (the discriminating metric defaults to `p99_ttft_ms`):
+
+- **`IMPROVEMENT` / `REGRESSION: median ±X%`** — the middle 50% (IQR) of the
+  per-repeat %change is entirely on one side of zero. This is a citable result;
+  quote the **median**, not the best run.
+- **`NO RELIABLE EFFECT (IQR spans zero)`** — the effect is within the noise. Report
+  exactly this; do **not** cherry-pick the favorable run.
+- **`INSUFFICIENT DATA`** — fewer than 2 valid repeats; run more.
+- **Hot-spot flag** — a repeat where the prefix arm's P99 is ≫ round-robin's *at a
+  high cache-hit rate* is the affinity-thrash signature; investigate before trusting
+  the headline (see the history archive's May 2026 investigation).
+
+Pre-registered rule for the re-baseline campaign: **report median-of-3; if the IQR
+spans zero on the discriminating metric, the verdict is "no reliable effect."**
+
 ---
 
 ### Scenario 3: High Concurrency Stress Test
