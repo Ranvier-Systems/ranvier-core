@@ -728,6 +728,12 @@ struct RanvierConfig {
     // and `telemetry` (tracing). Off by default. See config_infra.hpp for the
     // struct and src/usage_ledger_sink.hpp for the sink contract.
     UsageLedgerConfig usage_ledger;
+    // Optional pluggable source of route-scorer weights, supplied at runtime
+    // from an external policy service and consulted OFF the request path.
+    // DISTINCT from `routing.scoring.*` (the static baseline). Off by default.
+    // See config_infra.hpp for the struct and src/routing_weights_provider.hpp
+    // for the provider contract.
+    RoutingWeightsProviderConfig routing_weights_provider;
     // GIE Endpoint-Picker (EPP) ext_proc gRPC compatibility mode. Off by
     // default; compiled only when WITH_GIE_EPP=ON. See config_infra.hpp for the
     // struct and src/gie_epp_server.hpp for the server.

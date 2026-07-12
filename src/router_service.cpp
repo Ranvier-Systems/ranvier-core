@@ -451,6 +451,20 @@ struct ShardLocalState {
         static constexpr size_t MAX_ENTRIES = 256;         // Hard Rule #4
     } residency_cache;
 
+    // ========================================================================
+    // Routing-Score Weight Overrides (per-shard; from an optional provider)
+    // ========================================================================
+    // Provider-supplied route-scorer weights, published off the request path by
+    // RouterService::broadcast_routing_weights_overrides() via whole-map-replace
+    // (same shard-0 → all-shards idiom as the GPU/headroom caches). Keyed on the
+    // anchor backend's operator labels, which the scorer resolves in one shard-
+    // local lookup at scoring time. EMPTY in the stock build (no provider
+    // configured) — the scorer then reads config.scoring unchanged, so routing
+    // is identical to config-only, bit-for-bit (the safe-default guarantee).
+    // Bounded (Rule #4). Transient — never persisted.
+    RoutingWeightsSnapshot scoring_weights_overrides;
+    static constexpr size_t MAX_WEIGHT_OVERRIDES = 512;
+
     // Upsert one backend's residency on THIS shard (shard-local, lock-free).
     // Bounded by MAX_ENTRIES; an update to an already-tracked backend always
     // succeeds (refreshes value + timestamp) even at capacity. When inserting a
@@ -742,6 +756,9 @@ struct ShardLocalState {
 
         // Clear cache residency cache
         residency_cache.entries.clear();
+
+        // Clear provider-supplied route-scorer weight overrides
+        scoring_weights_overrides.clear();
 
         // Clear native KV-event state
         native_kv.fresh.clear();
@@ -2181,6 +2198,7 @@ seastar::future<> RouterService::stop() {
         // Gate closed - no in-flight TTL callbacks, safe to cancel timer
         stop_ttl_timer();
         stop_draining_reaper();
+        stop_weights_refresh();
 
         // Stop gossip last (returns future, may have pending operations)
         return stop_gossip();
@@ -2758,6 +2776,20 @@ std::optional<BackendId> RouterService::get_random_backend() {
 // routes are stored/looked up at the shared prefix boundary rather than the
 // full token sequence, improving KV-cache reuse for multi-turn conversations.
 //
+
+// The provider-lookup key for the scoring pass: the anchor backend's operator
+// labels, read from the shard-local BackendInfo the scorer already consults.
+// An unknown anchor yields a default key (unlabeled) — resolve_scoring_weights
+// then just misses the override map and returns the configured baseline.
+static RoutingWeightsKey weights_key_for(const ShardLocalState& state, BackendId anchor) {
+    auto it = state.backends.find(anchor);
+    if (it == state.backends.end()) {
+        return RoutingWeightsKey{};
+    }
+    return RoutingWeightsKey{it->second.model_family, it->second.type,
+                             it->second.hardware_label};
+}
+
 PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
                                                          const std::string& request_id,
                                                          size_t prefix_boundary,
@@ -3086,7 +3118,19 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     // Rule #17: all loops bounded by the live backend count (≤ 256, typically
     //           <10) — well under the preemption threshold.
 
-    const ScoringWeights& weights = state.config.scoring;
+    // Resolve the current weights: an optional provider may override the
+    // configured routing.scoring.* for this request's anchor-backend key. This
+    // is a pointer/read into the off-path snapshot, NOT a per-request weight
+    // computation. Stock build (or provider with no opinion): the snapshot is
+    // empty, so this is a single empty-check and `state.config.scoring` is
+    // returned by reference, unchanged — bit-for-bit the pre-provider path.
+    const ScoringWeights& weights =
+        state.scoring_weights_overrides.empty()
+            ? state.config.scoring
+            : resolve_scoring_weights(
+                  state.scoring_weights_overrides,
+                  weights_key_for(state, selected),
+                  state.config.scoring);
     const auto strategy = state.config.hash_strategy;
     const bool median_strategy =
         strategy == RoutingConfig::HashStrategy::JUMP ||
@@ -4429,6 +4473,30 @@ seastar::future<> RouterService::broadcast_cache_headroom(
         });
 }
 
+seastar::future<> RouterService::broadcast_routing_weights_overrides(
+        RoutingWeightsSnapshot overrides) {
+    // Rule #0/#14: cross the map to every shard via foreign_ptr; each shard
+    // whole-map-replaces its own (local-allocator) override map. Same shape as
+    // broadcast_gpu_load. Runs off the request path (the refresh timer), so the
+    // hot-path scorer only ever reads an already-published snapshot.
+    auto shared = seastar::make_foreign(
+        std::make_unique<RoutingWeightsSnapshot>(std::move(overrides)));
+
+    // Rule #20: the coroutine frame keeps `shared` alive across the co_await.
+    co_await seastar::smp::invoke_on_all(
+        [&shared] {
+            if (!g_shard_state) return;
+            auto& dst = g_shard_state->scoring_weights_overrides;
+            dst.clear();
+            for (const auto& [key, weights] : *shared) {
+                if (dst.size() >= ShardLocalState::MAX_WEIGHT_OVERRIDES) break;
+                // Copy-construct key+value LOCALLY on this shard (the key owns a
+                // std::string) — never move the foreign heap in (Rule #14).
+                dst.insert_or_assign(key, weights);
+            }
+        });
+}
+
 seastar::future<> RouterService::broadcast_cache_state_global(
         absl::flat_hash_map<BackendId, CacheStateSample> samples) {
     // Rule #0/#14: transfer the shared map across shards via foreign_ptr; each
@@ -5130,6 +5198,78 @@ void RouterService::run_draining_reaper() {
                 log_router.warn("Failed to unregister drained backends: {}", e.what());
             }
         });
+}
+
+// ============================================================================
+// Routing-Score Weights Provider Refresh Timer (shard 0, off request path)
+// ============================================================================
+//
+// HARD RULE #5 (Timer Ownership):
+// The callback captures `this` to reach _weights_provider and the shard-0
+// backend set. It acquires a _timer_gate holder at entry and moves it into the
+// async chain's .finally(), so the gate stays held for the whole refresh; stop()
+// closes _timer_gate (waiting for any in-flight refresh) BEFORE
+// stop_weights_refresh() cancels the timer.
+//
+void RouterService::start_weights_refresh(std::unique_ptr<RoutingWeightsProvider> provider,
+                                          std::chrono::seconds interval) {
+    _weights_provider = std::move(provider);
+    _weights_refresh_timer.set_callback([this] {
+        seastar::gate::holder holder;
+        try {
+            holder = _timer_gate.hold();
+        } catch (const seastar::gate_closed_exception&) {
+            return;  // service is stopping
+        }
+        // Rule #5: move the holder into .finally() so it outlives the whole
+        // async refresh, not just this synchronous callback body.
+        (void)refresh_routing_weights()
+            .handle_exception([](std::exception_ptr ep) {
+                // Rule #9: every catch logs at warn minimum. A provider fault
+                // leaves the last-published snapshot in place (or the empty
+                // stock snapshot) — routing keeps working on configured weights.
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::exception& e) {
+                    log_router.warn("Routing-weights refresh failed: {}", e.what());
+                }
+            })
+            .finally([holder = std::move(holder)] {});
+    });
+    _weights_refresh_timer.arm_periodic(interval);
+    log_main.info("Routing-weights provider refresh started (interval: {}s)",
+                  interval.count());
+}
+
+void RouterService::stop_weights_refresh() {
+    _weights_refresh_timer.cancel();
+}
+
+seastar::future<> RouterService::refresh_routing_weights() {
+    if (!_weights_provider || !g_shard_state) {
+        co_return;
+    }
+
+    // Gather the DISTINCT anchor keys from shard 0's registered backends. The
+    // backend set is operator-bounded (Rule #4/#17: <= 256, no yield needed),
+    // and dedup keeps the provider query count at the number of distinct label
+    // triples, not the backend count.
+    std::vector<RoutingWeightsKey> keys;
+    absl::flat_hash_set<RoutingWeightsKey, RoutingWeightsKeyHash> seen;
+    for (const auto& [id, info] : shard_state().backends) {
+        RoutingWeightsKey key{info.model_family, info.type, info.hardware_label};
+        if (seen.insert(key).second) {
+            keys.push_back(std::move(key));
+        }
+    }
+
+    // Consult the provider OFF the request path. build_routing_weights_snapshot
+    // is synchronous (per the provider contract, weights_for() is a non-blocking
+    // local lookup), so there is no sequential-await loop here (Rule #2 N/A).
+    RoutingWeightsSnapshot snapshot =
+        build_routing_weights_snapshot(*_weights_provider, keys);
+
+    co_await broadcast_routing_weights_overrides(std::move(snapshot));
 }
 
 seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {

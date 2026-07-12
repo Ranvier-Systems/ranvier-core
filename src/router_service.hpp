@@ -5,6 +5,7 @@
 #include "radix_tree.hpp"
 #include "config.hpp"
 #include "gossip_service.hpp"  // For NodeState
+#include "routing_weights_provider.hpp"  // RoutingWeightsProvider, RoutingWeightsSnapshot
 
 #include <absl/container/flat_hash_map.h>
 #include <cstdint>
@@ -569,6 +570,27 @@ public:
     // Stop the draining reaper timer (call before shutdown)
     void stop_draining_reaper();
 
+    // ---- Routing-Score Weights Provider (optional, off-request-path) ----
+
+    // Install a routing-weights provider (shard 0) and arm the periodic refresh
+    // that consults it off the request path and publishes a shard-local weight
+    // snapshot to every shard. Call once at start-up, only when configured
+    // (routing_weights_provider.enabled); the stock build never calls it, so the
+    // snapshot stays empty and the scorer reads config.scoring unchanged. Takes
+    // ownership of `provider`. Idempotent-unsafe: call exactly once.
+    void start_weights_refresh(std::unique_ptr<RoutingWeightsProvider> provider,
+                               std::chrono::seconds interval);
+
+    // Cancel the routing-weights refresh timer (call before shutdown). Safe when
+    // the refresh was never armed.
+    void stop_weights_refresh();
+
+    // Publish a provider-built weight snapshot to every shard via whole-map-
+    // replace (same foreign_ptr + invoke_on_all idiom as broadcast_gpu_load).
+    // Runs off the request path. Takes the map by value (Rule #22).
+    static seastar::future<> broadcast_routing_weights_overrides(
+        RoutingWeightsSnapshot overrides);
+
     // ---- Local Route Batching (shard-local, no cross-shard access on enqueue) ----
 
     // Start per-shard local batch flush timers (call via smp::invoke_on_all)
@@ -929,6 +951,17 @@ private:
 
     // Draining reaper timer (runs on shard 0, checks for expired draining backends)
     seastar::timer<> _draining_reaper_timer;
+
+    // Optional routing-weights provider + its periodic refresh timer (shard 0
+    // only; null / unarmed in the stock build). The refresh consults the
+    // provider OFF the request path and broadcasts a shard-local weight snapshot.
+    // Guarded by _timer_gate like the other shard-0 timers (Rule #5).
+    std::unique_ptr<RoutingWeightsProvider> _weights_provider;
+    seastar::timer<> _weights_refresh_timer;
+
+    // Refresh body (shard 0): gather the live backends' anchor keys, consult the
+    // provider for each, and broadcast the resulting snapshot to all shards.
+    seastar::future<> refresh_routing_weights();
 
     // Batch flush timer for remote routes (runs on shard 0)
     seastar::timer<> _batch_flush_timer;

@@ -617,6 +617,35 @@ telemetry_sink:
   max_buckets: 512
 
 # =============================================================================
+# Routing-Score Weights Provider Configuration
+# =============================================================================
+# Optional, pluggable source of route-scorer weights. By default the scorer's
+# per-signal weights come only from `routing.scoring.*` above. This seam lets an
+# operator supply those weights at runtime from an external policy/config
+# service instead. The provider is consulted OFF the request path by a periodic
+# refresh on shard 0, which publishes a per-shard override snapshot; the hot-
+# path scorer only ever reads that snapshot (one shard-local lookup).
+#
+# Off by default. With enabled=false, no provider is created and the refresh is
+# never armed, so the override snapshot stays empty and the scorer reads
+# `routing.scoring.*` unchanged — routing is identical to config-only.
+#
+# This stock build wires the no-op provider (always "no opinion"). Operators
+# plug in their own provider without recompiling consumers; the router does not
+# hard-depend on any concrete provider (see src/routing_weights_provider.hpp).
+# A concrete provider reads its own endpoint/credentials out-of-band, so the
+# only knobs here are the master switch and the refresh cadence.
+routing_weights_provider:
+  # Master switch (RANVIER_ROUTING_WEIGHTS_PROVIDER_ENABLED)
+  enabled: false
+
+  # How often shard 0 consults the provider and republishes the override
+  # snapshot to every shard. Off-path work only — weight policy changes slowly
+  # relative to request rate, so tens of seconds is typical.
+  # (RANVIER_ROUTING_WEIGHTS_PROVIDER_REFRESH_SECONDS)
+  refresh_seconds: 30
+
+# =============================================================================
 # Usage-Ledger Sink Configuration (per-request usage events)
 # =============================================================================
 # Pluggable per-request usage-event sink for external metering / attribution /
