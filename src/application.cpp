@@ -8,6 +8,7 @@
 #include "logging.hpp"
 #include "metrics_auth_handler.hpp"
 #include "metrics_service.hpp"
+#include "routing_weights_provider.hpp"
 #include "shard_load_metrics.hpp"
 #include "tracing_service.hpp"
 #include "usage_ledger_sink.hpp"
@@ -412,6 +413,17 @@ void Application::log_non_reloadable_changes(const RanvierConfig& new_config) co
     }
     if (new_config.telemetry_sink.max_buckets != _config.telemetry_sink.max_buckets) {
         log_main.warn("Config reload: telemetry_sink.max_buckets changes require restart to take effect");
+    }
+
+    // Routing-weights provider is installed once at start-up (the factory slot is
+    // read once, and the refresh timer is armed once). Toggling enablement or the
+    // refresh cadence via SIGHUP requires a restart to take effect.
+    if (new_config.routing_weights_provider.enabled != _config.routing_weights_provider.enabled) {
+        log_main.warn("Config reload: routing_weights_provider.enabled changes require restart to take effect");
+    }
+    if (new_config.routing_weights_provider.refresh_interval !=
+        _config.routing_weights_provider.refresh_interval) {
+        log_main.warn("Config reload: routing_weights_provider.refresh_seconds changes require restart to take effect");
     }
 
     // Usage-ledger sink is installed once per shard at startup; toggling it
@@ -1242,6 +1254,18 @@ seastar::future<> Application::startup() {
         }).then([this] {
             // 13. Start draining backend reaper timer
             _router->start_draining_reaper();
+
+            // 13a. Install the optional routing-weights provider and arm its
+            // off-request-path refresh. Off by default: the factory slot is
+            // unset in the stock build (yields the no-op provider), and the
+            // refresh is armed only when routing_weights_provider.enabled — so
+            // the override snapshot stays empty and the scorer reads
+            // routing.scoring.* unchanged.
+            if (_config.routing_weights_provider.enabled) {
+                _router->start_weights_refresh(
+                    get_routing_weights_provider_factory()(),
+                    _config.routing_weights_provider.refresh_interval);
+            }
             return seastar::make_ready_future<>();
         }).then([this] {
             // 14. Load persisted state (skip when local mode disables persistence)

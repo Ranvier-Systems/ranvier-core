@@ -656,6 +656,25 @@ target_link_libraries(telemetry_sink_test
 )
 gtest_discover_tests(telemetry_sink_test)
 
+# Routing-score weights provider unit tests: the provider seam (interface +
+# NoopRoutingWeightsProvider default + process-wide factory slot), the off-
+# request-path snapshot build, the hot-path resolve, and the two parity checks
+# against the unified route scorer (no-op fallthrough + single-key override).
+# Reactor-free by construction: the provider query path has no Seastar.
+add_executable(routing_weights_provider_test
+  tests/unit/routing_weights_provider_test.cpp
+)
+target_include_directories(routing_weights_provider_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/stubs
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(routing_weights_provider_test
+  PRIVATE
+  GTest::gtest_main
+  absl::flat_hash_map
+)
+gtest_discover_tests(routing_weights_provider_test)
+
 # Usage-ledger sink unit tests: UsageEvent defaults + forward-compat
 # readability (wire contract — see src/usage_ledger_schema.hpp), the
 # NoopUsageLedgerSink default, the process-wide factory seam, and that a sink

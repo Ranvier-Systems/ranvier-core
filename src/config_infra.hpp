@@ -484,6 +484,32 @@ struct TelemetrySinkConfig {
 };
 
 // =============================================================================
+// Routing-Score Weights Provider Configuration
+// =============================================================================
+
+// Optional, pluggable source of route-scorer weights, consulted OFF the request
+// path and published to the shards as a per-shard override snapshot. DISTINCT
+// from `routing.scoring.*` (the static baseline weights): this seam lets those
+// weights be supplied at runtime from an external policy/config service. See
+// `src/routing_weights_provider.hpp` for the provider contract.
+//
+// Off by default. With `enabled=false` no provider is created and the refresh
+// timer is never armed, so the override snapshot stays empty and the scorer
+// reads `routing.scoring.*` unchanged — routing is identical to config-only,
+// bit-for-bit. The seam itself has only the master switch and refresh cadence;
+// a concrete provider reads its own endpoint/credentials out-of-band, exactly
+// like the telemetry/usage sinks.
+struct RoutingWeightsProviderConfig {
+    // Master switch. Off by default — stock build behaves exactly as today.
+    bool enabled = false;
+
+    // How often the shard-0 refresh consults the provider and republishes the
+    // override snapshot to every shard. Off-path work only; the typical value
+    // is tens of seconds (weight policy changes slowly relative to requests).
+    std::chrono::seconds refresh_interval{30};
+};
+
+// =============================================================================
 // Usage-Ledger Configuration (per-API-key usage event sink)
 // =============================================================================
 

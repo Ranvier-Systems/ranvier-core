@@ -654,6 +654,15 @@ void RanvierConfig::apply_env_overrides() {
         if (*v > 0) telemetry_sink.max_buckets = *v;
     }
 
+    // Routing-weights provider (external route-scorer weight source; distinct
+    // from the static routing.scoring.* baseline)
+    if (auto v = get_env("RANVIER_ROUTING_WEIGHTS_PROVIDER_ENABLED")) {
+        routing_weights_provider.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<int>("RANVIER_ROUTING_WEIGHTS_PROVIDER_REFRESH_SECONDS")) {
+        if (*v > 0) routing_weights_provider.refresh_interval = std::chrono::seconds(*v);
+    }
+
     // Usage-ledger sink (per-request usage events; distinct from both telemetry
     // blocks above)
     if (auto v = get_env("RANVIER_USAGE_LEDGER_ENABLED")) {
@@ -1603,6 +1612,16 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 if (mb > 0) config.telemetry_sink.max_buckets = mb;
             }
         }
+        // Routing-weights provider section (external route-scorer weight source;
+        // distinct from the static routing.scoring.* baseline)
+        if (yaml["routing_weights_provider"]) {
+            YAML::Node rw = yaml["routing_weights_provider"];
+            if (rw["enabled"]) config.routing_weights_provider.enabled = rw["enabled"].as<bool>();
+            if (rw["refresh_seconds"]) {
+                int s = rw["refresh_seconds"].as<int>();
+                if (s > 0) config.routing_weights_provider.refresh_interval = std::chrono::seconds(s);
+            }
+        }
         // Usage-ledger sink section (per-request usage events; distinct from
         // both telemetry blocks above)
         if (yaml["usage_ledger"]) {
@@ -2268,6 +2287,13 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
         // is well under any reasonable per-shard budget.
         if (config.telemetry_sink.max_buckets > 65536) {
             return "telemetry_sink.max_buckets must not exceed 65536 (Rule #4)";
+        }
+    }
+
+    // Validate routing-weights provider settings (if enabled)
+    if (config.routing_weights_provider.enabled) {
+        if (config.routing_weights_provider.refresh_interval.count() <= 0) {
+            return "routing_weights_provider.refresh_seconds must be positive";
         }
     }
 
