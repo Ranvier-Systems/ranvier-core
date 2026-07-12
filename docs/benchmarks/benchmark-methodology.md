@@ -935,6 +935,12 @@ ROUTING MODE MISMATCH DETECTED!
 
 **Why this happens:** The `BENCHMARK_MODE` environment variable controls how the locustfile **labels** results, but `RANVIER_ROUTING_MODE` controls how the **server** actually routes requests. If they don't match, your benchmark results will be mislabeled.
 
+> **Note:** `round_robin` is treated as an alias of `random` on both sides (the server maps it
+> internally and reports the canonical `random`; the locustfile normalizes it too). So a
+> baseline arm labelled `round_robin` — as `bench.sh --compare` names it — does **not** trip
+> this warning against a server reporting `random`. Only a genuine mode difference (e.g.
+> `random` vs `prefix`, as above) fires it.
+
 **Solution:** Set BOTH variables consistently:
 ```bash
 # For prefix routing benchmark:

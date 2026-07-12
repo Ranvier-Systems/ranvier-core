@@ -43,7 +43,7 @@ breaks for the `CLIENT_TOKENIZE` fallback path.
 | Python | C++ | Notes |
 |--------|-----|-------|
 | `get_backend_from_response()` → `"X-Backend-ID"` | `add_header("X-Backend-ID", ...)` | Case-sensitive |
-| `verify_routing_mode_matches()` → `"X-Routing-Mode"` | `add_header("X-Routing-Mode", ...)` | Values: `"prefix"`, `"hash"`, `"random"` |
+| `verify_routing_mode_matches()` → `"X-Routing-Mode"` | `add_header("X-Routing-Mode", ...)` | Values: `"prefix"`, `"hash"`, `"random"`. Client normalizes `"round_robin"`→`"random"` (`_canonical_routing_mode`) to mirror the server alias (`config_loader.cpp`). |
 
 ## Admin API (http_controller.cpp)
 
