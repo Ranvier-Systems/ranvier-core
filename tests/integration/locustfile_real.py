@@ -524,6 +524,23 @@ RANVIER_METRICS = _build_ranvier_metrics_list(NUM_RANVIER_NODES)
 # Benchmark mode: "prefix" for ART+hash, "hash" for hash-only, "random" for baseline
 BENCHMARK_MODE = os.environ.get("BENCHMARK_MODE", "prefix")
 
+# The server accepts "round_robin" as an alias for "random" (config_loader.cpp:
+# `"random" || "round_robin"` -> RoutingMode::RANDOM) but reports the CANONICAL
+# "random" in its X-Routing-Mode header. Mirror that alias here so a baseline arm
+# labelled "round_robin" (as bench.sh names it) matches the server instead of
+# tripping a spurious ROUTING MODE MISMATCH, and so the missing-X-Backend-ID
+# fallback treats it as random (unpredictable backend) rather than a hash-
+# predictable mode — which would corrupt baseline cache accounting under
+# --client-tokenize.
+_ROUTING_MODE_ALIASES = {"round_robin": "random"}
+
+
+def _canonical_routing_mode(mode: Optional[str]) -> Optional[str]:
+    """Normalize a routing-mode label to the server's canonical name."""
+    if mode is None:
+        return None
+    return _ROUTING_MODE_ALIASES.get(mode, mode)
+
 
 def verify_routing_mode_matches() -> Tuple[bool, Optional[str]]:
     """Verify that the server's actual routing mode matches BENCHMARK_MODE.
@@ -554,7 +571,7 @@ def verify_routing_mode_matches() -> Tuple[bool, Optional[str]]:
                           "ensure Ranvier is updated with header support")
             return True, None  # Can't verify, assume OK
 
-        if actual_mode != BENCHMARK_MODE:
+        if _canonical_routing_mode(actual_mode) != _canonical_routing_mode(BENCHMARK_MODE):
             logger.error("=" * 70)
             logger.error("ROUTING MODE MISMATCH DETECTED!")
             logger.error(f"  BENCHMARK_MODE (client label): {BENCHMARK_MODE}")
@@ -4061,8 +4078,10 @@ class RealBackendUser(HttpUser):
                 if SINGLE_BACKEND_MODE:
                     # Single backend mode: all requests go to backend 1
                     metrics.backend_id = "1"
-                elif BENCHMARK_MODE == "random":
-                    # Random mode: can't predict backend - exclude from cache tracking
+                elif _canonical_routing_mode(BENCHMARK_MODE) == "random":
+                    # Random mode (incl. the "round_robin" alias): backend is not
+                    # hash-predictable - exclude from cache tracking rather than
+                    # fall through to the hash-prediction branch below.
                     logger.warning("X-Backend-ID header missing in random mode - "
                                   "excluding from cache hit tracking")
                     # metrics.backend_id remains None
