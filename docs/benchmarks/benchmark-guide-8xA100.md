@@ -10,27 +10,32 @@ single-file guide (~2,500 lines, ~60% dated lab notebook) was split on 2026-07-0
 |------------|------|
 | Run a benchmark — setup, knobs, warm-up, A/B scenarios, validation, monitoring, export | **[benchmark-methodology.md](benchmark-methodology.md)** |
 | See results valid on the **current** defaults | **[benchmark-results-current.md](benchmark-results-current.md)** |
-| Run the 50-prefix re-baseline campaign (fills the TBD headline) | **[benchmark-rebaseline-campaign.md](benchmark-rebaseline-campaign.md)** |
+| Run the 50-prefix re-baseline campaign (matrix done; threshold leg pending) | **[benchmark-rebaseline-campaign.md](benchmark-rebaseline-campaign.md)** |
 | Read the dated per-instance runs, invalidated sections, and re-run plans (append-only) | **[history/benchmark-history-8xA100.md](history/benchmark-history-8xA100.md)** |
 | Understand how to read TTFT / cache-hit numbers honestly | [interpreting-benchmark-numbers.md](interpreting-benchmark-numbers.md) |
 
 ## TL;DR (read this before quoting any number)
 
-**The representative-workload headline is currently [TBD](benchmark-results-current.md#representative-workload-headline-tbd).**
+**The representative-workload headline is measured** (50 prefixes, current defaults, commit
+`817a1b5`, median-of-3): prefix-aware routing's P99 effect is **load-dependent, not a uniform
+win** — a reliable **−9 to −13%** improvement under load (8B/20u, 13B/30u), a **wash** at
+moderate load (13B/20u), and a reliable **+29% regression** at light load (13B/10u) — tracking
+cluster throughput. Cache-hit rate rises ~3× in every config but is **decoupled** from P99. Full
+table + interpretation: **[benchmark-results-current.md](benchmark-results-current.md)**.
 
-Every headline the old guide advertised — P99 TTFT **−80% to −85%**, **+13-22%** throughput —
+Every headline the OLD guide advertised — P99 TTFT **−80% to −85%**, **+13-22%** throughput —
 was measured on the now-**deprecated 5-prefix workload** (all source runs, Instances 1–9,
 Jan–Apr 2026, predate the `NUM_LARGE_PREFIXES` 5→50 default change). With 8 backends, a prefix
 pool ≤ backend count pigeonholes every prefix onto ≤ 5 backends under pure affinity, which
 *manufactures* both the failure modes and, by concentration, much of the win. **Those numbers
-are not reproducible on current defaults and must not be quoted as current.** They are
-preserved, as recorded, in the [history archive](history/benchmark-history-8xA100.md#detailed-results-by-instance).
+are not reproducible on current defaults and must not be quoted as current** — at low load the
+representative workload **flips their sign** (10u is a +29% regression, not a −60…−79% win). They
+are preserved, as recorded, in the [history archive](history/benchmark-history-8xA100.md#detailed-results-by-instance).
 
-The only data we have on the current 50-prefix workload is directional (single runs): pure
-affinity **+19%** P99, load-aware with *raised* thresholds **−6%** P99. The shipped thresholds
-(factor 2.0 / floor 2) were never tested at 50 prefixes. See
-[benchmark-results-current.md](benchmark-results-current.md) for the details and the
-re-baseline plan (BACKLOG §25).
+The one open question is the **threshold leg** (shipped `2.0/2` vs raised `3.0/4` load-aware) —
+the ~30–47% fallback rates make it the highest-value follow-up. See
+[benchmark-results-current.md](benchmark-results-current.md) and the
+[campaign runbook](benchmark-rebaseline-campaign.md) §2.
 
 The May 2026 affinity-thrashing investigation that the old TL;DR flagged as "unresolved" was
 **closed 2026-05-26 as a workload artifact** (concentration, not a routing defect) — see the
