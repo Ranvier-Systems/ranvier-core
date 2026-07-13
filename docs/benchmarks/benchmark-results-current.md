@@ -21,40 +21,57 @@ routing config). When a default changes, prior entries move to
 > section changed it to 20ms, and the 20ms change shipped. Both dated sections are preserved
 > in the history archive; **20ms is current.**
 
-## Representative-workload headline: **TBD**
+## Representative-workload headline (measured 2026-07-13, commit `817a1b5`)
 
-**There is currently no citable headline for prefix-aware vs round-robin under the
-representative (50-prefix) workload.** Every -80%…-85% P99 / +13-22% throughput figure that
-the old guide advertised was measured on the now-deprecated **5-prefix** workload (see the
-[history archive](history/benchmark-history-8xA100.md)), where a prefix pool ≤ backend count
-pigeonholes affinity onto too few backends and *manufactures* both the failure modes and, by
-concentration, much of the headline win. Those numbers are **not reproducible on current
-defaults** and are not quoted here.
+**Prefix-aware routing's P99 effect is operating-point-dependent — it is not a uniform win.**
+On the representative 50-prefix workload it ranges from a **reliable −9 to −13% P99 improvement
+under load** to a **reliable +29% regression at light load**, and the outcome tracks **cluster
+throughput (queue pressure), not user count or model size**. Cache-hit rate improved **~3× in
+every single config** (12% → 43–52%) yet is **decoupled** from the P99 result — the campaign's
+clearest lesson.
 
-The headline will be filled in by the **50-prefix re-baseline campaign** (BACKLOG §25, items
-4–6): the standard matrix (13B 30u/30m, 13B 20u/10m, 13B 10u/10m, 8B 20u/10m — each
-`--compare`, ×3 repeats), reported as median-of-3 with an explicit "no reliable effect"
-verdict when the IQR spans zero on the discriminating metric. The turnkey procedure —
-copy-paste commands, run files, pre-registered decision rules, and validity gates — is in the
-**[re-baseline campaign runbook](benchmark-rebaseline-campaign.md)**. All the supporting tooling
-(repeats + verdicts, manifests, 3-node telemetry, fair A/B ordering) is in place; only GPU time
-remains.
+Standard matrix on current defaults (50 prefixes, ratio 0.9, stress, load-aware 2.0/2, residency
+0.2, 20ms flush), 8×A100 40GB, vLLM 0.15.1, `--compare` ×3 repeats, **median-of-3** (verdict =
+"no reliable effect" when the IQR of the per-repeat %change spans zero). Manifests + logs under
+`benchmark-reports/rebaseline/matrix/`.
 
-## Only current-workload data points we have so far
+| Config | ~req/s | P99 TTFT (median-of-3) | Verdict | Cache hit | Incompletes |
+|--------|-------:|------------------------|---------|-----------|-------------|
+| **8B 20u/10m**  | ~47 | **−13.3%** (IQR −15.6…−8.5) | ✅ reliable improvement | 12→48% | 0% both |
+| **13B 30u/30m** | ~38 | **−9.1%** (IQR −13.2…−5.7) | ✅ reliable improvement | 12→38% | ~2% both |
+| **13B 20u/10m** | ~28 | **+3.8%** (IQR −5.7…+8.0) | ⚖️ no reliable effect | 12→43% | ~2% both |
+| **13B 10u/10m** | ~16 | **+29.0%** (IQR +21…+34) | ❌ reliable regression | 12→49% | prefix worse |
 
-From the affinity-thrashing investigation close-out (`.dev-context/next-benchmark-checklist.md`,
-2026-05-26), at **50 prefixes / 8 backends** (single runs, no repeats — treat as directional,
-not a headline):
+**Read this as a gradient, not four labels.** Sorted by throughput the P99 effect slides
+monotonically from −13% (busiest) to +29% (idlest): under sustained load, routing to cache-warm
+backends relieves the tail; below a crossover (somewhere between ~16 and ~28 req/s on this
+hardware) the concentration it induces *adds* tail latency and timeouts while the cache-hit
+prefill savings are too small to offset it. Throughput — not the 20-user count — is why 8B/20u
+*wins* and 13B/20u doesn't: 8B pushes ~47 req/s, 13B/20u only ~28. (4-point interpolation; treat
+the crossover as a band, not a precise number.)
 
-| Leg | Config | P99 TTFT vs round-robin | Notes |
-|-----|--------|-------------------------|-------|
-| D1 | Pure affinity (load-aware OFF) | **+19%** | Affinity alone regresses the tail at 50 prefixes |
-| D2 | Load-aware ON, raised thresholds (factor 3.0 / floor 4) | **−6%** | Small improvement; single run |
+Secondary signals, consistent across the matrix:
+- **Cache hit rate up ~3× everywhere** yet uncorrelated with the P99 outcome — a high hit rate
+  is not evidence of a latency win.
+- **Throughput +1–7%** on every config (prefix never lost throughput).
+- **Load-aware fallbacks 30–47%** on every prefix run (highest on 8B, which drains fastest): a
+  third to a half of requests are diverted off affinity to balance load. That — not affinity
+  thrash (Gini stayed low, 0.06–0.13) — is what caps the win, and it is the strongest case for
+  the threshold leg below.
 
-Note the shipped defaults (factor **2.0 / floor 2**) were **never tested at 50 prefixes** —
-D2 validated only the *raised* thresholds. Closing that gap is the pre-registered threshold
-leg of the re-baseline (BACKLOG §25, item 5): adopt 3.0/4 as default only if median P99
-improves ≥10% with no incomplete-rate regression.
+This **confirms and supersedes** the earlier directional D2 result (−6% at 13B/30u with *raised*
+thresholds): 13B/30u here measures **−9.1% on the shipped `2.0/2` thresholds**. It also **flips
+the deprecated 5-prefix guide's sign at low load** — that guide advertised 10u as a −60…−79%
+win; on the representative workload 13B/10u is a **+29% regression**.
+
+## Still open: threshold leg (BACKLOG §25 item 5)
+
+The shipped `2.0/2` vs raised `3.0/4` load-aware decision is **not yet run**, and given the
+30–47% fallback rates it is now the highest-value follow-up. Pre-registered rule (unchanged):
+adopt `3.0/4` as default only if median P99 improves **≥10%** with no incomplete-rate regression.
+Procedure: [re-baseline campaign runbook](benchmark-rebaseline-campaign.md) §2. Superseded
+single-run predecessors (`.dev-context/next-benchmark-checklist.md`, directional only): D1
+pure-affinity **+19%**, D2 raised-thresholds **−6%**.
 
 ## Adding an entry here
 

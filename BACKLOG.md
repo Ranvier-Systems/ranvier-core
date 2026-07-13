@@ -1275,8 +1275,14 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
   scripts/{bench,bench-residency-ab}.sh` (+ the stubs if used); `bench.sh --help`/a
   `--dry-run`-equivalent grep to confirm the banner prints effective 50/0.9 with knobs unset;
   markdown link-check across `docs/benchmarks/` for orphaned anchors. See `/validate`.
-- [ ] Follow-on: P0/P1 re-baseline campaign (items 4-6, needs 8×A100) — turnkey runbook +
-  run files ready at `docs/benchmarks/benchmark-rebaseline-campaign.md`; only GPU time remains.
+- [x] **Item 4/6 — standard matrix + variance rule** (ran 2026-07-13 on 8×A100, commit
+  `817a1b5`): median-of-3 across the 4 configs. Headline is **load-dependent** — 8B/20u −13.3%,
+  13B/30u −9.1% (both reliable wins), 13B/20u no reliable effect, 13B/10u **+29% (reliable
+  regression)** — monotonic in cluster throughput. Cache hit +3× everywhere, decoupled from P99.
+  Written up in `docs/benchmarks/benchmark-results-current.md`.
+- [ ] **Item 5 — threshold leg** (shipped `2.0/2` vs raised `3.0/4`) NOT yet run; the 30–47%
+  load-aware fallback rates seen across the matrix make it the highest-value remaining GPU run.
+  Runbook `benchmark-rebaseline-campaign.md` §2; run files under `docs/benchmarks/rebaseline/`.
 
 ### P1 progress (follow-on branches)
 - [x] **Item 7 — `--repeat` + aggregation** (branch `claude/benchmark-p1-repeat-aggregate`,
