@@ -1,0 +1,43 @@
+# 50-prefix re-baseline — LEG V0: cross_shard_load_sync A/B at the regression point
+#
+# Decides the core question from the load-gating proposal
+# (.dev-context/prefix-routing-load-gating-proposal.md §5, Leg V0): is the +29%
+# P99 regression at 13B/10u caused by transient cross-node/cross-shard hot-spotting?
+# If enabling cross_shard_load_sync recovers the regression, the fix is a config
+# default change — NO new load-gate mechanism is needed.
+#
+# This file holds the WORKLOAD only (one --compare line). The control variable —
+# RANVIER_CROSS_SHARD_LOAD_SYNC — is set in the environment around the runner, so the
+# SAME workload runs once with sync OFF and once with sync ON. That knob IS already
+# wired into docker-compose.benchmark-real.yml (unlike epsilon/hash_strategy), so no
+# compose edit is required for this leg.
+#
+# Run BOTH arms on the same box, back to back:
+#   # V0a — baseline, sync OFF (reproduce the regression here)
+#   RANVIER_CROSS_SHARD_LOAD_SYNC=false \
+#     ./scripts/bench-runner.sh --suite custom \
+#         --file docs/benchmarks/rebaseline/v0-xshard.runs \
+#         --repeat 3 --output-dir benchmark-reports/rebaseline/xshard_off
+#   # V0b — cross_shard_load_sync ON (100ms default interval; the interval var is
+#   #        NOT compose-wired, so the shipped 100ms default applies — which is intended)
+#   RANVIER_CROSS_SHARD_LOAD_SYNC=true \
+#     ./scripts/bench-runner.sh --suite custom \
+#         --file docs/benchmarks/rebaseline/v0-xshard.runs \
+#         --repeat 3 --output-dir benchmark-reports/rebaseline/xshard_on
+#
+# Each line is itself a prefix-vs-round-robin --compare; --repeat 3 writes median/IQR
+# aggregates to <output-dir>/aggregates/. Compare V0a's prefix-vs-RR P99 %change against
+# V0b's. The RR baseline arm ignores affinity/load, so it is ~invariant to the flag; the
+# prefix arm is what moves.
+#
+# Pre-registered verdict rule: if V0b's 13B/10u prefix-vs-RR P99 regression is >=10
+# percentage points smaller than V0a's, with no worse incompletes, transient
+# cross-visibility is confirmed the driver -> ship cross_shard_load_sync=true as the
+# default for client-tokenize deployments and STOP (no gate). Also capture per-node
+# prometheus_metrics_node*.txt to see per-backend active_requests bursts align with the tail.
+#
+# Everything rides the CURRENT SHIPPED DEFAULTS (50 prefixes, ratio 0.9, stress, load-aware
+# 2.0/floor 2, cache-residency 0.2, 20ms flush, BOUNDED_LOAD). Confirm the "Effective
+# Routing Config" banner before trusting any run.
+
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 10 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress
