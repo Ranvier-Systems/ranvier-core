@@ -1,0 +1,40 @@
+# 50-prefix re-baseline — LEG V1: bounded_load_epsilon leg (the CORRECTED threshold leg)
+#
+# Replaces the inert threshold-2.0-2 / threshold-3.0-4 run files. The proposal
+# (.dev-context/prefix-routing-load-gating-proposal.md §3.1) proves that
+# load_imbalance_factor/floor are INERT under the shipped BOUNDED_LOAD strategy — they
+# feed only the JUMP/MODULAR allowance (router_service.cpp:1336) — so a 2.0/2-vs-3.0/4
+# sweep on the shipped strategy measures ~nothing. The knob that actually moves diversion
+# aggressiveness on BOUNDED_LOAD is bounded_load_epsilon (allowance = cap-1, cap from
+# epsilon at router_service.cpp:1324). This leg sweeps epsilon: 0.25 (shipped) vs 0.50
+# (looser = less diversion = more concentration).
+#
+# !!! PREREQUISITE — one compose edit, or this leg is silently inert !!!
+# RANVIER_BOUNDED_LOAD_EPSILON is NOT currently wired into docker-compose.benchmark-real.yml
+# (only CROSS_SHARD_LOAD_SYNC / LOAD_IMBALANCE_* are). Add this line to EACH of the 3 ranvier
+# services, beside the existing RANVIER_LOAD_IMBALANCE_* lines, before running:
+#       - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
+# Confirm the effective value reaches the server (routing banner / a quick /metrics check)
+# before trusting the run — silently keeping 0.25 is the exact trap this leg exists to avoid.
+#
+# Run (baseline = shipped epsilon 0.25: use V0a's 10u aggregate + the standard-matrix 30u):
+#   RANVIER_BOUNDED_LOAD_EPSILON=0.50 \
+#     ./scripts/bench-runner.sh --suite custom \
+#         --file docs/benchmarks/rebaseline/v1-epsilon.runs \
+#         --repeat 3 --output-dir benchmark-reports/rebaseline/epsilon_0.50
+#
+# Pre-registered rule (unchanged intent): adopt a looser default only if median P99 improves
+# >=10% with no incomplete-rate regression. ALSO record whether looser diversion WORSENS
+# 13B/10u — if it does and tighter doesn't fix it, the low-load problem is
+# visibility/transient (Leg V0), not diversion tuning, and a gate is not the answer.
+#
+# ALTERNATIVE (only if the literal factor/floor question must be answered): wire
+# RANVIER_HASH_STRATEGY the same way and run the existing threshold-3.0-4.runs with
+# RANVIER_HASH_STRATEGY=jump, so factor/floor actually govern the allowance.
+#
+# Two configs: the low-load regression point and the high-load win point. Everything else
+# rides the CURRENT SHIPPED DEFAULTS (50 prefixes, ratio 0.9, stress, residency 0.2, 20ms
+# flush). Confirm the "Effective Routing Config" banner (incl. the epsilon value) per run.
+
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 10 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress

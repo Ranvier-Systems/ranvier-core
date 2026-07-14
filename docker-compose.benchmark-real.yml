@@ -175,6 +175,14 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
+      # Divert-allowance knobs for the re-baseline threshold leg. Defaults match the
+      # shipped values, so an unset env is behavior-identical. Must be listed here or the
+      # host env var never reaches the server. factor/floor above only govern the
+      # jump/modular allowance; under the shipped BOUNDED_LOAD strategy the allowance comes
+      # from bounded_load_epsilon — the epsilon sweep is what actually moves diversion.
+      # hash_strategy lets the factor/floor variant run under jump.
+      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
+      - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
@@ -247,6 +255,14 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
+      # Divert-allowance knobs for the re-baseline threshold leg. Defaults match the
+      # shipped values, so an unset env is behavior-identical. Must be listed here or the
+      # host env var never reaches the server. factor/floor above only govern the
+      # jump/modular allowance; under the shipped BOUNDED_LOAD strategy the allowance comes
+      # from bounded_load_epsilon — the epsilon sweep is what actually moves diversion.
+      # hash_strategy lets the factor/floor variant run under jump.
+      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
+      - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
@@ -319,6 +335,14 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
+      # Divert-allowance knobs for the re-baseline threshold leg. Defaults match the
+      # shipped values, so an unset env is behavior-identical. Must be listed here or the
+      # host env var never reaches the server. factor/floor above only govern the
+      # jump/modular allowance; under the shipped BOUNDED_LOAD strategy the allowance comes
+      # from bounded_load_epsilon — the epsilon sweep is what actually moves diversion.
+      # hash_strategy lets the factor/floor variant run under jump.
+      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
+      - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
