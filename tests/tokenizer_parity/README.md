@@ -16,6 +16,24 @@ any token, prefix affinity degrades **silently** — no crash, no failing build,
 just a lower cache-hit ratio. Unit tests can't catch this because they don't run
 a real Kimi tokenizer; this harness does.
 
+## Kimi ships no fast `tokenizer.json`
+
+`moonshotai/Kimi-K2-Instruct` provides only `tiktoken.model` (plus
+`tokenization_kimi.py` and `chat_template.jinja`) — there is **no** HuggingFace
+fast `tokenizer.json` in the repo. Ranvier's `tokenizers-cpp` cannot load a
+tiktoken model; it needs a fast `tokenizer.json`. So **deploying Kimi on Ranvier
+requires converting** the tiktoken tokenizer to HF fast format, and the fidelity
+of that conversion is the routing risk this harness measures.
+
+The harness tries, in order: an explicit `--tokenizer-json`, a `tokenizer.json`
+in the model repo, then a transformers-built fast conversion
+(`AutoTokenizer(use_fast=True)`). If the auto-conversion fails (Kimi's custom
+tiktoken tokenizer may not build a fast variant), supply a `tokenizer.json`
+yourself — either the one you intend to deploy with, one from a community mirror
+(e.g. an `unsloth/Kimi-K2-*` repo), or a conversion you produce — and pass it via
+`--tokenizer-json`. Whatever tokenizer.json you deploy Ranvier with is the one
+worth testing here.
+
 ## What it checks
 
 For a set of Ranvier-rendered Kimi prompts (leading-system, no-system/injection,

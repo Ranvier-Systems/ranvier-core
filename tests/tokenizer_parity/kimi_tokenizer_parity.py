@@ -147,18 +147,41 @@ def main():
     print(f"Loading authoritative tokenizer: {args.model}")
     auth = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
-    tok_json = args.tokenizer_json
-    if tok_json is None:
+    # Obtain the fast tokenizer Ranvier's tokenizers-cpp would load. Kimi ships
+    # only a tiktoken tokenizer (no tokenizer.json), so this tries, in order:
+    # an explicit --tokenizer-json, a tokenizer.json in the model repo, then a
+    # transformers-built fast conversion (what an operator must deploy).
+    fast = None
+    fast_source = None
+    if args.tokenizer_json:
+        fast = tokenizers.Tokenizer.from_file(args.tokenizer_json)
+        fast_source = f"file: {args.tokenizer_json}"
+    else:
         try:
             from huggingface_hub import hf_hub_download
-            tok_json = hf_hub_download(args.model, "tokenizer.json")
-        except Exception as e:  # noqa: BLE001 - report and fall back to a message
-            print(f"ERROR: could not fetch tokenizer.json ({e}).", file=sys.stderr)
-            print("Pass --tokenizer-json /path/to/tokenizer.json instead.",
-                  file=sys.stderr)
-            return 2
-    print(f"Loading fast tokenizer.json (Ranvier path): {tok_json}")
-    fast = tokenizers.Tokenizer.from_file(tok_json)
+            p = hf_hub_download(args.model, "tokenizer.json")
+            fast = tokenizers.Tokenizer.from_file(p)
+            fast_source = f"hub: {args.model}/tokenizer.json"
+        except Exception:  # noqa: BLE001 - absence is expected for Kimi
+            print(f"note: {args.model} ships no tokenizer.json; attempting to "
+                  "build a fast tokenizer from the authoritative one.")
+        if fast is None:
+            try:
+                fast_tok = AutoTokenizer.from_pretrained(
+                    args.model, trust_remote_code=True, use_fast=True)
+                if getattr(fast_tok, "is_fast", False):
+                    fast = fast_tok.backend_tokenizer
+                    fast_source = "converted: AutoTokenizer(use_fast=True)"
+            except Exception as e:  # noqa: BLE001
+                print(f"note: could not build a fast tokenizer ({e}).")
+    if fast is None:
+        print("ERROR: no fast tokenizer.json available for the Ranvier path.\n"
+              "Kimi ships only a tiktoken tokenizer; tokenizers-cpp needs a fast\n"
+              "tokenizer.json. Supply the one you intend to deploy with via\n"
+              "--tokenizer-json, or convert the tiktoken tokenizer to HF fast\n"
+              "format first (see README).", file=sys.stderr)
+        return 2
+    print(f"Ranvier-path fast tokenizer -> {fast_source}")
 
     failures = 0
     fixture = []
