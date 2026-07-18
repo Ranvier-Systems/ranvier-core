@@ -425,6 +425,11 @@ RequestRewriter::extract_text_with_boundary_info(
         if (!first_is_system) {
             chat_template.format_message(combined, "system", default_system,
                                          /*is_first=*/true);
+            // The reference jinja leaves a newline after the injected default
+            // system turn (its injection block does not strip the trailing
+            // newline, unlike the tightly-packed real turns). Without it a
+            // system-less prompt tokenizes one token off from the backend.
+            combined.push_back('\n');
             is_first_message = false;
         }
     }
@@ -450,6 +455,11 @@ RequestRewriter::extract_text_with_boundary_info(
         // Get content
         if (!msg.HasMember("content")) continue;
         const auto& content = msg["content"];
+        // Only plain-string content participates in routing/tokenization. OpenAI
+        // multimodal content (an array of text/image parts, e.g. Kimi K3 vision
+        // requests) is skipped here — such requests route on their text turns
+        // only, and any image parts are absent from the routed prefix. Handling
+        // multimodal prefixes would need its own design (see tokenizer_parity).
         if (!content.IsString()) continue;
 
         std::string_view content_sv(content.GetString(), content.GetStringLength());
