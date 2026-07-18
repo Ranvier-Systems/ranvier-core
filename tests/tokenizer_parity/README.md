@@ -27,12 +27,21 @@ of that conversion is the routing risk this harness measures.
 
 The harness tries, in order: an explicit `--tokenizer-json`, a `tokenizer.json`
 in the model repo, then a transformers-built fast conversion
-(`AutoTokenizer(use_fast=True)`). If the auto-conversion fails (Kimi's custom
-tiktoken tokenizer may not build a fast variant), supply a `tokenizer.json`
-yourself — either the one you intend to deploy with, one from a community mirror
-(e.g. an `unsloth/Kimi-K2-*` repo), or a conversion you produce — and pass it via
-`--tokenizer-json`. Whatever tokenizer.json you deploy Ranvier with is the one
-worth testing here.
+(`AutoTokenizer(use_fast=True)`). For Kimi K2 all three fail — the repo has none,
+no public mirror ships one, and the custom tiktoken tokenizer has no auto-built
+fast variant. Produce a first-party conversion instead:
+
+```bash
+pip install transformers tokenizers tiktoken
+python3 convert_kimi_tokenizer.py --model moonshotai/Kimi-K2-Instruct --out kimi_fast
+python3 kimi_tokenizer_parity.py --tokenizer-json kimi_fast/tokenizer.json
+```
+
+`convert_kimi_tokenizer.py` extracts the exact `tiktoken.Encoding` Kimi's own
+tokenizer builds and writes a fast `tokenizer.json`. It is only trustworthy once
+the harness confirms it reproduces the authoritative IDs. Whatever `tokenizer.json`
+passes here is the contract: Ranvier's `tokenizer_path` **and** the serving
+backend must both load it, or the two sides won't share cache.
 
 ## What it checks
 
