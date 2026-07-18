@@ -18,7 +18,7 @@ If parity passes, that tokenizer.json is the contract: Ranvier's `tokenizer_path
 AND the serving backend must both load it, or the two sides won't share cache.
 
 Usage:
-    pip install transformers tokenizers tiktoken
+    pip install transformers tokenizers tiktoken blobfile
     python3 convert_kimi_tokenizer.py --model moonshotai/Kimi-K2-Instruct --out kimi_fast
 """
 

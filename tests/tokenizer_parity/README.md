@@ -32,10 +32,13 @@ no public mirror ships one, and the custom tiktoken tokenizer has no auto-built
 fast variant. Produce a first-party conversion instead:
 
 ```bash
-pip install transformers tokenizers tiktoken
+pip install transformers tokenizers tiktoken blobfile
 python3 convert_kimi_tokenizer.py --model moonshotai/Kimi-K2-Instruct --out kimi_fast
 python3 kimi_tokenizer_parity.py --tokenizer-json kimi_fast/tokenizer.json
 ```
+
+(The conversion also needs `blobfile` — tiktoken pulls it in to serialize the
+BPE ranks.)
 
 `convert_kimi_tokenizer.py` extracts the exact `tiktoken.Encoding` Kimi's own
 tokenizer builds and writes a fast `tokenizer.json`. It is only trustworthy once
