@@ -53,6 +53,21 @@ enum class ChatTemplateFormat {
     // Wraps user/assistant turns in [INST] / [/INST] markers.
     // System message is prepended inside the first [INST] block.
     mistral,
+
+    // Kimi K2 / K3 (Moonshot) format.
+    // Each message: {role-token}{role}<|im_middle|>{content}<|im_end|>
+    //   role-token ∈ { <|im_user|>, <|im_assistant|>, <|im_system|> }
+    //   — system and tool turns both open with <|im_system|>.
+    // Generation prompt: <|im_assistant|>assistant<|im_middle|>
+    // Unlike ChatML, role tokens are per-role rather than a shared <|im_start|>,
+    // so there is no single message-start marker to scan (see
+    // message_start_marker) — boundary detection falls back to estimation.
+    // Confirmed against Moonshot's chat_template.jinja: no BOS is rendered and
+    // turns concatenate with no separator whitespace. Default-system injection
+    // for system-less conversations is applied by the caller (see
+    // default_system_prompt); tool-result framing is not reproduced (see
+    // format_kimi).
+    kimi,
 };
 
 // Parse a chat template format name from string.
@@ -67,6 +82,10 @@ inline ChatTemplateFormat parse_chat_template_format(std::string_view name) {
     if (name == "mistral") {
         return ChatTemplateFormat::mistral;
     }
+    if (name == "kimi" || name == "kimi-k2" || name == "kimi-k3" ||
+        name == "moonshot") {
+        return ChatTemplateFormat::kimi;
+    }
     // "none" or anything unrecognized → legacy behavior
     return ChatTemplateFormat::none;
 }
@@ -76,6 +95,7 @@ inline std::string_view chat_template_format_name(ChatTemplateFormat fmt) {
         case ChatTemplateFormat::llama3:  return "llama3";
         case ChatTemplateFormat::chatml:  return "chatml";
         case ChatTemplateFormat::mistral: return "mistral";
+        case ChatTemplateFormat::kimi:    return "kimi";
         case ChatTemplateFormat::none:    return "none";
     }
     return "none";
@@ -117,6 +137,9 @@ public:
                 break;
             case ChatTemplateFormat::mistral:
                 format_mistral(out, role, content, is_first);
+                break;
+            case ChatTemplateFormat::kimi:
+                format_kimi(out, role, content, is_first);
                 break;
         }
     }
@@ -165,6 +188,14 @@ public:
                     out.append("</s>");
                 }
                 break;
+            case ChatTemplateFormat::kimi:
+                // No BOS for individual message tokenization (mirrors llama3).
+                out.append(kimi_role_token(role));
+                out.append(role);
+                out.append("<|im_middle|>");
+                out.append(content);
+                out.append("<|im_end|>");
+                break;
         }
         return out;
     }
@@ -185,6 +216,9 @@ public:
             case ChatTemplateFormat::mistral:
                 // Mistral's generation prompt is implicit (after [/INST])
                 break;
+            case ChatTemplateFormat::kimi:
+                out.append("<|im_assistant|>assistant<|im_middle|>");
+                break;
         }
     }
 
@@ -196,6 +230,9 @@ public:
         switch (_format) {
             case ChatTemplateFormat::llama3: return "<|start_header_id|>";
             case ChatTemplateFormat::chatml: return "<|im_start|>";
+            // Kimi opens each turn with a role-specific token, so a single-marker
+            // scan can't count messages; callers fall back to estimation.
+            case ChatTemplateFormat::kimi:   return {};
             default: return {};
         }
     }
@@ -207,12 +244,47 @@ public:
             case ChatTemplateFormat::llama3:  return 60;  // header + eot tokens
             case ChatTemplateFormat::chatml:  return 30;  // im_start/end tokens
             case ChatTemplateFormat::mistral: return 20;  // [INST] markers
+            case ChatTemplateFormat::kimi:    return 45;  // role + im_middle + im_end
         }
         return 5;
     }
 
+    // System content the backend's apply_chat_template injects before the first
+    // turn when a conversation has no leading system message. Only Kimi's
+    // reference template defines one; every other format returns empty (they
+    // inject nothing). The caller fires this only when messages[0] is not itself
+    // a system turn — a request that supplies its own system message suppresses
+    // it — matching the reference's `loop.first and messages[0].role != 'system'`.
+    std::string_view default_system_prompt() const {
+        switch (_format) {
+            case ChatTemplateFormat::kimi: return kKimiDefaultSystemPrompt;
+            default: return {};
+        }
+    }
+
 private:
     ChatTemplateFormat _format;
+
+    // Verbatim from Moonshot's chat_template.jinja (K2). Part of the template
+    // definition, like the token strings above; update if a future Kimi revision
+    // changes it. A client that sends its own system message overrides it.
+    static constexpr std::string_view kKimiDefaultSystemPrompt =
+        "You are Kimi, an AI assistant created by Moonshot AI.";
+
+    // Empty: Kimi's chat_template.jinja renders no BOS (its "[BOS]" token is
+    // never emitted, and tokenizer_config carries no add_bos_token). Kept as a
+    // named seam should a future variant reintroduce one — setting it must also
+    // update ChatTemplateKimiTest.
+    static constexpr std::string_view kKimiBosToken{};
+
+    // Kimi opens each turn with a role-specific token. system and tool turns
+    // both open with <|im_system|> (a tool turn renders as
+    // <|im_system|>tool<|im_middle|>...); user/assistant get their own tokens.
+    static std::string_view kimi_role_token(std::string_view role) {
+        if (role == "user")      return "<|im_user|>";
+        if (role == "assistant") return "<|im_assistant|>";
+        return "<|im_system|>";
+    }
 
     // --- Legacy format: raw content with "\n" separator ---
     static void format_none(std::string& out, std::string_view content, bool is_first) {
@@ -320,6 +392,32 @@ private:
             out.append(content);
             out.append("</s>");
         }
+    }
+
+    // --- Kimi K2 / K3 (Moonshot) format ---
+    // Per-turn: {role-token}{role}<|im_middle|>{content}<|im_end|>
+    // Segments are delimited by their own special tokens; no separator newline
+    // is emitted between turns.
+    //
+    // format_message stays verbatim to the message it is given (as the other
+    // formats do). The reference chat_template.jinja's default-system injection
+    // for system-less conversations is handled one level up, by the caller that
+    // owns the message list (see default_system_prompt) — this per-message
+    // function can't see whether the whole conversation lacks a system turn.
+    // Tool-result turns' "## Return of {id}" wrapper and the tool_call/media
+    // framing are not reproduced; routing keys on the system/user prefix.
+    static void format_kimi(std::string& out,
+                            std::string_view role,
+                            std::string_view content,
+                            bool is_first) {
+        if (is_first && !kKimiBosToken.empty()) {
+            out.append(kKimiBosToken);
+        }
+        out.append(kimi_role_token(role));
+        out.append(role);
+        out.append("<|im_middle|>");
+        out.append(content);
+        out.append("<|im_end|>");
     }
 };
 

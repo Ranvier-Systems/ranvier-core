@@ -1,7 +1,7 @@
 // Ranvier Core - Chat Template Unit Tests
 //
-// Tests for pre-compiled chat template formatting (llama3, chatml, mistral)
-// and the parse/name helper functions.
+// Tests for pre-compiled chat template formatting (llama3, chatml, mistral,
+// kimi) and the parse/name helper functions.
 
 #include "chat_template.hpp"
 #include <gtest/gtest.h>
@@ -31,6 +31,13 @@ TEST_F(ParseChatTemplateFormatTest, Mistral) {
     EXPECT_EQ(parse_chat_template_format("mistral"), ChatTemplateFormat::mistral);
 }
 
+TEST_F(ParseChatTemplateFormatTest, KimiAliases) {
+    EXPECT_EQ(parse_chat_template_format("kimi"), ChatTemplateFormat::kimi);
+    EXPECT_EQ(parse_chat_template_format("kimi-k2"), ChatTemplateFormat::kimi);
+    EXPECT_EQ(parse_chat_template_format("kimi-k3"), ChatTemplateFormat::kimi);
+    EXPECT_EQ(parse_chat_template_format("moonshot"), ChatTemplateFormat::kimi);
+}
+
 TEST_F(ParseChatTemplateFormatTest, NoneAndUnrecognized) {
     EXPECT_EQ(parse_chat_template_format("none"), ChatTemplateFormat::none);
     EXPECT_EQ(parse_chat_template_format(""), ChatTemplateFormat::none);
@@ -50,6 +57,7 @@ TEST_F(ChatTemplateFormatNameTest, AllFormats) {
     EXPECT_EQ(chat_template_format_name(ChatTemplateFormat::llama3), "llama3");
     EXPECT_EQ(chat_template_format_name(ChatTemplateFormat::chatml), "chatml");
     EXPECT_EQ(chat_template_format_name(ChatTemplateFormat::mistral), "mistral");
+    EXPECT_EQ(chat_template_format_name(ChatTemplateFormat::kimi), "kimi");
 }
 
 // =============================================================================
@@ -300,6 +308,89 @@ TEST_F(ChatTemplateMistralTest, SystemNotFirst) {
 }
 
 // =============================================================================
+// format_message — Kimi (Moonshot) format
+// =============================================================================
+//
+// These expectations match Moonshot's chat_template.jinja for the standard
+// system/user/assistant case (confirmed against the reference template): no BOS
+// token is rendered and turns carry no separator whitespace. Per-message
+// formatting is verbatim here; the reference's default-system injection for
+// system-less conversations is applied by the caller and covered in
+// request_rewriter_test (BoundaryInfoKimi*). Keep these strings in lockstep with
+// the format.
+
+class ChatTemplateKimiTest : public ::testing::Test {
+protected:
+    ChatTemplate tpl{ChatTemplateFormat::kimi};
+};
+
+TEST_F(ChatTemplateKimiTest, SingleSystemMessage) {
+    std::string out;
+    tpl.format_message(out, "system", "You are Kimi.", true);
+    EXPECT_EQ(out, "<|im_system|>system<|im_middle|>You are Kimi.<|im_end|>");
+}
+
+TEST_F(ChatTemplateKimiTest, PerRoleOpeningTokens) {
+    std::string user, assistant;
+    tpl.format_message(user, "user", "Hi", false);
+    tpl.format_message(assistant, "assistant", "Hello", false);
+    EXPECT_EQ(user, "<|im_user|>user<|im_middle|>Hi<|im_end|>");
+    EXPECT_EQ(assistant, "<|im_assistant|>assistant<|im_middle|>Hello<|im_end|>");
+}
+
+TEST_F(ChatTemplateKimiTest, ToolRoleOpensWithSystemToken) {
+    // Tool turns render under the system token but keep the literal role word.
+    std::string out;
+    tpl.format_message(out, "tool", "42", false);
+    EXPECT_EQ(out, "<|im_system|>tool<|im_middle|>42<|im_end|>");
+}
+
+TEST_F(ChatTemplateKimiTest, IsFirstHasNoEffectWhileBosEmpty) {
+    // Guards the no-BOS invariant: with an empty BOS constant the first turn
+    // renders identically to a later one. Setting kKimiBosToken must break this
+    // test deliberately.
+    std::string first, subsequent;
+    tpl.format_message(first, "system", "You are Kimi.", true);
+    tpl.format_message(subsequent, "system", "You are Kimi.", false);
+    EXPECT_EQ(first, subsequent);
+}
+
+TEST_F(ChatTemplateKimiTest, FullConversation) {
+    std::string out;
+    tpl.format_message(out, "system", "You are Kimi.", true);
+    tpl.format_message(out, "user", "Hello!", false);
+    tpl.append_generation_prompt(out);
+
+    std::string expected =
+        "<|im_system|>system<|im_middle|>You are Kimi.<|im_end|>"
+        "<|im_user|>user<|im_middle|>Hello!<|im_end|>"
+        "<|im_assistant|>assistant<|im_middle|>";
+    EXPECT_EQ(out, expected);
+}
+
+TEST_F(ChatTemplateKimiTest, MultiTurnConversation) {
+    std::string out;
+    tpl.format_message(out, "system", "Be helpful.", true);
+    tpl.format_message(out, "user", "Hi", false);
+    tpl.format_message(out, "assistant", "Hello!", false);
+    tpl.format_message(out, "user", "Bye", false);
+    tpl.append_generation_prompt(out);
+
+    std::string expected =
+        "<|im_system|>system<|im_middle|>Be helpful.<|im_end|>"
+        "<|im_user|>user<|im_middle|>Hi<|im_end|>"
+        "<|im_assistant|>assistant<|im_middle|>Hello!<|im_end|>"
+        "<|im_user|>user<|im_middle|>Bye<|im_end|>"
+        "<|im_assistant|>assistant<|im_middle|>";
+    EXPECT_EQ(out, expected);
+}
+
+TEST_F(ChatTemplateKimiTest, NoSingleMessageStartMarker) {
+    // Per-role tokens mean marker-scan boundary detection is unavailable.
+    EXPECT_TRUE(tpl.message_start_marker().empty());
+}
+
+// =============================================================================
 // append_generation_prompt Tests
 // =============================================================================
 
@@ -331,6 +422,13 @@ TEST_F(AppendGenerationPromptTest, MistralIsNoop) {
     std::string out = "prefix";
     tpl.append_generation_prompt(out);
     EXPECT_EQ(out, "prefix");
+}
+
+TEST_F(AppendGenerationPromptTest, Kimi) {
+    ChatTemplate tpl(ChatTemplateFormat::kimi);
+    std::string out;
+    tpl.append_generation_prompt(out);
+    EXPECT_EQ(out, "<|im_assistant|>assistant<|im_middle|>");
 }
 
 // =============================================================================
@@ -377,6 +475,16 @@ TEST_F(FormatSingleMessageTest, MistralAssistant) {
               "Hi there</s>");
 }
 
+TEST_F(FormatSingleMessageTest, KimiFormat) {
+    ChatTemplate tpl(ChatTemplateFormat::kimi);
+    EXPECT_EQ(tpl.format_single_message("user", "Hello"),
+              "<|im_user|>user<|im_middle|>Hello<|im_end|>");
+    EXPECT_EQ(tpl.format_single_message("assistant", "Hi"),
+              "<|im_assistant|>assistant<|im_middle|>Hi<|im_end|>");
+    EXPECT_EQ(tpl.format_single_message("system", "Be nice"),
+              "<|im_system|>system<|im_middle|>Be nice<|im_end|>");
+}
+
 // =============================================================================
 // overhead_per_message Tests
 // =============================================================================
@@ -388,6 +496,7 @@ TEST_F(OverheadPerMessageTest, AllFormatsReturnPositive) {
     EXPECT_GT(ChatTemplate(ChatTemplateFormat::llama3).overhead_per_message(), 0u);
     EXPECT_GT(ChatTemplate(ChatTemplateFormat::chatml).overhead_per_message(), 0u);
     EXPECT_GT(ChatTemplate(ChatTemplateFormat::mistral).overhead_per_message(), 0u);
+    EXPECT_GT(ChatTemplate(ChatTemplateFormat::kimi).overhead_per_message(), 0u);
 }
 
 TEST_F(OverheadPerMessageTest, Llama3HasMostOverhead) {
@@ -400,6 +509,24 @@ TEST_F(OverheadPerMessageTest, Llama3HasMostOverhead) {
 }
 
 // =============================================================================
+// default_system_prompt Tests
+// =============================================================================
+
+class DefaultSystemPromptTest : public ::testing::Test {};
+
+TEST_F(DefaultSystemPromptTest, KimiHasCanonicalDefault) {
+    EXPECT_EQ(ChatTemplate(ChatTemplateFormat::kimi).default_system_prompt(),
+              "You are Kimi, an AI assistant created by Moonshot AI.");
+}
+
+TEST_F(DefaultSystemPromptTest, OtherFormatsHaveNone) {
+    EXPECT_TRUE(ChatTemplate(ChatTemplateFormat::none).default_system_prompt().empty());
+    EXPECT_TRUE(ChatTemplate(ChatTemplateFormat::llama3).default_system_prompt().empty());
+    EXPECT_TRUE(ChatTemplate(ChatTemplateFormat::chatml).default_system_prompt().empty());
+    EXPECT_TRUE(ChatTemplate(ChatTemplateFormat::mistral).default_system_prompt().empty());
+}
+
+// =============================================================================
 // Roundtrip: parse → name → parse
 // =============================================================================
 
@@ -409,7 +536,8 @@ TEST_F(RoundtripTest, AllCanonicalNamesRoundtrip) {
     for (auto fmt : {ChatTemplateFormat::none,
                      ChatTemplateFormat::llama3,
                      ChatTemplateFormat::chatml,
-                     ChatTemplateFormat::mistral}) {
+                     ChatTemplateFormat::mistral,
+                     ChatTemplateFormat::kimi}) {
         auto name = chat_template_format_name(fmt);
         EXPECT_EQ(parse_chat_template_format(name), fmt)
             << "Roundtrip failed for: " << name;

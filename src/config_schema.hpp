@@ -331,7 +331,7 @@ struct AssetsConfig {
     // Chat template format for message tokenization.
     // Controls how chat messages are formatted before tokenization so that
     // Ranvier's token sequences match what vLLM produces via apply_chat_template().
-    // Values: "none" (legacy \n-joined), "llama3", "chatml", "mistral"
+    // Values: "none" (legacy \n-joined), "llama3", "chatml", "mistral", "kimi"
     // IMPORTANT: Must match the model family of the tokenizer JSON.
     std::string chat_template_format = "none";
 
