@@ -313,9 +313,11 @@ TEST_F(ChatTemplateMistralTest, SystemNotFirst) {
 //
 // These expectations match Moonshot's chat_template.jinja for the standard
 // system/user/assistant case (confirmed against the reference template): no BOS
-// token is rendered and turns carry no separator whitespace. The reference's
-// default system-prompt injection and tool-result framing are intentionally not
-// reproduced — see format_kimi. Keep these strings in lockstep with the format.
+// token is rendered and turns carry no separator whitespace. Per-message
+// formatting is verbatim here; the reference's default-system injection for
+// system-less conversations is applied by the caller and covered in
+// request_rewriter_test (BoundaryInfoKimi*). Keep these strings in lockstep with
+// the format.
 
 class ChatTemplateKimiTest : public ::testing::Test {
 protected:
@@ -504,6 +506,24 @@ TEST_F(OverheadPerMessageTest, Llama3HasMostOverhead) {
     auto mistral = ChatTemplate(ChatTemplateFormat::mistral).overhead_per_message();
     EXPECT_GT(llama3, chatml);
     EXPECT_GT(llama3, mistral);
+}
+
+// =============================================================================
+// default_system_prompt Tests
+// =============================================================================
+
+class DefaultSystemPromptTest : public ::testing::Test {};
+
+TEST_F(DefaultSystemPromptTest, KimiHasCanonicalDefault) {
+    EXPECT_EQ(ChatTemplate(ChatTemplateFormat::kimi).default_system_prompt(),
+              "You are Kimi, an AI assistant created by Moonshot AI.");
+}
+
+TEST_F(DefaultSystemPromptTest, OtherFormatsHaveNone) {
+    EXPECT_TRUE(ChatTemplate(ChatTemplateFormat::none).default_system_prompt().empty());
+    EXPECT_TRUE(ChatTemplate(ChatTemplateFormat::llama3).default_system_prompt().empty());
+    EXPECT_TRUE(ChatTemplate(ChatTemplateFormat::chatml).default_system_prompt().empty());
+    EXPECT_TRUE(ChatTemplate(ChatTemplateFormat::mistral).default_system_prompt().empty());
 }
 
 // =============================================================================

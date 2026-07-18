@@ -63,9 +63,10 @@ enum class ChatTemplateFormat {
     // so there is no single message-start marker to scan (see
     // message_start_marker) — boundary detection falls back to estimation.
     // Confirmed against Moonshot's chat_template.jinja: no BOS is rendered and
-    // turns concatenate with no separator whitespace. Two reference behaviors
-    // are intentionally not reproduced (default-system injection, tool framing)
-    // — see format_kimi.
+    // turns concatenate with no separator whitespace. Default-system injection
+    // for system-less conversations is applied by the caller (see
+    // default_system_prompt); tool-result framing is not reproduced (see
+    // format_kimi).
     kimi,
 };
 
@@ -248,8 +249,27 @@ public:
         return 5;
     }
 
+    // System content the backend's apply_chat_template injects before the first
+    // turn when a conversation has no leading system message. Only Kimi's
+    // reference template defines one; every other format returns empty (they
+    // inject nothing). The caller fires this only when messages[0] is not itself
+    // a system turn — a request that supplies its own system message suppresses
+    // it — matching the reference's `loop.first and messages[0].role != 'system'`.
+    std::string_view default_system_prompt() const {
+        switch (_format) {
+            case ChatTemplateFormat::kimi: return kKimiDefaultSystemPrompt;
+            default: return {};
+        }
+    }
+
 private:
     ChatTemplateFormat _format;
+
+    // Verbatim from Moonshot's chat_template.jinja (K2). Part of the template
+    // definition, like the token strings above; update if a future Kimi revision
+    // changes it. A client that sends its own system message overrides it.
+    static constexpr std::string_view kKimiDefaultSystemPrompt =
+        "You are Kimi, an AI assistant created by Moonshot AI.";
 
     // Empty: Kimi's chat_template.jinja renders no BOS (its "[BOS]" token is
     // never emitted, and tokenizer_config carries no add_bos_token). Kept as a
@@ -379,15 +399,13 @@ private:
     // Segments are delimited by their own special tokens; no separator newline
     // is emitted between turns.
     //
-    // Two behaviors of Moonshot's reference chat_template.jinja are intentionally
-    // not reproduced, keeping this formatter verbatim to the messages it is given
-    // (as the other formats are). Both diverge from vLLM's rendering only in the
-    // cases named, and both are documented so the cache-alignment gap is known:
-    //   - No default system turn is injected when the conversation has none. The
-    //     reference prepends "You are Kimi, an AI assistant created by Moonshot
-    //     AI." — so a system-less prompt tokenizes differently than vLLM's.
-    //   - Tool-result turns omit the "## Return of {id}" wrapper and the
-    //     tool_call/media framing; routing keys on the system/user prefix.
+    // format_message stays verbatim to the message it is given (as the other
+    // formats do). The reference chat_template.jinja's default-system injection
+    // for system-less conversations is handled one level up, by the caller that
+    // owns the message list (see default_system_prompt) — this per-message
+    // function can't see whether the whole conversation lacks a system turn.
+    // Tool-result turns' "## Return of {id}" wrapper and the tool_call/media
+    // framing are not reproduced; routing keys on the system/user prefix.
     static void format_kimi(std::string& out,
                             std::string_view role,
                             std::string_view content,

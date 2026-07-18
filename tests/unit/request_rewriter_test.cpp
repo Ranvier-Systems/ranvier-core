@@ -1151,6 +1151,82 @@ TEST_F(RequestRewriterTest, BoundaryInfoSystemPrefixMultipleContiguous) {
     EXPECT_EQ(result->system_text, "You are helpful.\nBe concise.");
 }
 
+// --- Kimi default-system injection (matches chat_template.jinja) ---
+
+TEST_F(RequestRewriterTest, BoundaryInfoKimiInjectsDefaultSystemWhenAbsent) {
+    std::string body = R"({
+        "messages": [
+            {"role": "user", "content": "Hi"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(
+        body, /*need_formatted_messages=*/false,
+        ChatTemplate(ChatTemplateFormat::kimi));
+
+    ASSERT_TRUE(result.has_value());
+    // Reference injects the default system turn before the first user turn.
+    EXPECT_EQ(result->text,
+        "<|im_system|>system<|im_middle|>"
+        "You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>"
+        "<|im_user|>user<|im_middle|>Hi<|im_end|>"
+        "<|im_assistant|>assistant<|im_middle|>");
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoKimiNoInjectionWhenSystemPresent) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(
+        body, /*need_formatted_messages=*/false,
+        ChatTemplate(ChatTemplateFormat::kimi));
+
+    ASSERT_TRUE(result.has_value());
+    // A supplied system message suppresses the default; no "You are Kimi" prefix.
+    EXPECT_EQ(result->text,
+        "<|im_system|>system<|im_middle|>You are helpful.<|im_end|>"
+        "<|im_user|>user<|im_middle|>Hi<|im_end|>"
+        "<|im_assistant|>assistant<|im_middle|>");
+    EXPECT_EQ(result->text.find("You are Kimi"), std::string::npos);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoKimiInjectionLeavesRoutingKeyUntouched) {
+    // The injected default is a template artifact; the routing key (system_text)
+    // stays template-independent and empty for a system-less request.
+    std::string body = R"({
+        "messages": [
+            {"role": "user", "content": "Hi"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(
+        body, /*need_formatted_messages=*/false,
+        ChatTemplate(ChatTemplateFormat::kimi));
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->system_text.empty());
+    EXPECT_FALSE(result->has_system_messages);
+    EXPECT_FALSE(result->has_system_prefix);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoNoInjectionForNonKimiFormat) {
+    // Only Kimi defines a default; chatml (and others) inject nothing.
+    std::string body = R"({
+        "messages": [
+            {"role": "user", "content": "Hi"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(
+        body, /*need_formatted_messages=*/false,
+        ChatTemplate(ChatTemplateFormat::chatml));
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->text.find("You are Kimi"), std::string::npos);
+    EXPECT_EQ(result->text,
+        "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
+}
+
 TEST_F(RequestRewriterTest, BoundaryInfoSystemPrefixInterleaved) {
     // System messages are NOT contiguous — has_system_prefix should be false
     std::string body = R"({

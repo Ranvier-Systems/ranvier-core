@@ -407,6 +407,28 @@ RequestRewriter::extract_text_with_boundary_info(
     size_t system_prefix_end_candidate = 0;
     bool is_first_message = true;        // For chat template BOS handling
 
+    // Kimi's reference chat_template.jinja injects a default system turn when the
+    // conversation has no leading system message; replicate it so `combined`
+    // tokenizes identically to the backend's apply_chat_template. Fires only for
+    // formats that define a default (currently Kimi) and only when messages[0] is
+    // not a system turn — matching the reference's `loop.first and
+    // messages[0].role != 'system'` guard. system_text (the routing key) is left
+    // untouched: that key is deliberately template-independent (see below), and
+    // the injected default is a constant that carries no routing signal.
+    if (std::string_view default_system = chat_template.default_system_prompt();
+        !default_system.empty()) {
+        const auto& m0 = messages[0];
+        const bool first_is_system =
+            m0.IsObject() && m0.HasMember("role") && m0["role"].IsString() &&
+            std::string_view(m0["role"].GetString(),
+                             m0["role"].GetStringLength()) == "system";
+        if (!first_is_system) {
+            chat_template.format_message(combined, "system", default_system,
+                                         /*is_first=*/true);
+            is_first_message = false;
+        }
+    }
+
     result.message_char_ends.reserve(messages.Size());
     if (need_formatted_messages) {
         result.formatted_messages.reserve(messages.Size());
