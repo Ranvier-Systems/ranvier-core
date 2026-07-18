@@ -62,9 +62,10 @@ enum class ChatTemplateFormat {
     // Unlike ChatML, role tokens are per-role rather than a shared <|im_start|>,
     // so there is no single message-start marker to scan (see
     // message_start_marker) — boundary detection falls back to estimation.
-    // VERIFY the BOS/leading token and inter-segment whitespace against
-    // Moonshot's tokenizer_config.json before relying on exact vLLM cache
-    // alignment (see format_kimi / kKimiBosToken).
+    // Confirmed against Moonshot's chat_template.jinja: no BOS is rendered and
+    // turns concatenate with no separator whitespace. Two reference behaviors
+    // are intentionally not reproduced (default-system injection, tool framing)
+    // — see format_kimi.
     kimi,
 };
 
@@ -250,12 +251,10 @@ public:
 private:
     ChatTemplateFormat _format;
 
-    // VERIFY(kimi-bos): exact leading/BOS string per Moonshot's
-    // tokenizer_config.json. Empty until confirmed on a real Kimi tokenizer:
-    // emitting a wrong special-token string is worse than emitting none (a wrong
-    // glyph tokenizes as literal text and pollutes the routed prefix), whereas an
-    // omitted BOS is a fixed one-token offset. Set once here when confirmed and
-    // update ChatTemplateKimiTest to match.
+    // Empty: Kimi's chat_template.jinja renders no BOS (its "[BOS]" token is
+    // never emitted, and tokenizer_config carries no add_bos_token). Kept as a
+    // named seam should a future variant reintroduce one — setting it must also
+    // update ChatTemplateKimiTest.
     static constexpr std::string_view kKimiBosToken{};
 
     // Kimi opens each turn with a role-specific token. system and tool turns
@@ -380,10 +379,15 @@ private:
     // Segments are delimited by their own special tokens; no separator newline
     // is emitted between turns.
     //
-    // Tool-call and tool-result turns carry extra structure in the reference
-    // template (e.g. "## Return of {id}") that is not reproduced here — routing
-    // keys on the system/user prefix, not on tool turns. See the enum's VERIFY
-    // note on the BOS token and inter-segment whitespace.
+    // Two behaviors of Moonshot's reference chat_template.jinja are intentionally
+    // not reproduced, keeping this formatter verbatim to the messages it is given
+    // (as the other formats are). Both diverge from vLLM's rendering only in the
+    // cases named, and both are documented so the cache-alignment gap is known:
+    //   - No default system turn is injected when the conversation has none. The
+    //     reference prepends "You are Kimi, an AI assistant created by Moonshot
+    //     AI." — so a system-less prompt tokenizes differently than vLLM's.
+    //   - Tool-result turns omit the "## Return of {id}" wrapper and the
+    //     tool_call/media framing; routing keys on the system/user prefix.
     static void format_kimi(std::string& out,
                             std::string_view role,
                             std::string_view content,

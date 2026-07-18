@@ -311,11 +311,11 @@ TEST_F(ChatTemplateMistralTest, SystemNotFirst) {
 // format_message — Kimi (Moonshot) format
 // =============================================================================
 //
-// These expectations encode the assumption that the template emits NO BOS
-// token (kKimiBosToken is empty) and NO inter-segment newline. Both are flagged
-// VERIFY in chat_template.hpp against Moonshot's tokenizer_config.json; if either
-// is confirmed different, update the constant/format AND these expected strings
-// together so the mismatch stays caught here rather than degrading cache hits.
+// These expectations match Moonshot's chat_template.jinja for the standard
+// system/user/assistant case (confirmed against the reference template): no BOS
+// token is rendered and turns carry no separator whitespace. The reference's
+// default system-prompt injection and tool-result framing are intentionally not
+// reproduced — see format_kimi. Keep these strings in lockstep with the format.
 
 class ChatTemplateKimiTest : public ::testing::Test {
 protected:
@@ -344,9 +344,9 @@ TEST_F(ChatTemplateKimiTest, ToolRoleOpensWithSystemToken) {
 }
 
 TEST_F(ChatTemplateKimiTest, IsFirstHasNoEffectWhileBosEmpty) {
-    // Guards the VERIFY(kimi-bos) assumption: with an empty BOS constant the
-    // first turn renders identically to a later one. Setting kKimiBosToken must
-    // break this test deliberately.
+    // Guards the no-BOS invariant: with an empty BOS constant the first turn
+    // renders identically to a later one. Setting kKimiBosToken must break this
+    // test deliberately.
     std::string first, subsequent;
     tpl.format_message(first, "system", "You are Kimi.", true);
     tpl.format_message(subsequent, "system", "You are Kimi.", false);
