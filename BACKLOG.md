@@ -1352,6 +1352,8 @@ Kimi K2 (and, once public, K3) with correct prefix-cache alignment.
 **Open:**
 - D — spike on a live K3-on-vLLM fleet: confirm KV events flow and prefix caching
   actually hits under Kimi Delta Attention (hybrid linear attention). Needs GPU.
+  Runbook ready: [`docs/benchmarks/kimi-k3-prefix-caching-spike.md`](docs/benchmarks/kimi-k3-prefix-caching-spike.md)
+  (pre-registered decision rules, K2 control, 3 gated questions).
 - A — benchmark the TTFT / cache-hit win for a Kimi workload. Needs GPU.
 - Re-run the convert→validate pipeline against **K3** when weights/tokenizer ship
   (K2 is today's proxy; confirm the template tokens/default prompt didn't shift).
