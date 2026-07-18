@@ -1324,6 +1324,46 @@ with run files under `docs/benchmarks/rebaseline/`. Nothing blocks it but the GP
 
 ---
 
+## 26. Kimi (Moonshot) Model Support (2026-07-18)
+
+Added the `kimi` chat-template format and the tokenizer tooling needed to route
+Kimi K2 (and, once public, K3) with correct prefix-cache alignment.
+
+**Done:**
+- `ChatTemplateFormat::kimi` — per-role tokens (`<|im_user|>`/`<|im_assistant|>`/
+  `<|im_system|>`) + `<|im_middle|>`/`<|im_end|>`, generation prompt, no BOS.
+  Verified byte-exact against Moonshot's `chat_template.jinja`.
+- Default-system injection for system-less conversations (in `RequestRewriter`),
+  including the trailing newline the reference template leaves — a bug the parity
+  harness caught before it shipped as a real cache-misalignment.
+- Convert→validate tokenizer pipeline under `tests/tokenizer_parity/`:
+  `convert_kimi_tokenizer.py` (tiktoken→fast) + `kimi_tokenizer_parity.py`
+  (authoritative vs Ranvier-path IDs). Verified 5/5 parity on Kimi-K2-Instruct.
+- Gated FFI parity test `kimi_tokenizer_parity_test.cpp`
+  (`-DRANVIER_BUILD_KIMI_PARITY_TEST=ON`, skips without the artifacts).
+
+**Deploy contract (Kimi on Ranvier):**
+1. `chat_template_format: kimi`.
+2. Kimi ships **no** fast `tokenizer.json` — a converted one is mandatory
+   (`convert_kimi_tokenizer.py`), and must pass the parity harness.
+3. Pin **the same** `tokenizer.json` on Ranvier (`tokenizer_path`) *and* the
+   serving backend, or the two sides tokenize differently and cache never aligns.
+
+**Open:**
+- D — spike on a live K3-on-vLLM fleet: confirm KV events flow and prefix caching
+  actually hits under Kimi Delta Attention (hybrid linear attention). Needs GPU.
+- A — benchmark the TTFT / cache-hit win for a Kimi workload. Needs GPU.
+- Re-run the convert→validate pipeline against **K3** when weights/tokenizer ship
+  (K2 is today's proxy; confirm the template tokens/default prompt didn't shift).
+- Optionally wire the gated parity test into a CI runner that has the artifacts.
+
+**Known limitations (documented in code):**
+- Multimodal `content` arrays (K3 vision) are dropped from routing/tokenization
+  (`request_rewriter.hpp`) — image requests route on their text turns only.
+- Tool-result `## Return of {id}` framing is not reproduced.
+
+---
+
 ## References
 
 - [Ranvier Architecture](./architecture.md)

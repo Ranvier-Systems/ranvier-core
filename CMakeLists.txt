@@ -1388,6 +1388,26 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(tokenization_cache_test)
 
+    # Kimi tokenizer FFI parity test (opt-in; needs a converted tokenizer.json
+    # that is not vendored). OFF by default so a normal build is unaffected;
+    # skips at run time unless RANVIER_KIMI_TOKENIZER_JSON and
+    # RANVIER_KIMI_PARITY_FIXTURE are set. See tests/tokenizer_parity/README.md.
+    option(RANVIER_BUILD_KIMI_PARITY_TEST
+           "Build the gated Kimi tokenizer FFI parity test" OFF)
+    if(RANVIER_BUILD_KIMI_PARITY_TEST)
+        add_executable(kimi_tokenizer_parity_test
+          tests/unit/kimi_tokenizer_parity_test.cpp
+        )
+        target_include_directories(kimi_tokenizer_parity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(kimi_tokenizer_parity_test
+          PRIVATE
+          tokenizers_cpp
+          rapidjson_interface
+          GTest::gtest_main
+        )
+        gtest_discover_tests(kimi_tokenizer_parity_test)
+    endif()
+
     # TokenizerThreadPool Unit Tests (Requires Seastar types for header includes)
     # Tests dedicated thread pool for non-blocking FFI offload (Rule #4, #11)
     add_executable(tokenizer_thread_pool_test

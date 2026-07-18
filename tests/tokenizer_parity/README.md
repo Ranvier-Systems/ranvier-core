@@ -94,10 +94,20 @@ confirm its tokenizer/template haven't shifted.
 python3 kimi_tokenizer_parity.py --emit-fixture kimi_reference_tokens.json
 ```
 
-This writes each case's authoritative token IDs. A follow-up Google Test can load
-a Kimi `tokenizer.json` (path via env var, skipped when absent) and assert
-`tokenizers-cpp` reproduces these IDs — moving the check into the real FFI path
-Ranvier uses, on every build. Not built yet; see the project backlog.
+This writes each case's authoritative token IDs, consumed by the gated C++ test
+`tests/unit/kimi_tokenizer_parity_test.cpp`, which loads a Kimi `tokenizer.json`
+and asserts `tokenizers-cpp` (Ranvier's real FFI path) reproduces those IDs.
+
+It is opt-in and inert by default — build with `-DRANVIER_BUILD_KIMI_PARITY_TEST=ON`
+and point two env vars at the artifacts; without them it reports SKIPPED:
+
+```bash
+cmake -B build -DRANVIER_BUILD_KIMI_PARITY_TEST=ON   # plus your usual flags
+cmake --build build --target kimi_tokenizer_parity_test
+RANVIER_KIMI_TOKENIZER_JSON=$PWD/kimi_fast/tokenizer.json \
+RANVIER_KIMI_PARITY_FIXTURE=$PWD/tests/tokenizer_parity/kimi_reference_tokens.json \
+  ./build/kimi_tokenizer_parity_test
+```
 
 ## Out of scope (by design)
 
