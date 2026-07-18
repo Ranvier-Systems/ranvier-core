@@ -450,6 +450,11 @@ RequestRewriter::extract_text_with_boundary_info(
         // Get content
         if (!msg.HasMember("content")) continue;
         const auto& content = msg["content"];
+        // Only plain-string content participates in routing/tokenization. OpenAI
+        // multimodal content (an array of text/image parts, e.g. Kimi K3 vision
+        // requests) is skipped here — such requests route on their text turns
+        // only, and any image parts are absent from the routed prefix. Handling
+        // multimodal prefixes would need its own design (see tokenizer_parity).
         if (!content.IsString()) continue;
 
         std::string_view content_sv(content.GetString(), content.GetStringLength());
