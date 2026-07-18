@@ -53,6 +53,19 @@ enum class ChatTemplateFormat {
     // Wraps user/assistant turns in [INST] / [/INST] markers.
     // System message is prepended inside the first [INST] block.
     mistral,
+
+    // Kimi K2 / K3 (Moonshot) format.
+    // Each message: {role-token}{role}<|im_middle|>{content}<|im_end|>
+    //   role-token ∈ { <|im_user|>, <|im_assistant|>, <|im_system|> }
+    //   — system and tool turns both open with <|im_system|>.
+    // Generation prompt: <|im_assistant|>assistant<|im_middle|>
+    // Unlike ChatML, role tokens are per-role rather than a shared <|im_start|>,
+    // so there is no single message-start marker to scan (see
+    // message_start_marker) — boundary detection falls back to estimation.
+    // VERIFY the BOS/leading token and inter-segment whitespace against
+    // Moonshot's tokenizer_config.json before relying on exact vLLM cache
+    // alignment (see format_kimi / kKimiBosToken).
+    kimi,
 };
 
 // Parse a chat template format name from string.
@@ -67,6 +80,10 @@ inline ChatTemplateFormat parse_chat_template_format(std::string_view name) {
     if (name == "mistral") {
         return ChatTemplateFormat::mistral;
     }
+    if (name == "kimi" || name == "kimi-k2" || name == "kimi-k3" ||
+        name == "moonshot") {
+        return ChatTemplateFormat::kimi;
+    }
     // "none" or anything unrecognized → legacy behavior
     return ChatTemplateFormat::none;
 }
@@ -76,6 +93,7 @@ inline std::string_view chat_template_format_name(ChatTemplateFormat fmt) {
         case ChatTemplateFormat::llama3:  return "llama3";
         case ChatTemplateFormat::chatml:  return "chatml";
         case ChatTemplateFormat::mistral: return "mistral";
+        case ChatTemplateFormat::kimi:    return "kimi";
         case ChatTemplateFormat::none:    return "none";
     }
     return "none";
@@ -117,6 +135,9 @@ public:
                 break;
             case ChatTemplateFormat::mistral:
                 format_mistral(out, role, content, is_first);
+                break;
+            case ChatTemplateFormat::kimi:
+                format_kimi(out, role, content, is_first);
                 break;
         }
     }
@@ -165,6 +186,14 @@ public:
                     out.append("</s>");
                 }
                 break;
+            case ChatTemplateFormat::kimi:
+                // No BOS for individual message tokenization (mirrors llama3).
+                out.append(kimi_role_token(role));
+                out.append(role);
+                out.append("<|im_middle|>");
+                out.append(content);
+                out.append("<|im_end|>");
+                break;
         }
         return out;
     }
@@ -185,6 +214,9 @@ public:
             case ChatTemplateFormat::mistral:
                 // Mistral's generation prompt is implicit (after [/INST])
                 break;
+            case ChatTemplateFormat::kimi:
+                out.append("<|im_assistant|>assistant<|im_middle|>");
+                break;
         }
     }
 
@@ -196,6 +228,9 @@ public:
         switch (_format) {
             case ChatTemplateFormat::llama3: return "<|start_header_id|>";
             case ChatTemplateFormat::chatml: return "<|im_start|>";
+            // Kimi opens each turn with a role-specific token, so a single-marker
+            // scan can't count messages; callers fall back to estimation.
+            case ChatTemplateFormat::kimi:   return {};
             default: return {};
         }
     }
@@ -207,12 +242,30 @@ public:
             case ChatTemplateFormat::llama3:  return 60;  // header + eot tokens
             case ChatTemplateFormat::chatml:  return 30;  // im_start/end tokens
             case ChatTemplateFormat::mistral: return 20;  // [INST] markers
+            case ChatTemplateFormat::kimi:    return 45;  // role + im_middle + im_end
         }
         return 5;
     }
 
 private:
     ChatTemplateFormat _format;
+
+    // VERIFY(kimi-bos): exact leading/BOS string per Moonshot's
+    // tokenizer_config.json. Empty until confirmed on a real Kimi tokenizer:
+    // emitting a wrong special-token string is worse than emitting none (a wrong
+    // glyph tokenizes as literal text and pollutes the routed prefix), whereas an
+    // omitted BOS is a fixed one-token offset. Set once here when confirmed and
+    // update ChatTemplateKimiTest to match.
+    static constexpr std::string_view kKimiBosToken{};
+
+    // Kimi opens each turn with a role-specific token. system and tool turns
+    // both open with <|im_system|> (a tool turn renders as
+    // <|im_system|>tool<|im_middle|>...); user/assistant get their own tokens.
+    static std::string_view kimi_role_token(std::string_view role) {
+        if (role == "user")      return "<|im_user|>";
+        if (role == "assistant") return "<|im_assistant|>";
+        return "<|im_system|>";
+    }
 
     // --- Legacy format: raw content with "\n" separator ---
     static void format_none(std::string& out, std::string_view content, bool is_first) {
@@ -320,6 +373,29 @@ private:
             out.append(content);
             out.append("</s>");
         }
+    }
+
+    // --- Kimi K2 / K3 (Moonshot) format ---
+    // Per-turn: {role-token}{role}<|im_middle|>{content}<|im_end|>
+    // Segments are delimited by their own special tokens; no separator newline
+    // is emitted between turns.
+    //
+    // Tool-call and tool-result turns carry extra structure in the reference
+    // template (e.g. "## Return of {id}") that is not reproduced here — routing
+    // keys on the system/user prefix, not on tool turns. See the enum's VERIFY
+    // note on the BOS token and inter-segment whitespace.
+    static void format_kimi(std::string& out,
+                            std::string_view role,
+                            std::string_view content,
+                            bool is_first) {
+        if (is_first && !kKimiBosToken.empty()) {
+            out.append(kKimiBosToken);
+        }
+        out.append(kimi_role_token(role));
+        out.append(role);
+        out.append("<|im_middle|>");
+        out.append(content);
+        out.append("<|im_end|>");
     }
 };
 
