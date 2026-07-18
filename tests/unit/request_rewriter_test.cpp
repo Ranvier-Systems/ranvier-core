@@ -1164,10 +1164,11 @@ TEST_F(RequestRewriterTest, BoundaryInfoKimiInjectsDefaultSystemWhenAbsent) {
         ChatTemplate(ChatTemplateFormat::kimi));
 
     ASSERT_TRUE(result.has_value());
-    // Reference injects the default system turn before the first user turn.
+    // Reference injects the default system turn before the first user turn,
+    // followed by a newline (the injection block leaves it unstripped).
     EXPECT_EQ(result->text,
         "<|im_system|>system<|im_middle|>"
-        "You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>"
+        "You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n"
         "<|im_user|>user<|im_middle|>Hi<|im_end|>"
         "<|im_assistant|>assistant<|im_middle|>");
 }

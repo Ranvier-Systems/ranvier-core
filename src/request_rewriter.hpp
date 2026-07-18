@@ -425,6 +425,11 @@ RequestRewriter::extract_text_with_boundary_info(
         if (!first_is_system) {
             chat_template.format_message(combined, "system", default_system,
                                          /*is_first=*/true);
+            // The reference jinja leaves a newline after the injected default
+            // system turn (its injection block does not strip the trailing
+            // newline, unlike the tightly-packed real turns). Without it a
+            // system-less prompt tokenizes one token off from the backend.
+            combined.push_back('\n');
             is_first_message = false;
         }
     }

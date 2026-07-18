@@ -64,8 +64,10 @@ def render_kimi_ranvier(messages, add_generation_prompt=True):
     # Default-system injection fires on messages[0], before content filtering,
     # matching the reference jinja's `loop.first and messages[0].role != system`.
     if messages and messages[0].get("role") != "system":
+        # Trailing newline: the reference jinja leaves one after the injected
+        # default system turn (see src/request_rewriter.hpp).
         parts.append(
-            f"<|im_system|>system<|im_middle|>{KIMI_DEFAULT_SYSTEM}<|im_end|>"
+            f"<|im_system|>system<|im_middle|>{KIMI_DEFAULT_SYSTEM}<|im_end|>\n"
         )
     for m in messages:
         # Ranvier skips messages whose content is not a plain string.
@@ -105,6 +107,20 @@ CONVERSATIONS = [
         {"role": "user", "content": "   leading spaces and\nnewlines   "},
     ],
 ]
+
+
+def _as_id_list(x):
+    """Normalize apply_chat_template(tokenize=True) output to a flat list[int].
+
+    Depending on the tokenizer / transformers version it can be a plain list, a
+    dict, or a BatchEncoding, and it may be batched ([[...]]).
+    """
+    if hasattr(x, "keys"):  # dict / BatchEncoding
+        x = x["input_ids"]
+    x = list(x)
+    if x and isinstance(x[0], (list, tuple)):  # batched -> first row
+        x = list(x[0])
+    return x
 
 
 def _first_divergence(a, b):
@@ -195,8 +211,9 @@ def main():
         str_ok = rendered == ref_str
 
         # 2) Authoritative token IDs (end-to-end via the reference tokenizer).
-        auth_ids = auth.apply_chat_template(
-            msgs, tokenize=True, add_generation_prompt=True)
+        #    apply_chat_template may hand back a list, dict, or BatchEncoding.
+        auth_ids = _as_id_list(auth.apply_chat_template(
+            msgs, tokenize=True, add_generation_prompt=True))
 
         # 3) Ranvier-path IDs. tokenizers-cpp Encode(text) feeds the already-
         #    rendered string; try both add_special_tokens settings so the report
