@@ -67,7 +67,7 @@ must do (see `src/tokenizer_service.cpp` / `src/tokenizer_thread_pool.cpp`).
 ## Running
 
 ```bash
-pip install transformers tokenizers huggingface_hub
+pip install transformers tokenizers huggingface_hub jinja2
 python3 kimi_tokenizer_parity.py                      # defaults to Kimi-K2-Instruct
 # or point at a local fast tokenizer.json:
 python3 kimi_tokenizer_parity.py --tokenizer-json /path/to/tokenizer.json

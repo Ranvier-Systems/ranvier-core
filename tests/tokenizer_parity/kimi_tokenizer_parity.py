@@ -29,7 +29,7 @@ multimodal (image) content are intentionally out of scope; Ranvier does not
 reproduce them (see src/request_rewriter.hpp and the README).
 
 Usage:
-    pip install transformers tokenizers huggingface_hub
+    pip install transformers tokenizers huggingface_hub jinja2
     python3 kimi_tokenizer_parity.py                       # defaults to K2-Instruct
     python3 kimi_tokenizer_parity.py --model moonshotai/Kimi-K2-Instruct
     python3 kimi_tokenizer_parity.py --tokenizer-json /path/to/tokenizer.json
@@ -140,7 +140,7 @@ def main():
         import tokenizers
     except ImportError as e:
         print(f"ERROR: missing dependency ({e}).", file=sys.stderr)
-        print("Install with: pip install transformers tokenizers huggingface_hub",
+        print("Install with: pip install transformers tokenizers huggingface_hub jinja2",
               file=sys.stderr)
         return 2
 
