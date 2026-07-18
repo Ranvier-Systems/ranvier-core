@@ -1,0 +1,240 @@
+{
+  "model": "moonshotai/Kimi-K2-Instruct",
+  "cases": [
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are helpful."
+        },
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "rendered": "<|im_system|>system<|im_middle|>You are helpful.<|im_end|><|im_user|>user<|im_middle|>What is 2+2?<|im_end|><|im_assistant|>assistant<|im_middle|>",
+      "token_ids": [
+        163594,
+        14062,
+        163601,
+        3900,
+        554,
+        13205,
+        13,
+        163586,
+        163587,
+        2482,
+        163601,
+        5376,
+        387,
+        220,
+        17,
+        10,
+        17,
+        30,
+        163586,
+        163588,
+        69702,
+        163601
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "rendered": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n<|im_user|>user<|im_middle|>Hi<|im_end|><|im_assistant|>assistant<|im_middle|>",
+      "token_ids": [
+        163594,
+        14062,
+        163601,
+        3900,
+        554,
+        24980,
+        72,
+        11,
+        519,
+        22572,
+        26626,
+        5232,
+        673,
+        30218,
+        10065,
+        22572,
+        13,
+        163586,
+        198,
+        163587,
+        2482,
+        163601,
+        18699,
+        163586,
+        163588,
+        69702,
+        163601
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be concise."
+        },
+        {
+          "role": "user",
+          "content": "Explain prefix caching."
+        },
+        {
+          "role": "assistant",
+          "content": "It reuses KV blocks for shared prefixes."
+        },
+        {
+          "role": "user",
+          "content": "Why does it help TTFT?"
+        }
+      ],
+      "rendered": "<|im_system|>system<|im_middle|>Be concise.<|im_end|><|im_user|>user<|im_middle|>Explain prefix caching.<|im_end|><|im_assistant|>assistant<|im_middle|>It reuses KV blocks for shared prefixes.<|im_end|><|im_user|>user<|im_middle|>Why does it help TTFT?<|im_end|><|im_assistant|>assistant<|im_middle|>",
+      "token_ids": [
+        163594,
+        14062,
+        163601,
+        4396,
+        67803,
+        13,
+        163586,
+        163587,
+        2482,
+        163601,
+        91561,
+        14280,
+        62273,
+        13,
+        163586,
+        163588,
+        69702,
+        163601,
+        1744,
+        333,
+        7992,
+        121358,
+        13825,
+        395,
+        9142,
+        102294,
+        13,
+        163586,
+        163587,
+        2482,
+        163601,
+        14887,
+        2354,
+        483,
+        1833,
+        44267,
+        7247,
+        30,
+        163586,
+        163588,
+        69702,
+        163601
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Café — naïve façade, 日本語, emoji 🚀\n\ttrailing"
+        }
+      ],
+      "rendered": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n<|im_user|>user<|im_middle|>Café — naïve façade, 日本語, emoji 🚀\n\ttrailing<|im_end|><|im_assistant|>assistant<|im_middle|>",
+      "token_ids": [
+        163594,
+        14062,
+        163601,
+        3900,
+        554,
+        24980,
+        72,
+        11,
+        519,
+        22572,
+        26626,
+        5232,
+        673,
+        30218,
+        10065,
+        22572,
+        13,
+        163586,
+        198,
+        163587,
+        2482,
+        163601,
+        34,
+        2680,
+        1941,
+        4275,
+        7915,
+        44187,
+        367,
+        133755,
+        11,
+        220,
+        4546,
+        63011,
+        11,
+        68369,
+        17137,
+        40101,
+        198,
+        49183,
+        16627,
+        163586,
+        163588,
+        69702,
+        163601
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are Kimi."
+        },
+        {
+          "role": "user",
+          "content": "   leading spaces and\nnewlines   "
+        }
+      ],
+      "rendered": "<|im_system|>system<|im_middle|>You are Kimi.<|im_end|><|im_user|>user<|im_middle|>   leading spaces and\nnewlines   <|im_end|><|im_assistant|>assistant<|im_middle|>",
+      "token_ids": [
+        163594,
+        14062,
+        163601,
+        3900,
+        554,
+        24980,
+        72,
+        13,
+        163586,
+        163587,
+        2482,
+        163601,
+        256,
+        8134,
+        14803,
+        316,
+        198,
+        3514,
+        11541,
+        274,
+        163586,
+        163588,
+        69702,
+        163601
+      ]
+    }
+  ]
+}
