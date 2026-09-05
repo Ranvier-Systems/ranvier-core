@@ -10,7 +10,7 @@
 #
 # Rebuild this base image only when:
 #   - Upgrading Fedora version
-#   - Upgrading Seastar version
+#   - Upgrading Seastar version (bump SEASTAR_REF below)
 #   - Upgrading tokenizers-cpp version
 #   - Adding new system-level build dependencies
 # ---------------------------------------------------------
@@ -51,8 +51,15 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Layer 3: Seastar - consolidated build + cleanup in single layer
 WORKDIR /tmp
-RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
-    cd seastar && \
+# Pinned Seastar commit (scylladb/seastar master as of 2026-09-05). The previous
+# unpinned `--depth 1` clone made this image non-reproducible. To upgrade Seastar,
+# bump SEASTAR_REF deliberately and rebuild.
+ARG SEASTAR_REF=805800685670b6ea4ab9a90461640d822e6c957b
+RUN mkdir seastar && cd seastar && \
+    git init -q && \
+    git remote add origin https://github.com/scylladb/seastar.git && \
+    git fetch -q --depth 1 origin "${SEASTAR_REF}" && \
+    git checkout -q FETCH_HEAD && \
     ./install-dependencies.sh && \
     dnf clean all && \
     ./configure.py --mode=release --prefix=/usr/local --c++-standard=20 --without-tests --without-apps --without-demos && \

@@ -2,7 +2,7 @@
 
 > **Architectural Gap Analysis**
 > Generated: 2025-12-27 | Reorganized: 2026-03-22
-> Current State: Alpha (stable ~60ms P99 TTFT in Docker testbed)
+> Current State: 2.1.0 released 2026-04-11; `main` carries unreleased changes (CHANGELOG `[Unreleased]`); single maintainer. The citable GPU headline is the 2026-07-13 50-prefix re-baseline (§25), not the deprecated 5-prefix figures.
 
 This document tracks **open** backlog items for Ranvier Core v1.0.
 Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
