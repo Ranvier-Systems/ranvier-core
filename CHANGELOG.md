@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+> **Note (2026-09-05).** The entries below have merged to `main` but have not been
+> exercised on GPU hardware since the 2026-07-13 re-baseline (BACKLOG §25). They will
+> be cut as 2.2.0 once each has a recorded run or is explicitly marked
+> hardware-independent. Release notes further down quote a 33–44% TTFT improvement
+> measured on a 5-prefix workload that the 2026-07-05 methodology review deprecated;
+> the citable figures are in README → Benchmark Results.
+
 ### Added
 
 - **Request-admission policy seam** (embeddability series) — A pluggable,
