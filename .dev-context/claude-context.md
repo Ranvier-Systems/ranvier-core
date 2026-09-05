@@ -2,7 +2,7 @@
 
 ## Project Essence
 
-Ranvier Core is a high-performance **Layer 7+ LLM traffic controller** built in **C++20** on the **Seastar** framework. It reduces GPU KV-cache thrashing by routing inference requests based on token prefixes rather than connection availability, achieving ~48% faster Time-To-First-Token for RAG, multi-turn chat, and few-shot workloads.
+Ranvier Core is a high-performance **Layer 7+ LLM traffic controller** built in **C++20** on the **Seastar** framework. It reduces GPU KV-cache thrashing by routing inference requests based on token prefixes rather than connection availability. On the representative 50-prefix workload (8×A100, 2026-07-13, commit `817a1b5`) it triples cache-hit rate at every load level and cuts P99 time-to-first-token by 9–13% under sustained load, with no reliable effect at moderate load and a +29% P99 regression at low load. The older ~48% and 33–44% figures came from the deprecated 5-prefix workload and are not citable (BACKLOG §25).
 
 **License:** Apache 2.0
 
@@ -427,7 +427,7 @@ Local equivalents of the verification workflows, and when to run which: see the 
 
 ## Deployment
 
-- **Docker:** `ghcr.io/ranvier-systems/ranvier:latest` (requires `--cap-add=IPC_LOCK`)
+- **Docker:** `ghcr.io/ranvier-systems/ranvier:2.1.0` (latest release; `:latest` tracks unreleased `main`; requires `--cap-add=IPC_LOCK`)
 - **Kubernetes:** Helm chart in `deploy/helm/ranvier/` (StatefulSet, HPA, service discovery)
 - **Local development:** Docker Compose via `docker-compose.test.yml` (3 nodes + 2 backends)
 

@@ -1,6 +1,6 @@
 # Ranvier Core
 
-> **33-44% faster Time-To-First-Token** through intelligent prefix-aware routing.
+> **Prefix-aware routing for self-hosted LLM fleets, in C++20 on Seastar.** On the representative 50-prefix workload (8×A100, July 2026) it tripled cache-hit rate at every load level and cut P99 time-to-first-token by 9–13% under sustained load, with no reliable effect at moderate load and a 29% P99 regression at low load. See [Benchmark Results](#benchmark-results), which also carries the superseded February figures.
 >
 > *Named for the Nodes of Ranvier—enabling signals to jump gaps, just as Ranvier enables inference to skip redundant computation.*
 
@@ -20,8 +20,11 @@ Run with Docker — no configuration needed:
 
 ```bash
 docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 \
-  ghcr.io/ranvier-systems/ranvier:latest
+  ghcr.io/ranvier-systems/ranvier:2.1.0
 ```
+
+`2.1.0` is the latest release (2026-04-11). The `:latest` tag tracks `main`, which carries
+unreleased changes; read [CHANGELOG → Unreleased](CHANGELOG.md#unreleased) before using it.
 
 Point your client at `http://localhost:8080` and start sending requests.
 For deployment options (Kubernetes, building from source), see [Deployment](#deployment) below.
@@ -68,53 +71,55 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 
 ## Benchmark Results
 
-Real-world results from 8x A100 GPUs (30-minute validated runs, February 2026):
+Two campaigns have been run on 8×A100 hardware. **The July 2026 re-baseline is the citable one.** The February 2026 numbers are kept below for history: they were measured on a 5-prefix synthetic workload that the project's own methodology review (`.dev-context/benchmark-tooling-review-2026-07-05.md`) found manufactures much of the headline win, and they should not be quoted as expected results.
 
-### Performance by Model Size
+### July 2026 re-baseline (citable)
+
+Representative workload: 50 large shared prefixes; prefix-aware routing against round-robin on the same fleet; median of three runs per configuration; commit `817a1b5`. Write-up: [benchmark-results-current.md](docs/benchmarks/benchmark-results-current.md).
+
+| Model, load | Cache hit rate | P99 TTFT vs round-robin | Verdict |
+|---|---|---|---|
+| Llama-3.1-8B, 20 users (~47 req/s) | ~3× higher | **−13.3%** | reliable improvement |
+| CodeLlama-13B, 30 users | ~3× higher | **−9.1%** | reliable improvement |
+| CodeLlama-13B, 20 users | ~3× higher | no reliable effect | interquartile range spans zero |
+| CodeLlama-13B, 10 users (~16 req/s) | ~3× higher | **+29%**, more timeouts | reliable regression |
+
+The effect is monotonic in cluster throughput. Prefix affinity pays when the GPUs are queue-bound, because a skipped prefill shortens the queue behind it, and costs a little when they are idle, because a skipped prefill is then worth less than the transient concentration affinity can cause. Cache-hit rate rose about threefold in every configuration and is decoupled from P99 at low load. Per-request routing overhead (about 1.7 ms at 30 users and about 16 ms at 10 users, against a P99 of several seconds) does not explain the regression; the leading hypothesis and its untested one-flag fix are written up in `.dev-context/prefix-routing-load-gating-proposal.md`.
+
+**What this does and does not show.** Ranvier reliably improves tail latency for prefix-heavy traffic on a saturated fleet. It has not been shown to help an under-utilized fleet, and it has not been compared head-to-head with other prefix-aware routers. A pre-registered comparison is the next planned GPU run.
+
+### February 2026 campaign (superseded)
+
+5-prefix workload, 30-minute runs. Earlier release notes and posts cite these figures. Treat them as an upper bound from a favourable synthetic case, not as expected results.
 
 | Model | Cache Hit Rate | TTFT Improvement | P99 Latency | Throughput |
 |-------|----------------|------------------|-------------|------------|
-| **Llama-3.1-70B** | 25% → **98%** | **44%** faster | ~same | ~same |
-| CodeLlama-13b | 12% → **58-98%** | **33%** faster | **-60% to -85%** | **+4% to +22%** |
-| Llama-3.1-8B | 12% → **68-98%** | **40%** faster | flat | ~same |
+| Llama-3.1-70B | 25% → 98% | 44% faster | ~same | ~same |
+| CodeLlama-13b | 12% → 58-98% | 33% faster | -60% to -85% | +4% to +22% |
+| Llama-3.1-8B | 12% → 68-98% | 40% faster | flat | ~same |
 
-<sub>Hardware: 70B on 80GB A100s (TP=2, 4 backends); 13B/8B on 40GB A100s (8 backends).
-The 13B P99 range reflects two routing modes: 30μs batched routes give 58% hits / -80% P99,
-while per-request SMP reaches 98% / -85%. Clean runs consistently land at P99 -60% to -80%.</sub>
+<sub>Hardware: 70B on 80GB A100s (TP=2, 4 backends); 13B/8B on 40GB A100s (8 backends).</sub>
 
-**Key insight:** Benefits scale with model size — larger models save more computation per cache hit.
+**Best suited for:** RAG with shared context documents, multi-turn chat with large system prompts, few-shot prompts with shared examples, and any workload with 2K+ token shared prefixes on a fleet that runs hot.
 
-- **70B** shows the highest per-request benefit (**44%** TTFT) but is compute-bound, so throughput stays flat.
-- **13B** is the sweet spot: queue buildup under load makes routing dramatically effective (**-60% to -85%** P99, **+4% to +22%** throughput).
-- **8B** still gains TTFT but has too little prefill work for the routing overhead to move P99 or throughput.
-
-**Best suited for:**
-- RAG applications with shared context documents
-- Multi-turn chat with large system prompts
-- Few-shot learning with shared examples
-- Any workload with 2K+ token shared prefixes
-
-See [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for detailed methodology and results.
+See the [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for methodology and [Benchmark Reproduction](docs/guides/benchmark-reproduction.md) to run it yourself.
 
 ---
 
-## Architecture & Vision
+## Architecture & Capabilities
 
-Ranvier is evolving from a prefix-aware router into a full **Intelligence Layer for AI Inference Infrastructure**.
+**Shipped in 2.1.0 (2026-04-11):**
+- Token-prefix routing via an Adaptive Radix Tree, with consistent-hash and random fallbacks, and passive route learning from backend responses
+- Partial tokenization for routing: a byte-budgeted prefix is tokenized for the routing decision and full tokenization is deferred until it is needed
+- Request intent classification (autocomplete, edit, chat), priority tiers, and a priority queue with fair per-agent scheduling
+- vLLM metrics ingestion, GPU-aware load routing, and per-backend cost budgets
+- Backend health checks with a circuit breaker; multi-node clustering over DTLS-encrypted gossip with cache-residency tracking
+- Ranvier Local: discovery of local backends such as Ollama and LM Studio
+- Kubernetes EndpointSlice discovery and a Helm chart
 
-**Current Capabilities (v1.0):**
-- Token prefix-based routing via Adaptive Radix Tree
-- Passive route learning (learns which prefixes → which backends)
-- Backend health checking with circuit breaker
-- Multi-node clustering with gossip protocol
+**On `main`, unreleased:** a Gateway API Inference Extension Endpoint Picker mode (build-gated, off by default), a native vLLM KV-event subscriber, an admission-policy seam, response-side usage accounting, and OpenTelemetry GenAI semantic conventions. See [CHANGELOG → Unreleased](CHANGELOG.md#unreleased). None of these has been exercised on GPU hardware since the July 2026 re-baseline.
 
-**Planned Capabilities ([see roadmap](docs/architecture/VISION.md)):**
-- **Request Intent Classification** - Route by FIM/Chat/Edit detection, not just token count
-- **Priority Queues** - Interactive requests never blocked by batch jobs
-- **Load-Aware Routing** - Ingest vLLM metrics for GPU-aware decisions
-- **Local Mode** - Auto-discover Ollama, LM Studio, llama.cpp
-
-The vision: A dropdown menu sets a global model preference. Ranvier will make **per-request routing decisions** based on intent, cost, and latency requirements.
+The roadmap that produced 2.0.0 is in [VISION.md](docs/architecture/VISION.md).
 
 ---
 
@@ -184,17 +189,17 @@ graph TD
 Pre-built images are available on GitHub Container Registry (linux/amd64, linux/arm64):
 
 ```bash
-# Pull the latest image
-docker pull ghcr.io/ranvier-systems/ranvier:latest
+# Pull the latest release
+docker pull ghcr.io/ranvier-systems/ranvier:2.1.0
 
-# Pull a specific version
-docker pull ghcr.io/ranvier-systems/ranvier:1.0.0
+# Pull whatever is on main (unreleased; see CHANGELOG → Unreleased)
+docker pull ghcr.io/ranvier-systems/ranvier:latest
 
 # Pull by commit SHA for traceability
 docker pull ghcr.io/ranvier-systems/ranvier:sha-abc1234
 
 # Run with required IPC_LOCK capability
-docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ghcr.io/ranvier-systems/ranvier:latest
+docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ghcr.io/ranvier-systems/ranvier:2.1.0
 ```
 
 Build from source (optional):
@@ -272,6 +277,15 @@ helm install ranvier ./deploy/helm/ranvier \
 ```
 
 See [Kubernetes Deployment Guide](docs/deployment/kubernetes.md) for detailed configuration options.
+
+---
+
+## Project status
+
+- **Latest release:** 2.1.0 (2026-04-11), on the [Releases page](https://github.com/Ranvier-Systems/ranvier-core/releases) and in [CHANGELOG.md](CHANGELOG.md). `main` carries unreleased work.
+- **Maintainer:** one, part-time. Issues and pull requests are welcome; expect a response within a week rather than a day. See [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Security:** see [SECURITY.md](SECURITY.md) for how to report a vulnerability and for the known hardening gaps. In short: backend connections are not yet encrypted, so terminate TLS in front of Ranvier, and do not expose the metrics/admin port publicly.
+- **Provenance:** a large share of this codebase was written with AI coding agents working under the maintainer's direction and review. Every change goes through the same CI (unit tests, sanitizers, fuzzers) and the Seastar rules in `.dev-context/claude-context.md`, and contributions are held to the same bar whether or not an agent helped write them.
 
 ---
 
