@@ -413,7 +413,7 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
         co_return TokenizationResult{};
     }
     // RAII guard: signal semaphore when scope exits (exception-safe, Rule #19)
-    auto sem_guard = seastar::defer([this] { _local_tokenize_sem.signal(1); });
+    auto sem_guard = seastar::defer([this]() noexcept { _local_tokenize_sem.signal(1); });
     co_return tokenize_locally(text);
 }
 
