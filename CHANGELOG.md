@@ -15,6 +15,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Kimi (Moonshot) model support** — `ChatTemplateFormat::kimi` (aliases
+  `kimi`, `kimi-k2`, `kimi-k3`, `moonshot`) renders Kimi K2/K3's per-role
+  `<|im_user|>`/`<|im_assistant|>`/`<|im_system|>` turns, `<|im_middle|>` and
+  `<|im_end|>`, and injects Moonshot's default system turn for system-less
+  conversations, so Ranvier's routing token sequence stays byte-aligned with the
+  backend's `apply_chat_template`. Kimi ships no fast `tokenizer.json`, so
+  `tests/tokenizer_parity/` adds a tiktoken→fast conversion helper, a parity
+  harness that checks the converted tokenizer and the rendered template against
+  the authoritative tokenizer, and a build-gated FFI parity test
+  (`RANVIER_BUILD_KIMI_PARITY_TEST`, default OFF) driven by an emitted fixture.
+  Non-string (multimodal) message content is documented as dropped from
+  routing. Deploy contract, open GPU-dependent items and the K3 prefix-caching
+  spike runbook are in BACKLOG §26. Not yet exercised on GPU hardware.
+
 - **Request-admission policy seam** (embeddability series) — A pluggable,
   per-request decision hook so embedders can apply custom admission policies —
   quota systems, tenant-tier products, priority rewriters — without forking the

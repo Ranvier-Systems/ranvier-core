@@ -43,7 +43,7 @@ These come from real lost benchmark days — see `.dev-context/next-benchmark-ch
 
 Key metrics and where they come from:
 - **Cache-hit ratio** — `ranvier_router` metrics (`:9180`); the point of the product. Prefix mode target vs consistent-hash baseline is documented in `docs/internals/prefix-affinity-routing.md` (~81% vs 49%).
-- **TTFT p50/p99** — Locust report; the headline claim is ~48% TTFT improvement, so regressions here are release blockers.
+- **TTFT p50/p99** — Locust report. The citable headline is the 2026-07-13 50-prefix re-baseline (`docs/benchmarks/benchmark-results-current.md`, BACKLOG §25): P99 TTFT −13.3% at 8B/20u and −9.1% at 13B/30u, no reliable effect at 13B/20u, +29% regression at 13B/10u. A regression against those medians on the same configuration is a release blocker. The older ~48% / 33–44% figures came from the deprecated 5-prefix workload and are not a baseline.
 - **Affinity thrashing** — cache-hit oscillation + backend flip-flopping under load; see `.dev-context/investigation-may22-affinity-thrashing-reproduction.md` for the signature.
 - Compare against `tests/integration/benchmark-baseline.json`; results parser: `tests/integration/results_parser.py`.
 

@@ -117,7 +117,7 @@ See the [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for methodo
 - Ranvier Local: discovery of local backends such as Ollama and LM Studio
 - Kubernetes EndpointSlice discovery and a Helm chart
 
-**On `main`, unreleased:** a Gateway API Inference Extension Endpoint Picker mode (build-gated, off by default), a native vLLM KV-event subscriber, an admission-policy seam, response-side usage accounting, and OpenTelemetry GenAI semantic conventions. See [CHANGELOG → Unreleased](CHANGELOG.md#unreleased). None of these has been exercised on GPU hardware since the July 2026 re-baseline.
+**On `main`, unreleased:** a Gateway API Inference Extension Endpoint Picker mode (build-gated, off by default), a native vLLM KV-event subscriber, disaggregated prefill/decode pool roles, a unified weighted route scorer, an admission-policy seam, response-side usage accounting, OpenTelemetry GenAI semantic conventions, and Kimi (Moonshot) chat-template support with a tokenizer-parity harness. See [CHANGELOG → Unreleased](CHANGELOG.md#unreleased). None of these has been exercised on GPU hardware since the July 2026 re-baseline.
 
 The roadmap that produced 2.0.0 is in [VISION.md](docs/architecture/VISION.md).
 
