@@ -18,7 +18,7 @@ Act as an External CTO and Lead Architect. I need a "brutally honest" evaluation
 ### 1. THE "GOAL ALIGNMENT" CHECK
 - Based on the code implemented, are we actually building a Prefix Caching balancer, or have we drifted into a general-purpose proxy?
 - Are the core "Prefix Logic" constraints actually reflected in the code, or are they just aspirations?
-- Do the benchmark numbers (`tests/integration/benchmark-baseline.json`, `docs/benchmarks/`) still support the headline claim (~48% faster TTFT)?
+- Do the benchmark numbers (`tests/integration/benchmark-baseline.json`, `docs/benchmarks/`) still support the citable headline (2026-07-13 50-prefix re-baseline: ~3× cache hit; P99 TTFT −9 to −13% under sustained load, +29% regression at low load)? The ~48% / 33–44% figures are deprecated and must not be used as the bar.
 
 ### 2. THE "COMPLEXITY VS. VALUE" AUDIT
 - Where is the highest concentration of complexity? Is that complexity buying us performance, or is it technical debt?

@@ -1,16 +1,90 @@
+# Create a GitHub Release for each version tag, using the matching CHANGELOG
+# section as the release body. Container images are the release artifacts;
+# docker-publish.yml publishes them to ghcr.io, tagged by semver from the same
+# tag, so nothing is built here.
+#
+# Can also be run by hand (Actions → Release → Run workflow → tag) to backfill
+# Releases for tags that predate this workflow. Run oldest first (v1.0.0,
+# v2.0.0, v2.1.0); the job marks a Release "latest" only when its tag is the
+# newest v* tag by version sort, so the order is belt-and-braces.
 name: Release
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish a Release for (for example v2.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
-  # TODO: Build static binaries for linux-amd64, linux-arm64,
-  # darwin-arm64, darwin-x86_64 using the base Docker image
-  # Upload to GitHub Releases
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: placeholder
-        run: echo "Release workflow - TODO"
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "tag ${TAG} does not exist"
+            exit 1
+          fi
+          NEWEST="$(git tag -l 'v*' | sort -V | tail -n 1)"
+          {
+            echo "tag=${TAG}"
+            echo "version=${TAG#v}"
+            if [ "${TAG}" = "${NEWEST}" ]; then echo "latest=true"; else echo "latest=false"; fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Extract CHANGELOG section
+        id: notes
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          awk -v v="${VERSION}" '
+            $0 ~ ("^## \\[" v "\\]") { p = 1; next }
+            /^## \[/ { if (p) exit }
+            p { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ -s release-notes.md ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No CHANGELOG section for ${VERSION}; falling back to generated notes"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          LATEST: ${{ steps.tag.outputs.latest }}
+          FOUND: ${{ steps.notes.outputs.found }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; nothing to do"
+            exit 0
+          fi
+          if [ "${FOUND}" = "true" ]; then
+            gh release create "${TAG}" --verify-tag --title "${TAG}" \
+              --notes-file release-notes.md --latest="${LATEST}"
+          else
+            gh release create "${TAG}" --verify-tag --title "${TAG}" \
+              --generate-notes --latest="${LATEST}"
+          fi
