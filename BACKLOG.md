@@ -312,6 +312,12 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
   _Location:_ `.github/workflows/`
   _Complexity:_ Low
 
+- [ ] **Migrate the Seastar pin past the C++20 retirement (2026-09-09)**
+  _Justification:_ `SEASTAR_REF` is pinned to `837ecedb` (master 2026-07-16), the last state that builds as C++20 on Fedora 39/GCC 13. Upstream retired C++20 (2026-06-17), landed the first C++23-only code on 2026-08-25 (`std::views::zip` in `src/core/prometheus.cc`) and now uses `std::ranges::to`, which needs GCC 14. The pin therefore freezes Seastar bug fixes from mid-July 2026 onward. Separately, Seastar has linked LTTng-UST by default since 2026-07-07 without exporting `Seastar_LTTNG` from its installed CMake config, which breaks every static consumer (`LTTng::UST ... target was not found`); the Dockerfiles pass `--disable-lttng`, and that flag must survive the migration unless upstream fixes the export.
+  _Scope:_ one tracked change: Fedora base to a release with GCC 14+ (39 is EOL), `CMAKE_CXX_STANDARD 23` in `CMakeLists.txt`, `--c++-standard=23` in all three Dockerfiles, a fresh `SEASTAR_REF`, then the full verification ladder (`/validate`) plus a base-image build before merge.
+  _Location:_ `Dockerfile.base`, `Dockerfile.base.default-alloc`, `Dockerfile.production`, `CMakeLists.txt`
+  _Complexity:_ Medium
+
 ### 5.2 Testing Infrastructure
 
 - [ ] **Add chaos testing for cluster scenarios**
