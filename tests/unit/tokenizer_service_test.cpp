@@ -201,7 +201,7 @@ TEST_F(DeferContractTest, DeferFiresOnScopeExit) {
     EXPECT_TRUE(sem.try_wait(1));
 
     {
-        auto guard = seastar::defer([&sem] { sem.signal(1); });
+        auto guard = seastar::defer([&sem]() noexcept { sem.signal(1); });
         // Semaphore is still drained inside the scope
         EXPECT_FALSE(sem.try_wait(1));
     }
@@ -215,7 +215,7 @@ TEST_F(DeferContractTest, DeferFiresOnException) {
     EXPECT_TRUE(sem.try_wait(1));
 
     try {
-        auto guard = seastar::defer([&sem] { sem.signal(1); });
+        auto guard = seastar::defer([&sem]() noexcept { sem.signal(1); });
         throw std::runtime_error("simulated tokenization failure");
     } catch (...) {
         // Guard destructor should have fired during stack unwinding
@@ -237,7 +237,7 @@ TEST_F(DeferContractTest, SemaphoreAndDeferInteractionPattern) {
         if (!sem.try_wait(1)) {
             ++rejected_count;
         } else {
-            auto guard = seastar::defer([&sem] { sem.signal(1); });
+            auto guard = seastar::defer([&sem]() noexcept { sem.signal(1); });
             // Simulate synchronous tokenize_locally() work
             volatile int work = 42;
             (void)work;
@@ -254,7 +254,7 @@ TEST_F(DeferContractTest, SemaphoreAndDeferInteractionPattern) {
         if (!sem.try_wait(1)) {
             ++rejected_count;
         } else {
-            auto guard = seastar::defer([&sem] { sem.signal(1); });
+            auto guard = seastar::defer([&sem]() noexcept { sem.signal(1); });
         }
     }
     EXPECT_EQ(rejected_count, 1u);
@@ -265,7 +265,7 @@ TEST_F(DeferContractTest, SemaphoreAndDeferInteractionPattern) {
         if (!sem.try_wait(1)) {
             ++rejected_count;
         } else {
-            auto guard = seastar::defer([&sem] { sem.signal(1); });
+            auto guard = seastar::defer([&sem]() noexcept { sem.signal(1); });
         }
     }
     EXPECT_EQ(rejected_count, 1u);  // No new rejections

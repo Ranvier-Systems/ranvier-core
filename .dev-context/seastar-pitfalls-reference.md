@@ -127,15 +127,17 @@ co_await seastar::max_concurrent_for_each(cache, 64, [](auto& fptr) {
 ```cpp
 co_await seastar::async([&] {
     seastar::sharded<ServiceB> b;
-    auto stop_b = seastar::defer([&] { b.stop().get(); });
+    auto stop_b = seastar::defer([&]() noexcept { b.stop().get(); });
     b.start().get();
 
     seastar::sharded<ServiceA> a;
-    auto stop_a = seastar::defer([&] { a.stop().get(); });
+    auto stop_a = seastar::defer([&]() noexcept { a.stop().get(); });
     a.start(std::ref(b)).get();
     // C++ destroys in reverse order: stop_a first, then stop_b
 });
 ```
+
+**`defer` callables must be `noexcept`.** Seastar builds with `Seastar_DEFERRED_ACTION_REQUIRE_NOEXCEPT` on by default and, since 2026-07-08, exports that definition to consumers, so `seastar::defer(f)` only compiles when `f()` is `noexcept` (the `deferrable_action` concept). A plain `[&] { ... }` lambda fails with "no matching function for call to 'defer'"; write `[&]() noexcept { ... }`. The body must then genuinely not throw: `semaphore::signal()` is `noexcept`, but a `.get()` on a future that can fail will `std::terminate` — catch inside the lambda or make the callee non-throwing.
 
 **Source:** [seastar::sharded docs](https://docs.seastar.io/master/classseastar_1_1sharded.html), [ScyllaDB issue #8421](https://github.com/scylladb/scylladb/issues/8421)
 
