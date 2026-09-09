@@ -131,10 +131,19 @@ RUN dnf install -y zeromq-devel && dnf clean all && rm -rf /var/cache/dnf
 # matches the production base's compiler choice for everything except
 # the allocator switch.
 WORKDIR /tmp
-# Pinned Seastar commit (scylladb/seastar master as of 2026-09-05). The previous
-# unpinned `--depth 1` clone made this image non-reproducible. To upgrade Seastar,
-# bump SEASTAR_REF deliberately and rebuild.
-ARG SEASTAR_REF=805800685670b6ea4ab9a90461640d822e6c957b
+# Pinned Seastar commit: scylladb/seastar master as of 2026-07-16, the last
+# state the unpinned clone built here (base image run of 2026-07-18). Two
+# upstream constraints bound this pin (BACKLOG §5.1):
+#   - Seastar retired C++20 (build config 2026-06-17; first C++23-only code in
+#     src/core/prometheus.cc on 2026-08-25, std::views::zip; master also uses
+#     std::ranges::to, which needs GCC 14). Moving past this commit needs
+#     --c++-standard=23, a newer Fedora/GCC base, and Ranvier on C++23.
+#   - Since 2026-07-07 Seastar links LTTng-UST by default but its installed
+#     CMake config never tells consumers, so a static Seastar built with it
+#     fails every downstream configure with "LTTng::UST ... target was not
+#     found". Hence --disable-lttng below; Ranvier does not use IO tracing.
+# Bump deliberately, as one tracked change, and rebuild.
+ARG SEASTAR_REF=837ecedbbd8d7d2fbd71be730b7a2248d272a914
 RUN mkdir seastar && cd seastar && \
     git init -q && \
     git remote add origin https://github.com/scylladb/seastar.git && \
@@ -149,7 +158,8 @@ RUN mkdir seastar && cd seastar && \
         --c++-standard=20 \
         --without-tests \
         --without-apps \
-        --without-demos && \
+        --without-demos \
+        --disable-lttng && \
     ninja -j$(nproc) -C build/release install && \
     cd /tmp && \
     rm -rf seastar && \
