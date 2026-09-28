@@ -482,3 +482,54 @@ python3 tests/integration/results_parser.py aggregate \
 
 V0b is aggregated the same way. The runner is deliberately left unfixed until V0b completes, so
 both arms run on identical tooling.
+
+---
+
+## Result note 2026-09-28 — Leg V0b (sync ON): inconclusive
+
+*Appended after the V0b arm finished. The amendment above is unchanged.*
+
+**V0b result (sync ON), same box, same day, same run file, 3 paired repeats in alternating
+order.** The run is valid: `router_load_sync_broadcasts_total` was nonzero in the prefix arm's
+node metrics (6,845 on shard 0 of one node), and every run log records
+`RANVIER_CROSS_SHARD_LOAD_SYNC=true`.
+
+| Prefix vs round-robin | V0a, sync OFF | V0b, sync ON |
+|---|---|---|
+| P99 TTFT, paired median change | **+9.7%** | **+3.4%** |
+| P99 per-repeat changes | 0.0 / +9.7 / +14.7 | −6.2 / +17.1 / +3.4 |
+| P99 IQR of the change | 4.8…12.2 | −1.4…10.3 |
+| Aggregator verdict | `REGRESSION` (reliable) | `NO RELIABLE EFFECT (IQR spans zero)` |
+| P95 TTFT change | +12% (1,700 → 1,900 ms) | −11% (1,800 → 1,600 ms) |
+| Cache-miss P99 change | +7% | −6% |
+| Prefix / RR incomplete rate | 2.3% / 1.7% | 2.1% / 2.8% |
+| Prefix cache-hit rate | 49.7% | 46.7% |
+
+**Verdict under the binding rule: not recovered.** "Recovered" requires V0b's paired median P99
+change to be ≤ 0; it is +3.4%. The amendment's rule also has a gap that this result falls into:
+V0b is not a reliable regression (so not "partial") and its median is below +9.7% (so not
+"not recovered"). The gap is closed conservatively, as **inconclusive**, which leads to the same
+next step as the other two non-recovered outcomes. `cross_shard_load_sync` stays **off** by
+default.
+
+**What the result does and does not show.** Every metric moves in the direction the transient
+hot-spotting hypothesis predicts: the P99 regression shrinks and loses reliability, P95 and
+cache-miss P99 flip from losses to wins, and the prefix arm's incompletes go from worse than
+round-robin to better, at a cost of about three points of cache-hit rate. None of those
+secondary metrics was in the pre-registered rule, so they are not grounds for shipping. The P99
+test is underpowered at this operating point: each run's P99 rests on ~17 requests in 100 ms
+steps, and one V0b repeat (4,100 ms, +17.1%) alone spans most of the IQR. Three repeats cannot
+separate +3% from zero.
+
+**Next step — pending the maintainer's choice.** Either (a) Leg V1, the epsilon sweep, which
+needs `RANVIER_BOUNDED_LOAD_EPSILON` wired into `docker-compose.benchmark-real.yml` first; or
+(b) a higher-powered V0 rerun (30-minute runs, which roughly triple the requests behind each P99,
+and/or more repeats per arm) with the three outcomes above and the gap closed. Deciding to rerun
+after seeing V0b is itself a data-dependent choice, so whichever leg runs next must have its
+binding rule committed before its first run.
+
+**Tooling.** Both V0 aggregates were produced by hand as described in the amendment. The runner
+bug (warm-up dirs classified as result dirs) and the garbled key-metrics column in the runner
+summary (per-bucket stats repeat the top-level keys) were fixed in the same commit as this
+note, after both arms had finished.
+
