@@ -30,11 +30,11 @@
 # V0b's. The RR baseline arm ignores affinity/load, so it is ~invariant to the flag; the
 # prefix arm is what moves.
 #
-# Pre-registered verdict rule: if V0b's 13B/10u prefix-vs-RR P99 regression is >=10
-# percentage points smaller than V0a's, with no worse incompletes, transient
-# cross-visibility is confirmed the driver -> ship cross_shard_load_sync=true as the
-# default for client-tokenize deployments and STOP (no gate). Also capture per-node
-# prometheus_metrics_node*.txt to see per-backend active_requests bursts align with the tail.
+# Verdict rule REVISED 2026-09-28, before any V0b run, after V0a measured only +9.7%
+# (the original ">=10pp smaller" rule was then unreachable). Recovered: V0b paired median
+# P99 change <= 0, verdict not REGRESSION, prefix incompletes <= V0a's 2.3% -> ship sync=true
+# as default, no gate. Partial/not recovered -> Leg V1. Full text: load-gating proposal,
+# "Amendment 2026-09-28". Capture prometheus_metrics_node*.txt to see active_requests bursts.
 #
 # Everything rides the CURRENT SHIPPED DEFAULTS (50 prefixes, ratio 0.9, stress, load-aware
 # 2.0/floor 2, cache-residency 0.2, 20ms flush, BOUNDED_LOAD). Confirm the "Effective

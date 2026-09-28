@@ -1289,6 +1289,12 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
 - [ ] **Item 5 — threshold leg** (shipped `2.0/2` vs raised `3.0/4`) NOT yet run; the 30–47%
   load-aware fallback rates seen across the matrix make it the highest-value remaining GPU run.
   Runbook `benchmark-rebaseline-campaign.md` §2; run files under `docs/benchmarks/rebaseline/`.
+- [ ] **Load-gating Leg V0 — `cross_shard_load_sync` A/B at 13B/10u** (ran 2026-09-28, 8×A100):
+  **inconclusive.** Sync off reproduced a reliable +9.7% P99 regression; sync on shrank it to
+  +3.4% with no reliable effect, short of the pre-registered "≤ 0" bar. Sync stays off by
+  default. Next leg pending: V1 (epsilon sweep) or a higher-powered V0 rerun, with its rule
+  committed before the first run. Record, rule amendment and numbers:
+  `.dev-context/prefix-routing-load-gating-proposal.md` (Amendment + Result note 2026-09-28).
 
 ### P1 progress (follow-on branches)
 - [x] **Item 7 — `--repeat` + aggregation** (branch `claude/benchmark-p1-repeat-aggregate`,
