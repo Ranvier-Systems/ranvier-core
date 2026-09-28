@@ -1292,9 +1292,11 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
 - [ ] **Load-gating Leg V0 — `cross_shard_load_sync` A/B at 13B/10u** (ran 2026-09-28, 8×A100):
   **inconclusive.** Sync off reproduced a reliable +9.7% P99 regression; sync on shrank it to
   +3.4% with no reliable effect, short of the pre-registered "≤ 0" bar. Sync stays off by
-  default. Next leg pending: V1 (epsilon sweep) or a higher-powered V0 rerun, with its rule
-  committed before the first run. Record, rule amendment and numbers:
-  `.dev-context/prefix-routing-load-gating-proposal.md` (Amendment + Result note 2026-09-28).
+  default. **Next: the powered V0 rerun** (30-minute runs, 4 repeats per arm, OFF-ON-OFF
+  blocks, ~9 h GPU), run file `docs/benchmarks/rebaseline/v0-xshard-30m.runs`, with its binding
+  rule and stopping rule pre-registered. Record, rule amendment, numbers and pre-registration:
+  `.dev-context/prefix-routing-load-gating-proposal.md` (Amendment, Result note and
+  Pre-registration, all 2026-09-28).
 
 ### P1 progress (follow-on branches)
 - [x] **Item 7 — `--repeat` + aggregation** (branch `claude/benchmark-p1-repeat-aggregate`,

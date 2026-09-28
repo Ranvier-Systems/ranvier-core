@@ -1,0 +1,32 @@
+# 50-prefix re-baseline — LEG V0, POWERED RERUN: cross_shard_load_sync A/B at 13B/10u, 30-minute runs
+#
+# Why this exists: the 10-minute V0 run on 2026-09-28 was inconclusive. Sync off gave a reliable
+# +9.7% prefix-vs-RR P99 regression; sync on gave +3.4% with no reliable effect, short of the
+# "<= 0" bar. Each run's P99 rested on ~17 requests. This rerun triples the duration (~50 requests
+# behind each P99) and uses 4 repeats per arm, so the rr-first / prefix-first order is balanced.
+# Full design, binding decision rule and stopping rule: .dev-context/prefix-routing-load-gating-
+# proposal.md, "Pre-registration 2026-09-28 — Leg V0 powered rerun". Committed before any run.
+#
+# The control variable, RANVIER_CROSS_SHARD_LOAD_SYNC, is set around the runner, so the SAME line
+# runs in every block. Blocks run OFF(2) -> ON(4) -> OFF(2) so both arms are centred on the same
+# point in time and slow drift over the ~9h session cancels. Run from the repo root, in screen:
+#
+#   R=benchmark-reports/rebaseline
+#   F=docs/benchmarks/rebaseline/v0-xshard-30m.runs
+#   RANVIER_CROSS_SHARD_LOAD_SYNC=false ./scripts/bench-runner.sh --suite custom --file $F \
+#       --repeat 2 --output-dir $R/xshard30_off_a
+#   sleep 180
+#   RANVIER_CROSS_SHARD_LOAD_SYNC=true  ./scripts/bench-runner.sh --suite custom --file $F \
+#       --repeat 4 --output-dir $R/xshard30_on
+#   sleep 180
+#   RANVIER_CROSS_SHARD_LOAD_SYNC=false ./scripts/bench-runner.sh --suite custom --file $F \
+#       --repeat 2 --output-dir $R/xshard30_off_b
+#
+# The binding figures are the FINAL aggregates over all 4 repeats per arm (commands in the
+# proposal), not the per-block aggregates the runner writes on its own.
+#
+# Everything else rides the current shipped defaults (50 prefixes, ratio 0.9, stress, load-aware
+# 2.0/floor 2, cache-residency 0.2, 20ms flush, BOUNDED_LOAD). Confirm the banner before trusting
+# any run.
+
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 10 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress

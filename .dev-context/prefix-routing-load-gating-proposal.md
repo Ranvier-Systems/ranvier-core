@@ -533,3 +533,94 @@ bug (warm-up dirs classified as result dirs) and the garbled key-metrics column 
 summary (per-bucket stats repeat the top-level keys) were fixed in the same commit as this
 note, after both arms had finished.
 
+---
+
+## Pre-registration 2026-09-28 — Leg V0 powered rerun
+
+*Appended and committed before any run of this leg. Nothing above is changed. The rule below is
+binding for this rerun and was fixed after seeing the 10-minute V0 results, which is why it
+carries its own stopping rule.*
+
+**Purpose.** Settle the question the 10-minute V0 run could only hint at: does
+`cross_shard_load_sync=true` remove the low-load P99 regression at CodeLlama-13B, 10 users?
+
+**Design.**
+
+| Item | 10-minute V0 | Powered rerun |
+|---|---|---|
+| Run file | `v0-xshard.runs` | `v0-xshard-30m.runs` |
+| Run length per arm | 10 min | 30 min |
+| Requests behind each P99 | ~17 | ~50 |
+| Repeats per arm | 3 (order 2:1) | 4 (order 2:2) |
+| Block order | OFF(3), ON(3) | OFF(2), ON(4), OFF(2) |
+| GPU time | ~2.6 h | ~9 h (runner estimate 9h 3m plus cooldowns) |
+
+The OFF-ON-OFF blocking centres both arms on the same point in time, so slow drift across the
+session (thermal state, vLLM cache growth) affects both equally. Everything else is identical to
+the 10-minute run: shipped defaults, `--warmup`, paired prefix-vs-round-robin compares, and the
+100 ms sync interval. The results are not pooled with the 10-minute runs.
+
+**Commands.** From the repo root on the branch that carries this note (it also carries the
+bench-runner aggregation fix), in one screen session:
+
+```bash
+R=benchmark-reports/rebaseline
+F=docs/benchmarks/rebaseline/v0-xshard-30m.runs
+RANVIER_CROSS_SHARD_LOAD_SYNC=false ./scripts/bench-runner.sh --suite custom --file $F \
+    --repeat 2 --output-dir $R/xshard30_off_a
+sleep 180
+RANVIER_CROSS_SHARD_LOAD_SYNC=true  ./scripts/bench-runner.sh --suite custom --file $F \
+    --repeat 4 --output-dir $R/xshard30_on
+sleep 180
+RANVIER_CROSS_SHARD_LOAD_SYNC=false ./scripts/bench-runner.sh --suite custom --file $F \
+    --repeat 2 --output-dir $R/xshard30_off_b
+```
+
+**Final aggregates (the binding figures).** The runner's own per-block aggregates are
+informational. The decision uses one aggregate per arm over all four repeats. Globs expand in
+timestamp order within each directory, so every prefix run pairs with the round-robin run of its
+own repeat:
+
+```bash
+R=benchmark-reports/rebaseline
+P=tests/integration/results_parser.py
+python3 $P aggregate $R/xshard30_off_a/2026*_8gpu_prefix $R/xshard30_off_b/2026*_8gpu_prefix \
+  --baseline $R/xshard30_off_a/2026*_8gpu_round_robin $R/xshard30_off_b/2026*_8gpu_round_robin \
+  --json $R/agg_final_v0_30m_off.json
+python3 $P aggregate $R/xshard30_on/2026*_8gpu_prefix \
+  --baseline $R/xshard30_on/2026*_8gpu_round_robin \
+  --json $R/agg_final_v0_30m_on.json
+```
+
+**Validity gates, per repeat.** A repeat is valid only if all of these hold:
+
+- the effective-config banner shows the shipped defaults, 3 nodes were scraped, there is no
+  `WORKLOAD MISMATCH` warning, and warm-up completed on both arms;
+- its run log's env-overrides line shows the block's `RANVIER_CROSS_SHARD_LOAD_SYNC` value;
+- the summed `router_load_sync_broadcasts_total` in its prefix arm's node metrics is nonzero in
+  the ON block and zero in the OFF blocks.
+
+An invalid repeat is excluded from its arm's aggregate and reported, never silently dropped or
+rerun. If either arm ends with fewer than 3 valid repeats, the rerun is **void** and nothing is
+concluded from it.
+
+**Decision rule (binding).** Evaluated on the two final aggregates, in this order:
+
+1. **Regression not reproduced.** The OFF arm's verdict is not `REGRESSION`. → There is no
+   regression at this operating point for sync to fix. Do not change the default, do not run
+   V1 for this purpose, and record that the low-load regression did not reproduce with 30-minute
+   runs.
+2. **Recovered.** The OFF arm is a `REGRESSION`, and the ON arm's paired median P99 change is
+   **≤ 0**, its verdict is **not** `REGRESSION`, and its prefix-arm median incomplete rate is
+   **no higher than the OFF arm's**. → Transient cross-visibility is confirmed as the driver:
+   ship `cross_shard_load_sync=true` as the default for client-tokenize deployments. No gate.
+3. **Not recovered.** Every other outcome, with no gaps. Record which applies: *partial* if the
+   ON arm's median is below the OFF arm's, *none* if it is not. → Proceed to Leg V1.
+
+**Stopping rule.** This is the last V0 run at this operating point. Whatever the outcome, there
+is no further V0 rerun, no extension of repeats, and no pooling with the 10-minute data.
+
+**Reported but not decisive.** P95, cache-miss P99, incomplete rates, cache-hit rate and
+requests per second for both arms. **Known limit:** Locust reports P99 in 100 ms steps, about 3%
+at this latency. Longer runs make the P99 steadier but do not remove that step.
+
