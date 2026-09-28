@@ -359,6 +359,9 @@ smaller than V0a's (and incompletes no worse), transient cross-visibility is con
 driver → ship `cross_shard_load_sync=true` as the default for client-tokenize deployments and
 **stop** (no gate needed). Also capture per-node time-series `active_requests` to *see* the bursts.
 
+> **Superseded 2026-09-28.** This rule was revised before any V0b run, once V0a measured a
+> regression too small for it to be reachable. See **Amendment 2026-09-28** at the end of this document.
+
 ### Leg V1 — Corrected threshold/epsilon leg (replaces the inert §3.1 run file)
 
 Test the knob that actually moves diversion on the shipped `BOUNDED_LOAD` strategy, across the
@@ -408,3 +411,74 @@ band, not a guessed constant.
 - `docs/benchmarks/rebaseline/{standard-matrix,threshold-2.0-2,threshold-3.0-4}.runs`,
   `docs/benchmarks/benchmark-results-current.md`, `.dev-context/next-benchmark-checklist.md`
   (D1 +19% / D2 −6%), BACKLOG.md §25 item 5.
+
+---
+
+## Amendment 2026-09-28 — Leg V0 decision rule revised before any V0b data
+
+*Appended per the `.dev-context/README.md` convention for dated records. The original rule in
+§5 Leg V0 is kept as written and marked superseded; nothing else in this document changed.*
+
+**Timing.** This amendment was committed after the V0a arm finished and **before the V0b arm
+was started**, so no V0b result had been produced, let alone seen, when the rule below was
+fixed. The commit timestamp is the record of that ordering.
+
+**V0a result (sync OFF), 2026-09-28, 8×A100, CodeLlama-13B, 10 users, 3 paired repeats,
+alternating arm order (rr-first, prefix-first, rr-first).** Run file
+`docs/benchmarks/rebaseline/v0-xshard.runs`; the exact commit is stamped in each report's
+`manifest.json`.
+
+| Metric (median of 3) | Round-robin | Prefix | Change |
+|---|---|---|---|
+| P50 TTFT | 840 ms | 720 ms | −14% |
+| P95 TTFT | 1,700 ms | 1,900 ms | +12% |
+| P99 TTFT, paired | 3,400 ms | 3,600 ms | **+9.7%** (IQR 4.8…12.2, per-repeat 0.0 / +9.7 / +14.7) |
+| Cache-miss P99 TTFT | 3,080 ms | 3,284 ms | +7% |
+| Cache-hit rate | 11.3% | 49.7% | |
+| Incomplete rate | 1.7% | 2.3% | |
+| Requests/s | 15.8 | 16.1 | |
+
+Aggregator verdict: `REGRESSION: median +9.7% on p99_ttft_ms`, `reliable: true`. The regression
+reproduces, at about a third of the July re-baseline's +29% at the same operating point. The
+shape (median win, tail loss, slower cache misses under prefix routing) is consistent with the
+transient hot-spotting hypothesis in §1.2.
+
+**Why the original rule had to change.** It required V0b's regression to be ≥10 percentage
+points smaller than V0a's. With V0a at +9.7%, fully eliminating the regression would still fall
+short; V0b would have to become a clear *improvement*, which is a stronger claim than the one Leg
+V0 exists to test. The rule was written when the expected V0a figure was ~+29%.
+
+**Revised rule (binding for V0b).** Compare V0b's paired prefix-vs-RR aggregate to V0a's:
+
+- **Recovered:** V0b's paired median P99 change is **≤ 0**, its verdict is **not** `REGRESSION`,
+  and its prefix-arm median incomplete rate is **≤ 2.3%** (V0a's). → Transient cross-visibility is
+  confirmed as the driver: ship `cross_shard_load_sync=true` as the default for client-tokenize
+  deployments and stop (no gate).
+- **Partial:** V0b is still a reliable `REGRESSION` but with a smaller median than V0a's +9.7%.
+  → Inconclusive; proceed to Leg V1.
+- **Not recovered:** V0b's median is ≥ +9.7%. → The hypothesis is weakened; proceed to Leg V1.
+
+The ≥10-percentage-point threshold is dropped rather than rescaled: at this effect size, "the
+regression is gone" is the decidable question. V0b must also show a nonzero
+`router_load_sync_broadcasts_total` in its `prometheus_metrics_node*.txt` files; a V0b run with a
+zero counter is invalid.
+
+**Measurement note.** P99 at ~1,700 requests per arm rests on ~17 requests and is reported in
+100 ms steps, so single repeats move in ~3% increments; this is why the rule reads the paired
+median and verdict, not any single repeat.
+
+**Tooling note.** `bench-runner.sh --repeat` wrote no aggregate for V0a: its arm classifier
+matches the per-arm `warmup_prefix_*` / `warmup_round_robin_*` directories (named that way since
+#624), which hold `warmup.log` rather than `benchmark.log`, so `results_parser.py aggregate`
+exits on the first one. The V0a figures above come from running the aggregator by hand on the
+real report directories only:
+
+```bash
+D=benchmark-reports/rebaseline/xshard_off
+python3 tests/integration/results_parser.py aggregate \
+  $D/2026*_8gpu_prefix --baseline $D/2026*_8gpu_round_robin \
+  --json $D/aggregates/agg_00_v0_xshard_off.json
+```
+
+V0b is aggregated the same way. The runner is deliberately left unfixed until V0b completes, so
+both arms run on identical tooling.
