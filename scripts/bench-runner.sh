@@ -743,8 +743,21 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
                     # Capture one-line summary for the final table
                     json_line=$(grep "BENCHMARK_STATS_JSON:" "$local_log" 2>/dev/null | tail -1 | sed 's/.*BENCHMARK_STATS_JSON://' || echo "")
                     if [[ -n "$json_line" ]]; then
-                        hr=$(echo "$json_line" | grep -oP '"cache_hit_rate_pct":\s*[0-9.]+' | grep -oP '[0-9.]+$' || echo "")
-                        ti=$(echo "$json_line" | grep -oP '"ttft_improvement_pct":\s*-?[0-9.]+' | grep -oP '\-?[0-9.]+$' || echo "")
+                        # Parse the JSON rather than grepping it: per-bucket stats repeat
+                        # these keys, and a grep returns every occurrence (one table cell
+                        # became five lines of numbers). Only the top-level values are wanted.
+                        hr=$(echo "$json_line" | python3 -c 'import json,sys
+try:
+    v = json.loads(sys.stdin.read()).get("cache_hit_rate_pct")
+    print("" if v is None else "%.1f" % v)
+except Exception:
+    pass' 2>/dev/null || echo "")
+                        ti=$(echo "$json_line" | python3 -c 'import json,sys
+try:
+    v = json.loads(sys.stdin.read()).get("ttft_improvement_pct")
+    print("" if v is None else "%.1f" % v)
+except Exception:
+    pass' 2>/dev/null || echo "")
                         if [[ -n "$hr" ]]; then
                             METRIC_SUMMARY+="${mode_label}: ${hr}% hit"
                             [[ -n "$ti" ]] && METRIC_SUMMARY+=", ${ti}% improv"
@@ -924,6 +937,10 @@ if [[ "$REPEAT" -gt 1 ]]; then
             IFS=',' read -ra _dirs <<< "$rdir_csv" || true
             for d in "${_dirs[@]}"; do
                 base="$(basename "$d")"
+                # Per-arm warm-up dirs (warmup_prefix_*, warmup_round_robin_*) also match the
+                # arm patterns below but hold warmup.log, not benchmark.log; passing one to the
+                # aggregator makes it exit before writing anything. They are not results.
+                [[ "$base" == warmup_* ]] && continue
                 if echo "$base" | grep -qE 'round_robin|random'; then
                     RR_DIRS+=("$d")
                 elif echo "$base" | grep -qE 'prefix'; then
