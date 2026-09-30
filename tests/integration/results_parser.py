@@ -83,11 +83,26 @@ class BenchmarkResults:
     p90_ttft_ms: Optional[float] = None
     p95_ttft_ms: Optional[float] = None
     p99_ttft_ms: Optional[float] = None
+    # "raw": exact percentiles over every TTFT sample (BENCHMARK_STATS_JSON).
+    # "locust_table": Locust's approximated table, which rounds 1-10 s values
+    # to 100 ms buckets — a ±50 ms floor on any P99 quoted from it.
+    ttft_source: Optional[str] = None
 
-    # Cache-specific metrics (real benchmarks only)
+    # Route-consistency metrics (real benchmarks only). cache_hits/misses and
+    # cache_hit_rate_pct are the client-side SAME-BACKEND affinity proxy: a
+    # "hit" is a request that landed on the same backend as the previous
+    # request with that prefix. Random routing scores ~1/N here by
+    # construction. The field names predate that understanding; every label
+    # printed from them says "route consistency".
     cache_hits: Optional[int] = None
     cache_misses: Optional[int] = None
     cache_hit_rate_pct: Optional[float] = None
+    # Real KV-cache signal: vLLM prefix_cache_hits/queries (token-level),
+    # differenced over the run across the backends that expose them.
+    kv_prefix_cache_hit_rate_pct: Optional[float] = None
+    kv_prefix_cache_hits: Optional[float] = None
+    kv_prefix_cache_queries: Optional[float] = None
+    kv_prefix_cache_backends_scraped: Optional[int] = None
     ttft_cache_hit_p50_ms: Optional[float] = None
     ttft_cache_hit_p99_ms: Optional[float] = None
     ttft_cache_miss_p50_ms: Optional[float] = None
@@ -210,6 +225,8 @@ def detect_benchmark_type(content: str) -> str:
     # Real benchmarks have cache hit/miss tracking from locustfile_real.py
     if "Cache HIT" in content or "Cache MISS" in content:
         return "real"
+    if "Route-consistent" in content or "route_consistency_pct" in content:
+        return "real"
     if "cache_hit_rate" in content.lower():
         return "real"
     # Note: BENCHMARK_STATS_JSON is emitted by both mock and real locustfiles,
@@ -252,14 +269,14 @@ def parse_cache_ttft(content: str) -> Dict[str, Optional[float]]:
     }
 
     # Cache hit pattern
-    cache_hit_pattern = r"GET\s+TTFT \(Cache HIT\)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
+    cache_hit_pattern = r"GET\s+TTFT \((?:Cache HIT|Route-consistent)\)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
     hit_match = re.search(cache_hit_pattern, content)
     if hit_match:
         results["ttft_cache_hit_p50_ms"] = float(hit_match.group(1))
         results["ttft_cache_hit_p99_ms"] = float(hit_match.group(8))
 
     # Cache miss pattern
-    cache_miss_pattern = r"GET\s+TTFT \(Cache MISS\)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
+    cache_miss_pattern = r"GET\s+TTFT \((?:Cache MISS|Route-changed)\)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
     miss_match = re.search(cache_miss_pattern, content)
     if miss_match:
         results["ttft_cache_miss_p50_ms"] = float(miss_match.group(1))
@@ -300,8 +317,14 @@ def parse_json_stats(content: str) -> Dict[str, Any]:
         # Core metrics
         results["cache_hits"] = stats.get("cache_hits")
         results["cache_misses"] = stats.get("cache_misses")
-        results["cache_hit_rate_pct"] = stats.get("cache_hit_rate_pct")
+        # route_consistency_pct is the honest name; cache_hit_rate_pct is what
+        # logs written before 2026-09-30 carry for the same number.
+        results["cache_hit_rate_pct"] = stats.get("route_consistency_pct", stats.get("cache_hit_rate_pct"))
         results["ttft_improvement_pct"] = stats.get("ttft_improvement_pct")
+        for key in ("ttft_p50_ms", "ttft_p90_ms", "ttft_p95_ms", "ttft_p99_ms",
+                    "kv_prefix_cache_hit_rate_pct", "kv_prefix_cache_hits",
+                    "kv_prefix_cache_queries", "kv_prefix_cache_backends_scraped"):
+            results[key] = stats.get(key)
         results["total_prompt_tokens"] = stats.get("total_prompt_tokens")
         results["total_completion_tokens"] = stats.get("total_completion_tokens")
         results["tokens_per_second"] = stats.get("tokens_per_second")
@@ -372,17 +395,18 @@ def parse_cache_stats_text(content: str) -> Dict[str, Any]:
     results = {}
 
     # Cache Hits: 5393
-    hits_match = re.search(r"Cache Hits:\s*(\d+)", content)
+    hits_match = re.search(r"(?:Cache Hits|Route-consistent):\s*(\d+)", content)
     if hits_match:
         results["cache_hits"] = int(hits_match.group(1))
 
     # Cache Misses: 117
-    misses_match = re.search(r"Cache Misses:\s*(\d+)", content)
+    misses_match = re.search(r"(?:Cache Misses|Route changed / first seen):\s*(\d+)", content)
     if misses_match:
         results["cache_misses"] = int(misses_match.group(1))
 
     # Cache Hit Rate: 97.9%
-    rate_match = re.search(r"Cache Hit Rate:\s*([0-9.]+)%", content)
+    # Lookbehind keeps "KV Prefix-Cache Hit Rate:" from matching as the affinity rate.
+    rate_match = re.search(r"(?<![-\w])(?:Cache Hit Rate|Route Consistency):\s*([0-9.]+)%", content)
     if rate_match:
         results["cache_hit_rate_pct"] = float(rate_match.group(1))
 
@@ -397,22 +421,22 @@ def parse_cache_stats_text(content: str) -> Dict[str, Any]:
         results["ttft_improvement_pct"] = float(improvement_match.group(1))
 
     # Cache Hit P50: 459.9ms
-    hit_p50_match = re.search(r"Cache Hit P50:\s*([0-9.]+)ms", content)
+    hit_p50_match = re.search(r"(?:Cache Hit|Route-consistent) P50:\s*([0-9.]+)ms", content)
     if hit_p50_match:
         results["ttft_cache_hit_p50_ms"] = float(hit_p50_match.group(1))
 
     # Cache Hit P99: 607.4ms
-    hit_p99_match = re.search(r"Cache Hit P99:\s*([0-9.]+)ms", content)
+    hit_p99_match = re.search(r"(?:Cache Hit|Route-consistent) P99:\s*([0-9.]+)ms", content)
     if hit_p99_match:
         results["ttft_cache_hit_p99_ms"] = float(hit_p99_match.group(1))
 
     # Cache Miss P50: 406.3ms
-    miss_p50_match = re.search(r"Cache Miss P50:\s*([0-9.]+)ms", content)
+    miss_p50_match = re.search(r"(?:Cache Miss|Route-changed) P50:\s*([0-9.]+)ms", content)
     if miss_p50_match:
         results["ttft_cache_miss_p50_ms"] = float(miss_p50_match.group(1))
 
     # Cache Miss P99: 1040.7ms
-    miss_p99_match = re.search(r"Cache Miss P99:\s*([0-9.]+)ms", content)
+    miss_p99_match = re.search(r"(?:Cache Miss|Route-changed) P99:\s*([0-9.]+)ms", content)
     if miss_p99_match:
         results["ttft_cache_miss_p99_ms"] = float(miss_p99_match.group(1))
 
@@ -813,6 +837,8 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
     results.p90_ttft_ms = ttft["p90_ttft_ms"]
     results.p95_ttft_ms = ttft["p95_ttft_ms"]
     results.p99_ttft_ms = ttft["p99_ttft_ms"]
+    if results.p99_ttft_ms is not None:
+        results.ttft_source = "locust_table"
 
     # Parse aggregated stats (common to both types)
     agg = parse_aggregated_stats(content)
@@ -857,6 +883,18 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.total_completion_tokens = json_stats.get("total_completion_tokens")
         results.tokens_per_second = json_stats.get("tokens_per_second")
         results.unique_prefixes = json_stats.get("unique_prefixes")
+        results.kv_prefix_cache_hit_rate_pct = json_stats.get("kv_prefix_cache_hit_rate_pct")
+        results.kv_prefix_cache_hits = json_stats.get("kv_prefix_cache_hits")
+        results.kv_prefix_cache_queries = json_stats.get("kv_prefix_cache_queries")
+        results.kv_prefix_cache_backends_scraped = json_stats.get("kv_prefix_cache_backends_scraped")
+
+        # Exact raw-sample TTFT percentiles beat Locust's approximated table.
+        if json_stats.get("ttft_p99_ms") is not None:
+            results.p50_ttft_ms = json_stats.get("ttft_p50_ms")
+            results.p90_ttft_ms = json_stats.get("ttft_p90_ms")
+            results.p95_ttft_ms = json_stats.get("ttft_p95_ms")
+            results.p99_ttft_ms = json_stats.get("ttft_p99_ms")
+            results.ttft_source = "raw"
 
         # Override cache TTFT from JSON if available
         if json_stats.get("ttft_cache_hit_p50_ms"):
@@ -1088,13 +1126,15 @@ def format_markdown_table(results: BenchmarkResults) -> str:
         ("P90 TTFT (ms)", results.p90_ttft_ms),
         ("P95 TTFT (ms)", results.p95_ttft_ms),
         ("P99 TTFT (ms)", results.p99_ttft_ms),
-        ("Cache Hit Rate (%)", results.cache_hit_rate_pct),
-        ("Cache Hits", results.cache_hits),
-        ("Cache Misses", results.cache_misses),
-        ("TTFT Cache Hit P50 (ms)", results.ttft_cache_hit_p50_ms),
-        ("TTFT Cache Hit P99 (ms)", results.ttft_cache_hit_p99_ms),
-        ("TTFT Cache Miss P50 (ms)", results.ttft_cache_miss_p50_ms),
-        ("TTFT Cache Miss P99 (ms)", results.ttft_cache_miss_p99_ms),
+        ("TTFT Source", results.ttft_source),
+        ("Route Consistency (%)", results.cache_hit_rate_pct),
+        ("Route-consistent Requests", results.cache_hits),
+        ("Route-changed Requests", results.cache_misses),
+        ("KV Prefix-Cache Hit Rate (%)", results.kv_prefix_cache_hit_rate_pct),
+        ("TTFT Route-consistent P50 (ms)", results.ttft_cache_hit_p50_ms),
+        ("TTFT Route-consistent P99 (ms)", results.ttft_cache_hit_p99_ms),
+        ("TTFT Route-changed P50 (ms)", results.ttft_cache_miss_p50_ms),
+        ("TTFT Route-changed P99 (ms)", results.ttft_cache_miss_p99_ms),
         ("TTFT Improvement (%)", results.ttft_improvement_pct),
         ("Tokens/Second", results.tokens_per_second),
         ("Total Requests", results.total_requests),
@@ -1127,25 +1167,32 @@ def print_summary(results: BenchmarkResults):
         print(f"Mode: {results.benchmark_mode}")
 
     if results.benchmark_type == "real" and results.cache_hit_rate_pct is not None:
-        print("\nCache Performance:")
-        print(f"  Cache Hit Rate: {results.cache_hit_rate_pct:.1f}%")
+        print("\nRoute Consistency (client-side same-backend affinity; not a KV-cache hit rate):")
+        print(f"  Route Consistency: {results.cache_hit_rate_pct:.1f}%")
         if results.cache_hits is not None:
-            print(f"  Cache Hits: {results.cache_hits}")
+            print(f"  Route-consistent: {results.cache_hits}")
         if results.cache_misses is not None:
-            print(f"  Cache Misses: {results.cache_misses}")
+            print(f"  Route changed / first seen: {results.cache_misses}")
+        if results.kv_prefix_cache_hit_rate_pct is not None:
+            print(f"  KV Prefix-Cache Hit Rate (vLLM counters): {results.kv_prefix_cache_hit_rate_pct:.1f}%")
+        else:
+            print("  KV Prefix-Cache Hit Rate (vLLM counters): unavailable")
 
     print("\nTTFT Latency:")
+    if results.ttft_source:
+        note = "exact, raw samples" if results.ttft_source == "raw" else "Locust approximated table, ±50 ms above 1 s"
+        print(f"  Source: {results.ttft_source} ({note})")
     if results.p50_ttft_ms is not None:
         print(f"  P50: {results.p50_ttft_ms:.1f}ms")
     if results.p99_ttft_ms is not None:
         print(f"  P99: {results.p99_ttft_ms:.1f}ms")
 
     if results.ttft_cache_hit_p50_ms is not None:
-        print(f"  Cache Hit P50: {results.ttft_cache_hit_p50_ms:.1f}ms")
+        print(f"  Route-consistent P50: {results.ttft_cache_hit_p50_ms:.1f}ms")
     if results.ttft_cache_miss_p50_ms is not None:
-        print(f"  Cache Miss P50: {results.ttft_cache_miss_p50_ms:.1f}ms")
+        print(f"  Route-changed P50: {results.ttft_cache_miss_p50_ms:.1f}ms")
     if results.ttft_improvement_pct is not None:
-        print(f"  Improvement (Hit vs Miss): {results.ttft_improvement_pct:.1f}%")
+        print(f"  Improvement (consistent vs changed): {results.ttft_improvement_pct:.1f}%")
 
     print("\nThroughput:")
     if results.tokens_per_second is not None:
@@ -1311,17 +1358,23 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
         f"  Incompletes:  baseline {baseline.incomplete_requests} ({inc_b:.1f}%)  "
         f"new {new.incomplete_requests} ({inc_n:.1f}%){inc_warn}"
     )
+    lines.append(f"TTFT source: baseline={baseline.ttft_source or 'unknown'}, "
+                 f"new={new.ttft_source or 'unknown'}"
+                 + ("  *** locust_table is approximated (±50 ms above 1 s) ***"
+                    if "locust_table" in (baseline.ttft_source, new.ttft_source) else ""))
     lines.append("")
 
-    # KEY METRICS - Cache hit rate is the most important comparison
+    # KEY METRICS — route consistency is the affinity signal; the KV row is the
+    # backends' own cache counters and the only real cache-hit measurement.
     lines.append("-" * 80)
-    lines.append("KEY METRICS (Cache Efficiency)")
+    lines.append("KEY METRICS (Routing Affinity / KV Cache)")
     lines.append("-" * 80)
 
     cache_metrics = [
-        ("cache_hit_rate_pct", "Cache Hit Rate (%)", False),
-        ("cache_hits", "Cache Hits", False),
-        ("cache_misses", "Cache Misses", True),
+        ("cache_hit_rate_pct", "Route Consistency (%)", False),
+        ("kv_prefix_cache_hit_rate_pct", "KV Prefix-Cache Hit (%)", False),
+        ("cache_hits", "Route-consistent Reqs", False),
+        ("cache_misses", "Route-changed Reqs", True),
         ("unique_prefixes", "Unique Prefixes", None),
     ]
 
@@ -1512,10 +1565,10 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     ttft_metrics = [
         ("p50_ttft_ms", "P50 TTFT (ms)", True),
         ("p99_ttft_ms", "P99 TTFT (ms)", True),
-        ("ttft_cache_hit_p50_ms", "Cache Hit P50 (ms)", True),
-        ("ttft_cache_hit_p99_ms", "Cache Hit P99 (ms)", True),
-        ("ttft_cache_miss_p50_ms", "Cache Miss P50 (ms)", True),
-        ("ttft_cache_miss_p99_ms", "Cache Miss P99 (ms)", True),
+        ("ttft_cache_hit_p50_ms", "Route-consistent P50 (ms)", True),
+        ("ttft_cache_hit_p99_ms", "Route-consistent P99 (ms)", True),
+        ("ttft_cache_miss_p50_ms", "Route-changed P50 (ms)", True),
+        ("ttft_cache_miss_p99_ms", "Route-changed P99 (ms)", True),
     ]
 
     lines.append(f"{'Metric':<25} {'Baseline':>12} {'New':>12} {'Change':>30}")
@@ -1706,7 +1759,10 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     lines.append("SUMMARY:")
     if new.cache_hit_rate_pct and baseline.cache_hit_rate_pct:
         improvement = new.cache_hit_rate_pct - baseline.cache_hit_rate_pct
-        lines.append(f"  Cache Hit Rate: {baseline.cache_hit_rate_pct:.1f}% -> {new.cache_hit_rate_pct:.1f}% (+{improvement:.1f}%)")
+        lines.append(f"  Route Consistency: {baseline.cache_hit_rate_pct:.1f}% -> {new.cache_hit_rate_pct:.1f}% ({improvement:+.1f} pp)")
+    if new.kv_prefix_cache_hit_rate_pct is not None and baseline.kv_prefix_cache_hit_rate_pct is not None:
+        kv_delta = new.kv_prefix_cache_hit_rate_pct - baseline.kv_prefix_cache_hit_rate_pct
+        lines.append(f"  KV Prefix-Cache Hit: {baseline.kv_prefix_cache_hit_rate_pct:.1f}% -> {new.kv_prefix_cache_hit_rate_pct:.1f}% ({kv_delta:+.1f} pp)")
     for bucket_key, bucket_label in (("large", "Large"), ("xlarge", "XLarge")):
         improv = getattr(new, f"ttft_{bucket_key}_improvement_pct", None)
         miss_p50 = getattr(new, f"ttft_{bucket_key}_miss_p50_ms", None)
@@ -1762,7 +1818,8 @@ _LOWER_IS_BETTER = {
 # so the table stays readable and stable across schema growth.
 _AGG_METRICS = [
     "p50_ttft_ms", "p90_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
-    "cache_hit_rate_pct", "ttft_cache_miss_p99_ms", "tokens_per_second",
+    "cache_hit_rate_pct", "kv_prefix_cache_hit_rate_pct",
+    "ttft_cache_miss_p99_ms", "tokens_per_second",
     "requests_per_sec", "incomplete_rate_pct", "failure_rate_pct",
     "total_requests",
 ]
@@ -1838,6 +1895,7 @@ def aggregate_runs(runs: List[BenchmarkResults],
     return {
         "mode": "single-arm",
         "n_repeats": len(runs),
+        "ttft_sources": sorted({(r.ttft_source or "unknown") for r in runs}),
         "metrics": per_metric,
         "p99_outliers": outliers,
     }
@@ -1899,6 +1957,7 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
 
     return {
         "mode": "paired-ab",
+        "ttft_sources": sorted({(r.ttft_source or "unknown") for r in baseline_runs + treatment_runs}),
         "discriminating_metric": discriminating_metric,
         "lower_is_better": lower_better,
         "n_pairs": n,
@@ -1919,6 +1978,14 @@ def _fmt_stat(s: Optional[Dict[str, Any]]) -> str:
     return f"median {s['median']:.1f} [{s['min']:.1f}..{s['max']:.1f}]{iqr} (n={s['n']})"
 
 
+def _ttft_sources_line(agg: Dict[str, Any]) -> str:
+    sources = agg.get("ttft_sources") or ["unknown"]
+    line = f"TTFT source(s): {', '.join(sources)}"
+    if any(src != "raw" for src in sources):
+        line += "  *** not all runs carry raw-sample percentiles; Locust's table is approximated (±50 ms above 1 s) ***"
+    return line
+
+
 def format_aggregate(agg: Dict[str, Any]) -> str:
     """Human-readable rendering of an aggregate_runs / aggregate_compare result."""
     lines = []
@@ -1928,6 +1995,7 @@ def format_aggregate(agg: Dict[str, Any]) -> str:
                      f"discriminating metric: {agg['discriminating_metric']}")
         lines.append("=" * 72)
         lines.append(f"VERDICT: {agg['verdict']}")
+        lines.append(_ttft_sources_line(agg))
         ds = agg["delta_pct"]
         if ds:
             lines.append(f"  {agg['discriminating_metric']} %change: {_fmt_stat(ds)}")
@@ -1943,11 +2011,12 @@ def format_aggregate(agg: Dict[str, Any]) -> str:
             for h in agg["hotspots"]:
                 lines.append(f"  repeat {h['repeat']}: treatment P99 {h['treatment_p99_ms']:.0f}ms "
                              f"≫ baseline {h['baseline_p99_ms']:.0f}ms at "
-                             f"{h['cache_hit_rate_pct']:.0f}% hit rate")
+                             f"{h['cache_hit_rate_pct']:.0f}% route consistency")
     else:
         lines.append("=" * 72)
         lines.append(f"AGGREGATE over {agg['n_repeats']} repeat(s)")
         lines.append("=" * 72)
+        lines.append(_ttft_sources_line(agg))
         for m, s in agg["metrics"].items():
             lines.append(f"  {m:24s} {_fmt_stat(s)}")
         if agg["p99_outliers"]:

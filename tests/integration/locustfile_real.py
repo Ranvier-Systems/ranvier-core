@@ -3,14 +3,19 @@
 Real vLLM Backend Load Testing for Ranvier Core
 
 This load test measures the actual value proposition of prefix-aware routing:
-1. Cache hit rate - requests routed to same backend for shared prefix
-2. TTFT comparison - cache hit vs. cache miss latency
+1. Route consistency - requests routed to the same backend for a shared prefix
+   (a client-side affinity proxy; NOT a KV-cache hit rate)
+2. KV prefix-cache hit rate - vLLM's own prefix_cache_hits/queries counters,
+   differenced over the run (the real cache signal, when backends expose it)
+3. TTFT comparison - route-consistent vs. route-changed latency
 3. Tokens per second throughput
 4. Usage statistics from SSE responses
 
 Key Metrics:
 - TTFT (Time To First Token): Latency until first token arrives
-- Cache Hit Rate: Percentage of requests hitting warm KV cache
+- Route Consistency: % of requests that landed on the same backend as the
+  previous request carrying the same prefix (random routing scores ~1/N)
+- KV Prefix-Cache Hit Rate: token-level hits/queries from vLLM counters
 - Token Throughput: Tokens generated per second
 - Routing Accuracy: Whether router correctly identified prefix locality
 
@@ -2584,9 +2589,20 @@ class BenchmarkStats:
     cache_hits: int = 0
     cache_misses: int = 0
 
-    # TTFT by cache status
+    # Every successful request's TTFT, for exact overall percentiles. Locust's
+    # own table is approximated (100 ms buckets above 1 s), so the headline
+    # P99 must come from here, not from there.
+    ttft_all: List[float] = field(default_factory=list)
+
+    # TTFT by route consistency (same backend as last time for this prefix)
     ttft_cache_hit: List[float] = field(default_factory=list)
     ttft_cache_miss: List[float] = field(default_factory=list)
+
+    # vLLM prefix-cache counters differenced over the run (None when the
+    # backends do not expose vllm:prefix_cache_{hits,queries}).
+    kv_prefix_cache_hits: Optional[float] = None
+    kv_prefix_cache_queries: Optional[float] = None
+    kv_prefix_cache_backends_scraped: int = 0
 
     # Token throughput
     total_prompt_tokens: int = 0
@@ -2631,6 +2647,7 @@ class BenchmarkStats:
                 return
 
             self.successful_requests += 1
+            self.ttft_all.append(metrics.ttft_ms)
             self.total_prompt_tokens += metrics.prompt_tokens
             self.total_completion_tokens += metrics.completion_tokens
 
@@ -2684,6 +2701,15 @@ class BenchmarkStats:
             if self.cache_hits + self.cache_misses > 0:
                 cache_hit_rate = self.cache_hits / (self.cache_hits + self.cache_misses) * 100
 
+            ttft_p50 = self._percentile(self.ttft_all, 0.50)
+            ttft_p90 = self._percentile(self.ttft_all, 0.90)
+            ttft_p95 = self._percentile(self.ttft_all, 0.95)
+            ttft_p99 = self._percentile(self.ttft_all, 0.99)
+
+            kv_hit_rate = None
+            if self.kv_prefix_cache_queries:
+                kv_hit_rate = (self.kv_prefix_cache_hits or 0.0) / self.kv_prefix_cache_queries * 100
+
             ttft_hit_p50 = self._percentile(self.ttft_cache_hit, 0.50)
             ttft_hit_p99 = self._percentile(self.ttft_cache_hit, 0.99)
             ttft_miss_p50 = self._percentile(self.ttft_cache_miss, 0.50)
@@ -2708,9 +2734,21 @@ class BenchmarkStats:
                 "incomplete_no_data": self.incomplete_no_data,
                 "incomplete_connection_reset": self.incomplete_connection_reset,
                 "incomplete_rate_pct": incomplete_rate_pct,
+                # Exact overall TTFT percentiles from raw samples.
+                "ttft_p50_ms": ttft_p50,
+                "ttft_p90_ms": ttft_p90,
+                "ttft_p95_ms": ttft_p95,
+                "ttft_p99_ms": ttft_p99,
+                "ttft_samples": len(self.ttft_all),
+                # Client-side same-backend affinity proxy (was misnamed cache_hit_rate_pct).
                 "cache_hits": self.cache_hits,
                 "cache_misses": self.cache_misses,
-                "cache_hit_rate_pct": cache_hit_rate,
+                "route_consistency_pct": cache_hit_rate,
+                # Real KV-cache signal from the backends, token-level, delta over the run.
+                "kv_prefix_cache_hit_rate_pct": kv_hit_rate,
+                "kv_prefix_cache_hits": self.kv_prefix_cache_hits,
+                "kv_prefix_cache_queries": self.kv_prefix_cache_queries,
+                "kv_prefix_cache_backends_scraped": self.kv_prefix_cache_backends_scraped,
                 "ttft_cache_hit_p50_ms": ttft_hit_p50,
                 "ttft_cache_hit_p99_ms": ttft_hit_p99,
                 "ttft_cache_miss_p50_ms": ttft_miss_p50,
@@ -3130,6 +3168,65 @@ def register_backends_on_all_nodes():
 
     _backends_registered = True
     logger.info("Backend registration complete")
+
+
+# vLLM exposes prefix-cache counters (token-level) on its own /metrics. Names
+# differ by version: prometheus_client appends _total to counters, older
+# builds omit it. Backends without either (mock, Ollama) are skipped.
+_VLLM_PREFIX_CACHE_HITS = ("vllm:prefix_cache_hits_total", "vllm:prefix_cache_hits")
+_VLLM_PREFIX_CACHE_QUERIES = ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_queries")
+_initial_kv_prefix_cache: Dict[int, Tuple[float, float]] = {}
+
+
+def _first_present_metric(text: str, names: Tuple[str, ...]) -> Optional[float]:
+    for name in names:
+        value = prom_metric_value(text, name)
+        if value is not None:
+            return value
+    return None
+
+
+def scrape_backend_prefix_cache() -> Dict[int, Tuple[float, float]]:
+    """(hits, queries) token counters per backend id, from each backend's /metrics."""
+    counters: Dict[int, Tuple[float, float]] = {}
+    for backend in BACKENDS:
+        text = _fetch_metrics_text(f"http://{backend['ip']}:{backend['port']}")
+        if text is None:
+            continue
+        hits = _first_present_metric(text, _VLLM_PREFIX_CACHE_HITS)
+        queries = _first_present_metric(text, _VLLM_PREFIX_CACHE_QUERIES)
+        if hits is None or queries is None:
+            continue
+        counters[backend["id"]] = (hits, queries)
+    return counters
+
+
+def capture_initial_kv_prefix_cache():
+    """Snapshot the counters before traffic so the run's hit rate is a delta, not cumulative."""
+    global _initial_kv_prefix_cache
+    _initial_kv_prefix_cache = scrape_backend_prefix_cache()
+    if _initial_kv_prefix_cache:
+        logger.info(f"KV prefix-cache counters found on {len(_initial_kv_prefix_cache)}/{len(BACKENDS)} backends")
+    else:
+        logger.info("KV prefix-cache counters not exposed by backends; real hit rate will be unavailable")
+
+
+def kv_prefix_cache_delta() -> Tuple[Optional[float], Optional[float], int]:
+    """(hits, queries, backends) accumulated since capture_initial_kv_prefix_cache()."""
+    final = scrape_backend_prefix_cache()
+    hits = queries = 0.0
+    scraped = 0
+    for backend_id, (final_hits, final_queries) in final.items():
+        start_hits, start_queries = _initial_kv_prefix_cache.get(backend_id, (0.0, 0.0))
+        if final_hits < start_hits or final_queries < start_queries:
+            # Counter reset (backend restarted mid-run): the delta is the final value.
+            start_hits = start_queries = 0.0
+        hits += final_hits - start_hits
+        queries += final_queries - start_queries
+        scraped += 1
+    if scraped == 0:
+        return None, None, 0
+    return hits, queries, scraped
 
 
 def capture_initial_sync_errors():
@@ -3633,6 +3730,7 @@ def on_test_start(environment, **kwargs):
 
     # Capture initial sync errors
     capture_initial_sync_errors()
+    capture_initial_kv_prefix_cache()
 
     logger.info("Load test initialization complete")
 
@@ -3647,15 +3745,30 @@ def on_test_stop(environment, **kwargs):
     logger.info("Benchmark Results Summary")
     logger.info("=" * 70)
 
+    # Real KV-cache signal from the backends, differenced over the run.
+    kv_hits, kv_queries, kv_backends = kv_prefix_cache_delta()
+    _benchmark_stats.kv_prefix_cache_hits = kv_hits
+    _benchmark_stats.kv_prefix_cache_queries = kv_queries
+    _benchmark_stats.kv_prefix_cache_backends_scraped = kv_backends
+
     # Get aggregated stats
     summary = _benchmark_stats.get_summary()
 
-    # Print cache hit statistics
-    logger.info(f"Cache Statistics:")
-    logger.info(f"  Cache Hits: {summary['cache_hits']}")
-    logger.info(f"  Cache Misses: {summary['cache_misses']}")
-    logger.info(f"  Cache Hit Rate: {summary['cache_hit_rate_pct']:.1f}%")
+    logger.info("Route Consistency (client-side: same backend as the previous request with this prefix):")
+    logger.info(f"  Route-consistent: {summary['cache_hits']}")
+    logger.info(f"  Route changed / first seen: {summary['cache_misses']}")
+    logger.info(f"  Route Consistency: {summary['route_consistency_pct']:.1f}%")
     logger.info(f"  Unique Prefixes: {summary['unique_prefixes']}")
+    logger.info("  (random routing scores ~1/N here by construction; this is NOT a KV-cache hit rate)")
+
+    kv_rate = summary.get("kv_prefix_cache_hit_rate_pct")
+    if kv_rate is not None:
+        logger.info("KV Prefix-Cache Hit Rate (vLLM counters, token-level, delta over the run):")
+        logger.info(f"  KV Prefix-Cache Hit Rate: {kv_rate:.1f}% "
+                    f"({summary['kv_prefix_cache_hits']:.0f}/{summary['kv_prefix_cache_queries']:.0f} tokens "
+                    f"across {summary['kv_prefix_cache_backends_scraped']} backends)")
+    else:
+        logger.info("KV Prefix-Cache Hit Rate: unavailable (backends expose no vllm:prefix_cache_* counters)")
 
     # Print prefix boundary optimization stats (server-side)
     prefix_stats = get_prefix_boundary_stats()
@@ -3666,18 +3779,25 @@ def on_test_stop(environment, **kwargs):
         if prefix_stats["prefix_boundary_ratio_pct"] is not None:
             logger.info(f"  Usage Ratio: {prefix_stats['prefix_boundary_ratio_pct']:.1f}%")
             # Correlation hint
-            if prefix_stats["prefix_boundary_ratio_pct"] < 50 and summary['cache_hit_rate_pct'] < 50:
-                logger.info(f"  Note: Low prefix boundary usage may explain low cache hit rate")
+            if prefix_stats["prefix_boundary_ratio_pct"] < 50 and summary['route_consistency_pct'] < 50:
+                logger.info(f"  Note: Low prefix boundary usage may explain low route consistency")
                 logger.info(f"        (requests may lack system messages or have short system prompts)")
 
+    # Exact overall TTFT from raw samples. Locust's percentile table rounds
+    # 1-10 s values to 100 ms buckets, so it must not be the headline source.
+    if summary['ttft_p99_ms'] is not None:
+        logger.info(f"\nTTFT (raw samples, n={summary['ttft_samples']}):")
+        logger.info(f"  P50: {summary['ttft_p50_ms']:.1f}ms  P90: {summary['ttft_p90_ms']:.1f}ms  "
+                    f"P95: {summary['ttft_p95_ms']:.1f}ms  P99: {summary['ttft_p99_ms']:.1f}ms")
+
     # Print TTFT comparison
-    logger.info(f"\nTTFT Comparison:")
+    logger.info(f"\nTTFT Comparison (by route consistency):")
     if summary['ttft_cache_hit_p50_ms']:
-        logger.info(f"  Cache Hit P50: {summary['ttft_cache_hit_p50_ms']:.1f}ms")
-        logger.info(f"  Cache Hit P99: {summary['ttft_cache_hit_p99_ms']:.1f}ms")
+        logger.info(f"  Route-consistent P50: {summary['ttft_cache_hit_p50_ms']:.1f}ms")
+        logger.info(f"  Route-consistent P99: {summary['ttft_cache_hit_p99_ms']:.1f}ms")
     if summary['ttft_cache_miss_p50_ms']:
-        logger.info(f"  Cache Miss P50: {summary['ttft_cache_miss_p50_ms']:.1f}ms")
-        logger.info(f"  Cache Miss P99: {summary['ttft_cache_miss_p99_ms']:.1f}ms")
+        logger.info(f"  Route-changed P50: {summary['ttft_cache_miss_p50_ms']:.1f}ms")
+        logger.info(f"  Route-changed P99: {summary['ttft_cache_miss_p99_ms']:.1f}ms")
     if summary['ttft_improvement_pct']:
         logger.info(f"  TTFT Improvement: {summary['ttft_improvement_pct']:.1f}%")
 
@@ -4094,7 +4214,8 @@ class RealBackendUser(HttpUser):
                 record_derived_sample(stats, "GET", "TTFT (Time To First Token)", ttft)
 
                 cache_status = "hit" if metrics.is_cache_hit else "miss"
-                record_derived_sample(stats, "GET", f"TTFT (Cache {cache_status.upper()})", ttft)
+                route_label = "Route-consistent" if metrics.is_cache_hit else "Route-changed"
+                record_derived_sample(stats, "GET", f"TTFT ({route_label})", ttft)
 
                 if prefix_size_bucket and prefix_size_bucket != "unknown":
                     record_derived_sample(stats, "GET", f"TTFT ({prefix_size_bucket})", ttft)

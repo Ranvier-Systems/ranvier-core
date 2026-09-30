@@ -291,6 +291,15 @@ BENCHMARK OPTIONS:
     --load-imbalance-floor N
                         Additive floor to prevent flapping at low load (default: 2).
                         Threshold = median * factor + floor.
+                        NOTE: factor/floor govern the divert allowance ONLY under
+                        --hash-strategy jump|modular. The shipped default is
+                        bounded_load, where --bounded-load-epsilon is the knob;
+                        bench.sh refuses to run a mislabelled combination.
+    --hash-strategy S   Ranvier hash strategy: bounded_load (default), p2c, jump, modular.
+                        Sets RANVIER_HASH_STRATEGY for the cluster.
+    --bounded-load-epsilon E
+                        Divert allowance under bounded_load: cap = avg * (1 + E)
+                        (default: 0.25). Sets RANVIER_BOUNDED_LOAD_EPSILON.
     --vllm-version VER  Pin vLLM to a specific version (default: ${DEFAULT_VLLM_VERSION}).
                         Ensures reproducible benchmarks across instances.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models).
@@ -479,6 +488,8 @@ MULTI_DEPTH=false
 LOAD_AWARE=true
 LOAD_IMBALANCE_FACTOR=""
 LOAD_IMBALANCE_FLOOR=""
+HASH_STRATEGY=""            # --hash-strategy: bounded_load | p2c | jump | modular
+BOUNDED_LOAD_EPSILON=""     # --bounded-load-epsilon: divert allowance under bounded_load
 CACHE_RESIDENCY_THRESHOLD=""
 COMPRESSION_RATIO=""
 PRIORITY_QUEUE=false
@@ -521,6 +532,8 @@ while [[ $# -gt 0 ]]; do
         --compression-ratio) COMPRESSION_RATIO="$2"; shift 2 ;;
         --load-imbalance-factor) LOAD_IMBALANCE_FACTOR="$2"; shift 2 ;;
         --load-imbalance-floor)  LOAD_IMBALANCE_FLOOR="$2"; shift 2 ;;
+        --hash-strategy)  HASH_STRATEGY="$2"; shift 2 ;;
+        --bounded-load-epsilon) BOUNDED_LOAD_EPSILON="$2"; shift 2 ;;
         --cache-residency-threshold) CACHE_RESIDENCY_THRESHOLD="$2"; shift 2 ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --tp)             TP_SIZE="$2"; shift 2 ;;
@@ -1084,6 +1097,8 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Load-Aware:      $LOAD_AWARE"
     [[ -n "$LOAD_IMBALANCE_FACTOR" ]] && echo "  Imbalance Factor: $LOAD_IMBALANCE_FACTOR"
     [[ -n "$LOAD_IMBALANCE_FLOOR" ]] && echo "  Imbalance Floor:  $LOAD_IMBALANCE_FLOOR"
+    [[ -n "$HASH_STRATEGY" ]] && echo "  Hash Strategy:   $HASH_STRATEGY"
+    [[ -n "$BOUNDED_LOAD_EPSILON" ]] && echo "  Bounded Epsilon: $BOUNDED_LOAD_EPSILON"
     [[ -n "$CACHE_RESIDENCY_THRESHOLD" ]] && echo "  Residency Thresh: $CACHE_RESIDENCY_THRESHOLD"
     echo "  Max Tokens:      $MAX_TOKENS"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
@@ -1420,6 +1435,14 @@ if [[ -n "$LOAD_IMBALANCE_FLOOR" ]]; then
     export RANVIER_LOAD_IMBALANCE_FLOOR="$LOAD_IMBALANCE_FLOOR"
     log_info "Load imbalance floor: $LOAD_IMBALANCE_FLOOR"
 fi
+if [[ -n "$HASH_STRATEGY" ]]; then
+    export RANVIER_HASH_STRATEGY="$HASH_STRATEGY"
+    log_info "Hash strategy: $HASH_STRATEGY"
+fi
+if [[ -n "$BOUNDED_LOAD_EPSILON" ]]; then
+    export RANVIER_BOUNDED_LOAD_EPSILON="$BOUNDED_LOAD_EPSILON"
+    log_info "Bounded-load epsilon: $BOUNDED_LOAD_EPSILON"
+fi
 # Residency routing toggle (#527). The flag takes precedence over a bare
 # RANVIER_CACHE_RESIDENCY_THRESHOLD=... env prefix; both reach the servers now
 # that docker-compose.benchmark-real.yml passes the variable through.
@@ -1439,6 +1462,24 @@ log_info "RANVIER_ROUTING_MODE          = ${RANVIER_ROUTING_MODE:-prefix} (defau
 log_info "RANVIER_LOAD_AWARE_ROUTING    = ${RANVIER_LOAD_AWARE_ROUTING}"
 log_info "RANVIER_LOAD_IMBALANCE_FACTOR = ${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0 (compose default)}"
 log_info "RANVIER_LOAD_IMBALANCE_FLOOR  = ${RANVIER_LOAD_IMBALANCE_FLOOR:-2 (compose default)}"
+# The divert allowance depends on the hash strategy (router_service.cpp
+# compute_load_allowance): factor/floor apply only under jump/modular; the
+# shipped default bounded_load uses epsilon, p2c uses its load bias. A run
+# labelled "factor 3.0 / floor 4" under bounded_load measured the defaults —
+# so refuse that combination instead of recording a mislabelled experiment.
+EFFECTIVE_HASH_STRATEGY="${RANVIER_HASH_STRATEGY:-bounded_load}"
+log_info "RANVIER_HASH_STRATEGY         = ${RANVIER_HASH_STRATEGY:-bounded_load (compose default)}"
+log_info "RANVIER_BOUNDED_LOAD_EPSILON  = ${RANVIER_BOUNDED_LOAD_EPSILON:-0.25 (compose default)}"
+case "$EFFECTIVE_HASH_STRATEGY" in
+    jump|modular) ;;
+    *)
+        if [[ -n "${RANVIER_LOAD_IMBALANCE_FACTOR:-}" || -n "${RANVIER_LOAD_IMBALANCE_FLOOR:-}" ]]; then
+            log_error "--load-imbalance-factor/--load-imbalance-floor have NO effect under hash strategy '$EFFECTIVE_HASH_STRATEGY'."
+            log_error "Use --bounded-load-epsilon (bounded_load), or add --hash-strategy jump so factor/floor apply."
+            exit 1
+        fi
+        ;;
+esac
 # Residency routing (#527) is a SECOND diversion mechanism, on by default
 # (threshold 0.2). It is NOT controlled by --no-load-aware — only by
 # --cache-residency-threshold (or the env var; 0.0 disables). Surfaced here
@@ -1602,7 +1643,22 @@ write_manifest() {
         printf '    "load_aware_routing": "%s",\n' "$(_json_escape "${RANVIER_LOAD_AWARE_ROUTING:-}")"
         printf '    "load_imbalance_factor": "%s",\n' "$(_json_escape "${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}")"
         printf '    "load_imbalance_floor": "%s",\n' "$(_json_escape "${RANVIER_LOAD_IMBALANCE_FLOOR:-2}")"
-        printf '    "cache_residency_threshold": "%s"\n' "$(_json_escape "${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}")"
+        printf '    "cache_residency_threshold": "%s",\n' "$(_json_escape "${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}")"
+        # Every other RANVIER_* knob the compose file forwards from the host env.
+        # Defaults mirror docker-compose.benchmark-real.yml so an unset knob is
+        # recorded as the value the server actually ran with.
+        printf '    "hash_strategy": "%s",\n' "$(_json_escape "${RANVIER_HASH_STRATEGY:-bounded_load}")"
+        printf '    "bounded_load_epsilon": "%s",\n' "$(_json_escape "${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}")"
+        printf '    "cross_shard_load_sync": "%s",\n' "$(_json_escape "${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}")"
+        printf '    "min_token_length": "%s",\n' "$(_json_escape "${RANVIER_MIN_TOKEN_LENGTH:-10}")"
+        printf '    "route_batch_flush_interval_ms": "%s",\n' "$(_json_escape "${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}")"
+        printf '    "enable_multi_depth_routing": "%s",\n' "$(_json_escape "${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}")"
+        printf '    "default_compression_ratio": "%s",\n' "$(_json_escape "${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}")"
+        printf '    "backpressure_enable_priority_queue": "%s",\n' "$(_json_escape "${RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE:-false}")"
+        printf '    "backpressure_tier_capacity": "%s",\n' "$(_json_escape "${RANVIER_BACKPRESSURE_TIER_CAPACITY:-64,128,256,512}")"
+        printf '    "chat_template_format": "%s",\n' "$(_json_escape "${RANVIER_CHAT_TEMPLATE_FORMAT:-none}")"
+        printf '    "tokenizer_thread_pool_enabled": "%s",\n' "$(_json_escape "${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}")"
+        printf '    "health_vllm_metrics_timeout_ms": "%s"\n' "$(_json_escape "${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}")"
         printf '  },\n'
         # workload knobs — the block results_parser.py compares for comparability.
         printf '  "workload": {\n'

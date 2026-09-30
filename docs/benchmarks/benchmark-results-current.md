@@ -42,6 +42,14 @@ Standard matrix on current defaults (50 prefixes, ratio 0.9, stress, load-aware 
 | **13B 20u/10m** | ~28 | **+3.8%** (IQR −5.7…+8.0) | ⚖️ no reliable effect | 12→43% | ~2% both |
 | **13B 10u/10m** | ~16 | **+29.0%** (IQR +21…+34) | ❌ reliable regression | 12→49% | prefix worse |
 
+> **Column caveats (audit 2026-09-30).** "Cache hit" is the client-side *route consistency*
+> proxy (same backend as the previous request with that prefix), not vLLM's KV hit rate; under
+> round-robin it is ~1/N by construction, so "12→48%" is an affinity statement. "~req/s" was read
+> from Locust's Aggregated row while that row also counted derived TTFT samples, so it is roughly
+> 6× the HTTP request rate; the ratios between configs still hold, the absolute crossover band
+> does not. P99 values come from Locust's approximated table (±50 ms above 1 s). See
+> `.dev-context/benchmark-accuracy-audit-2026-09-30.md`.
+
 **Read this as a gradient, not four labels.** Sorted by throughput the P99 effect slides
 monotonically from −13% (busiest) to +29% (idlest): under sustained load, routing to cache-warm
 backends relieves the tail; below a crossover (somewhere between ~16 and ~28 req/s on this
@@ -51,8 +59,8 @@ prefill savings are too small to offset it. Throughput — not the 20-user count
 the crossover as a band, not a precise number.)
 
 Secondary signals, consistent across the matrix:
-- **Cache hit rate up ~3× everywhere** yet uncorrelated with the P99 outcome — a high hit rate
-  is not evidence of a latency win.
+- **Route consistency (the "cache hit" column) up ~3× everywhere** yet uncorrelated with the
+  P99 outcome — a high affinity rate is not evidence of a latency win.
 - **Throughput +1–7%** on every config (prefix never lost throughput).
 - **Load-aware fallbacks 30–47%** on every prefix run (highest on 8B, which drains fastest): a
   third to a half of requests are diverted off affinity to balance load. That — not affinity

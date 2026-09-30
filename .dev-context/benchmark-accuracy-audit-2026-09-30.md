@@ -42,6 +42,7 @@ overclaimed:
 ## Tier 1 — Distorts published numbers
 
 ### 1. "Cache hit rate" is a routing-affinity proxy, not a cache-hit rate — Sev 8, CONFIRMED
+- **Status:** FIXED 2026-09-30. The locustfile now reports the number as `route_consistency_pct` and labels it "Route Consistency" everywhere; it also snapshots vLLM `prefix_cache_hits/queries` per backend at start and stop and reports the delta as `kv_prefix_cache_hit_rate_pct`. The parser reads both (old key as fallback), relabels every table, and adds the KV row to compare and aggregate. Docs corrected.
 - `locustfile_real.py:2641-2672` `record_request`: hit ⇔ same `X-Backend-ID` as the previous
   request with this prefix hash; first sight = miss; a route change = miss and re-learn. No
   vLLM `prefix_cache_hits`/`cached_tokens` or Ranvier `cache_hits_total` is read.
@@ -76,6 +77,7 @@ overclaimed:
   POST rows only.
 
 ### 3. Headline P99 TTFT is Locust's *approximated* percentile, reported to 0.1% — Sev 6, CONFIRMED
+- **Status:** FIXED 2026-09-30. `BENCHMARK_STATS_JSON` now carries exact `ttft_p50/p90/p95/p99_ms` over every sample; the parser prefers them and tags `ttft_source` ("raw" vs "locust_table"), which compare and aggregate print, with a warning when any run is table-sourced.
 - `results_parser.py:221-240` regexes the "Response time percentiles (approximated)" table.
   Locust 2.24 `stats.py:398-404` rounds logged times: <1 s to 10 ms, 1–10 s to **100 ms**,
   ≥10 s to 1 s; percentiles are nearest-rank over rounded keys. 13B P99 TTFT sits in 1–10 s,
@@ -141,6 +143,7 @@ overclaimed:
   interpolate; sum counters across shards (the parser already does this correctly).
 
 ### 7. `--load-imbalance-factor/--floor` have no effect under the default strategy, and nothing records which strategy ran — Sev 8 for any "raised thresholds" claim, CONFIRMED
+- **Status:** FIXED 2026-09-30. Banner prints `RANVIER_HASH_STRATEGY` and `RANVIER_BOUNDED_LOAD_EPSILON`; `bench.sh` exits with an error when factor/floor are passed under a strategy that ignores them; new `--hash-strategy` and `--bounded-load-epsilon` flags; `manifest.json` records every `RANVIER_*` knob the compose file forwards, with compose defaults for unset ones.
 - Plumbing is fine (`bench.sh:1417-1424` → compose `:168-169` → `config_loader.cpp:202-207`),
   but `src/config_schema.hpp:80` defaults `hash_strategy = BOUNDED_LOAD`, and
   `router_service.cpp:1311-1346` `compute_load_allowance` uses factor/floor only for
