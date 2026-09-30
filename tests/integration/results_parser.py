@@ -486,6 +486,12 @@ def parse_bucket_ttft(content: str) -> Dict[str, Any]:
 def parse_aggregated_stats(content: str) -> Dict[str, Any]:
     """Parse Locust aggregated statistics.
 
+    The "Aggregated" row counts HTTP requests only: the locustfiles log their
+    derived rows (TTFT, per-bucket TTFT, Tokens/Second) straight to those rows
+    via record_derived_sample, never through events.request. Logs written
+    before 2026-09-30 have a row inflated by those samples (~6x real workload,
+    2x mock).
+
     Example formats:
       Standard:   Aggregated    1263  282(22.33%) |     38       0      72     53 |    3.09        0.69
       With 0%:    Aggregated    5510    0(0.00%)  |     58      31     124    148 |    9.18        3.71

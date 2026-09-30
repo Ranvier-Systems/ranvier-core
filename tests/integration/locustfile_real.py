@@ -159,6 +159,11 @@ import requests
 from requests.exceptions import ReadTimeout, ConnectTimeout, Timeout
 from locust import HttpUser, task, between, events
 from locust.runners import MasterRunner, WorkerRunner
+from prom_scrape import (
+    histogram_avg as prom_histogram_avg,
+    histogram_percentile as prom_histogram_percentile,
+    metric_value as prom_metric_value,
+)
 
 # Optional: tokenizers library for client-side tokenization
 # Install with: pip install tokenizers
@@ -2787,141 +2792,46 @@ _backends_registered = False
 # Helper Functions
 # ============================================================================
 
-def get_metric_value(metrics_url: str, metric_name: str) -> Optional[float]:
-    """Extract a specific metric value from Prometheus endpoint."""
+def _fetch_metrics_text(metrics_url: str) -> Optional[str]:
+    """GET the Prometheus exposition, or None (logged) when the scrape fails."""
     try:
         resp = requests.get(f"{metrics_url}/metrics", timeout=5)
         if resp.status_code != 200:
             return None
-
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            if metric_name in line:
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    return float(match.group(1))
-        return None
+        return resp.text
     except requests.exceptions.RequestException as e:
         logger.warning(f"Failed to fetch metrics from {metrics_url}: {e}")
         return None
 
 
+def get_metric_value(metrics_url: str, metric_name: str, agg: str = "sum") -> Optional[float]:
+    """One metric combined across Seastar shards: agg="sum" for counters, "max" for gauges."""
+    text = _fetch_metrics_text(metrics_url)
+    return prom_metric_value(text, metric_name, agg) if text is not None else None
+
+
 def get_histogram_avg(metrics_url: str, metric_name: str) -> Optional[float]:
-    """Get average value from a Prometheus histogram (sum/count)."""
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return None
-
-        sum_val = None
-        count_val = None
-
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            if f"{metric_name}_sum" in line:
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    sum_val = float(match.group(1))
-            elif f"{metric_name}_count" in line:
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    count_val = float(match.group(1))
-
-        if sum_val is not None and count_val is not None and count_val > 0:
-            return sum_val / count_val
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Failed to fetch histogram from {metrics_url}: {e}")
-        return None
+    """Histogram mean across all shards (sum of _sum over sum of _count)."""
+    text = _fetch_metrics_text(metrics_url)
+    return prom_histogram_avg(text, metric_name) if text is not None else None
 
 
 def get_histogram_percentile(metrics_url: str, metric_name: str, percentile: float) -> Optional[float]:
-    """Calculate percentile from Prometheus histogram buckets using linear interpolation.
+    """Histogram percentile over buckets summed per `le` across all shards (see prom_scrape)."""
+    text = _fetch_metrics_text(metrics_url)
+    return prom_histogram_percentile(text, metric_name, percentile) if text is not None else None
 
-    Reference: https://prometheus.io/docs/practices/histograms/#quantiles
 
-    Args:
-        metrics_url: Base URL for Prometheus metrics endpoint
-        metric_name: Name of the histogram metric (without _bucket suffix)
-        percentile: Percentile to calculate (0.0 to 1.0, e.g., 0.5 for P50, 0.99 for P99)
+def record_derived_sample(environment, request_type: str, name: str, value: float) -> None:
+    """Log a derived sample (TTFT, tokens/s) to its own Locust stats row only.
 
-    Returns:
-        Estimated percentile value, or None if calculation fails
+    Deliberately bypasses events.request: that path also logs into the
+    "Aggregated" row, which must count HTTP requests only because
+    results_parser and the CI gate read request count, req/s, failure rate and
+    latency percentiles from it. The named row still appears in Locust's
+    console tables, CSV and HTML output.
     """
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return None
-
-        # Parse bucket data: metric_name_bucket{le="X"} value
-        # Buckets are cumulative counts up to boundary le
-        buckets = []  # List of (upper_bound, cumulative_count)
-
-        bucket_pattern = re.compile(
-            rf'{metric_name}_bucket\{{le="([^"]+)"\}}\s+(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
-        )
-
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            match = bucket_pattern.search(line)
-            if match:
-                le_str = match.group(1)
-                count = float(match.group(2))
-                # Handle +Inf bucket
-                if le_str == "+Inf":
-                    upper_bound = float("inf")
-                else:
-                    upper_bound = float(le_str)
-                buckets.append((upper_bound, count))
-
-        if not buckets:
-            return None
-
-        # Sort buckets by upper bound
-        buckets.sort(key=lambda x: x[0])
-
-        # Get total count from +Inf bucket
-        total_count = buckets[-1][1] if buckets else 0
-        if total_count == 0:
-            return None
-
-        # Target count for the percentile
-        target_count = percentile * total_count
-
-        # Find the bucket where cumulative count crosses the target
-        prev_bound = 0.0
-        prev_count = 0.0
-
-        for upper_bound, cumulative_count in buckets:
-            if cumulative_count >= target_count:
-                # Linear interpolation within this bucket
-                # Formula: lower_bound + (upper_bound - lower_bound) * (target - prev_count) / (current - prev_count)
-                if upper_bound == float("inf"):
-                    # Can't interpolate into +Inf bucket, return previous bound
-                    return prev_bound
-                bucket_count = cumulative_count - prev_count
-                if bucket_count == 0:
-                    return prev_bound
-                fraction = (target_count - prev_count) / bucket_count
-                return prev_bound + (upper_bound - prev_bound) * fraction
-            prev_bound = upper_bound
-            prev_count = cumulative_count
-
-        # If we get here, return the highest finite bucket bound
-        for upper_bound, _ in reversed(buckets):
-            if upper_bound != float("inf"):
-                return upper_bound
-        return None
-
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Failed to fetch histogram percentile from {metrics_url}: {e}")
-        return None
-    except (ValueError, ZeroDivisionError) as e:
-        logger.warning(f"Failed to calculate percentile for {metric_name}: {e}")
-        return None
+    environment.stats.get(name, request_type).log(value, 0)
 
 
 def get_labeled_metric_values(metrics_url: str, metric_name: str, label: str) -> dict:
@@ -2963,7 +2873,7 @@ def get_scheduler_metrics() -> Optional[dict]:
     # Check if scheduler is enabled on any node
     enabled = False
     for metrics_url in RANVIER_METRICS:
-        val = get_metric_value(metrics_url, "ranvier_scheduler_enabled")
+        val = get_metric_value(metrics_url, "ranvier_scheduler_enabled", agg="max")
         if val is not None and val == 1.0:
             enabled = True
             break
@@ -2999,8 +2909,8 @@ def get_scheduler_metrics() -> Optional[dict]:
         if p99 is not None:
             stats["wait_seconds_p99"] = max(stats["wait_seconds_p99"] or 0, p99)
 
-        # Agents tracked (gauge — take max across nodes)
-        agents = get_metric_value(metrics_url, "ranvier_scheduler_agents_tracked")
+        # Agents tracked (gauge — take max across shards and nodes)
+        agents = get_metric_value(metrics_url, "ranvier_scheduler_agents_tracked", agg="max")
         if agents is not None:
             stats["agents_tracked"] = max(stats["agents_tracked"], int(agents))
 
@@ -4177,61 +4087,27 @@ class RealBackendUser(HttpUser):
                 context={},
             )
 
+            # Derived rows: logged directly so they never inflate "Aggregated"
+            # (see record_derived_sample).
             if ttft is not None:
-                # Record TTFT
-                events.request.fire(
-                    request_type="GET",
-                    name="TTFT (Time To First Token)",
-                    response_time=ttft,
-                    response_length=0,
-                    exception=None,
-                    context={},
-                )
+                stats = self.environment
+                record_derived_sample(stats, "GET", "TTFT (Time To First Token)", ttft)
 
-                # Record cache-specific TTFT
                 cache_status = "hit" if metrics.is_cache_hit else "miss"
-                events.request.fire(
-                    request_type="GET",
-                    name=f"TTFT (Cache {cache_status.upper()})",
-                    response_time=ttft,
-                    response_length=0,
-                    exception=None,
-                    context={},
-                )
+                record_derived_sample(stats, "GET", f"TTFT (Cache {cache_status.upper()})", ttft)
 
-                # Record bucket-specific TTFT for stress testing
                 if prefix_size_bucket and prefix_size_bucket != "unknown":
-                    events.request.fire(
-                        request_type="GET",
-                        name=f"TTFT ({prefix_size_bucket})",
-                        response_time=ttft,
-                        response_length=0,
-                        exception=None,
-                        context={},
-                    )
-
-                    # Record bucket + cache status for detailed analysis
-                    events.request.fire(
-                        request_type="GET",
-                        name=f"TTFT ({prefix_size_bucket} {cache_status})",
-                        response_time=ttft,
-                        response_length=0,
-                        exception=None,
-                        context={},
+                    record_derived_sample(stats, "GET", f"TTFT ({prefix_size_bucket})", ttft)
+                    record_derived_sample(
+                        stats, "GET", f"TTFT ({prefix_size_bucket} {cache_status})", ttft
                     )
 
             if completion_tokens > 0:
-                # Record tokens per second for this request
+                # Per-request decode rate, stored in the response_time slot.
                 gen_time_s = (total_time - (ttft or 0)) / 1000.0
                 if gen_time_s > 0:
-                    tps = completion_tokens / gen_time_s
-                    events.request.fire(
-                        request_type="METRIC",
-                        name="Tokens/Second",
-                        response_time=tps,  # Using response_time to record the metric
-                        response_length=completion_tokens,
-                        exception=None,
-                        context={},
+                    record_derived_sample(
+                        self.environment, "METRIC", "Tokens/Second", completion_tokens / gen_time_s
                     )
 
         except ReadTimeout as e:

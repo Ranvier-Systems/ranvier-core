@@ -28,6 +28,11 @@ from typing import Optional
 import requests
 from locust import HttpUser, task, between, events
 from locust.runners import MasterRunner, WorkerRunner
+from prom_scrape import (
+    histogram_avg as prom_histogram_avg,
+    histogram_percentile as prom_histogram_percentile,
+    metric_value as prom_metric_value,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -103,120 +108,46 @@ _initial_sync_errors: dict[str, float] = {}
 _backends_registered = False
 
 
-def get_metric_value(metrics_url: str, metric_name: str) -> Optional[float]:
-    """Extract a specific metric value from Prometheus endpoint."""
+def _fetch_metrics_text(metrics_url: str) -> Optional[str]:
+    """GET the Prometheus exposition, or None (logged) when the scrape fails."""
     try:
         resp = requests.get(f"{metrics_url}/metrics", timeout=5)
         if resp.status_code != 200:
             return None
-
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            if metric_name in line:
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    return float(match.group(1))
-        return None
+        return resp.text
     except requests.exceptions.RequestException as e:
         logger.warning(f"Failed to fetch metrics from {metrics_url}: {e}")
         return None
 
 
+def get_metric_value(metrics_url: str, metric_name: str, agg: str = "sum") -> Optional[float]:
+    """One metric combined across Seastar shards: agg="sum" for counters, "max" for gauges."""
+    text = _fetch_metrics_text(metrics_url)
+    return prom_metric_value(text, metric_name, agg) if text is not None else None
+
+
 def get_histogram_avg(metrics_url: str, metric_name: str) -> Optional[float]:
-    """Get average value from a Prometheus histogram (sum/count)."""
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return None
-
-        sum_val = None
-        count_val = None
-
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            if f"{metric_name}_sum" in line:
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    sum_val = float(match.group(1))
-            elif f"{metric_name}_count" in line:
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    count_val = float(match.group(1))
-
-        if sum_val is not None and count_val is not None and count_val > 0:
-            return sum_val / count_val
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Failed to fetch histogram from {metrics_url}: {e}")
-        return None
+    """Histogram mean across all shards (sum of _sum over sum of _count)."""
+    text = _fetch_metrics_text(metrics_url)
+    return prom_histogram_avg(text, metric_name) if text is not None else None
 
 
 def get_histogram_percentile(metrics_url: str, metric_name: str, percentile: float) -> Optional[float]:
-    """Calculate percentile from Prometheus histogram buckets using linear interpolation.
+    """Histogram percentile over buckets summed per `le` across all shards (see prom_scrape)."""
+    text = _fetch_metrics_text(metrics_url)
+    return prom_histogram_percentile(text, metric_name, percentile) if text is not None else None
 
-    Reference: https://prometheus.io/docs/practices/histograms/#quantiles
+
+def record_derived_sample(environment, request_type: str, name: str, value: float) -> None:
+    """Log a derived sample (TTFT, tokens/s) to its own Locust stats row only.
+
+    Deliberately bypasses events.request: that path also logs into the
+    "Aggregated" row, which must count HTTP requests only because
+    results_parser and the CI gate read request count, req/s, failure rate and
+    latency percentiles from it. The named row still appears in Locust's
+    console tables, CSV and HTML output.
     """
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return None
-
-        buckets = []
-        bucket_pattern = re.compile(
-            rf'{metric_name}_bucket\{{le="([^"]+)"\}}\s+(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
-        )
-
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            match = bucket_pattern.search(line)
-            if match:
-                le_str = match.group(1)
-                count = float(match.group(2))
-                if le_str == "+Inf":
-                    upper_bound = float("inf")
-                else:
-                    upper_bound = float(le_str)
-                buckets.append((upper_bound, count))
-
-        if not buckets:
-            return None
-
-        buckets.sort(key=lambda x: x[0])
-
-        total_count = buckets[-1][1] if buckets else 0
-        if total_count == 0:
-            return None
-
-        target_count = percentile * total_count
-        prev_bound = 0.0
-        prev_count = 0.0
-
-        for upper_bound, cumulative_count in buckets:
-            if cumulative_count >= target_count:
-                if upper_bound == float("inf"):
-                    return prev_bound
-                bucket_count = cumulative_count - prev_count
-                if bucket_count == 0:
-                    return prev_bound
-                fraction = (target_count - prev_count) / bucket_count
-                return prev_bound + (upper_bound - prev_bound) * fraction
-            prev_bound = upper_bound
-            prev_count = cumulative_count
-
-        for upper_bound, _ in reversed(buckets):
-            if upper_bound != float("inf"):
-                return upper_bound
-        return None
-
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Failed to fetch histogram percentile from {metrics_url}: {e}")
-        return None
-    except (ValueError, ZeroDivisionError) as e:
-        logger.warning(f"Failed to calculate percentile for {metric_name}: {e}")
-        return None
+    environment.stats.get(name, request_type).log(value, 0)
 
 
 def get_ranvier_latency_breakdown() -> dict:
@@ -726,13 +657,10 @@ class ChatCompletionUser(HttpUser):
                 )
 
                 if ttft is not None:
-                    events.request.fire(
-                        request_type="GET",
-                        name="TTFT (Time To First Token)",
-                        response_time=ttft,
-                        response_length=0,
-                        exception=None,
-                        context={},
+                    # Logged directly so it never inflates "Aggregated", which the
+                    # CI gate reads for request count, req/s and percentiles.
+                    record_derived_sample(
+                        self.environment, "GET", "TTFT (Time To First Token)", ttft
                     )
 
         except Exception as e:

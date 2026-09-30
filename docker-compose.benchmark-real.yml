@@ -139,6 +139,12 @@ services:
         hard: -1
     volumes:
       - /tmp:/tmp  # For core dumps
+    # Routing DB on a container-local tmpfs so no ART/backend state carries
+    # across arms, legs or runs. /tmp above is a HOST bind mount shared by all
+    # three nodes: a DB there survives `rm`/`down -v` and is replayed by
+    # load_persisted_state() at every start.
+    tmpfs:
+      - /var/lib/ranvier:size=256M
     environment:
       # Cluster configuration
       - RANVIER_CLUSTER_ENABLED=true
@@ -149,7 +155,7 @@ services:
       - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
       # Routing config - use more tokens for real workloads
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
-      - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_DB_PATH=/var/lib/ranvier/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       # Accept client-provided prompt_token_ids for routing (bypasses local tokenization)
       - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
@@ -231,6 +237,12 @@ services:
         hard: -1
     volumes:
       - /tmp:/tmp  # For core dumps
+    # Routing DB on a container-local tmpfs so no ART/backend state carries
+    # across arms, legs or runs. /tmp above is a HOST bind mount shared by all
+    # three nodes: a DB there survives `rm`/`down -v` and is replayed by
+    # load_persisted_state() at every start.
+    tmpfs:
+      - /var/lib/ranvier:size=256M
     environment:
       - RANVIER_CLUSTER_ENABLED=true
       - RANVIER_CLUSTER_GOSSIP_PORT=9190
@@ -239,7 +251,7 @@ services:
       - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
       - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
-      - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_DB_PATH=/var/lib/ranvier/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
       - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
@@ -311,6 +323,12 @@ services:
         hard: -1
     volumes:
       - /tmp:/tmp  # For core dumps
+    # Routing DB on a container-local tmpfs so no ART/backend state carries
+    # across arms, legs or runs. /tmp above is a HOST bind mount shared by all
+    # three nodes: a DB there survives `rm`/`down -v` and is replayed by
+    # load_persisted_state() at every start.
+    tmpfs:
+      - /var/lib/ranvier:size=256M
     environment:
       - RANVIER_CLUSTER_ENABLED=true
       - RANVIER_CLUSTER_GOSSIP_PORT=9190
@@ -319,7 +337,7 @@ services:
       - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
       - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
-      - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_DB_PATH=/var/lib/ranvier/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
       - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}

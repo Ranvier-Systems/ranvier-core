@@ -51,6 +51,7 @@
     "Partial tokenization delta vs 2.0.0: P99 85ms -> 59ms (-30%), throughput 502->513 rps (+2%)",
     "Intelligence layer Prometheus counters read zero on mock backends (expected)",
     "P99 latency target: <65ms for CI (10% regression budget over 59ms)",
-    "Update baseline via: gh workflow run benchmark.yml -f update_baseline=true"
+    "Update baseline via: gh workflow run benchmark.yml -f update_baseline=true",
+    "STALE since 2026-09-30: captured while the TTFT row also fed the Aggregated row, so throughput_rps/total_requests are ~2x the HTTP rate and the latency percentiles are over a mixed TTFT+total sample. Regenerate before the next comparison is meaningful."
   ]
 }

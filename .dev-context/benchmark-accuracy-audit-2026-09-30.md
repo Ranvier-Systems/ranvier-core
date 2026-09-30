@@ -58,6 +58,7 @@ overclaimed:
   `cached_tokens` where the engine emits it.
 
 ### 2. Request counts and req/s are Locust event counts, ~6× real (2× in CI) — Sev 7, CONFIRMED
+- **Status:** FIXED 2026-09-30. Both locustfiles log derived rows via `record_derived_sample` (direct `StatsEntry.log`, never `events.request`), so the Aggregated row counts HTTP requests only. `benchmark-baseline.json` is marked stale and must be regenerated.
 - `locustfile_real.py:4171-4235`: each success fires POST + `TTFT (Time To First Token)` +
   `TTFT (Cache X)` + `TTFT (<bucket>)` + `TTFT (<bucket> status)` + `Tokens/Second` (a rate
   stuffed into a ms field). Locust logs all of them into the `Aggregated` row.
@@ -100,6 +101,7 @@ overclaimed:
   share the sign; print Q1…Q3 explicitly if the docs are going to quote it.
 
 ### 5. SQLite routing state lives on the host, is shared by all three nodes, and is never cleared — Sev 7, CONFIRMED
+- **Status:** FIXED 2026-09-30. `docker-compose.benchmark-real.yml` mounts a per-node tmpfs at `/var/lib/ranvier` and points `RANVIER_DB_PATH` there; container removal (per arm in `bench.sh`) discards it. The `/tmp` bind mount remains for core dumps only.
 - `docker-compose.benchmark-real.yml:141,233,313` bind-mount host `/tmp` into every node
   ("for core dumps") and `:152,242,322` set `RANVIER_DB_PATH=/tmp/ranvier.db`. `bench.sh`
   `restart_ranvier_with_mode` (`:2003-2016`, `stop` + `rm -f` + `up -d`) and `cleanup`
@@ -119,6 +121,7 @@ overclaimed:
   disabled.
 
 ### 6. Prometheus latency breakdown reports a single-shard mean as both P50 and P99 — Sev 8 for those columns, CONFIRMED
+- **Status:** FIXED 2026-09-30. Shared `tests/integration/prom_scrape.py` tolerates any label block, sums buckets per `le` and counters across shards, takes max for gauges; unit-tested in `test_prom_scrape.py`. Both locustfiles delegate to it.
 - `locustfile_real.py:2858-2860` (and `locustfile.py:167-169`) regex:
   `{metric}_bucket\{le="X"\}` — requires `}` right after `le`. Seastar emits every series
   with a `shard="N"` label and sorts labels, so lines read `_bucket{le="0.001",shard="0"} N`

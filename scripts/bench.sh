@@ -1533,6 +1533,7 @@ fi
 
 # Start Ranvier nodes
 log_info "Starting Ranvier nodes..."
+log_info "Routing DB is a container-local tmpfs (RANVIER_DB_PATH in the compose file): no routes or backends carry over from earlier runs or arms."
 $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real up -d ranvier1 ranvier2 ranvier3 2>/dev/null
 
 # Wait for Ranvier to be healthy
@@ -2004,7 +2005,8 @@ restart_ranvier_with_mode() {
     local MODE="$1"
     log_info "Restarting Ranvier cluster with RANVIER_ROUTING_MODE=$MODE..."
 
-    # Stop existing containers
+    # Stop and remove existing containers. Removal also discards the routing DB
+    # (container-local tmpfs), so the new arm starts with an empty ART.
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         stop ranvier1 ranvier2 ranvier3 2>/dev/null
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
