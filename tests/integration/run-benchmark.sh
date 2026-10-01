@@ -10,6 +10,9 @@
 #   --results-dir <dir>        Directory containing Locust CSV output
 #   --baseline <file>          Path to baseline JSON file
 #   --p99-threshold <pct>      P99 latency regression threshold (default: 10)
+#   --p99-abs-floor-ms <ms>    P99 fails only if the delta also exceeds this many
+#                              milliseconds (default: 3). On a ~20 ms mock-backend
+#                              P99, 10% is 2 ms — inside runner jitter.
 #   --throughput-threshold <pct>  Throughput regression threshold (default: 5)
 #   --generate-baseline <file> Generate new baseline from results
 #
@@ -21,6 +24,7 @@ set -euo pipefail
 
 # Default thresholds
 P99_THRESHOLD=10
+P99_ABS_FLOOR_MS=3
 THROUGHPUT_THRESHOLD=5
 RESULTS_DIR=""
 BASELINE_FILE=""
@@ -39,6 +43,7 @@ usage() {
     echo "  --results-dir <dir>           Directory containing Locust CSV output"
     echo "  --baseline <file>             Path to baseline JSON file"
     echo "  --p99-threshold <pct>         P99 latency regression threshold (default: 10)"
+    echo "  --p99-abs-floor-ms <ms>       P99 must also regress by more than this many ms (default: 3)"
     echo "  --throughput-threshold <pct>  Throughput regression threshold (default: 5)"
     echo "  --generate-baseline <file>    Generate new baseline from results"
     exit 1
@@ -53,6 +58,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --baseline)
             BASELINE_FILE="$2"
+            shift 2
+            ;;
+        --p99-abs-floor-ms)
+            P99_ABS_FLOOR_MS="$2"
             shift 2
             ;;
         --p99-threshold)
@@ -341,14 +350,25 @@ EOF
     # Track if any regression detected
     REGRESSION_DETECTED=0
 
-    # Check P99 latency regression
-    P99_THRESHOLD_EXCEEDED=$(echo "$P99_DELTA > $P99_THRESHOLD" | bc -l)
-    if [[ "$P99_THRESHOLD_EXCEEDED" -eq 1 ]]; then
-        echo -e "${RED}FAIL${NC}: P99 latency regressed by ${P99_DELTA}% (threshold: ${P99_THRESHOLD}%)"
+    # Check P99 latency regression. Both conditions must hold: the relative
+    # threshold alone is meaningless at mock-backend scale (10% of 20 ms is
+    # 2 ms, inside shared-runner jitter), and the absolute floor alone would
+    # let a large baseline drift unnoticed.
+    _require_number "P99_ABS_FLOOR_MS" "$P99_ABS_FLOOR_MS"
+    P99_ABS_DELTA=$(echo "scale=2; $P99_LATENCY - $BASELINE_P99" | bc -l)
+    P99_PCT_EXCEEDED=$(echo "$P99_DELTA > $P99_THRESHOLD" | bc -l)
+    P99_ABS_EXCEEDED=$(echo "$P99_ABS_DELTA > $P99_ABS_FLOOR_MS" | bc -l)
+    P99_THRESHOLD_EXCEEDED=0
+    if [[ "$P99_PCT_EXCEEDED" -eq 1 && "$P99_ABS_EXCEEDED" -eq 1 ]]; then
+        P99_THRESHOLD_EXCEEDED=1
+        echo -e "${RED}FAIL${NC}: P99 latency regressed by ${P99_DELTA}% / ${P99_ABS_DELTA}ms (thresholds: ${P99_THRESHOLD}% and ${P99_ABS_FLOOR_MS}ms)"
         echo "       ${BASELINE_P99}ms -> ${P99_LATENCY}ms"
         REGRESSION_DETECTED=1
+    elif [[ "$P99_PCT_EXCEEDED" -eq 1 ]]; then
+        echo -e "${GREEN}PASS${NC}: P99 latency delta ${P99_DELTA}% exceeds ${P99_THRESHOLD}% but only by ${P99_ABS_DELTA}ms (floor: ${P99_ABS_FLOOR_MS}ms) — within runner jitter"
+        echo "       ${BASELINE_P99}ms -> ${P99_LATENCY}ms"
     else
-        echo -e "${GREEN}PASS${NC}: P99 latency delta: ${P99_DELTA}% (threshold: ${P99_THRESHOLD}%)"
+        echo -e "${GREEN}PASS${NC}: P99 latency delta: ${P99_DELTA}% / ${P99_ABS_DELTA}ms (thresholds: ${P99_THRESHOLD}% and ${P99_ABS_FLOOR_MS}ms)"
         echo "       ${BASELINE_P99}ms -> ${P99_LATENCY}ms"
     fi
 
@@ -460,7 +480,7 @@ EOF
 | Total Requests | - | ${REQUEST_COUNT} | - | - |
 
 **Thresholds:**
-- P99 latency regression: ≤${P99_THRESHOLD}%
+- P99 latency regression: fails only if >${P99_THRESHOLD}% AND >${P99_ABS_FLOOR_MS}ms
 - Throughput regression: ≤${THROUGHPUT_THRESHOLD}%
 - Max failure rate: ≤${MAX_FAILURE_RATE}%
 

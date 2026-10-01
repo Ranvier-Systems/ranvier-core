@@ -10,7 +10,8 @@
 #     the PR ref rather than the published :latest tag.
 #
 # Fail conditions:
-#   - P99 latency regresses >10%
+#   - P99 latency regresses >10% AND by >3 ms (the mock-backend P99 is ~20 ms,
+#     so the percentage alone is inside runner jitter)
 #   - Throughput drops >5%
 #
 # NOTE: Uses pre-built ranvier image from GHCR by default to avoid long C++
@@ -58,6 +59,9 @@ env:
   BENCHMARK_SPAWN_RATE: 10
   # Regression thresholds
   P99_REGRESSION_THRESHOLD: 10
+  # P99 fails only when it regresses by more than the percentage AND this many
+  # milliseconds. The mock-backend P99 is ~20 ms, so 10% alone is 2 ms: jitter.
+  P99_ABS_FLOOR_MS: 3
   THROUGHPUT_REGRESSION_THRESHOLD: 5
 
 jobs:
@@ -224,6 +228,7 @@ jobs:
             --results-dir benchmark-results \
             --baseline tests/integration/benchmark-baseline.json \
             --p99-threshold $P99_REGRESSION_THRESHOLD \
+            --p99-abs-floor-ms $P99_ABS_FLOOR_MS \
             --throughput-threshold $THROUGHPUT_REGRESSION_THRESHOLD; then
             echo "regression_detected=false" >> $GITHUB_OUTPUT
             echo "## Benchmark Passed" >> $GITHUB_STEP_SUMMARY
