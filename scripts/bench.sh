@@ -253,6 +253,10 @@ BENCHMARK OPTIONS:
                         See tests/integration/data/prompts/ for examples
     --prefix-ratio R    Shared prefix ratio 0.0-1.0 (default: 0.9)
     --prefix-max-tokens N  Maximum prefix size in tokens (default: 8000)
+    --num-prefixes N    Number of distinct large prefixes in the stress pool (default: 50,
+                        the locustfile's). Sets NUM_LARGE_PREFIXES for warm-up and both
+                        arms; with --prefix-max-tokens it sizes the hot working set, so a
+                        13B fleet (~11.6k KV tokens/backend) can be given a set that fits.
     --cache-residency-threshold F
                         Cache-residency downgrade threshold (#527). ART hits whose
                         backend reports residency < F are diverted. 0.0 disables
@@ -471,6 +475,7 @@ SPAWN_RATE="$DEFAULT_SPAWN_RATE"
 PROMPT_DIST="$DEFAULT_PROMPT_DIST"
 PREFIX_RATIO="$DEFAULT_PREFIX_RATIO"
 PREFIX_MAX_TOKENS=""
+NUM_PREFIXES_FLAG=""        # --num-prefixes: exported as NUM_LARGE_PREFIXES after parsing
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 COMPARE=false
 ORDER="rr-first"   # --order: arm order in --compare (rr-first | prefix-first)
@@ -513,6 +518,7 @@ while [[ $# -gt 0 ]]; do
         --prompt-file)    PROMPT_FILE="$2"; shift 2 ;;
         --prefix-ratio)   PREFIX_RATIO="$2"; shift 2 ;;
         --prefix-max-tokens) PREFIX_MAX_TOKENS="$2"; shift 2 ;;
+        --num-prefixes)   NUM_PREFIXES_FLAG="$2"; shift 2 ;;
         --output-dir)     OUTPUT_DIR="$2"; shift 2 ;;
         --compare)        COMPARE=true; shift ;;
         --order)          ORDER="$2"; shift 2 ;;
@@ -559,6 +565,16 @@ fi
 # If prompt file is specified, automatically set distribution to "file"
 if [[ -n "$PROMPT_FILE" ]]; then
     PROMPT_DIST="file"
+fi
+
+# --num-prefixes rides the existing NUM_LARGE_PREFIXES env path (forwarded to
+# warm-up and both arms only when set; banner; manifest; regime estimate).
+if [[ -n "$NUM_PREFIXES_FLAG" ]]; then
+    if ! [[ "$NUM_PREFIXES_FLAG" =~ ^[0-9]+$ ]] || [[ "$NUM_PREFIXES_FLAG" -lt 1 ]]; then
+        log_error "--num-prefixes must be a positive integer (got: $NUM_PREFIXES_FLAG)"
+        exit 1
+    fi
+    export NUM_LARGE_PREFIXES="$NUM_PREFIXES_FLAG"
 fi
 
 # Validate --order (only meaningful with --compare; harmless otherwise).
@@ -1088,6 +1104,7 @@ if [[ "$DRY_RUN" = true ]]; then
     fi
     echo "  Prefix Ratio:    $PREFIX_RATIO"
     [[ -n "$PREFIX_MAX_TOKENS" ]] && echo "  Prefix Max Tok:  $PREFIX_MAX_TOKENS"
+    [[ -n "$NUM_PREFIXES_FLAG" ]] && echo "  Num Prefixes:    $NUM_PREFIXES_FLAG"
     echo "  Output Dir:      $OUTPUT_DIR"
     echo "  Compare Mode:    $COMPARE"
     echo "  Warmup:          $WARMUP"

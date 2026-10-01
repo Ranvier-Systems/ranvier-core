@@ -10,6 +10,7 @@
 #   ./scripts/bench-runner.sh                          # Default: --suite rebaseline (x3 repeats)
 #   ./scripts/bench-runner.sh --suite rebaseline       # The citable 4-config matrix, A/B, x3
 #   ./scripts/bench-runner.sh --suite epsilon          # Leg V1: bounded-load epsilon 0.5, x3
+#   ./scripts/bench-runner.sh --suite fitted           # 13B with a prefix set that fits its KV cache, x3
 #   ./scripts/bench-runner.sh --suite low              # Exploratory: 70B, 64-user stress
 #   ./scripts/bench-runner.sh --suite all              # rebaseline + epsilon + low
 #   ./scripts/bench-runner.sh --suite custom --file runs.txt  # Custom run file
@@ -235,7 +236,7 @@ USAGE:
     ./scripts/bench-runner.sh [OPTIONS]
 
 OPTIONS:
-    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, low, all, custom
+    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, low, all, custom
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
@@ -278,11 +279,21 @@ BUILT-IN SUITES:
       rate regression; record whether it WORSENS 13B/10u (Option 0 evidence).
       For the factor/floor variant add --hash-strategy jump, or bench.sh refuses.
 
-    low (2 runs, exploratory, not part of any headline):
-      7. 70B model test (16 users, TP auto)
-      8. 8B high-concurrency stress (64 users, single arm)
+    fitted (1 config x 2 arms x 3 repeats, ~1.5h) — 13B in the regime where routing
+      can matter. The rebaseline 13B rows run a ~250k-token hot set against
+      ~11.6k tokens of KV per backend (measured 2026-10-01 on A100-40GB), so
+      every backend evicts whatever the router does. This row shrinks the set
+      to 16 prefixes of 2000..4000 tokens (~48k, ~6k per backend) so a
+      backend's share plus in-flight requests fits:
+      7. 13B 10 users 10m   --compare --warmup --num-prefixes 16 --prefix-max-tokens 4000
+      Compare with rebaseline row 4 (same load, default set): if the +29%-class
+      regression persists here, it is not a cache-capacity artefact.
 
-    all = rebaseline + epsilon + low.
+    low (2 runs, exploratory, not part of any headline):
+      8. 70B model test (16 users, TP auto)
+      9. 8B high-concurrency stress (64 users, single arm)
+
+    all = rebaseline + epsilon + fitted + low.
 
     Retired (see .dev-context/benchmark-accuracy-audit-2026-09-30.md):
       - prefix-ratio 0.5/0.7 sweep: SHARED_PREFIX_RATIO only governs 20% of the
@@ -293,11 +304,11 @@ BUILT-IN SUITES:
       - 8B 16K-prefix run: superseded by the KV-regime check (manifest now
         records each backend's KV capacity next to the prefix working set).
 
-    rebaseline and epsilon default to --repeat 3; pass --repeat 1 for a smoke run.
+    rebaseline, epsilon and fitted default to --repeat 3; pass --repeat 1 for a smoke run.
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
-      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | low
+      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | low
     Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
@@ -360,6 +371,7 @@ done
 # Suites (not cumulative, except `all`):
 #   rebaseline = the citable 4-config A/B matrix        (--suite rebaseline, all)
 #   epsilon    = Leg V1 bounded-load epsilon 0.5 leg    (--suite epsilon, all)
+#   fitted     = 13B with a KV-fitting prefix set         (--suite fitted, all)
 #   low        = exploratory runs outside any headline  (--suite low, all)
 #
 # Run numbers are assigned in definition order within the selected suite.
@@ -372,7 +384,7 @@ add_run() {
     local args="$*"
 
     case "$SUITE" in
-        rebaseline|epsilon|low) [[ "$suite" != "$SUITE" ]] && return ;;
+        rebaseline|epsilon|fitted|low) [[ "$suite" != "$SUITE" ]] && return ;;
         all)    ;;  # include everything
         *)      return ;;  # custom suite doesn't use add_run
     esac
@@ -418,6 +430,15 @@ define_runs() {
         --warmup --duration 10m --users 10 --max-model-len 8192 \
         --bounded-load-epsilon 0.5
 
+    # --- fitted: 13B inside its KV cache ----------------------------------------
+    # 16 prefixes x 2000..4000 tokens (~48k) against ~11.6k KV tokens/backend: a
+    # backend's share (~6k) plus 10 users' in-flight requests fits. Pairs with
+    # rebaseline row 4 to separate the low-load regression from cache capacity.
+    add_run fitted "13B 10u/10m A/B, fitted prefix set (16 x 2000..4000)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 10 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
     # --- low: exploratory, outside any headline --------------------------------
     # TP, max-model-len, and gpu-mem-util are auto-detected from GPU VRAM.
     # Explicit overrides: --tp 4 --max-model-len 4096 --gpu-mem-util 0.92 (for 40GB)
@@ -460,7 +481,7 @@ define_runs
 # so the post-suite aggregation can gather each config's repeats. See BACKLOG §25.
 # A single run is not a result (review F3): the headline suites default to
 # three repeats so the aggregate can issue a CONSISTENT / MIXED verdict.
-if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" ) ]]; then
+if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" ) ]]; then
     REPEAT=3
     log_info "Suite '$SUITE' defaults to --repeat 3 (pass --repeat 1 for a smoke run)"
 fi
