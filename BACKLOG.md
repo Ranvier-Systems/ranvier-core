@@ -1289,6 +1289,12 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
 - [ ] **Item 5 — threshold leg** (shipped `2.0/2` vs raised `3.0/4`) NOT yet run; the 30–47%
   load-aware fallback rates seen across the matrix make it the highest-value remaining GPU run.
   Runbook `benchmark-rebaseline-campaign.md` §2; run files under `docs/benchmarks/rebaseline/`.
+  **2026-09-30 audit:** factor/floor are inert under the shipped `bounded_load` strategy, so the
+  leg as written (and D2) measured nothing; `bench.sh` now refuses it without `--hash-strategy
+  jump`. The live replacement is **Leg V1, `bench-runner.sh --suite epsilon`** (bounded-load
+  epsilon 0.5 vs 0.25, ×3). Prerequisite: re-run the July matrix with `--suite rebaseline`
+  (default, ×3) — the July runs carried the routing DB across arms and used unseeded,
+  per-arm-different prefixes, so the −13%/−9%/+29% headline is unconfirmed until then.
 - [ ] **Load-gating Leg V0 — `cross_shard_load_sync` A/B at 13B/10u** (ran 2026-09-28, 8×A100):
   **inconclusive.** Sync off reproduced a reliable +9.7% P99 regression; sync on shrank it to
   +3.4% with no reliable effect, short of the pre-registered "≤ 0" bar. Sync stays off by

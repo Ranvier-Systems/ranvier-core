@@ -9,16 +9,12 @@
 # epsilon at router_service.cpp:1324). This leg sweeps epsilon: 0.25 (shipped) vs 0.50
 # (looser = less diversion = more concentration).
 #
-# !!! PREREQUISITE — one compose edit, or this leg is silently inert !!!
-# RANVIER_BOUNDED_LOAD_EPSILON is NOT currently wired into docker-compose.benchmark-real.yml
-# (only CROSS_SHARD_LOAD_SYNC / LOAD_IMBALANCE_* are). Add this line to EACH of the 3 ranvier
-# services, beside the existing RANVIER_LOAD_IMBALANCE_* lines, before running:
-#       - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
-# Confirm the effective value reaches the server (routing banner / a quick /metrics check)
-# before trusting the run — silently keeping 0.25 is the exact trap this leg exists to avoid.
+# 2026-09-30: the compose file forwards RANVIER_BOUNDED_LOAD_EPSILON, bench.sh has a
+# --bounded-load-epsilon flag (printed in the "Effective Routing Config" banner and
+# recorded in manifest.json), and `bench-runner.sh --suite epsilon` is the built-in
+# equivalent of this file. The run lines below carry the flag; no env prefix needed.
 #
-# Run (baseline = shipped epsilon 0.25: use V0a's 10u aggregate + the standard-matrix 30u):
-#   RANVIER_BOUNDED_LOAD_EPSILON=0.50 \
+# Run (baseline = the rebaseline suite's PREFIX arms at the shipped epsilon 0.25):
 #     ./scripts/bench-runner.sh --suite custom \
 #         --file docs/benchmarks/rebaseline/v1-epsilon.runs \
 #         --repeat 3 --output-dir benchmark-reports/rebaseline/epsilon_0.50
@@ -36,5 +32,5 @@
 # rides the CURRENT SHIPPED DEFAULTS (50 prefixes, ratio 0.9, stress, residency 0.2, 20ms
 # flush). Confirm the "Effective Routing Config" banner (incl. the epsilon value) per run.
 
---compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 10 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress
---compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 10 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress --bounded-load-epsilon 0.5
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress --bounded-load-epsilon 0.5

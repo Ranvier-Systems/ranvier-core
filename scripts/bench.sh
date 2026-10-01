@@ -1457,6 +1457,40 @@ fi
 # --load-imbalance-factor/floor) are the ONLY supported way to override
 # load-aware behavior — a bare `RANVIER_LOAD_AWARE_ROUTING=... ./bench.sh`
 # env prefix is overwritten by the export above and has no effect.
+# KV-cache regime. Prefix routing can only pay off when the hot prefix set does
+# not fit in one backend's KV cache but does fit when split across backends;
+# below that, round-robin already hits, and above it every backend thrashes
+# whatever the router does. Record both sides so each run states its regime.
+# vLLM prints its capacity at startup: V1 "GPU KV cache size: N tokens",
+# V0 "# GPU blocks: N" (16-token blocks). External/--skip-vllm backends: unknown.
+KV_CACHE_TOKENS_JSON="{}"
+KV_CACHE_TOKENS_MIN=""
+capture_kv_capacity() {
+    local json="" sep="" i tokens blocks
+    for ((i=0; i<NUM_BACKENDS; i++)); do
+        local log="/tmp/vllm_gpu${i}.log"
+        [[ -f "$log" ]] || continue
+        tokens=$(grep -oE 'GPU KV cache size: *[0-9,]+ tokens' "$log" | tail -1 | grep -oE '[0-9,]+ tokens' | tr -d ', tokens' || true)
+        if [[ -z "$tokens" ]]; then
+            blocks=$(grep -oE '# GPU blocks: *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+            [[ -n "$blocks" ]] && tokens=$((blocks * 16))
+        fi
+        [[ -n "$tokens" ]] || continue
+        json+="${sep}\"$((i+1))\": $tokens"; sep=", "
+        if [[ -z "$KV_CACHE_TOKENS_MIN" || "$tokens" -lt "$KV_CACHE_TOKENS_MIN" ]]; then
+            KV_CACHE_TOKENS_MIN="$tokens"
+        fi
+    done
+    KV_CACHE_TOKENS_JSON="{${json}}"
+}
+capture_kv_capacity
+# Prefix working set the stress workload keeps hot: NUM_LARGE_PREFIXES prefixes
+# of LARGE_PREFIX_MIN..MAX tokens (locustfile defaults 50, 2000..8000; the
+# --prefix-max-tokens flag raises MAX). Mean size x count, as an estimate.
+_WS_MIN="${LARGE_PREFIX_MIN_TOKENS:-2000}"
+_WS_MAX="${PREFIX_MAX_TOKENS:-${LARGE_PREFIX_MAX_TOKENS:-8000}}"
+PREFIX_WORKING_SET_TOKENS=$(( ${NUM_LARGE_PREFIXES:-50} * (_WS_MIN + _WS_MAX) / 2 ))
+
 log_header "Effective Routing Config"
 log_info "RANVIER_ROUTING_MODE          = ${RANVIER_ROUTING_MODE:-prefix} (default prefix)"
 log_info "RANVIER_LOAD_AWARE_ROUTING    = ${RANVIER_LOAD_AWARE_ROUTING}"
@@ -1498,6 +1532,20 @@ fi
 # Fallback literal must match locustfile_real.py's NUM_LARGE_PREFIXES default: it
 # is only a display/pigeonhole-check value here; bench.sh no longer injects it.
 log_info "NUM_LARGE_PREFIXES            = ${NUM_LARGE_PREFIXES:-50 (locust default)}  [workload, not routing]"
+log_info "PREFIX_WORKING_SET            ~ ${PREFIX_WORKING_SET_TOKENS} tokens (${NUM_LARGE_PREFIXES:-50} prefixes x ${_WS_MIN}..${_WS_MAX})  [estimate]"
+if [[ -n "$KV_CACHE_TOKENS_MIN" ]]; then
+    log_info "KV_CACHE_PER_BACKEND          = min ${KV_CACHE_TOKENS_MIN} tokens  ${KV_CACHE_TOKENS_JSON}"
+    _WS_PER_BACKEND=$(( PREFIX_WORKING_SET_TOKENS / (NUM_BACKENDS > 0 ? NUM_BACKENDS : 1) ))
+    if [[ "$_WS_PER_BACKEND" -gt "$KV_CACHE_TOKENS_MIN" ]]; then
+        log_warn "KV regime: even split ${NUM_BACKENDS} ways (~${_WS_PER_BACKEND} tokens/backend) the hot set exceeds a backend's KV cache (${KV_CACHE_TOKENS_MIN}). Every backend evicts regardless of routing; P99 here measures eviction, not affinity."
+    elif [[ "$PREFIX_WORKING_SET_TOKENS" -le "$KV_CACHE_TOKENS_MIN" ]]; then
+        log_warn "KV regime: the whole hot set (~${PREFIX_WORKING_SET_TOKENS}) fits in ONE backend's KV cache (${KV_CACHE_TOKENS_MIN}). Round-robin will also hit once warm; affinity has little to gain."
+    else
+        log_ok "KV regime: hot set fits when split across backends but not in one — the regime where affinity can pay."
+    fi
+else
+    log_info "KV_CACHE_PER_BACKEND          = unknown (no vLLM startup log; external backends?)"
+fi
 if [[ "${NUM_LARGE_PREFIXES:-50}" -le "${NUM_BACKENDS:-0}" ]] 2>/dev/null; then
     log_warn "NUM_LARGE_PREFIXES (${NUM_LARGE_PREFIXES:-50}) <= backends (${NUM_BACKENDS:-?}): pure affinity cannot use all backends (pigeonhole concentration; intentional only for a stress test)."
 fi
@@ -1638,6 +1686,10 @@ write_manifest() {
         printf '  "vllm_version": "%s",\n' "$(_json_escape "$VLLM_VERSION")"
         printf '  "hardware": { "gpu_name": "%s", "gpu_count": "%s" },\n' \
             "$(_json_escape "${GPU_NAME:-unknown}")" "${TOTAL_GPUS:-0}"
+        # KV-cache regime: per-backend capacity from vLLM's startup log beside the
+        # prefix working set the workload keeps hot (see capture_kv_capacity).
+        printf '  "regime": { "kv_cache_tokens_per_backend": %s, "kv_cache_tokens_min": %s, "prefix_working_set_tokens_est": %s },\n' \
+            "${KV_CACHE_TOKENS_JSON:-{\}}" "${KV_CACHE_TOKENS_MIN:-null}" "${PREFIX_WORKING_SET_TOKENS:-null}"
         printf '  "routing": {\n'
         printf '    "mode": "%s",\n' "$(_json_escape "$mode")"
         printf '    "load_aware_routing": "%s",\n' "$(_json_escape "${RANVIER_LOAD_AWARE_ROUTING:-}")"
