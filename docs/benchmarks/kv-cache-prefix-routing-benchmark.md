@@ -5,6 +5,13 @@
 **Models:** Llama-3.1-8B, CodeLlama-13b, Llama-3.1-70B
 **vLLM:** Prefix caching enabled (`--enable-prefix-caching`)
 
+> ⚠️ **Superseded (2026-10-01 note).** Every figure in this document ("58–98% cache hit rate",
+> "P99 −60% to −85%", "+4–22% throughput") was measured on the five-prefix workload that the
+> project deprecated in June 2026; at 50 prefixes the citable effect is −9 to −13% P99 under
+> load and a regression at light load (see [benchmark-results-current.md](benchmark-results-current.md)).
+> "Cache hit rate" throughout is the client-side route-consistency proxy, not vLLM's KV hit rate.
+> Kept as a historical record; do not cite as expected results.
+
 > **For the full 8x A100 benchmark docs**, start at the **[Benchmark Guide index](benchmark-guide-8xA100.md)**: how to run in **[benchmark-methodology.md](benchmark-methodology.md)**, results valid on current defaults in **[benchmark-results-current.md](benchmark-results-current.md)** (representative-workload headline currently TBD pending the 50-prefix re-baseline), and the dated per-run lab notebook (13B/70B, prefix-ratio sweeps, client tokenization, stress tests — measured on the deprecated 5-prefix workload) in **[history/benchmark-history-8xA100.md](history/benchmark-history-8xA100.md)**.
 >
 > This document contains the original 8B benchmarks from January 2026 plus updated summary data.

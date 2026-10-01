@@ -37,10 +37,12 @@ fi
 
 # Step 2: Start the test environment
 echo "Starting test environment..."
-docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
-if ! docker compose -f "$COMPOSE_FILE" up -d --wait; then
+# ranvier2/ranvier3 are gated behind the 'full' profile and locust depends on
+# them, so the profile is required here exactly as in benchmark.yml.
+docker compose -f "$COMPOSE_FILE" --profile full down -v --remove-orphans 2>/dev/null || true
+if ! docker compose -f "$COMPOSE_FILE" --profile full up -d --wait; then
     echo "Failed to start services — skipping"
-    docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+    docker compose -f "$COMPOSE_FILE" --profile full down -v --remove-orphans 2>/dev/null || true
     exit 125
 fi
 
@@ -51,7 +53,10 @@ echo "Running benchmark (${BENCHMARK_USERS} users, ${BENCHMARK_DURATION})..."
 mkdir -p "$RESULTS_DIR"
 chmod 777 "$RESULTS_DIR"
 
-docker compose -f "$COMPOSE_FILE" run --rm \
+# `|| true`: locust exits 1 on any request error or its own P99 check; under
+# `set -euo pipefail` that would abort before the CSV is read and mark the
+# commit "bad" on a different metric than the threshold below.
+docker compose -f "$COMPOSE_FILE" --profile full run --rm \
     -e RANVIER_NODE1=http://172.28.2.1:8080 \
     -e RANVIER_NODE2=http://172.28.2.2:8080 \
     -e RANVIER_NODE3=http://172.28.2.3:8080 \
@@ -71,7 +76,7 @@ docker compose -f "$COMPOSE_FILE" run --rm \
       -t "$BENCHMARK_DURATION" \
       --stop-timeout 10 \
       --csv=/mnt/results/benchmark \
-      2>&1 | tail -20
+      2>&1 | tail -20 || true
 
 # Step 4: Extract P99 from CSV
 if [ ! -f "$RESULTS_DIR/benchmark_stats.csv" ]; then
@@ -80,11 +85,11 @@ if [ ! -f "$RESULTS_DIR/benchmark_stats.csv" ]; then
     exit 125
 fi
 
-# P99 is column 18 (0-indexed: 17) in the Aggregated row
-P99=$(awk -F',' '/Aggregated/ { print $18 }' "$RESULTS_DIR/benchmark_stats.csv" | head -1)
+# P99 is column 19 in the Aggregated row (Locust 2.24 emits a 98% column at 18).
+P99=$(awk -F',' '/Aggregated/ { print $19 }' "$RESULTS_DIR/benchmark_stats.csv" | head -1)
 
 # Step 5: Cleanup
-docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+docker compose -f "$COMPOSE_FILE" --profile full down -v --remove-orphans 2>/dev/null || true
 rm -rf "$(dirname "$RESULTS_DIR")"
 
 if [ -z "$P99" ]; then

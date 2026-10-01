@@ -30,7 +30,7 @@ These come from real lost benchmark days — see `.dev-context/next-benchmark-ch
 2. **Confirm the "Effective Routing Config" banner** bench.sh prints at startup matches the intended experiment *before* letting a 30-minute run proceed. A mislabeled run is worse than no run.
 3. **Routing has multiple diversion layers** (prefix affinity, load-aware override, cache-residency override — unified scoring in `src/route_scorer.hpp`). An A/B that toggles one layer while another stays active measures nothing. State explicitly which layers are on in each arm.
 4. **Python/C++ coupling is silent.** If the change touched `router_service.cpp`, `http_controller.cpp`, `request_rewriter.hpp`, or metrics names, verify `.dev-context/claude-locust-sync-map.md` first — drift produces *wrong metrics*, not errors.
-5. **SQLite state persists across runs.** For clean comparisons, remove the container (not just stop it) to clear `/tmp/ranvier.db`, re-register backends, and warm up identically.
+5. **SQLite state is container-local since 2026-09-30.** `docker-compose.benchmark-real.yml` keeps the routing DB on a tmpfs inside each node, so removing the Ranvier containers (which `bench.sh` does per arm) clears it. Before that date the DB sat on the host `/tmp` bind mount, shared by all three nodes and never deleted, so every prefix-mode start replayed the previous run's routes; treat pre-2026-09-30 report dirs accordingly. Still re-register backends and warm up identically per arm.
 
 ## EXPERIMENT DESIGN (A/B discipline)
 

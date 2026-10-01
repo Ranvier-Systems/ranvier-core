@@ -91,19 +91,28 @@ if [[ ! -f "$STATS_FILE" ]]; then
 fi
 
 # Parse Locust CSV stats
-# Format: Type,Name,Request Count,Failure Count,Median Response Time,Average Response Time,
-#         Min Response Time,Max Response Time,Average Content Size,Requests/s,Failures/s,
-#         50%,66%,75%,80%,90%,95%,99%,99.9%,99.99%,100%
+# Format (Locust 2.24): Type,Name,Request Count,Failure Count,Median Response Time,
+#         Average Response Time,Min Response Time,Max Response Time,Average Content Size,
+#         Requests/s,Failures/s,50%,66%,75%,80%,90%,95%,98%,99%,99.9%,99.99%,100%
+# The Aggregated row counts HTTP requests only: the locustfile logs its derived
+# TTFT row directly (record_derived_sample), never through events.request.
 parse_locust_stats() {
     local stats_file="$1"
 
-    # Get the aggregated row (Type="Aggregated")
+    # Get the aggregated row. Locust writes it with an EMPTY Type column
+    # (`,Aggregated,...`), so match on the Name column rather than a line
+    # anchor; the old `^Aggregated` grep never matched and the script lived
+    # off a last-line fallback.
     local agg_line
-    agg_line=$(grep "^Aggregated" "$stats_file" 2>/dev/null || grep "^\"Aggregated\"" "$stats_file" 2>/dev/null || echo "")
+    agg_line=$(awk -F',' '{ a=$1; b=$2; gsub(/"/, "", a); gsub(/"/, "", b);
+                            if (a == "Aggregated" || b == "Aggregated") print }' "$stats_file" 2>/dev/null | tail -n 1)
 
     if [[ -z "$agg_line" ]]; then
-        # Try to get the last non-header line as aggregate
-        agg_line=$(tail -n 1 "$stats_file")
+        # No Aggregated row means Locust recorded nothing (or the CSV is a bare
+        # header). Falling back to the last line used to feed the header text
+        # into eval; refuse instead so the gate fails for a stated reason.
+        echo "GATE ERROR: no Aggregated row in $stats_file — Locust produced no stats." >&2
+        exit 2
     fi
 
     # Parse CSV fields (handle both quoted and unquoted formats)
@@ -116,10 +125,12 @@ parse_locust_stats() {
             gsub(/"$/, "", $i)
         }
 
-        # Locust CSV columns (0-indexed in awk is 1-indexed):
+        # Locust CSV columns (awk is 1-indexed). PERCENTILES_TO_REPORT in Locust
+        # 2.24 is 50,66,75,80,90,95,98,99,99.9,99.99,100 — note the 98% column
+        # at 18; before 2026-10-01 this script read $18 and called it P99.
         # 1:Type, 2:Name, 3:Request Count, 4:Failure Count, 5:Median, 6:Average,
         # 7:Min, 8:Max, 9:Avg Content Size, 10:Requests/s, 11:Failures/s,
-        # 12:50%, 13:66%, 14:75%, 15:80%, 16:90%, 17:95%, 18:99%, 19:99.9%, 20:99.99%, 21:100%
+        # 12:50%, 13:66%, 14:75%, 15:80%, 16:90%, 17:95%, 18:98%, 19:99%, 20:99.9%, 21:99.99%, 22:100%
 
         request_count = $3
         failure_count = $4
@@ -129,7 +140,7 @@ parse_locust_stats() {
         rps = $10
         p50 = $12
         p90 = $16
-        p99 = $18
+        p99 = $19
 
         # Calculate failure rate
         if (request_count > 0) {
@@ -159,6 +170,10 @@ generate_baseline() {
 
     # Parse current results
     eval "$(parse_locust_stats "$STATS_FILE")"
+    # A baseline with an unparsable or zero P99 would make every later run pass.
+    _require_positive_number "P99_LATENCY" "${P99_LATENCY:-}"
+    _require_positive_number "THROUGHPUT" "${THROUGHPUT:-}"
+    _require_positive_number "REQUEST_COUNT" "${REQUEST_COUNT:-}"
 
     # Calculate success rate
     local success_rate
@@ -205,6 +220,24 @@ EOF
 
     echo "Generated baseline: $output_file"
     cat "$output_file"
+}
+
+# Numeric guards for the gate. Exit 2 (not 1) so a broken gate is
+# distinguishable from a measured regression in the workflow log; both fail
+# the job because benchmark.yml maps any non-zero exit to regression_detected.
+_require_number() {
+    local name="$1" value="$2"
+    if ! [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo -e "${RED}GATE ERROR${NC}: $name is not a number ('${value}'). Refusing to compare."
+        exit 2
+    fi
+}
+_require_positive_number() {
+    _require_number "$1" "$2"
+    if [[ "$(echo "$2 > 0" | bc -l)" != "1" ]]; then
+        echo -e "${RED}GATE ERROR${NC}: $1 must be > 0 (got '$2'). Refusing to compare."
+        exit 2
+    fi
 }
 
 # Compare current results against baseline
@@ -277,6 +310,17 @@ EOF
     echo "  Throughput:   ${BASELINE_THROUGHPUT} req/s"
     echo "  Failure Rate: ${BASELINE_FAILURE_RATE}%"
     echo ""
+
+    # Fail closed. `bc` prints a syntax error but exits 0 on an empty or "null"
+    # operand, which left every comparison below as "" -> PASS. Any unparsable
+    # or zero baseline is a broken gate, not a passing one.
+    _require_positive_number "P99_LATENCY"        "$P99_LATENCY"
+    _require_positive_number "THROUGHPUT"         "$THROUGHPUT"
+    _require_number          "FAILURE_RATE"       "$FAILURE_RATE"
+    _require_positive_number "BASELINE_P99"       "$BASELINE_P99"
+    _require_positive_number "BASELINE_THROUGHPUT" "$BASELINE_THROUGHPUT"
+    _require_positive_number "BASELINE_P90"       "$BASELINE_P90"
+    _require_positive_number "BASELINE_P50"       "$BASELINE_P50"
 
     # Calculate deltas
     # P99 regression: positive delta is bad (latency increased)

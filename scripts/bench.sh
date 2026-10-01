@@ -291,6 +291,15 @@ BENCHMARK OPTIONS:
     --load-imbalance-floor N
                         Additive floor to prevent flapping at low load (default: 2).
                         Threshold = median * factor + floor.
+                        NOTE: factor/floor govern the divert allowance ONLY under
+                        --hash-strategy jump|modular. The shipped default is
+                        bounded_load, where --bounded-load-epsilon is the knob;
+                        bench.sh refuses to run a mislabelled combination.
+    --hash-strategy S   Ranvier hash strategy: bounded_load (default), p2c, jump, modular.
+                        Sets RANVIER_HASH_STRATEGY for the cluster.
+    --bounded-load-epsilon E
+                        Divert allowance under bounded_load: cap = avg * (1 + E)
+                        (default: 0.25). Sets RANVIER_BOUNDED_LOAD_EPSILON.
     --vllm-version VER  Pin vLLM to a specific version (default: ${DEFAULT_VLLM_VERSION}).
                         Ensures reproducible benchmarks across instances.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models).
@@ -479,6 +488,8 @@ MULTI_DEPTH=false
 LOAD_AWARE=true
 LOAD_IMBALANCE_FACTOR=""
 LOAD_IMBALANCE_FLOOR=""
+HASH_STRATEGY=""            # --hash-strategy: bounded_load | p2c | jump | modular
+BOUNDED_LOAD_EPSILON=""     # --bounded-load-epsilon: divert allowance under bounded_load
 CACHE_RESIDENCY_THRESHOLD=""
 COMPRESSION_RATIO=""
 PRIORITY_QUEUE=false
@@ -521,6 +532,8 @@ while [[ $# -gt 0 ]]; do
         --compression-ratio) COMPRESSION_RATIO="$2"; shift 2 ;;
         --load-imbalance-factor) LOAD_IMBALANCE_FACTOR="$2"; shift 2 ;;
         --load-imbalance-floor)  LOAD_IMBALANCE_FLOOR="$2"; shift 2 ;;
+        --hash-strategy)  HASH_STRATEGY="$2"; shift 2 ;;
+        --bounded-load-epsilon) BOUNDED_LOAD_EPSILON="$2"; shift 2 ;;
         --cache-residency-threshold) CACHE_RESIDENCY_THRESHOLD="$2"; shift 2 ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --tp)             TP_SIZE="$2"; shift 2 ;;
@@ -1084,6 +1097,8 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Load-Aware:      $LOAD_AWARE"
     [[ -n "$LOAD_IMBALANCE_FACTOR" ]] && echo "  Imbalance Factor: $LOAD_IMBALANCE_FACTOR"
     [[ -n "$LOAD_IMBALANCE_FLOOR" ]] && echo "  Imbalance Floor:  $LOAD_IMBALANCE_FLOOR"
+    [[ -n "$HASH_STRATEGY" ]] && echo "  Hash Strategy:   $HASH_STRATEGY"
+    [[ -n "$BOUNDED_LOAD_EPSILON" ]] && echo "  Bounded Epsilon: $BOUNDED_LOAD_EPSILON"
     [[ -n "$CACHE_RESIDENCY_THRESHOLD" ]] && echo "  Residency Thresh: $CACHE_RESIDENCY_THRESHOLD"
     echo "  Max Tokens:      $MAX_TOKENS"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
@@ -1420,6 +1435,14 @@ if [[ -n "$LOAD_IMBALANCE_FLOOR" ]]; then
     export RANVIER_LOAD_IMBALANCE_FLOOR="$LOAD_IMBALANCE_FLOOR"
     log_info "Load imbalance floor: $LOAD_IMBALANCE_FLOOR"
 fi
+if [[ -n "$HASH_STRATEGY" ]]; then
+    export RANVIER_HASH_STRATEGY="$HASH_STRATEGY"
+    log_info "Hash strategy: $HASH_STRATEGY"
+fi
+if [[ -n "$BOUNDED_LOAD_EPSILON" ]]; then
+    export RANVIER_BOUNDED_LOAD_EPSILON="$BOUNDED_LOAD_EPSILON"
+    log_info "Bounded-load epsilon: $BOUNDED_LOAD_EPSILON"
+fi
 # Residency routing toggle (#527). The flag takes precedence over a bare
 # RANVIER_CACHE_RESIDENCY_THRESHOLD=... env prefix; both reach the servers now
 # that docker-compose.benchmark-real.yml passes the variable through.
@@ -1439,6 +1462,24 @@ log_info "RANVIER_ROUTING_MODE          = ${RANVIER_ROUTING_MODE:-prefix} (defau
 log_info "RANVIER_LOAD_AWARE_ROUTING    = ${RANVIER_LOAD_AWARE_ROUTING}"
 log_info "RANVIER_LOAD_IMBALANCE_FACTOR = ${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0 (compose default)}"
 log_info "RANVIER_LOAD_IMBALANCE_FLOOR  = ${RANVIER_LOAD_IMBALANCE_FLOOR:-2 (compose default)}"
+# The divert allowance depends on the hash strategy (router_service.cpp
+# compute_load_allowance): factor/floor apply only under jump/modular; the
+# shipped default bounded_load uses epsilon, p2c uses its load bias. A run
+# labelled "factor 3.0 / floor 4" under bounded_load measured the defaults —
+# so refuse that combination instead of recording a mislabelled experiment.
+EFFECTIVE_HASH_STRATEGY="${RANVIER_HASH_STRATEGY:-bounded_load}"
+log_info "RANVIER_HASH_STRATEGY         = ${RANVIER_HASH_STRATEGY:-bounded_load (compose default)}"
+log_info "RANVIER_BOUNDED_LOAD_EPSILON  = ${RANVIER_BOUNDED_LOAD_EPSILON:-0.25 (compose default)}"
+case "$EFFECTIVE_HASH_STRATEGY" in
+    jump|modular) ;;
+    *)
+        if [[ -n "${RANVIER_LOAD_IMBALANCE_FACTOR:-}" || -n "${RANVIER_LOAD_IMBALANCE_FLOOR:-}" ]]; then
+            log_error "--load-imbalance-factor/--load-imbalance-floor have NO effect under hash strategy '$EFFECTIVE_HASH_STRATEGY'."
+            log_error "Use --bounded-load-epsilon (bounded_load), or add --hash-strategy jump so factor/floor apply."
+            exit 1
+        fi
+        ;;
+esac
 # Residency routing (#527) is a SECOND diversion mechanism, on by default
 # (threshold 0.2). It is NOT controlled by --no-load-aware — only by
 # --cache-residency-threshold (or the env var; 0.0 disables). Surfaced here
@@ -1533,6 +1574,7 @@ fi
 
 # Start Ranvier nodes
 log_info "Starting Ranvier nodes..."
+log_info "Routing DB is a container-local tmpfs (RANVIER_DB_PATH in the compose file): no routes or backends carry over from earlier runs or arms."
 $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real up -d ranvier1 ranvier2 ranvier3 2>/dev/null
 
 # Wait for Ranvier to be healthy
@@ -1601,7 +1643,22 @@ write_manifest() {
         printf '    "load_aware_routing": "%s",\n' "$(_json_escape "${RANVIER_LOAD_AWARE_ROUTING:-}")"
         printf '    "load_imbalance_factor": "%s",\n' "$(_json_escape "${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}")"
         printf '    "load_imbalance_floor": "%s",\n' "$(_json_escape "${RANVIER_LOAD_IMBALANCE_FLOOR:-2}")"
-        printf '    "cache_residency_threshold": "%s"\n' "$(_json_escape "${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}")"
+        printf '    "cache_residency_threshold": "%s",\n' "$(_json_escape "${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}")"
+        # Every other RANVIER_* knob the compose file forwards from the host env.
+        # Defaults mirror docker-compose.benchmark-real.yml so an unset knob is
+        # recorded as the value the server actually ran with.
+        printf '    "hash_strategy": "%s",\n' "$(_json_escape "${RANVIER_HASH_STRATEGY:-bounded_load}")"
+        printf '    "bounded_load_epsilon": "%s",\n' "$(_json_escape "${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}")"
+        printf '    "cross_shard_load_sync": "%s",\n' "$(_json_escape "${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}")"
+        printf '    "min_token_length": "%s",\n' "$(_json_escape "${RANVIER_MIN_TOKEN_LENGTH:-10}")"
+        printf '    "route_batch_flush_interval_ms": "%s",\n' "$(_json_escape "${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}")"
+        printf '    "enable_multi_depth_routing": "%s",\n' "$(_json_escape "${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}")"
+        printf '    "default_compression_ratio": "%s",\n' "$(_json_escape "${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}")"
+        printf '    "backpressure_enable_priority_queue": "%s",\n' "$(_json_escape "${RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE:-false}")"
+        printf '    "backpressure_tier_capacity": "%s",\n' "$(_json_escape "${RANVIER_BACKPRESSURE_TIER_CAPACITY:-64,128,256,512}")"
+        printf '    "chat_template_format": "%s",\n' "$(_json_escape "${RANVIER_CHAT_TEMPLATE_FORMAT:-none}")"
+        printf '    "tokenizer_thread_pool_enabled": "%s",\n' "$(_json_escape "${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}")"
+        printf '    "health_vllm_metrics_timeout_ms": "%s"\n' "$(_json_escape "${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}")"
         printf '  },\n'
         # workload knobs — the block results_parser.py compares for comparability.
         printf '  "workload": {\n'
@@ -1613,6 +1670,7 @@ write_manifest() {
         printf '    "prompt_distribution": "%s",\n' "$(_json_escape "$PROMPT_DIST")"
         printf '    "shared_prefix_ratio": "%s",\n' "$(_json_escape "$PREFIX_RATIO")"
         printf '    "num_large_prefixes": "%s",\n' "$(_json_escape "${NUM_LARGE_PREFIXES:-50}")"
+        printf '    "prefix_seed": "%s",\n' "$(_json_escape "${PREFIX_SEED:-42}")"
         printf '    "max_output_tokens": "%s",\n' "$(_json_escape "${MAX_TOKENS:-}")"
         printf '    "client_tokenize": "%s"' "$client_tok"
         if [[ "$PROMPT_DIST" == "churn" ]]; then
@@ -1758,6 +1816,7 @@ run_benchmark() {
     # Set NUM_LARGE_PREFIXES=5 in the environment only to stress prefix concentration.
     NUM_PREFIXES_ARGS=""
     [[ -n "$NUM_LARGE_PREFIXES" ]] && NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=$NUM_LARGE_PREFIXES"
+    [[ -n "$PREFIX_SEED" ]] && NUM_PREFIXES_ARGS+=" -e PREFIX_SEED=$PREFIX_SEED"
 
     # Forward churn-workload knobs (read by locustfile_real.py; only meaningful with
     # --prompt-dist churn) ONLY when explicitly set — the locustfile owns the defaults.
@@ -1773,6 +1832,20 @@ run_benchmark() {
     LOCUST_RUN_TIME_SECS=$(parse_duration "$DURATION")
     log_info "Locust --run-time: ${LOCUST_RUN_TIME_SECS}s (from DURATION=$DURATION)" >&2
     BENCHMARK_START_TS=$(date +%s)
+
+    # Start-of-run /metrics snapshot per node. Counters are cumulative since the
+    # arm's Ranvier start, which includes the warm-up; results_parser subtracts
+    # these from the end-of-run dumps so diversion/routed counters cover the
+    # main run only. Filename deliberately does not match prometheus_metrics_node*.
+    if command -v docker &> /dev/null; then
+        node_idx=0
+        for node in ranvier-bench1 ranvier-bench2 ranvier-bench3; do
+            node_idx=$((node_idx + 1))
+            start_file="$REPORT_DIR/prometheus_metrics_start_node${node_idx}.txt"
+            docker exec "$node" curl -sf http://localhost:9180/metrics > "$start_file" 2>/dev/null \
+                || rm -f "$start_file"
+        done
+    fi
 
     # Capture GPU clocks/throttle state at start of run for environmental-drift
     # auditing between runs. See .dev-context/investigation-289-routing-regression.md.
@@ -1827,6 +1900,8 @@ run_benchmark() {
         --csv "/mnt/locust/output/results" \
         --html "/mnt/locust/output/report.html" \
         2>&1 | tee "$REPORT_DIR/benchmark.log" /dev/stderr > /dev/null
+    # tee masks locust's status (no pipefail); keep it for the arm check below.
+    LOCUST_RC=${PIPESTATUS[0]}
 
     BENCHMARK_END_TS=$(date +%s)
     ACTUAL_DURATION=$((BENCHMARK_END_TS - BENCHMARK_START_TS))
@@ -1878,6 +1953,29 @@ run_benchmark() {
         done
         # If nothing scraped at all, remove the empty combined file too.
         [[ -s "$REPORT_DIR/prometheus_metrics.txt" ]] || rm -f "$REPORT_DIR/prometheus_metrics.txt"
+    fi
+
+    # Arm validity. A crashed locust (no stats block), or a server running a
+    # different routing mode than the arm's label, must not reach compare or
+    # aggregate as a "pass". Locust's own exit code is NOT by itself a failure:
+    # it exits 1 whenever any request errored or its P99 check tripped, both of
+    # which are measurements, not crashes. It is recorded for the log.
+    local ARM_FAILURE=""
+    if ! grep -q "BENCHMARK_STATS_JSON:" "$REPORT_DIR/benchmark.log" 2>/dev/null; then
+        ARM_FAILURE="no BENCHMARK_STATS_JSON in benchmark.log (locust exit ${LOCUST_RC:-?})"
+    fi
+    if grep -q "ROUTING MODE MISMATCH" "$REPORT_DIR/benchmark.log" 2>/dev/null; then
+        ARM_FAILURE="${ARM_FAILURE:+$ARM_FAILURE; }server routing mode != arm label '$ROUTING_MODE' (ROUTING MODE MISMATCH in log)"
+    fi
+    if [[ -n "$ARM_FAILURE" ]]; then
+        echo "$ARM_FAILURE" > "$REPORT_DIR/FAILED"
+        log_error "Arm '$ROUTING_MODE' FAILED: $ARM_FAILURE" >&2
+        log_error "Marker written: $REPORT_DIR/FAILED — this dir must not be compared or aggregated." >&2
+        echo "$REPORT_DIR"
+        return 1
+    fi
+    if [[ "${LOCUST_RC:-0}" -ne 0 ]]; then
+        log_warn "locust exited ${LOCUST_RC} (request errors or its own P99 check); stats block present, arm kept." >&2
     fi
 
     log_ok "Results saved to: $REPORT_DIR/" >&2
@@ -1950,6 +2048,7 @@ run_warmup() {
     # locustfile default (50), so the two stay identically primed either way.
     NUM_PREFIXES_ARGS=""
     [[ -n "$NUM_LARGE_PREFIXES" ]] && NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=$NUM_LARGE_PREFIXES"
+    [[ -n "$PREFIX_SEED" ]] && NUM_PREFIXES_ARGS+=" -e PREFIX_SEED=$PREFIX_SEED"
 
     # Match the main run's churn knobs so warm-up exercises the same universe
     # (CHURN_SEED makes the prefix content identical). Forward only when set.
@@ -2004,7 +2103,8 @@ restart_ranvier_with_mode() {
     local MODE="$1"
     log_info "Restarting Ranvier cluster with RANVIER_ROUTING_MODE=$MODE..."
 
-    # Stop existing containers
+    # Stop and remove existing containers. Removal also discards the routing DB
+    # (container-local tmpfs), so the new arm starts with an empty ART.
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         stop ranvier1 ranvier2 ranvier3 2>/dev/null
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
@@ -2129,7 +2229,10 @@ if [[ "$COMPARE" = true ]]; then
 else
     # Single-arm run: warm the (already-running, prefix-mode) cluster if requested.
     [[ "$WARMUP" = true ]] && run_warmup "prefix"
-    run_benchmark "prefix" "Prefix-Aware Routing"
+    # The cluster was started from the host env (compose default: prefix), so the
+    # arm label, manifest and BENCHMARK_MODE must follow that, not a literal.
+    SINGLE_ARM_MODE="${RANVIER_ROUTING_MODE:-prefix}"
+    run_benchmark "$SINGLE_ARM_MODE" "Single arm (${SINGLE_ARM_MODE})"
 fi
 
 log_header "Benchmark Complete"

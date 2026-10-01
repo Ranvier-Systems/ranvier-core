@@ -545,7 +545,10 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         else:
             chunks_content = [w + " " for w in canned_words]
 
-        latency_s = latency_ms / 1000.0 if latency_ms > 0 else 0.01
+        # 0 means no artificial delay. The old 10 ms-per-chunk floor put a hard
+        # 40 ms under every request, which hid Ranvier's own share from the CI
+        # regression gate and from the inline-vs-sidecar A/B.
+        latency_s = latency_ms / 1000.0
 
         try:
             for i, content in enumerate(chunks_content):

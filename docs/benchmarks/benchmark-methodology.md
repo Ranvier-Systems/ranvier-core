@@ -757,67 +757,13 @@ grep "Cache" benchmark-reports/*/benchmark.log
 
 ## Expected Metrics Reference
 
-### TTFT (Time To First Token)
-
-Real-world results from 8x A100 40GB benchmarks (stress distribution):
-
-| Model | Users | Duration | Prefix Size | Cache Miss | Cache Hit | Improvement | Notes |
-|-------|-------|----------|-------------|------------|-----------|-------------|-------|
-| **13B** | **20** | **1m** | XLarge | ~1142ms | ~846ms | **~26%** | Feb 27, post-SSE-fix (b63c165), 1m quick validation |
-| **13B** | **20** | **10m** | XLarge | ~1301ms | ~834ms | **~36%** | Feb 2026, post-fix |
-| **13B** | **10** | **10m** | XLarge | ~1394ms | ~845ms | **~39%** | Feb 2026, post-fix |
-| **8B** | **20** | **10m** | XLarge | ~649ms | ~444ms | **~32%** | Feb 2026, post-fix |
-| 13B | 30 | 30m | XLarge | ~1525ms | ~992ms | ~35% | Feb 2026, pre-fix validated |
-| 8B | 30 | 30m | XLarge | ~674ms | ~465ms | ~31% | Feb 2026, pre-fix validated |
-| 13B | 20 | 10m | XLarge | ~1158ms | ~769ms | ~34% | Feb 2026, pre-fix |
-| 13B | 10 | 10m | XLarge | ~1318ms | ~751ms | ~43% | Feb 2026, pre-fix |
-| 8B | 20 | 10m | XLarge | ~638ms | ~448ms | ~30% | Feb 2026, pre-fix |
-| 8B (16K pfx) | 20 | 10m | XLarge | ~639ms | ~461ms | **~28%** | Feb 2026, post-fix, `--prefix-max-tokens 16000` |
-| 8B (64u stress) | 64 | 15m | XLarge | ~668ms | ~474ms | ~29% | Feb 2026, post-fix, high concurrency |
-| 13B (ratio 0.7) | 20 | 10m | XLarge | ~1123ms | ~748ms | ~33% | Feb 2026, `--prefix-ratio 0.7` |
-| 13B (ratio 0.5) | 20 | 10m | XLarge | ~1523ms | ~861ms | ~44% | Feb 2026, `--prefix-ratio 0.5` |
-| 13B (client tok) | 30 | 10m | XLarge | ~1065ms | ~802ms | ~25% | Feb 2026, `--client-tokenize` |
-| 13B | 30 | 10m | XLarge | ~1800ms | ~1030ms | ~43% | Jan 2026 |
-| 13B | 20 | 10m | XLarge | ~1451ms | ~886ms | ~39% | Jan 2026 |
-| 13B | 10 | 10m | XLarge | ~1575ms | ~816ms | ~48% | Jan 2026 |
-| 8B | 30 | 10m | XLarge | ~655ms | ~499ms | ~26% | Jan 2026 |
-| 8B | 20 | 10m | XLarge | ~804ms | ~453ms | ~44% | Jan 2026 |
-| 8B | 10 | 10m | XLarge | ~580ms | ~333ms | ~43% | Jan 2026 |
-| 1B | 30 | 10m | XLarge | ~130ms | ~130ms | ~0% | Jan 2026 |
-| 70B (TP=2) | 16 | 30m | XLarge | ~2665ms | ~1498ms | **~44%** | Feb 2026, 80GB A100s, 4 backends, 32K context |
-| 70B (TP=2) | 16 | 15m | XLarge | ~2924ms | ~1520ms | ~48% | Feb 2026, 80GB, warm-up effects inflate P99 |
-| 70B (TP=4) | 16 | 15m | XLarge | ~2108ms | ~1069ms | ~49% | Feb 2026, 40GB A100s, 2 backends, 4K context |
-
-**Key insights:**
-- **P99 tail latency is the strongest win for 13B** — -79% to -85% on Instance 3 (valid). ⚠ bb20555 showed -24% to -51% but baselines were inflated 3.3x.
-- **0% incomplete rate** — stale connection retry (Feb 9 fix) eliminated phantom timeouts
-- **Results are instance/architecture dependent** — cache hit rates range 54-98% across runs
-- **1B models show no benefit** — KV cache computation is already trivial (~10-20ms)
-- **Small prefixes have overhead** — Routing cost exceeds cache benefit
-- **Larger models amplify benefits** — 13B sees bigger throughput/P99 gains than 8B
-- **Throughput improves for 13B** — +3% to +22% depending on instance and concurrency
-- **Batched route learning trades cache affinity for SMP efficiency** — lower cache hit rates but less overhead
-
-### Cache Hit Rate
-
-| Prefix Ratio | Round-Robin | Prefix-Aware (Instance 3) | Prefix-Aware (bb20555) | Notes |
-|--------------|-------------|--------------------------|----------------------|-------|
-| 0.5 (50% shared) | ~11% | **~91%** | **~67%** | Lower with batched routes |
-| 0.7 (70% shared) | ~13% | **~90%** | **~77%** | Lower with batched routes |
-| 0.9 (90% shared) | ~12% | **~97-98%** | **~87-95%** | Still strong |
-| 0.95 (95% shared) | ~12.5% | ~98%+ | ~95%+ | Estimated |
-
-### Throughput Scaling
-
-| GPUs | Expected RPS (8B model) | Notes |
-|------|------------------------|-------|
-| 1 | 0.5-1.0 | Baseline |
-| 2 | 1.0-2.0 | Linear scaling |
-| 4 | 2.0-4.0 | Near-linear |
-| 8 | 3.5-7.0 | Some overhead |
+Moved to the history notebook on 2026-10-01: every row in the former table here was a
+January–February 2026 run on the deprecated five-prefix workload, in a document that is meant
+to stay free of dated results. For the figures valid on current defaults see
+[benchmark-results-current.md](benchmark-results-current.md); for the dated tables see
+[history/benchmark-history-8xA100.md](history/benchmark-history-8xA100.md#expected-metrics-reference-moved-from-benchmark-methodologymd-2026-10-01).
 
 ---
-
 
 ## Cleanup & Restarts
 

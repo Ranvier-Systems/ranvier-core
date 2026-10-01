@@ -3,14 +3,19 @@
 Real vLLM Backend Load Testing for Ranvier Core
 
 This load test measures the actual value proposition of prefix-aware routing:
-1. Cache hit rate - requests routed to same backend for shared prefix
-2. TTFT comparison - cache hit vs. cache miss latency
+1. Route consistency - requests routed to the same backend for a shared prefix
+   (a client-side affinity proxy; NOT a KV-cache hit rate)
+2. KV prefix-cache hit rate - vLLM's own prefix_cache_hits/queries counters,
+   differenced over the run (the real cache signal, when backends expose it)
+3. TTFT comparison - route-consistent vs. route-changed latency
 3. Tokens per second throughput
 4. Usage statistics from SSE responses
 
 Key Metrics:
 - TTFT (Time To First Token): Latency until first token arrives
-- Cache Hit Rate: Percentage of requests hitting warm KV cache
+- Route Consistency: % of requests that landed on the same backend as the
+  previous request carrying the same prefix (random routing scores ~1/N)
+- KV Prefix-Cache Hit Rate: token-level hits/queries from vLLM counters
 - Token Throughput: Tokens generated per second
 - Routing Accuracy: Whether router correctly identified prefix locality
 
@@ -76,7 +81,9 @@ Environment Variables:
     Large Prefix Stress Testing:
         LARGE_PREFIX_MIN_TOKENS - Minimum prefix size (default: 2000)
         LARGE_PREFIX_MAX_TOKENS - Maximum prefix size (default: 8000)
-        NUM_LARGE_PREFIXES      - Number of unique prefixes to generate (default: 5)
+        NUM_LARGE_PREFIXES      - Number of unique prefixes to generate (default: 50)
+        PREFIX_SEED             - RNG seed for the stress/large-prefix pool (default: 42),
+                                  so warm-up and both A/B arms generate identical prefixes
 
     Client-Side Tokenization:
         CLIENT_TOKENIZE         - Enable client-side tokenization (default: false)
@@ -159,6 +166,11 @@ import requests
 from requests.exceptions import ReadTimeout, ConnectTimeout, Timeout
 from locust import HttpUser, task, between, events
 from locust.runners import MasterRunner, WorkerRunner
+from prom_scrape import (
+    histogram_avg as prom_histogram_avg,
+    histogram_percentile as prom_histogram_percentile,
+    metric_value as prom_metric_value,
+)
 
 # Optional: tokenizers library for client-side tokenization
 # Install with: pip install tokenizers
@@ -614,6 +626,11 @@ LARGE_PREFIX_MAX_TOKENS = int(os.environ.get("LARGE_PREFIX_MAX_TOKENS", "8000"))
 # This locustfile is the single source of truth for the default; wrapper scripts
 # (bench.sh, bench-residency-ab.sh) pass this through only when the caller sets it.
 NUM_LARGE_PREFIXES = int(os.environ.get("NUM_LARGE_PREFIXES", "50"))
+# Seed for the stress/large-prefix pool. Each Locust process (warm-up, each
+# --compare arm) builds its own pool; without a fixed seed the arms would run
+# different prefix bytes and sizes, and warm-up would prime prefixes the main
+# run never sends. Same role as CHURN_SEED for the churn workload.
+PREFIX_SEED = int(os.environ.get("PREFIX_SEED", "42"))
 
 # Cache-churn workload configuration (PROMPT_DISTRIBUTION=churn)
 #
@@ -2453,16 +2470,18 @@ def initialize_large_prefixes():
     if _large_prefixes:
         return
 
-    logger.info(f"Generating {NUM_LARGE_PREFIXES} large prefixes...")
+    logger.info(f"Generating {NUM_LARGE_PREFIXES} large prefixes (PREFIX_SEED={PREFIX_SEED})...")
 
     prefix_types = ["rag", "fewshot", "system", "mixed"]
+    rng = random.Random(PREFIX_SEED)
 
     for i in range(NUM_LARGE_PREFIXES):
-        # Random size within configured range
-        target_tokens = random.randint(LARGE_PREFIX_MIN_TOKENS, LARGE_PREFIX_MAX_TOKENS)
+        # Size and chunk order both come from the seeded generator so every
+        # process in a run (warm-up, each arm) builds byte-identical prefixes.
+        target_tokens = rng.randint(LARGE_PREFIX_MIN_TOKENS, LARGE_PREFIX_MAX_TOKENS)
         prefix_type = prefix_types[i % len(prefix_types)]
 
-        prefix_text = generate_large_prefix(target_tokens, prefix_type, i)
+        prefix_text = generate_large_prefix(target_tokens, prefix_type, i, rng=rng)
         actual_tokens = estimate_tokens(prefix_text)
 
         _large_prefixes.append((prefix_text, actual_tokens))
@@ -2579,9 +2598,20 @@ class BenchmarkStats:
     cache_hits: int = 0
     cache_misses: int = 0
 
-    # TTFT by cache status
+    # Every successful request's TTFT, for exact overall percentiles. Locust's
+    # own table is approximated (100 ms buckets above 1 s), so the headline
+    # P99 must come from here, not from there.
+    ttft_all: List[float] = field(default_factory=list)
+
+    # TTFT by route consistency (same backend as last time for this prefix)
     ttft_cache_hit: List[float] = field(default_factory=list)
     ttft_cache_miss: List[float] = field(default_factory=list)
+
+    # vLLM prefix-cache counters differenced over the run (None when the
+    # backends do not expose vllm:prefix_cache_{hits,queries}).
+    kv_prefix_cache_hits: Optional[float] = None
+    kv_prefix_cache_queries: Optional[float] = None
+    kv_prefix_cache_backends_scraped: int = 0
 
     # Token throughput
     total_prompt_tokens: int = 0
@@ -2626,6 +2656,7 @@ class BenchmarkStats:
                 return
 
             self.successful_requests += 1
+            self.ttft_all.append(metrics.ttft_ms)
             self.total_prompt_tokens += metrics.prompt_tokens
             self.total_completion_tokens += metrics.completion_tokens
 
@@ -2679,6 +2710,15 @@ class BenchmarkStats:
             if self.cache_hits + self.cache_misses > 0:
                 cache_hit_rate = self.cache_hits / (self.cache_hits + self.cache_misses) * 100
 
+            ttft_p50 = self._percentile(self.ttft_all, 0.50)
+            ttft_p90 = self._percentile(self.ttft_all, 0.90)
+            ttft_p95 = self._percentile(self.ttft_all, 0.95)
+            ttft_p99 = self._percentile(self.ttft_all, 0.99)
+
+            kv_hit_rate = None
+            if self.kv_prefix_cache_queries:
+                kv_hit_rate = (self.kv_prefix_cache_hits or 0.0) / self.kv_prefix_cache_queries * 100
+
             ttft_hit_p50 = self._percentile(self.ttft_cache_hit, 0.50)
             ttft_hit_p99 = self._percentile(self.ttft_cache_hit, 0.99)
             ttft_miss_p50 = self._percentile(self.ttft_cache_miss, 0.50)
@@ -2703,9 +2743,21 @@ class BenchmarkStats:
                 "incomplete_no_data": self.incomplete_no_data,
                 "incomplete_connection_reset": self.incomplete_connection_reset,
                 "incomplete_rate_pct": incomplete_rate_pct,
+                # Exact overall TTFT percentiles from raw samples.
+                "ttft_p50_ms": ttft_p50,
+                "ttft_p90_ms": ttft_p90,
+                "ttft_p95_ms": ttft_p95,
+                "ttft_p99_ms": ttft_p99,
+                "ttft_samples": len(self.ttft_all),
+                # Client-side same-backend affinity proxy (was misnamed cache_hit_rate_pct).
                 "cache_hits": self.cache_hits,
                 "cache_misses": self.cache_misses,
-                "cache_hit_rate_pct": cache_hit_rate,
+                "route_consistency_pct": cache_hit_rate,
+                # Real KV-cache signal from the backends, token-level, delta over the run.
+                "kv_prefix_cache_hit_rate_pct": kv_hit_rate,
+                "kv_prefix_cache_hits": self.kv_prefix_cache_hits,
+                "kv_prefix_cache_queries": self.kv_prefix_cache_queries,
+                "kv_prefix_cache_backends_scraped": self.kv_prefix_cache_backends_scraped,
                 "ttft_cache_hit_p50_ms": ttft_hit_p50,
                 "ttft_cache_hit_p99_ms": ttft_hit_p99,
                 "ttft_cache_miss_p50_ms": ttft_miss_p50,
@@ -2787,141 +2839,46 @@ _backends_registered = False
 # Helper Functions
 # ============================================================================
 
-def get_metric_value(metrics_url: str, metric_name: str) -> Optional[float]:
-    """Extract a specific metric value from Prometheus endpoint."""
+def _fetch_metrics_text(metrics_url: str) -> Optional[str]:
+    """GET the Prometheus exposition, or None (logged) when the scrape fails."""
     try:
         resp = requests.get(f"{metrics_url}/metrics", timeout=5)
         if resp.status_code != 200:
             return None
-
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            if metric_name in line:
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    return float(match.group(1))
-        return None
+        return resp.text
     except requests.exceptions.RequestException as e:
         logger.warning(f"Failed to fetch metrics from {metrics_url}: {e}")
         return None
 
 
+def get_metric_value(metrics_url: str, metric_name: str, agg: str = "sum") -> Optional[float]:
+    """One metric combined across Seastar shards: agg="sum" for counters, "max" for gauges."""
+    text = _fetch_metrics_text(metrics_url)
+    return prom_metric_value(text, metric_name, agg) if text is not None else None
+
+
 def get_histogram_avg(metrics_url: str, metric_name: str) -> Optional[float]:
-    """Get average value from a Prometheus histogram (sum/count)."""
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return None
-
-        sum_val = None
-        count_val = None
-
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            if f"{metric_name}_sum" in line:
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    sum_val = float(match.group(1))
-            elif f"{metric_name}_count" in line:
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    count_val = float(match.group(1))
-
-        if sum_val is not None and count_val is not None and count_val > 0:
-            return sum_val / count_val
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Failed to fetch histogram from {metrics_url}: {e}")
-        return None
+    """Histogram mean across all shards (sum of _sum over sum of _count)."""
+    text = _fetch_metrics_text(metrics_url)
+    return prom_histogram_avg(text, metric_name) if text is not None else None
 
 
 def get_histogram_percentile(metrics_url: str, metric_name: str, percentile: float) -> Optional[float]:
-    """Calculate percentile from Prometheus histogram buckets using linear interpolation.
+    """Histogram percentile over buckets summed per `le` across all shards (see prom_scrape)."""
+    text = _fetch_metrics_text(metrics_url)
+    return prom_histogram_percentile(text, metric_name, percentile) if text is not None else None
 
-    Reference: https://prometheus.io/docs/practices/histograms/#quantiles
 
-    Args:
-        metrics_url: Base URL for Prometheus metrics endpoint
-        metric_name: Name of the histogram metric (without _bucket suffix)
-        percentile: Percentile to calculate (0.0 to 1.0, e.g., 0.5 for P50, 0.99 for P99)
+def record_derived_sample(environment, request_type: str, name: str, value: float) -> None:
+    """Log a derived sample (TTFT, tokens/s) to its own Locust stats row only.
 
-    Returns:
-        Estimated percentile value, or None if calculation fails
+    Deliberately bypasses events.request: that path also logs into the
+    "Aggregated" row, which must count HTTP requests only because
+    results_parser and the CI gate read request count, req/s, failure rate and
+    latency percentiles from it. The named row still appears in Locust's
+    console tables, CSV and HTML output.
     """
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return None
-
-        # Parse bucket data: metric_name_bucket{le="X"} value
-        # Buckets are cumulative counts up to boundary le
-        buckets = []  # List of (upper_bound, cumulative_count)
-
-        bucket_pattern = re.compile(
-            rf'{metric_name}_bucket\{{le="([^"]+)"\}}\s+(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
-        )
-
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            match = bucket_pattern.search(line)
-            if match:
-                le_str = match.group(1)
-                count = float(match.group(2))
-                # Handle +Inf bucket
-                if le_str == "+Inf":
-                    upper_bound = float("inf")
-                else:
-                    upper_bound = float(le_str)
-                buckets.append((upper_bound, count))
-
-        if not buckets:
-            return None
-
-        # Sort buckets by upper bound
-        buckets.sort(key=lambda x: x[0])
-
-        # Get total count from +Inf bucket
-        total_count = buckets[-1][1] if buckets else 0
-        if total_count == 0:
-            return None
-
-        # Target count for the percentile
-        target_count = percentile * total_count
-
-        # Find the bucket where cumulative count crosses the target
-        prev_bound = 0.0
-        prev_count = 0.0
-
-        for upper_bound, cumulative_count in buckets:
-            if cumulative_count >= target_count:
-                # Linear interpolation within this bucket
-                # Formula: lower_bound + (upper_bound - lower_bound) * (target - prev_count) / (current - prev_count)
-                if upper_bound == float("inf"):
-                    # Can't interpolate into +Inf bucket, return previous bound
-                    return prev_bound
-                bucket_count = cumulative_count - prev_count
-                if bucket_count == 0:
-                    return prev_bound
-                fraction = (target_count - prev_count) / bucket_count
-                return prev_bound + (upper_bound - prev_bound) * fraction
-            prev_bound = upper_bound
-            prev_count = cumulative_count
-
-        # If we get here, return the highest finite bucket bound
-        for upper_bound, _ in reversed(buckets):
-            if upper_bound != float("inf"):
-                return upper_bound
-        return None
-
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Failed to fetch histogram percentile from {metrics_url}: {e}")
-        return None
-    except (ValueError, ZeroDivisionError) as e:
-        logger.warning(f"Failed to calculate percentile for {metric_name}: {e}")
-        return None
+    environment.stats.get(name, request_type).log(value, 0)
 
 
 def get_labeled_metric_values(metrics_url: str, metric_name: str, label: str) -> dict:
@@ -2963,7 +2920,7 @@ def get_scheduler_metrics() -> Optional[dict]:
     # Check if scheduler is enabled on any node
     enabled = False
     for metrics_url in RANVIER_METRICS:
-        val = get_metric_value(metrics_url, "ranvier_scheduler_enabled")
+        val = get_metric_value(metrics_url, "ranvier_scheduler_enabled", agg="max")
         if val is not None and val == 1.0:
             enabled = True
             break
@@ -2999,8 +2956,8 @@ def get_scheduler_metrics() -> Optional[dict]:
         if p99 is not None:
             stats["wait_seconds_p99"] = max(stats["wait_seconds_p99"] or 0, p99)
 
-        # Agents tracked (gauge — take max across nodes)
-        agents = get_metric_value(metrics_url, "ranvier_scheduler_agents_tracked")
+        # Agents tracked (gauge — take max across shards and nodes)
+        agents = get_metric_value(metrics_url, "ranvier_scheduler_agents_tracked", agg="max")
         if agents is not None:
             stats["agents_tracked"] = max(stats["agents_tracked"], int(agents))
 
@@ -3220,6 +3177,65 @@ def register_backends_on_all_nodes():
 
     _backends_registered = True
     logger.info("Backend registration complete")
+
+
+# vLLM exposes prefix-cache counters (token-level) on its own /metrics. Names
+# differ by version: prometheus_client appends _total to counters, older
+# builds omit it. Backends without either (mock, Ollama) are skipped.
+_VLLM_PREFIX_CACHE_HITS = ("vllm:prefix_cache_hits_total", "vllm:prefix_cache_hits")
+_VLLM_PREFIX_CACHE_QUERIES = ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_queries")
+_initial_kv_prefix_cache: Dict[int, Tuple[float, float]] = {}
+
+
+def _first_present_metric(text: str, names: Tuple[str, ...]) -> Optional[float]:
+    for name in names:
+        value = prom_metric_value(text, name)
+        if value is not None:
+            return value
+    return None
+
+
+def scrape_backend_prefix_cache() -> Dict[int, Tuple[float, float]]:
+    """(hits, queries) token counters per backend id, from each backend's /metrics."""
+    counters: Dict[int, Tuple[float, float]] = {}
+    for backend in BACKENDS:
+        text = _fetch_metrics_text(f"http://{backend['ip']}:{backend['port']}")
+        if text is None:
+            continue
+        hits = _first_present_metric(text, _VLLM_PREFIX_CACHE_HITS)
+        queries = _first_present_metric(text, _VLLM_PREFIX_CACHE_QUERIES)
+        if hits is None or queries is None:
+            continue
+        counters[backend["id"]] = (hits, queries)
+    return counters
+
+
+def capture_initial_kv_prefix_cache():
+    """Snapshot the counters before traffic so the run's hit rate is a delta, not cumulative."""
+    global _initial_kv_prefix_cache
+    _initial_kv_prefix_cache = scrape_backend_prefix_cache()
+    if _initial_kv_prefix_cache:
+        logger.info(f"KV prefix-cache counters found on {len(_initial_kv_prefix_cache)}/{len(BACKENDS)} backends")
+    else:
+        logger.info("KV prefix-cache counters not exposed by backends; real hit rate will be unavailable")
+
+
+def kv_prefix_cache_delta() -> Tuple[Optional[float], Optional[float], int]:
+    """(hits, queries, backends) accumulated since capture_initial_kv_prefix_cache()."""
+    final = scrape_backend_prefix_cache()
+    hits = queries = 0.0
+    scraped = 0
+    for backend_id, (final_hits, final_queries) in final.items():
+        start_hits, start_queries = _initial_kv_prefix_cache.get(backend_id, (0.0, 0.0))
+        if final_hits < start_hits or final_queries < start_queries:
+            # Counter reset (backend restarted mid-run): the delta is the final value.
+            start_hits = start_queries = 0.0
+        hits += final_hits - start_hits
+        queries += final_queries - start_queries
+        scraped += 1
+    if scraped == 0:
+        return None, None, 0
+    return hits, queries, scraped
 
 
 def capture_initial_sync_errors():
@@ -3723,6 +3739,7 @@ def on_test_start(environment, **kwargs):
 
     # Capture initial sync errors
     capture_initial_sync_errors()
+    capture_initial_kv_prefix_cache()
 
     logger.info("Load test initialization complete")
 
@@ -3737,15 +3754,30 @@ def on_test_stop(environment, **kwargs):
     logger.info("Benchmark Results Summary")
     logger.info("=" * 70)
 
+    # Real KV-cache signal from the backends, differenced over the run.
+    kv_hits, kv_queries, kv_backends = kv_prefix_cache_delta()
+    _benchmark_stats.kv_prefix_cache_hits = kv_hits
+    _benchmark_stats.kv_prefix_cache_queries = kv_queries
+    _benchmark_stats.kv_prefix_cache_backends_scraped = kv_backends
+
     # Get aggregated stats
     summary = _benchmark_stats.get_summary()
 
-    # Print cache hit statistics
-    logger.info(f"Cache Statistics:")
-    logger.info(f"  Cache Hits: {summary['cache_hits']}")
-    logger.info(f"  Cache Misses: {summary['cache_misses']}")
-    logger.info(f"  Cache Hit Rate: {summary['cache_hit_rate_pct']:.1f}%")
+    logger.info("Route Consistency (client-side: same backend as the previous request with this prefix):")
+    logger.info(f"  Route-consistent: {summary['cache_hits']}")
+    logger.info(f"  Route changed / first seen: {summary['cache_misses']}")
+    logger.info(f"  Route Consistency: {summary['route_consistency_pct']:.1f}%")
     logger.info(f"  Unique Prefixes: {summary['unique_prefixes']}")
+    logger.info("  (random routing scores ~1/N here by construction; this is NOT a KV-cache hit rate)")
+
+    kv_rate = summary.get("kv_prefix_cache_hit_rate_pct")
+    if kv_rate is not None:
+        logger.info("KV Prefix-Cache Hit Rate (vLLM counters, token-level, delta over the run):")
+        logger.info(f"  KV Prefix-Cache Hit Rate: {kv_rate:.1f}% "
+                    f"({summary['kv_prefix_cache_hits']:.0f}/{summary['kv_prefix_cache_queries']:.0f} tokens "
+                    f"across {summary['kv_prefix_cache_backends_scraped']} backends)")
+    else:
+        logger.info("KV Prefix-Cache Hit Rate: unavailable (backends expose no vllm:prefix_cache_* counters)")
 
     # Print prefix boundary optimization stats (server-side)
     prefix_stats = get_prefix_boundary_stats()
@@ -3756,18 +3788,25 @@ def on_test_stop(environment, **kwargs):
         if prefix_stats["prefix_boundary_ratio_pct"] is not None:
             logger.info(f"  Usage Ratio: {prefix_stats['prefix_boundary_ratio_pct']:.1f}%")
             # Correlation hint
-            if prefix_stats["prefix_boundary_ratio_pct"] < 50 and summary['cache_hit_rate_pct'] < 50:
-                logger.info(f"  Note: Low prefix boundary usage may explain low cache hit rate")
+            if prefix_stats["prefix_boundary_ratio_pct"] < 50 and summary['route_consistency_pct'] < 50:
+                logger.info(f"  Note: Low prefix boundary usage may explain low route consistency")
                 logger.info(f"        (requests may lack system messages or have short system prompts)")
 
+    # Exact overall TTFT from raw samples. Locust's percentile table rounds
+    # 1-10 s values to 100 ms buckets, so it must not be the headline source.
+    if summary['ttft_p99_ms'] is not None:
+        logger.info(f"\nTTFT (raw samples, n={summary['ttft_samples']}):")
+        logger.info(f"  P50: {summary['ttft_p50_ms']:.1f}ms  P90: {summary['ttft_p90_ms']:.1f}ms  "
+                    f"P95: {summary['ttft_p95_ms']:.1f}ms  P99: {summary['ttft_p99_ms']:.1f}ms")
+
     # Print TTFT comparison
-    logger.info(f"\nTTFT Comparison:")
+    logger.info(f"\nTTFT Comparison (by route consistency):")
     if summary['ttft_cache_hit_p50_ms']:
-        logger.info(f"  Cache Hit P50: {summary['ttft_cache_hit_p50_ms']:.1f}ms")
-        logger.info(f"  Cache Hit P99: {summary['ttft_cache_hit_p99_ms']:.1f}ms")
+        logger.info(f"  Route-consistent P50: {summary['ttft_cache_hit_p50_ms']:.1f}ms")
+        logger.info(f"  Route-consistent P99: {summary['ttft_cache_hit_p99_ms']:.1f}ms")
     if summary['ttft_cache_miss_p50_ms']:
-        logger.info(f"  Cache Miss P50: {summary['ttft_cache_miss_p50_ms']:.1f}ms")
-        logger.info(f"  Cache Miss P99: {summary['ttft_cache_miss_p99_ms']:.1f}ms")
+        logger.info(f"  Route-changed P50: {summary['ttft_cache_miss_p50_ms']:.1f}ms")
+        logger.info(f"  Route-changed P99: {summary['ttft_cache_miss_p99_ms']:.1f}ms")
     if summary['ttft_improvement_pct']:
         logger.info(f"  TTFT Improvement: {summary['ttft_improvement_pct']:.1f}%")
 
@@ -4177,61 +4216,28 @@ class RealBackendUser(HttpUser):
                 context={},
             )
 
+            # Derived rows: logged directly so they never inflate "Aggregated"
+            # (see record_derived_sample).
             if ttft is not None:
-                # Record TTFT
-                events.request.fire(
-                    request_type="GET",
-                    name="TTFT (Time To First Token)",
-                    response_time=ttft,
-                    response_length=0,
-                    exception=None,
-                    context={},
-                )
+                stats = self.environment
+                record_derived_sample(stats, "GET", "TTFT (Time To First Token)", ttft)
 
-                # Record cache-specific TTFT
                 cache_status = "hit" if metrics.is_cache_hit else "miss"
-                events.request.fire(
-                    request_type="GET",
-                    name=f"TTFT (Cache {cache_status.upper()})",
-                    response_time=ttft,
-                    response_length=0,
-                    exception=None,
-                    context={},
-                )
+                route_label = "Route-consistent" if metrics.is_cache_hit else "Route-changed"
+                record_derived_sample(stats, "GET", f"TTFT ({route_label})", ttft)
 
-                # Record bucket-specific TTFT for stress testing
                 if prefix_size_bucket and prefix_size_bucket != "unknown":
-                    events.request.fire(
-                        request_type="GET",
-                        name=f"TTFT ({prefix_size_bucket})",
-                        response_time=ttft,
-                        response_length=0,
-                        exception=None,
-                        context={},
-                    )
-
-                    # Record bucket + cache status for detailed analysis
-                    events.request.fire(
-                        request_type="GET",
-                        name=f"TTFT ({prefix_size_bucket} {cache_status})",
-                        response_time=ttft,
-                        response_length=0,
-                        exception=None,
-                        context={},
+                    record_derived_sample(stats, "GET", f"TTFT ({prefix_size_bucket})", ttft)
+                    record_derived_sample(
+                        stats, "GET", f"TTFT ({prefix_size_bucket} {cache_status})", ttft
                     )
 
             if completion_tokens > 0:
-                # Record tokens per second for this request
+                # Per-request decode rate, stored in the response_time slot.
                 gen_time_s = (total_time - (ttft or 0)) / 1000.0
                 if gen_time_s > 0:
-                    tps = completion_tokens / gen_time_s
-                    events.request.fire(
-                        request_type="METRIC",
-                        name="Tokens/Second",
-                        response_time=tps,  # Using response_time to record the metric
-                        response_length=completion_tokens,
-                        exception=None,
-                        context={},
+                    record_derived_sample(
+                        self.environment, "METRIC", "Tokens/Second", completion_tokens / gen_time_s
                     )
 
         except ReadTimeout as e:
