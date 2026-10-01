@@ -213,7 +213,7 @@ generate_baseline() {
     "Baseline established with mock vLLM backends (docker-compose.test.yml)",
     "Mock backends have minimal latency compared to real vLLM inference",
     "P99 latency target: <100ms for mock backend tests",
-    "Update baseline via: gh workflow run benchmark.yml -f update_baseline=true"
+    "Update baseline via: gh workflow run benchmark.yml -f update_baseline=true (opens a PR; main rejects direct pushes)"
   ]
 }
 EOF
