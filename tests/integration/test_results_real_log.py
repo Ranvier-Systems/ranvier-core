@@ -11,7 +11,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import pytest  # noqa: E402
+
 from results_parser import (  # noqa: E402
+    _resolve_run_input,
     aggregate_compare,
     aggregate_runs,
     format_aggregate,
@@ -131,3 +134,12 @@ Route Consistency (client-side: same backend as the previous request with this p
     r = _parse(text, tmp_path)
     assert r.cache_hit_rate_pct == 80.8
     assert r.cache_hits == 800 and r.cache_misses == 190
+
+
+def test_failed_marker_refuses_dir(tmp_path):
+    (tmp_path / "benchmark.log").write_text(_log(NEW_STATS))
+    assert _resolve_run_input(str(tmp_path)).p99_ttft_ms == 3063.7   # no marker: fine
+    (tmp_path / "FAILED").write_text("no BENCHMARK_STATS_JSON in benchmark.log (locust exit 1)\n")
+    with pytest.raises(SystemExit) as exc:
+        _resolve_run_input(str(tmp_path))
+    assert "FAILED" in str(exc.value) and "locust exit 1" in str(exc.value)

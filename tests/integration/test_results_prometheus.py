@@ -116,3 +116,44 @@ def test_parse_benchmark_log_sets_gini_and_node_count(tmp_path):
 
 if __name__ == "__main__":
     sys.exit(__import__("pytest").main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Start-of-run snapshots: counters are differenced over the main run (audit 2026-09-30, fix 9)
+# ---------------------------------------------------------------------------
+
+def test_counters_differenced_against_start_snapshots(tmp_path):
+    # Warm-up left 10 fallbacks and 100 routed/backend on each node before the main run.
+    for n in (1, 2, 3):
+        (tmp_path / f"prometheus_metrics_start_node{n}.txt").write_text(_node_dump(10, 1, {"1": 100, "2": 100}))
+        (tmp_path / f"prometheus_metrics_node{n}.txt").write_text(_node_dump(25, 4, {"1": 160, "2": 140}))
+    agg = parse_prometheus_report(str(tmp_path))
+    assert agg["nodes_scraped"] == 3
+    assert agg["counters_differenced"] is True
+    assert agg["load_aware_fallbacks_total"] == 3 * (25 - 10)
+    assert agg["residency_route_downgrades_total"] == 3 * (4 - 1)
+    assert agg["backend_routed_total"] == {"1": 3 * 60.0, "2": 3 * 40.0}
+
+
+def test_missing_start_snapshot_falls_back_to_cumulative(tmp_path):
+    (tmp_path / "prometheus_metrics_node1.txt").write_text(_node_dump(25, 4, {"1": 160}))
+    agg = parse_prometheus_report(str(tmp_path))
+    assert agg["counters_differenced"] is False
+    assert agg["load_aware_fallbacks_total"] == 25
+
+
+def test_partial_start_snapshots_are_reported_as_not_differenced(tmp_path):
+    (tmp_path / "prometheus_metrics_start_node1.txt").write_text(_node_dump(10, 1, {"1": 100}))
+    (tmp_path / "prometheus_metrics_node1.txt").write_text(_node_dump(25, 4, {"1": 160}))
+    (tmp_path / "prometheus_metrics_node2.txt").write_text(_node_dump(25, 4, {"1": 160}))
+    agg = parse_prometheus_report(str(tmp_path))
+    assert agg["counters_differenced"] is False      # node 2 had no start file
+    assert agg["load_aware_fallbacks_total"] == 15 + 25
+
+
+def test_counter_reset_mid_run_does_not_go_negative(tmp_path):
+    (tmp_path / "prometheus_metrics_start_node1.txt").write_text(_node_dump(50, 5, {"1": 500}))
+    (tmp_path / "prometheus_metrics_node1.txt").write_text(_node_dump(7, 1, {"1": 70}))
+    agg = parse_prometheus_report(str(tmp_path))
+    assert agg["load_aware_fallbacks_total"] == 0
+    assert agg["backend_routed_total"] == {"1": 0.0}

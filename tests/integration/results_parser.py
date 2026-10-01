@@ -763,6 +763,17 @@ def _gini_coefficient(values: List[float]) -> Optional[float]:
     return (2.0 * cum) / (n * total) - (n + 1.0) / n
 
 
+def _start_snapshot_for(end_file: Path) -> Dict[str, Any]:
+    """Parsed start-of-run dump matching an end dump's node index, or {} if none."""
+    m = re.search(r"prometheus_metrics_node(\d+)\.txt$", end_file.name)
+    if not m:
+        return {}
+    start_file = end_file.with_name(f"prometheus_metrics_start_node{m.group(1)}.txt")
+    if not start_file.exists():
+        return {}
+    return parse_prometheus_dump(str(start_file)) or {}
+
+
 def parse_prometheus_report(report_dir: str) -> Dict[str, Any]:
     """Aggregate /metrics across ALL ranvier nodes in a report dir.
 
@@ -771,6 +782,13 @@ def parse_prometheus_report(report_dir: str) -> Dict[str, Any]:
     for older or one-node runs. Scalar counters are summed across nodes, per-backend
     dicts merged per backend_id, `residency_cache_size` taken as the max, and the
     number of nodes actually scraped is recorded so a partial capture is visible.
+
+    When bench.sh also left start-of-run snapshots (`prometheus_metrics_start_node{N}.txt`,
+    taken after warm-up, before the main locust run), counters are DIFFERENCED
+    against them per node, so fallbacks/downgrades/routed counts cover the main
+    run only instead of everything since the arm's Ranvier start. Gauges are
+    taken from the end dump as before. `counters_differenced` records which case
+    applied so a report mixing the two is visible.
     """
     d = Path(report_dir)
     node_files = sorted(d.glob("prometheus_metrics_node*.txt"))
@@ -787,23 +805,31 @@ def parse_prometheus_report(report_dir: str) -> Dict[str, Any]:
     routed: Dict[str, float] = {}
     res_size: Optional[int] = None
     nodes = 0
+    differenced = 0
     for nf in node_files:
         part = parse_prometheus_dump(str(nf))
         if not part:
             continue
         nodes += 1
+        start = _start_snapshot_for(nf)
+        if start:
+            differenced += 1
         for k in sum_keys:
             if k in part:
-                sums[k] = sums.get(k, 0) + int(part[k])
+                delta = int(part[k]) - int(start.get(k, 0))
+                sums[k] = sums.get(k, 0) + max(delta, 0)  # a restart mid-run resets to 0
         if "residency_cache_size" in part:
             v = int(part["residency_cache_size"])
             res_size = v if res_size is None else max(res_size, v)
         for bid, val in (part.get("backend_active_requests") or {}).items():
             active[bid] = active.get(bid, 0.0) + val
+        start_routed = start.get("backend_routed_total") or {}
         for bid, val in (part.get("backend_routed_total") or {}).items():
-            routed[bid] = routed.get(bid, 0.0) + val
+            routed[bid] = routed.get(bid, 0.0) + max(val - start_routed.get(bid, 0.0), 0.0)
 
     merged: Dict[str, Any] = dict(sums)
+    if nodes:
+        merged["counters_differenced"] = (differenced == nodes)
     if res_size is not None:
         merged["residency_cache_size"] = res_size
     if active:
@@ -2033,6 +2059,13 @@ def _resolve_run_input(path: str) -> BenchmarkResults:
     """Accept a report DIR (uses <dir>/benchmark.log), a .csv, or a log file."""
     p = Path(path)
     if p.is_dir():
+        # bench.sh writes <dir>/FAILED when an arm crashed (no stats block) or the
+        # server ran a different routing mode than the arm's label. Such a dir is
+        # not a measurement and must never enter a comparison or an aggregate.
+        marker = p / "FAILED"
+        if marker.exists():
+            reason = marker.read_text().strip() or "no reason recorded"
+            raise SystemExit(f"refusing {path}: arm marked FAILED by bench.sh ({reason})")
         log = p / "benchmark.log"
         if not log.exists():
             raise FileNotFoundError(f"no benchmark.log in report dir: {path}")

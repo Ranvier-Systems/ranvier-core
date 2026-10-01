@@ -1670,6 +1670,7 @@ write_manifest() {
         printf '    "prompt_distribution": "%s",\n' "$(_json_escape "$PROMPT_DIST")"
         printf '    "shared_prefix_ratio": "%s",\n' "$(_json_escape "$PREFIX_RATIO")"
         printf '    "num_large_prefixes": "%s",\n' "$(_json_escape "${NUM_LARGE_PREFIXES:-50}")"
+        printf '    "prefix_seed": "%s",\n' "$(_json_escape "${PREFIX_SEED:-42}")"
         printf '    "max_output_tokens": "%s",\n' "$(_json_escape "${MAX_TOKENS:-}")"
         printf '    "client_tokenize": "%s"' "$client_tok"
         if [[ "$PROMPT_DIST" == "churn" ]]; then
@@ -1815,6 +1816,7 @@ run_benchmark() {
     # Set NUM_LARGE_PREFIXES=5 in the environment only to stress prefix concentration.
     NUM_PREFIXES_ARGS=""
     [[ -n "$NUM_LARGE_PREFIXES" ]] && NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=$NUM_LARGE_PREFIXES"
+    [[ -n "$PREFIX_SEED" ]] && NUM_PREFIXES_ARGS+=" -e PREFIX_SEED=$PREFIX_SEED"
 
     # Forward churn-workload knobs (read by locustfile_real.py; only meaningful with
     # --prompt-dist churn) ONLY when explicitly set — the locustfile owns the defaults.
@@ -1830,6 +1832,20 @@ run_benchmark() {
     LOCUST_RUN_TIME_SECS=$(parse_duration "$DURATION")
     log_info "Locust --run-time: ${LOCUST_RUN_TIME_SECS}s (from DURATION=$DURATION)" >&2
     BENCHMARK_START_TS=$(date +%s)
+
+    # Start-of-run /metrics snapshot per node. Counters are cumulative since the
+    # arm's Ranvier start, which includes the warm-up; results_parser subtracts
+    # these from the end-of-run dumps so diversion/routed counters cover the
+    # main run only. Filename deliberately does not match prometheus_metrics_node*.
+    if command -v docker &> /dev/null; then
+        node_idx=0
+        for node in ranvier-bench1 ranvier-bench2 ranvier-bench3; do
+            node_idx=$((node_idx + 1))
+            start_file="$REPORT_DIR/prometheus_metrics_start_node${node_idx}.txt"
+            docker exec "$node" curl -sf http://localhost:9180/metrics > "$start_file" 2>/dev/null \
+                || rm -f "$start_file"
+        done
+    fi
 
     # Capture GPU clocks/throttle state at start of run for environmental-drift
     # auditing between runs. See .dev-context/investigation-289-routing-regression.md.
@@ -1884,6 +1900,8 @@ run_benchmark() {
         --csv "/mnt/locust/output/results" \
         --html "/mnt/locust/output/report.html" \
         2>&1 | tee "$REPORT_DIR/benchmark.log" /dev/stderr > /dev/null
+    # tee masks locust's status (no pipefail); keep it for the arm check below.
+    LOCUST_RC=${PIPESTATUS[0]}
 
     BENCHMARK_END_TS=$(date +%s)
     ACTUAL_DURATION=$((BENCHMARK_END_TS - BENCHMARK_START_TS))
@@ -1935,6 +1953,29 @@ run_benchmark() {
         done
         # If nothing scraped at all, remove the empty combined file too.
         [[ -s "$REPORT_DIR/prometheus_metrics.txt" ]] || rm -f "$REPORT_DIR/prometheus_metrics.txt"
+    fi
+
+    # Arm validity. A crashed locust (no stats block), or a server running a
+    # different routing mode than the arm's label, must not reach compare or
+    # aggregate as a "pass". Locust's own exit code is NOT by itself a failure:
+    # it exits 1 whenever any request errored or its P99 check tripped, both of
+    # which are measurements, not crashes. It is recorded for the log.
+    local ARM_FAILURE=""
+    if ! grep -q "BENCHMARK_STATS_JSON:" "$REPORT_DIR/benchmark.log" 2>/dev/null; then
+        ARM_FAILURE="no BENCHMARK_STATS_JSON in benchmark.log (locust exit ${LOCUST_RC:-?})"
+    fi
+    if grep -q "ROUTING MODE MISMATCH" "$REPORT_DIR/benchmark.log" 2>/dev/null; then
+        ARM_FAILURE="${ARM_FAILURE:+$ARM_FAILURE; }server routing mode != arm label '$ROUTING_MODE' (ROUTING MODE MISMATCH in log)"
+    fi
+    if [[ -n "$ARM_FAILURE" ]]; then
+        echo "$ARM_FAILURE" > "$REPORT_DIR/FAILED"
+        log_error "Arm '$ROUTING_MODE' FAILED: $ARM_FAILURE" >&2
+        log_error "Marker written: $REPORT_DIR/FAILED — this dir must not be compared or aggregated." >&2
+        echo "$REPORT_DIR"
+        return 1
+    fi
+    if [[ "${LOCUST_RC:-0}" -ne 0 ]]; then
+        log_warn "locust exited ${LOCUST_RC} (request errors or its own P99 check); stats block present, arm kept." >&2
     fi
 
     log_ok "Results saved to: $REPORT_DIR/" >&2
@@ -2007,6 +2048,7 @@ run_warmup() {
     # locustfile default (50), so the two stay identically primed either way.
     NUM_PREFIXES_ARGS=""
     [[ -n "$NUM_LARGE_PREFIXES" ]] && NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=$NUM_LARGE_PREFIXES"
+    [[ -n "$PREFIX_SEED" ]] && NUM_PREFIXES_ARGS+=" -e PREFIX_SEED=$PREFIX_SEED"
 
     # Match the main run's churn knobs so warm-up exercises the same universe
     # (CHURN_SEED makes the prefix content identical). Forward only when set.
@@ -2187,7 +2229,10 @@ if [[ "$COMPARE" = true ]]; then
 else
     # Single-arm run: warm the (already-running, prefix-mode) cluster if requested.
     [[ "$WARMUP" = true ]] && run_warmup "prefix"
-    run_benchmark "prefix" "Prefix-Aware Routing"
+    # The cluster was started from the host env (compose default: prefix), so the
+    # arm label, manifest and BENCHMARK_MODE must follow that, not a literal.
+    SINGLE_ARM_MODE="${RANVIER_ROUTING_MODE:-prefix}"
+    run_benchmark "$SINGLE_ARM_MODE" "Single arm (${SINGLE_ARM_MODE})"
 fi
 
 log_header "Benchmark Complete"

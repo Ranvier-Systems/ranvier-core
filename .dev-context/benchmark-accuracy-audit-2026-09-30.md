@@ -168,6 +168,7 @@ overclaimed:
 ## Tier 2 — The CI regression gate
 
 ### 8. CI "P99" is the 98th percentile — Sev 7, CONFIRMED
+- **Status:** FIXED 2026-10-01. `run-benchmark.sh` and `bisect-benchmark.sh` read column 19; the column comment now lists the 98% column. Verified against a CSV written by Locust 2.24.0.
 - Locust 2.24 `PERCENTILES_TO_REPORT = [0.50, 0.66, 0.75, 0.80, 0.90, 0.95, 0.98, 0.99, …]`
   → CSV columns 12–22; column 18 = 98%, 19 = 99%. `run-benchmark.sh:122` documents the
   columns *without* the 98% column and `:132` sets `p99 = $18`; `bisect-benchmark.sh:83-84`
@@ -177,6 +178,7 @@ overclaimed:
 - Combined with finding 2, the gate is roughly the POST **P96** of a TTFT + total-time union.
 
 ### 9. Mock backend has a hard-coded 40 ms floor and no cache model — Sev 8, CONFIRMED (floor) / SUSPECTED (share)
+- **Status:** FIXED 2026-10-01 (floor). `mock_backend.py` sleeps only when a latency is configured; 0 means no delay. The baseline must be regenerated (already marked stale). No cache model was added; the gate measures pass-through overhead only, which is now what it claims.
 - `tests/integration/mock_backend.py:548`: `latency_s = latency_ms/1000 if latency_ms > 0
   else 0.01` → 10 ms sleep after each of 4 canned chunks = 40 ms per request even when the
   knob is "off". Latency is identical regardless of backend, prefix or cache state, so prefix
@@ -188,6 +190,7 @@ overclaimed:
   so); gate on the TTFT row, not the mixed Aggregated row.
 
 ### 10. Missing or zero baseline key → silent PASS — Sev 6, CONFIRMED (reproduced)
+- **Status:** FIXED 2026-10-01. `run-benchmark.sh` validates every operand is a number (and every baseline/current latency and throughput is > 0) before any `bc` arithmetic, exiting 2 otherwise; `generate_baseline` refuses to write a zero or unparsable P99/throughput/request count. Found while verifying: the `^Aggregated` grep had never matched (Locust writes that row with an empty Type column, `,Aggregated,...`), so the script had been living off a last-line fallback that would `eval` a bare CSV header; the row is now matched on its Name column and a missing row is an explicit error.
 - `run-benchmark.sh:257-262` `jq -r` prints `null` for a missing key; `:283` `bc` prints a
   syntax error but exits 0 so `set -e` does not fire and `P99_DELTA=""`; `:301`
   `echo " > 10" | bc` → empty; `[[ "" -eq 1 ]]` is false → PASS. Same path for a baseline
@@ -198,6 +201,7 @@ overclaimed:
 - **Fix:** validate parsed numbers non-empty and > 0 before comparing; fail closed.
 
 ### 11. `make benchmark` and `bisect-benchmark.sh` never start ranvier2/ranvier3 — Sev 7 (bisect), CONFIRMED
+- **Status:** FIXED 2026-10-01. Both pass `--profile full`. Bisect no longer aborts on Locust's own non-zero exit, so its verdict comes from the CSV P99 alone.
 - `docker-compose.test.yml` gates ranvier2/3 behind `profiles: [full]`; `locust`
   `depends_on` both with `service_healthy`. `Makefile:499` `COMPOSE_ARGS` and the `benchmark`
   target (`:572-584`) pass only `--profile benchmark`; `bisect-benchmark.sh:41,54` likewise.
@@ -210,6 +214,7 @@ overclaimed:
   no repeats.
 
 ### 12. `bench.sh` swallows Locust's exit status; a crashed or mismatched arm is recorded as "pass" — Sev 6, CONFIRMED
+- **Status:** FIXED 2026-10-01. `run_benchmark` reads Locust's status via `PIPESTATUS`, and fails the arm (writes `<dir>/FAILED`, returns 1 so the script stops) when the log lacks `BENCHMARK_STATS_JSON` or contains `ROUTING MODE MISMATCH`; a non-zero Locust exit with a complete stats block is logged as a warning only, since Locust exits 1 on any request error. `results_parser.py` refuses a dir carrying the marker. The single-arm label follows `RANVIER_ROUTING_MODE` instead of a literal.
 - `bench.sh:31` `set -e` with no `pipefail`; `:1829` `… 2>&1 | tee … > /dev/null` returns
   tee's 0. Import failure, registration failure, or Locust's `process_exit_code = 1`
   (`locustfile_real.py:3968`) all return 0; `bench-runner.sh:701-703` records `pass` and feeds
@@ -253,6 +258,7 @@ overclaimed:
   keep-alive session or document the cold-connect cost; drop or lower the floor.
 
 ### 14. Stress-mode prefix pool is generated from the unseeded global RNG — Sev 5, CONFIRMED
+- **Status:** FIXED 2026-10-01. `initialize_large_prefixes` draws sizes and chunk order from `random.Random(PREFIX_SEED)` (default 42); `bench.sh` forwards `PREFIX_SEED` to warm-up and both arms when set and records it in the manifest. Verified byte-identical across processes.
 - `locustfile_real.py:2449-2471` draws `random.randint(LARGE_PREFIX_MIN, MAX)` per prefix and
   `random.shuffle`s RAG chunks (`:2401-2402`); only the churn universe seeds (`:2516`). Each
   Locust process (warm-up, RR arm, prefix arm) builds a different pool: different size-bucket
@@ -261,6 +267,7 @@ overclaimed:
 - **Fix:** seed a `random.Random(SEED)` for the pool exactly as churn does and forward the seed.
 
 ### 15. Counters are cumulative and include warm-up; percent denominators are main-run only — Sev 3, CONFIRMED
+- **Status:** FIXED 2026-10-01. `bench.sh` snapshots every node's `/metrics` to `prometheus_metrics_start_node{N}.txt` after warm-up and before the main run; `parse_prometheus_report` differences counters and per-backend routed totals against the matching snapshot (clamped at 0 on a reset) and records `counters_differenced`.
 - `bench.sh:1856-1880` scrapes once after Locust exits (correctly after `--stop-timeout`), never
   differences against a start snapshot. `--warmup` runs after the per-arm restart (`:2085`), so
   `load_aware_fallbacks_total`, `residency_route_downgrades_total` and per-backend `routed_total`

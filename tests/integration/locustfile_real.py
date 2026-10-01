@@ -81,7 +81,9 @@ Environment Variables:
     Large Prefix Stress Testing:
         LARGE_PREFIX_MIN_TOKENS - Minimum prefix size (default: 2000)
         LARGE_PREFIX_MAX_TOKENS - Maximum prefix size (default: 8000)
-        NUM_LARGE_PREFIXES      - Number of unique prefixes to generate (default: 5)
+        NUM_LARGE_PREFIXES      - Number of unique prefixes to generate (default: 50)
+        PREFIX_SEED             - RNG seed for the stress/large-prefix pool (default: 42),
+                                  so warm-up and both A/B arms generate identical prefixes
 
     Client-Side Tokenization:
         CLIENT_TOKENIZE         - Enable client-side tokenization (default: false)
@@ -624,6 +626,11 @@ LARGE_PREFIX_MAX_TOKENS = int(os.environ.get("LARGE_PREFIX_MAX_TOKENS", "8000"))
 # This locustfile is the single source of truth for the default; wrapper scripts
 # (bench.sh, bench-residency-ab.sh) pass this through only when the caller sets it.
 NUM_LARGE_PREFIXES = int(os.environ.get("NUM_LARGE_PREFIXES", "50"))
+# Seed for the stress/large-prefix pool. Each Locust process (warm-up, each
+# --compare arm) builds its own pool; without a fixed seed the arms would run
+# different prefix bytes and sizes, and warm-up would prime prefixes the main
+# run never sends. Same role as CHURN_SEED for the churn workload.
+PREFIX_SEED = int(os.environ.get("PREFIX_SEED", "42"))
 
 # Cache-churn workload configuration (PROMPT_DISTRIBUTION=churn)
 #
@@ -2463,16 +2470,18 @@ def initialize_large_prefixes():
     if _large_prefixes:
         return
 
-    logger.info(f"Generating {NUM_LARGE_PREFIXES} large prefixes...")
+    logger.info(f"Generating {NUM_LARGE_PREFIXES} large prefixes (PREFIX_SEED={PREFIX_SEED})...")
 
     prefix_types = ["rag", "fewshot", "system", "mixed"]
+    rng = random.Random(PREFIX_SEED)
 
     for i in range(NUM_LARGE_PREFIXES):
-        # Random size within configured range
-        target_tokens = random.randint(LARGE_PREFIX_MIN_TOKENS, LARGE_PREFIX_MAX_TOKENS)
+        # Size and chunk order both come from the seeded generator so every
+        # process in a run (warm-up, each arm) builds byte-identical prefixes.
+        target_tokens = rng.randint(LARGE_PREFIX_MIN_TOKENS, LARGE_PREFIX_MAX_TOKENS)
         prefix_type = prefix_types[i % len(prefix_types)]
 
-        prefix_text = generate_large_prefix(target_tokens, prefix_type, i)
+        prefix_text = generate_large_prefix(target_tokens, prefix_type, i, rng=rng)
         actual_tokens = estimate_tokens(prefix_text)
 
         _large_prefixes.append((prefix_text, actual_tokens))
