@@ -133,3 +133,40 @@ def test_paired_uneven_counts_truncate_to_min():
 
 if __name__ == "__main__":
     sys.exit(__import__("pytest").main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Verdict honesty at n=3 (audit 2026-09-30, finding 4)
+# ---------------------------------------------------------------------------
+
+def test_one_contradicting_repeat_is_not_reliable():
+    # Q3 = mean of the two worst = (-20 + 15) / 2 = -2.5 < 0, so the old rule
+    # called this a reliable improvement. One repeat regressed 15%: it is MIXED.
+    baseline = [_run(p99=100), _run(p99=100), _run(p99=100)]
+    treatment = [_run(p99=70), _run(p99=80), _run(p99=115)]
+    agg = aggregate_compare(baseline, treatment, "p99_ttft_ms")
+    assert agg["reliable"] is False
+    assert agg["verdict"].startswith("MIXED")
+    assert "2/3 repeats agree" in agg["verdict"]
+    assert agg["agreeing_pairs"] == 2
+
+
+def test_two_agreeing_repeats_are_consistent_but_not_reliable():
+    agg = aggregate_compare([_run(p99=100), _run(p99=100)], [_run(p99=80), _run(p99=85)], "p99_ttft_ms")
+    assert agg["reliable"] is False
+    assert agg["verdict"].startswith("CONSISTENT IMPROVEMENT")
+    assert "too few repeats" in agg["verdict"]
+
+
+def test_three_agreeing_repeats_are_consistent_and_reliable():
+    agg = aggregate_compare([_run(p99=100)] * 3, [_run(p99=80), _run(p99=85), _run(p99=90)], "p99_ttft_ms")
+    assert agg["reliable"] is True
+    assert agg["verdict"].startswith("CONSISTENT IMPROVEMENT")
+    assert "3/3 repeats agree" in agg["verdict"]
+    assert "IQR" in agg["verdict"]
+
+
+def test_fmt_stat_prints_q1_q3_range():
+    from results_parser import _fmt_stat, _summarize_metric
+    text = _fmt_stat(_summarize_metric([-30.0, -20.0, 15.0]))
+    assert "IQR -25.0…-2.5" in text and "min -30.0" in text and "max 15.0" in text

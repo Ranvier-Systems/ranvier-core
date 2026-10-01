@@ -1934,9 +1934,15 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
 
     Computes the per-pair percent change of the discriminating metric, then the
     median and IQR of that change across repeats, and a verdict:
-      - < 2 pairs                -> INSUFFICIENT DATA
-      - IQR straddles zero       -> NO RELIABLE EFFECT (report, do not cherry-pick)
-      - otherwise                -> improvement / regression by the median change
+      - < 2 pairs                    -> INSUFFICIENT DATA
+      - IQR straddles zero           -> NO RELIABLE EFFECT (report, do not cherry-pick)
+      - every repeat same direction  -> CONSISTENT improvement / regression
+                                        (reliable only with >= 3 repeats)
+      - otherwise                    -> MIXED: not reliable, even if the IQR clears zero
+    "reliable" means every repeat moved the same way, nothing more: with n=3 the
+    inclusive-method Q3 is the mean of the two worst repeats, so an IQR that
+    clears zero can still hide one repeat that went the other way. No
+    significance test is performed; this tool has no claim to one at n=3.
     Also flags per-pair affinity-thrash hot-spots (treatment P99 >> baseline P99
     at high hit rate).
     """
@@ -1966,20 +1972,37 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
     lower_better = discriminating_metric in _LOWER_IS_BETTER
     delta_summ = _summarize_metric(deltas)
 
+    def _better(d: float) -> bool:
+        return (d < 0) if lower_better else (d > 0)
+
+    agreeing = 0
     if delta_summ is None or delta_summ["n"] < 2:
         verdict = "INSUFFICIENT DATA (need >= 2 valid repeats)"
         reliable = False
     else:
-        q1, q3 = delta_summ["q1"], delta_summ["q3"]
+        q1, q3, med = delta_summ["q1"], delta_summ["q3"], delta_summ["median"]
+        n_valid = delta_summ["n"]
+        improved = _better(med)
+        agreeing = sum(1 for d in deltas if d != 0 and _better(d) == improved)
+        direction = "IMPROVEMENT" if improved else "REGRESSION"
+        iqr_txt = f"IQR {q1:+.1f}…{q3:+.1f}"
         if q1 <= 0 <= q3:
-            verdict = "NO RELIABLE EFFECT (IQR spans zero)"
+            verdict = f"NO RELIABLE EFFECT ({iqr_txt} spans zero) on {discriminating_metric}"
+            reliable = False
+        elif agreeing == n_valid and n_valid >= 3:
+            verdict = (f"CONSISTENT {direction}: median {med:+.1f}% on {discriminating_metric} "
+                       f"({agreeing}/{n_valid} repeats agree; {iqr_txt})")
+            reliable = True
+        elif agreeing == n_valid:
+            verdict = (f"CONSISTENT {direction}: median {med:+.1f}% on {discriminating_metric} "
+                       f"({agreeing}/{n_valid} repeats agree; {iqr_txt}) — "
+                       f"too few repeats to call reliable (need >= 3)")
             reliable = False
         else:
-            med = delta_summ["median"]
-            improved = (med < 0) if lower_better else (med > 0)
-            verdict = (f"{'IMPROVEMENT' if improved else 'REGRESSION'}: "
-                       f"median {med:+.1f}% on {discriminating_metric}")
-            reliable = True
+            verdict = (f"MIXED: median {med:+.1f}% on {discriminating_metric} "
+                       f"({agreeing}/{n_valid} repeats agree; {iqr_txt}) — not reliable: "
+                       f"{n_valid - agreeing} repeat(s) moved the other way")
+            reliable = False
 
     return {
         "mode": "paired-ab",
@@ -1992,6 +2015,7 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
         "hotspots": hotspots,
         "verdict": verdict,
         "reliable": reliable,
+        "agreeing_pairs": agreeing,
         "baseline": aggregate_runs(baseline_runs)["metrics"],
         "treatment": aggregate_runs(treatment_runs)["metrics"],
     }
@@ -2000,8 +2024,12 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
 def _fmt_stat(s: Optional[Dict[str, Any]]) -> str:
     if not s:
         return "n/a"
-    iqr = "" if s["iqr"] is None else f", IQR {s['iqr']:.1f}"
-    return f"median {s['median']:.1f} [{s['min']:.1f}..{s['max']:.1f}]{iqr} (n={s['n']})"
+    # Print the Q1…Q3 RANGE, not just its width: the results doc quotes ranges
+    # ("IQR −15.6…−8.5") and nothing used to print one.
+    iqr = ""
+    if s["iqr"] is not None:
+        iqr = f", IQR {s['q1']:.1f}…{s['q3']:.1f} (width {s['iqr']:.1f})"
+    return f"median {s['median']:.1f} [min {s['min']:.1f} .. max {s['max']:.1f}]{iqr} (n={s['n']})"
 
 
 def _ttft_sources_line(agg: Dict[str, Any]) -> str:
@@ -2021,6 +2049,8 @@ def format_aggregate(agg: Dict[str, Any]) -> str:
                      f"discriminating metric: {agg['discriminating_metric']}")
         lines.append("=" * 72)
         lines.append(f"VERDICT: {agg['verdict']}")
+        lines.append("  ('reliable' = every repeat moved the same direction, n >= 3; "
+                     "no significance test is performed)")
         lines.append(_ttft_sources_line(agg))
         ds = agg["delta_pct"]
         if ds:

@@ -89,6 +89,7 @@ overclaimed:
   the bucket resolution wherever the Locust-table number is shown.
 
 ### 4. "Reliable" verdict at n=3 is not statistically supported — Sev 5, CONFIRMED
+- **Status:** FIXED 2026-10-01. `aggregate_compare` now calls a result CONSISTENT only when every repeat moved the same direction, and `reliable` only with three or more such repeats; an IQR clearing zero with one repeat the other way is reported as MIXED with the agreeing count. `_fmt_stat` prints the Q1…Q3 range (plus width). The formatter states that no significance test is performed.
 - `results_parser.py:1773-1783` `_quartiles` uses `statistics.quantiles(method="inclusive")`;
   with n=3, Q1 = mean(s0,s1), Q3 = mean(s1,s2). Verdict (`:1883-1892`) is "reliable
   IMPROVEMENT" whenever Q3 < 0. Reproduced: pairs (−30%, −20%, **+15%**) → Q3 = −2.5 →
@@ -333,6 +334,7 @@ overclaimed:
 ---
 
 ## Documentation carrying superseded or unsupported figures
+- **Status:** FIXED 2026-10-01. README performance table rewritten around the July 2026 figures and route consistency; the reproduction guide's expected results, key-metric table and "what good looks like" rewritten; the methodology doc's dated "Expected Metrics Reference" moved verbatim into the history notebook under a superseded banner; `kv-cache-prefix-routing-benchmark.md` carries a superseded banner; hybrid-fleets.md no longer calls the 44% figure the headline. README's February table and CHANGELOG entries remain as labelled history. The locustfile docstring defaults were corrected in the earlier commits.
 
 - `README.md:58-63` "Performance Characteristics" table: "Cache Hit Rate 58–98%", "Ranvier P50
   Overhead ~7 ms", "Radix Tree Lookup <50 μs" — all from the 5-prefix campaign the same README

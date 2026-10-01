@@ -57,10 +57,12 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 
 | Metric | Measured | Notes |
 |--------|----------|-------|
-| **Radix Tree Lookup** | < 50μs | Pure routing decision (O(L) where L = prefix length) |
-| **Total Routing Overhead** | 1-10ms | Includes tokenization; scales with prompt size |
-| **Ranvier P50 Overhead** | ~7ms | Measured vs direct vLLM connection |
-| **Cache Hit Rate** | 58-98% | With prefix-heavy workloads (RAG, few-shot) |
+| **Radix Tree Lookup** | < 50μs | Pure routing decision, O(L) in prefix length; component micro-benchmark (`make bench-hot-prefix`) |
+| **Per-request Routing Overhead** | ~2–16 ms | Includes tokenization; measured ~1.7 ms at 30 users and ~16 ms at 10 users in the July 2026 campaign |
+| **Route Consistency** | ~3× round-robin | Share of requests landing on the same backend as the previous request with that prefix (a client-side affinity proxy, not a KV-cache hit rate) |
+| **P99 TTFT vs round-robin** | −13% … +29% | Depends on load: see [Benchmark Results](#benchmark-results) |
+
+Figures from the superseded February 2026 five-prefix campaign (such as "58–98% cache hit rate" and "~7 ms P50 overhead") are no longer quoted here; they appear only in the history section below.
 
 **Design Principles:**
 * **Minimized Copying:** Uses `string_view` parsing with single network buffer copy; Radix lookups use `std::span` for zero-copy token access.
