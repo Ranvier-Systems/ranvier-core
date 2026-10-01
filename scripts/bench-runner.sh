@@ -10,7 +10,7 @@
 #   ./scripts/bench-runner.sh                          # Default: --suite rebaseline (x3 repeats)
 #   ./scripts/bench-runner.sh --suite rebaseline       # The citable 4-config matrix, A/B, x3
 #   ./scripts/bench-runner.sh --suite epsilon          # Leg V1: bounded-load epsilon 0.5, x3
-#   ./scripts/bench-runner.sh --suite fitted           # 13B with a prefix set that fits its KV cache, x3
+#   ./scripts/bench-runner.sh --suite fitted           # 13B (10u, 20u) with a prefix set that fits its KV cache, x3
 #   ./scripts/bench-runner.sh --suite low              # Exploratory: 70B, 64-user stress
 #   ./scripts/bench-runner.sh --suite all              # rebaseline + epsilon + low
 #   ./scripts/bench-runner.sh --suite custom --file runs.txt  # Custom run file
@@ -279,19 +279,24 @@ BUILT-IN SUITES:
       rate regression; record whether it WORSENS 13B/10u (Option 0 evidence).
       For the factor/floor variant add --hash-strategy jump, or bench.sh refuses.
 
-    fitted (1 config x 2 arms x 3 repeats, ~1.5h) — 13B in the regime where routing
+    fitted (2 configs x 2 arms x 3 repeats, ~3h) — 13B in the regime where routing
       can matter. The rebaseline 13B rows run a ~250k-token hot set against
-      ~11.6k tokens of KV per backend (measured 2026-10-01 on A100-40GB), so
-      every backend evicts whatever the router does. This row shrinks the set
-      to 16 prefixes of 2000..4000 tokens (~48k, ~6k per backend) so a
-      backend's share plus in-flight requests fits:
+      ~11.6k tokens of KV per backend (measured 2026-10-01 on A100-40GB: KV
+      hit rate 5% round-robin vs 14% prefix at 30 users, with preemptions),
+      so every backend evicts whatever the router does. These rows shrink
+      the set to 16 prefixes of 2000..4000 tokens (~48k, ~6k per backend):
       7. 13B 10 users 10m   --compare --warmup --num-prefixes 16 --prefix-max-tokens 4000
-      Compare with rebaseline row 4 (same load, default set): if the +29%-class
-      regression persists here, it is not a cache-capacity artefact.
+         A backend's share plus 10 users' in-flight requests fits comfortably.
+      8. 13B 20 users 10m   same set. Marginal: ~6k share + ~7.5k in-flight
+         slightly exceeds 11.6k, so expect some eviction; it is the load
+         gradient point between row 7 and the rebaseline rows, not a clean fit.
+      Compare row 7 with rebaseline row 4 and row 8 with rebaseline row 3 (same
+      load, default set). If the low-load regression persists on the fitted
+      set, it is not a cache-capacity artefact.
 
     low (2 runs, exploratory, not part of any headline):
-      8. 70B model test (16 users, TP auto)
-      9. 8B high-concurrency stress (64 users, single arm)
+      9.  70B model test (16 users, TP auto)
+      10. 8B high-concurrency stress (64 users, single arm)
 
     all = rebaseline + epsilon + fitted + low.
 
@@ -437,6 +442,14 @@ define_runs() {
     add_run fitted "13B 10u/10m A/B, fitted prefix set (16 x 2000..4000)" \
         --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 10m --users 10 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    # Same set at 20 users: a backend's ~6k share plus ~7.5k in-flight slightly
+    # exceeds 11.6k, so this is the gradient point between row 7 and the
+    # rebaseline rows rather than a clean fit. Pairs with rebaseline row 3.
+    add_run fitted "13B 20u/10m A/B, fitted prefix set (16 x 2000..4000, marginal)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
         --num-prefixes 16 --prefix-max-tokens 4000
 
     # --- low: exploratory, outside any headline --------------------------------
