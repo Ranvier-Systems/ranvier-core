@@ -76,8 +76,14 @@ fi
 
 # -----------------------------------------------------------------------------
 section "4. Host toolchain"
-for t in docker python3 bc jq curl git; do
-    if command -v "$t" >/dev/null 2>&1; then ok "$t"; else bad "$t not found (bench.sh / run-benchmark.sh need it)"; fi
+for t in docker python3 curl git; do
+    if command -v "$t" >/dev/null 2>&1; then ok "$t"; else bad "$t not found (bench.sh needs it)"; fi
+done
+# bc and jq are NOT needed by the GPU campaign: bench.sh uses bc only inside a
+# guarded block with an integer fallback (KV-fit autosizing), and jq only by the
+# mock-CI gate (run-benchmark.sh). Report, do not block.
+for t in bc jq; do
+    if command -v "$t" >/dev/null 2>&1; then ok "$t (optional for bench.sh; required by run-benchmark.sh)"; else warn "$t not found — fine for bench.sh/bench-runner.sh; install (apt-get install -y bc jq) before running the CI gate script locally"; fi
 done
 if docker ps >/dev/null 2>&1; then ok "docker usable without sudo"; else bad "cannot run docker (add user to docker group, or run under sudo)"; fi
 if docker compose version >/dev/null 2>&1; then ok "docker compose v2"; else bad "docker compose v2 not available"; fi
@@ -92,7 +98,11 @@ if python3 -c "import yaml" 2>/dev/null; then ok "python3 yaml module"; else war
 AVAIL_TMP=$(df -Pm /tmp 2>/dev/null | awk 'NR==2{print $4}'); AVAIL_HERE=$(df -Pm . 2>/dev/null | awk 'NR==2{print $4}')
 [[ "${AVAIL_TMP:-0}" -ge 5000 ]] && ok "/tmp free: ${AVAIL_TMP} MB (vLLM logs, core dumps)" || warn "/tmp has only ${AVAIL_TMP:-?} MB free"
 [[ "${AVAIL_HERE:-0}" -ge 5000 ]] && ok "repo volume free: ${AVAIL_HERE} MB (benchmark-reports)" || warn "repo volume has only ${AVAIL_HERE:-?} MB free"
-ULIM=$(ulimit -n); [[ "$ULIM" -ge 65536 ]] && ok "ulimit -n $ULIM" || warn "ulimit -n is $ULIM; bench.sh --setup raises it (Locust with many users needs >= 65536)"
+# vLLM runs as HOST processes (Locust and Ranvier run in containers under the
+# daemon's own limits), so the shell's fd limit applies to vLLM only. 1024 is
+# ample for the suites here (<= 64 concurrent users); bench.sh --setup does not
+# change it. Raise in the launching shell if you go far beyond that.
+ULIM=$(ulimit -n); [[ "$ULIM" -ge 4096 ]] && ok "ulimit -n $ULIM (applies to the host vLLM processes)" || warn "ulimit -n is $ULIM: fine for the built-in suites; run 'ulimit -n 65536' in this shell first if you benchmark hundreds of users"
 
 # -----------------------------------------------------------------------------
 section "5. Compose file"
