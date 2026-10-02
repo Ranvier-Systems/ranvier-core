@@ -1286,6 +1286,15 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
   13B/30u −9.1% (both reliable wins), 13B/20u no reliable effect, 13B/10u **+29% (reliable
   regression)** — monotonic in cluster throughput. Cache hit +3× everywhere, decoupled from P99.
   Written up in `docs/benchmarks/benchmark-results-current.md`.
+- [x] **Re-baseline on fixed tooling (2026-10-01, 8×A100-40GB, `bench-runner.sh --suite rebaseline`,
+  12/12 runs, 7h11m):** 8B/20u **−17.0% P99, 3/3 repeats agree** (KV hit 72%→94%): the one July
+  row that reproduces, stronger. All three 13B rows measured an eviction regime (11,648 KV
+  tokens/backend vs a ~250k-token hot set; KV hits 4–6% RR, 14–26% prefix; 216–277 preemptions/
+  backend/45 min): 30u no reliable effect (was −9.1%), **20u +11.0% consistent regression** (was
+  +3.8%), 10u no reliable effect (was +29%). July's "monotonic in throughput" reading does not
+  survive. Written up in `benchmark-results-current.md`; July moved to its superseded section.
+  **Next:** `--suite fitted` (13B with a KV-fitting set, 10u + 20u ×3) decides whether the 20u
+  regression is a memory-pressure artefact; then `--suite epsilon` on a fitting set.
 - [ ] **Item 5 — threshold leg** (shipped `2.0/2` vs raised `3.0/4`) NOT yet run; the 30–47%
   load-aware fallback rates seen across the matrix make it the highest-value remaining GPU run.
   Runbook `benchmark-rebaseline-campaign.md` §2; run files under `docs/benchmarks/rebaseline/`.

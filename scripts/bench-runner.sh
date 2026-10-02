@@ -171,7 +171,7 @@ extract_metrics() {
         ttft_improv=$(grep "TTFT Improvement:" "$log_file" 2>/dev/null | tail -1 | grep -oP '\-?[0-9.]+(?=%)' || echo "")
         if [[ -n "$hit_rate" || -n "$ttft_improv" ]]; then
             echo -ne "    ${label:+${BOLD}${label}:${NC} }"
-            [[ -n "$hit_rate" ]] && echo -ne "Cache: ${hit_rate}%"
+            [[ -n "$hit_rate" ]] && echo -ne "Route consistency: ${hit_rate}%"
             [[ -n "$hit_rate" && -n "$cache_hits" ]] && echo -ne " (${cache_hits} hits)"
             [[ -n "$ttft_improv" ]] && echo -ne " | TTFT Improv: ${ttft_improv}%"
             echo ""
@@ -181,7 +181,8 @@ extract_metrics() {
 
     # Parse JSON with lightweight field extraction (no jq dependency)
     local hit_rate cache_hits ttft_improv total_reqs failed_reqs tokens_sec
-    hit_rate=$(echo "$json_line" | grep -oP '"cache_hit_rate_pct":\s*[0-9.]+' | grep -oP '[0-9.]+$' || echo "")
+    # route_consistency_pct since 2026-09-30; cache_hit_rate_pct in older logs.
+    hit_rate=$(echo "$json_line" | grep -oP '"(route_consistency_pct|cache_hit_rate_pct)":\s*[0-9.]+' | head -1 | grep -oP '[0-9.]+$' || echo "")
     cache_hits=$(echo "$json_line" | grep -oP '"cache_hits":\s*[0-9]+' | grep -oP '[0-9]+$' || echo "")
     ttft_improv=$(echo "$json_line" | grep -oP '"ttft_improvement_pct":\s*-?[0-9.]+' | grep -oP '\-?[0-9.]+$' || echo "")
     total_reqs=$(echo "$json_line" | grep -oP '"total_requests":\s*[0-9]+' | grep -oP '[0-9]+$' || echo "")
@@ -189,7 +190,7 @@ extract_metrics() {
     tokens_sec=$(echo "$json_line" | grep -oP '"tokens_per_second":\s*[0-9.]+' | grep -oP '[0-9.]+$' || echo "")
 
     echo -ne "    ${label:+${BOLD}${label}:${NC} }"
-    [[ -n "$hit_rate" ]] && echo -ne "Cache: ${hit_rate}%"
+    [[ -n "$hit_rate" ]] && echo -ne "Route consistency: ${hit_rate}%"
     [[ -n "$cache_hits" ]] && echo -ne " (${cache_hits} hits)"
     [[ -n "$ttft_improv" ]] && echo -ne " | TTFT Improv: ${ttft_improv}%"
     [[ -n "$tokens_sec" ]] && echo -ne " | Tok/s: ${tokens_sec}"
@@ -804,7 +805,8 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
                         # became five lines of numbers). Only the top-level values are wanted.
                         hr=$(echo "$json_line" | python3 -c 'import json,sys
 try:
-    v = json.loads(sys.stdin.read()).get("cache_hit_rate_pct")
+    j = json.loads(sys.stdin.read())
+    v = j.get("route_consistency_pct", j.get("cache_hit_rate_pct"))
     print("" if v is None else "%.1f" % v)
 except Exception:
     pass' 2>/dev/null || echo "")
