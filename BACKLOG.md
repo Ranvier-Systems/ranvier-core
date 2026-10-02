@@ -1395,6 +1395,47 @@ Kimi K2 (and, once public, K3) with correct prefix-cache alignment.
 
 ---
 
+## 27. Strategic Assessment (2026-10-02)
+
+Full write-up: [`docs/audits/strategic-assessment-2026-10-02.md`](docs/audits/strategic-assessment-2026-10-02.md).
+Scorecard: Architecture **B**, Reliability **B−**, Progress-to-goal **C+**. Trigger: the 2026-10-01
+re-baseline (§25) — one configuration demonstrates the goal with a real cache metric (8B/20u:
+KV hit 72→94%, P99 −17% ×3); every 13B row sat in an eviction regime (11,648 KV tokens/backend
+vs a ~250k-token hot set) where both arms were cache-cold and routing could not help.
+
+- [ ] **[STRATEGIC] KV-aware dispatch.** Extend the backend load signal with the already-scraped
+  `gpu_cache_usage_percent` (`health_service.cpp:425`, `vllm_metrics.hpp:21`) and add a
+  `kv_pressure` candidate field + weight to `route_scorer.hpp`, so dispatch diverts off an anchor
+  whose KV is near full as it does off one over its in-flight allowance. Addresses the 13B/20u
+  +11% regression at its mechanism (affinity concentrating onto evicting backends). Gate on the
+  `fitted` suite result: if the regression vanishes when the set fits, this is next.
+- [ ] **[STRATEGIC] Runtime regime detection.** Compute hot-set tokens (ART working set) against
+  per-backend KV capacity (vLLM reports it) and expose an operator-facing advisory: "fleet in
+  eviction regime — affinity degraded". The bench banner already computes the ratio offline.
+- [ ] **[STRATEGIC] Delete `JUMP`/`MODULAR` hash strategies and `load_imbalance_factor/floor`.**
+  Unreachable under the shipped `bounded_load` default; produced the inert threshold leg (§25
+  item 5, D2); `bench.sh` now refuses them. Remove config, compose, docs and the refusal check.
+- [ ] **[STRATEGIC] Fuzz target on the dispatch path** (`router_service.cpp` request → route).
+  The two load-bearing files (`router_service.cpp` 5,985 lines, `http_controller.cpp` 4,346)
+  are the only unfuzzed hot-path code and the place the KV term lands.
+- [ ] **[STRATEGIC] Four-arm benchmark design**: direct-to-vLLM, random, least-loaded without
+  affinity, prefix. Needs a least-loaded mode and a no-proxy arm in `bench.sh`. Then a capacity
+  sweep (working set ÷ KV at fixed load) and a multi-turn workload. Supersedes the throughput
+  "crossover" framing.
+- [ ] **[STRATEGIC] Re-scope GPU legs to a fitting set.** The "powered V0 rerun" (~9 GPU-h) and
+  the epsilon leg as written run 13B on the default 50-prefix set and would measure eviction
+  noise. Run them, if at all, with `--num-prefixes 16 --prefix-max-tokens 4000` or equivalent.
+- [ ] **[STRATEGIC] Freeze sideways growth** until the core claim is settled: no new Intelligence
+  Layer (§15), telemetry-export (§21) or model-template work; GIE EPP maintained, not expanded.
+- [ ] **[STRATEGIC] Benchmark code to data-plane standard.** Add `tests/integration/test_prom_scrape.py`,
+  `test_results_*.py` to CI; keep `bench-preflight.sh` in the runbook; a headline without a
+  manifest and a KV hit rate is not a result.
+- [ ] **[STRATEGIC] Reframe the public claim** in README/docs once `fitted` lands: "prefix routing
+  cuts P99 when the fleet's KV cache can hold its share of the hot set, and Ranvier tells you
+  which regime you are in."
+
+---
+
 ## References
 
 - [Ranvier Architecture](./architecture.md)
