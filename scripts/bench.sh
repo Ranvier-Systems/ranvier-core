@@ -1477,10 +1477,16 @@ if [[ "$MULTI_DEPTH" = true ]]; then
     log_info "Multi-depth routing enabled (Option C)"
 fi
 
-# Export load-aware routing settings for docker-compose
+# Export load-aware routing settings for docker-compose. --no-load-aware wins;
+# otherwise an explicit host env RANVIER_LOAD_AWARE_ROUTING=false is honored
+# (it used to be silently overwritten to true, which turned a "pure affinity"
+# leg into another default-config run; the manifest records the effective value).
 if [[ "$LOAD_AWARE" = false ]]; then
     export RANVIER_LOAD_AWARE_ROUTING=false
-    log_info "Load-aware routing disabled (pure affinity mode)"
+    log_info "Load-aware routing disabled (pure affinity mode, --no-load-aware)"
+elif [[ "${RANVIER_LOAD_AWARE_ROUTING:-true}" == "false" ]]; then
+    export RANVIER_LOAD_AWARE_ROUTING=false
+    log_info "Load-aware routing disabled (pure affinity mode, RANVIER_LOAD_AWARE_ROUTING=false in env)"
 else
     export RANVIER_LOAD_AWARE_ROUTING=true
 fi
@@ -1510,10 +1516,10 @@ fi
 
 # Effective routing config the server is about to launch with. Printed at
 # second 0 so a misconfigured load-aware experiment is caught immediately
-# rather than after a 30-minute run. NOTE: these flags (--no-load-aware,
-# --load-imbalance-factor/floor) are the ONLY supported way to override
-# load-aware behavior — a bare `RANVIER_LOAD_AWARE_ROUTING=... ./bench.sh`
-# env prefix is overwritten by the export above and has no effect.
+# rather than after a 30-minute run. --no-load-aware and
+# --load-imbalance-factor/floor are the preferred way to override load-aware
+# behavior; a `RANVIER_LOAD_AWARE_ROUTING=false ./bench.sh` env prefix is
+# honored too (see the export above).
 # KV-cache regime. Prefix routing can only pay off when the hot prefix set does
 # not fit in one backend's KV cache but does fit when split across backends;
 # below that, round-robin already hits, and above it every backend thrashes
