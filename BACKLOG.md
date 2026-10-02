@@ -1415,6 +1415,11 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   among under-cap probes), and consider a pull rule for backends far below average. Acceptance
   test: `--suite fitted` 13B 20u turns to a consistent improvement. Cheaper and better supported
   than the KV-aware item below; do it first.
+  **Implemented 2026-10-02 (awaiting the acceptance run):** `bounded_load_select` now diverts an
+  over-cap primary to the least-loaded live candidate (probe order breaks equal loads), and the
+  scorer's dispatch tie order ranks load ahead of `probe_rank` so ART-hit diverts do the same. No
+  pull rule: an under-cap primary keeps affinity, so the change is isolated to requests that were
+  already being diverted. Re-run `--suite fitted` 13B 20u to close this item.
 - [ ] **[STRATEGIC] KV-aware dispatch.** Extend the backend load signal with the already-scraped
   `gpu_cache_usage_percent` (`health_service.cpp:425`, `vllm_metrics.hpp:21`) and add a
   `kv_pressure` candidate field + weight to `route_scorer.hpp`, so dispatch diverts off an anchor

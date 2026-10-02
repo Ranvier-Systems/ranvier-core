@@ -25,7 +25,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <random>
+#include <vector>
 
 // ============================================================================
 // RouterService: Central Routing Orchestration
@@ -1436,15 +1438,31 @@ inline int32_t jump_consistent_hash(uint64_t key, int32_t num_buckets) {
 // Hash Strategy: Bounded-Load Consistent Hashing
 // ============================================================================
 // Mirrokni, Thorup, Zadimoghaddam (Google, 2018).
-// Caps each backend at ceil(avg_load * (1 + epsilon)). When the primary
-// jump-hash bucket exceeds capacity, probe subsequent buckets until one
-// with headroom is found. Falls back to least-loaded on full saturation.
+// Caps each backend at ceil(avg_load * (1 + epsilon)). The primary jump-hash
+// bucket keeps the request while it is under cap (affinity). When it is over
+// cap the request is DIVERTED to the least-loaded live candidate; equal loads
+// break in jump-probe order (deterministic), then by position.
+//
+// Why least-loaded and not first-under-cap (the Mirrokni paper's rule): the
+// 2026-10-02 fitted-suite GPU campaign showed that first-under-cap probing
+// only pushes load away from hot anchors and never pulls it toward the
+// coldest backend. With epsilon 0.25 on 8 backends every prefix arm left one
+// backend 35-45% below the fleet mean while 30% of requests were already
+// being diverted; once the fleet was queue-bound that stranded eighth of the
+// capacity was a consistent +10% P99 regression (BACKLOG section 27). A
+// divert is already an affinity break, so sending it to the coldest backend
+// costs nothing in cache terms and removes the stranding. The probe sequence
+// itself is part of the problem: for n = 8 the n jump probes of one key
+// visit every bucket for well under 1% of keys, so under the old rule some
+// backends were simply unreachable from a given prefix. Saturation (every
+// candidate at or over cap) needs no separate path: least-loaded is the
+// answer there too.
 //
 // Load awareness is built into the hash selection itself, so the post-anchor
 // load term does not re-apply to BOUNDED_LOAD hash anchors.
 //
 // Rule #1: Lock-free — all reads are shard-local plain integers.
-// Rule #4: probe loop bounded by live_backends.size().
+// Rule #4: both loops bounded by live_backends.size() (<= 64, discovery cap).
 static BackendId bounded_load_select(
     uint64_t prefix_hash,
     const std::vector<BackendId>& live_backends,
@@ -1468,50 +1486,66 @@ static BackendId bounded_load_select(
     // Compute total capacity-adjusted load across all live backends for average.
     // When cache headroom data is available and capacity_headroom_weight > 0,
     // backends with fuller caches appear more loaded — especially for large requests.
+    // Loads are read once per candidate and reused by the divert scan below.
+    // Rule #4: scratch sized by the live set (<= 64).
+    std::vector<uint64_t> loads;
+    loads.reserve(static_cast<size_t>(n));
     uint64_t total_load = 0;
     for (BackendId id : live_backends) {
-        total_load += get_capacity_adjusted_load(id, estimated_cost);
+        loads.push_back(get_capacity_adjusted_load(id, estimated_cost));
+        total_load += loads.back();
     }
     double avg = static_cast<double>(total_load) / static_cast<double>(n);
     // Cap: at least 1 to avoid starving all backends when idle
     uint64_t cap = std::max(static_cast<uint64_t>(1),
                             static_cast<uint64_t>(std::ceil(avg * (1.0 + epsilon))));
 
-    // Probe from primary hash bucket, then sequential offsets
+    // Primary bucket under cap: affinity holds, no divert.
+    const int32_t primary_idx = jump_consistent_hash(prefix_hash, n);
+    const uint64_t primary_load = loads[static_cast<size_t>(primary_idx)];
+    if (primary_load < cap) {
+        return live_backends[primary_idx];
+    }
+
+    // Primary over cap: divert to the least-loaded candidate. Ties break by
+    // jump-probe rank (first appearance in the probe sequence
+    // jump_consistent_hash(prefix_hash + k, n), k = 0..n-1) so equal-load
+    // targets stay deterministic and cluster-consistent; candidates the probe
+    // sequence never reaches rank after all probed ones, then by position.
+    std::vector<uint32_t> probe_rank(static_cast<size_t>(n),
+                                     std::numeric_limits<uint32_t>::max());
     for (int32_t probe = 0; probe < n; ++probe) {
-        int32_t idx = jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n);
-        BackendId candidate = live_backends[idx];
-        uint64_t load = get_capacity_adjusted_load(candidate, estimated_cost);
-        if (load < cap) {
-            if (probe > 0) {
-                // Diverted from primary — record as load-aware fallback
-                g_shard_state->stats.load_aware_fallbacks++;
-                if (g_metrics) {
-                    metrics().record_load_aware_fallback();
-                }
-                log_router.debug("[{}] Bounded-load: primary over cap ({}>{}), "
-                                 "probe {} -> backend {} (load={})",
-                                 request_id, get_capacity_adjusted_load(live_backends[jump_consistent_hash(prefix_hash, n)], estimated_cost),
-                                 cap, probe, candidate, load);
-            }
-            return candidate;
+        auto idx = static_cast<size_t>(
+            jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n));
+        if (probe_rank[idx] == std::numeric_limits<uint32_t>::max()) {
+            probe_rank[idx] = static_cast<uint32_t>(probe);
         }
     }
 
-    // All backends at or above cap — fall back to least-loaded
-    auto [least_id, least_load] = get_least_loaded_backend(live_backends);
-    if (least_id != 0) {
-        g_shard_state->stats.load_aware_fallbacks++;
-        if (g_metrics) {
-            metrics().record_load_aware_fallback();
+    size_t best = static_cast<size_t>(primary_idx);
+    for (size_t i = 0; i < static_cast<size_t>(n); ++i) {
+        if (i == best) continue;
+        if (loads[i] < loads[best] ||
+            (loads[i] == loads[best] && probe_rank[i] < probe_rank[best])) {
+            best = i;
         }
-        log_router.debug("[{}] Bounded-load: all over cap ({}), least-loaded -> backend {} (load={})",
-                         request_id, cap, least_id, least_load);
-        return least_id;
     }
 
-    // Absolute fallback: primary bucket
-    return live_backends[jump_consistent_hash(prefix_hash, n)];
+    if (best == static_cast<size_t>(primary_idx)) {
+        // Nothing colder than the primary (uniform saturation): stay put. Not
+        // a divert, so not counted as one.
+        return live_backends[primary_idx];
+    }
+
+    g_shard_state->stats.load_aware_fallbacks++;
+    if (g_metrics) {
+        metrics().record_load_aware_fallback();
+    }
+    log_router.debug("[{}] Bounded-load: primary backend {} over cap (load={} >= cap={}), "
+                     "least-loaded -> backend {} (load={}, probe_rank={})",
+                     request_id, live_backends[primary_idx], primary_load, cap,
+                     live_backends[best], loads[best], probe_rank[best]);
+    return live_backends[best];
 }
 
 // ============================================================================
@@ -3334,12 +3368,14 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         scored.push_back(c);
     }
 
-    // BOUNDED_LOAD spillover order: when an ART anchor forfeits its
-    // allowance, the former override re-probed the jump-hash sequence and
-    // took the first under-cap candidate — a deterministic, cluster-
-    // consistent target. Probe ranks reproduce it through the comparator,
-    // filled only for under-allowance candidates so the saturated case falls
-    // through to the least-loaded tie-break.
+    // BOUNDED_LOAD spillover tie order: when an ART anchor forfeits its
+    // allowance, every under-allowance candidate scores equal (zero hinge, no
+    // affinity) and the scorer's tie keys pick the target: least loaded
+    // first, then jump-probe rank. Probe ranks are filled here so equal-load
+    // targets stay deterministic and cluster-consistent; they no longer
+    // outrank load (the first-under-cap rule stranded the coldest backend,
+    // see bounded_load_select). Filled only for under-allowance candidates so
+    // the saturated case falls through to the least-loaded key unchanged.
     if (load_term && strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD &&
         art_hit && load_hinge(scored[anchor_index].load, allowance) > 0.0) {
         prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
@@ -5817,6 +5853,11 @@ size_t RouterService::prefix_hash_index_size_for_testing() {
 uint64_t RouterService::headroom_redirects_for_testing() {
     if (!g_shard_state) return 0;
     return shard_state().stats.headroom_redirects;
+}
+
+uint64_t RouterService::load_aware_fallbacks_for_testing() {
+    if (!g_shard_state) return 0;
+    return shard_state().stats.load_aware_fallbacks;
 }
 
 uint64_t RouterService::remote_routes_trust_refused_for_testing() {

@@ -915,6 +915,10 @@ public:
     // Shard-local headroom-divert counter observer (invariant R9).
     static uint64_t headroom_redirects_for_testing();
 
+    // Shard-local load-divert counter observer: every load-driven departure
+    // from the anchor (bounded-load, P2C, scorer load term).
+    static uint64_t load_aware_fallbacks_for_testing();
+
     // Shard-local trust-ladder refusal counter observer (invariant T7): gossip
     // REMOTE announcements refused by a higher-trust LOCAL/PUSH route.
     static uint64_t remote_routes_trust_refused_for_testing();

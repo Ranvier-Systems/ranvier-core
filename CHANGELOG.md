@@ -246,6 +246,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Bounded-load diversion targets the least-loaded backend** — `bounded_load_select`
+  used to send an over-cap primary to the first under-cap bucket in jump-probe order,
+  and the route scorer's dispatch tie order reproduced the same rule for ART-hit
+  diverts. That pushed load off hot anchors without ever pulling it toward the
+  coldest backend: every prefix arm of the 2026-10-02 fitted suite left one backend
+  35–45% below the fleet mean with 30% of requests already diverted, a consistent
+  +10% P99 TTFT regression at 13B/20 users. A divert now goes to the least-loaded
+  live candidate (jump-probe order breaks equal loads, keeping equal-load targets
+  deterministic), on both the hash-miss and ART-hit paths. An under-cap primary
+  still keeps affinity; a uniformly saturated fleet stays on the primary and no
+  longer counts a divert. Acceptance run (`bench-runner.sh --suite fitted`, 13B 20u)
+  pending; see BACKLOG §27.
+
 - **Unified weighted route scorer** (BACKLOG §20.1 P0.2) — The post-anchor
   routing decision is now one weighted ranking over the live candidates
   (`src/route_scorer.hpp`) instead of the former sequential override chain
