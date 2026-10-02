@@ -70,10 +70,53 @@ the main run, repeat 1 of each row. P99 TTFT is the exact percentile over every 
   load-aware fallback watches in-flight counts, not KV occupancy, so it does not see it.
   Whether that holds is the question the `fitted` suite answers (below).
 
-**Pending: `bench-runner.sh --suite fitted`** — 13B at 10 and 20 users with 16 prefixes of
-2000..4000 tokens (~48k, ~6k per backend) so a backend's share plus in-flight requests fits.
-If the 20-user regression disappears on the fitted set, it was a memory-pressure artefact;
-if it persists, the low-load problem is in the routing policy. Results will be appended here.
+### Fitted suite (measured 2026-10-02): 13B inside its KV cache
+
+`bench-runner.sh --suite fitted`: same fleet and router, 16 prefixes of 2000..4000 tokens
+(~48k, ~6k per backend) so a backend's share fits beside in-flight requests. Six runs, 6/6
+passed, three repeats per row, alternating arm order. Regime banner confirmed "fits when split
+across backends but not in one" (11,680 KV tokens/backend vs 48k working set).
+
+| Config | P99 TTFT per repeat | Verdict | KV hit rate, RR → prefix (rep 1) | Prefix-arm backend dist (min..max, Gini) |
+|--------|---------------------|---------|----------------------------------|------------------------------------------|
+| **13B 10u/10m, fitted** | −7.3, −5.8, −0.1 (IQR −6.6…−3.0) | ✅ consistent improvement, −5.8% median | 17.0% → 64.8% | 114..264, 0.151 / 132..292, 0.139 / 131..235, 0.119 |
+| **13B 20u/10m, fitted** | +10.1, +8.2, +21.4 (IQR +9.1…+15.7) | ❌ consistent regression, +10.1% median | 14.2% → 44.9% | 237..388, 0.060 / 217..433, 0.096 / 238..431, 0.094 |
+
+Round-robin arms in the same six runs: Gini 0.018–0.055, min..max within ±10% of the mean.
+vLLM preemptions stayed in single and low double digits per backend throughout the 20-user
+fitted runs (vs 216–277 per backend in 45 min on the default set at 30 users), so memory
+pressure was largely relieved.
+
+**What the fitted suite settles.**
+
+- **Fitting the set restored the cache signal and turned the 10-user row from noise into a
+  small consistent win** (KV hits 26% → 65%; P99 from ±12% sign-flips to −5.8% median). The
+  13B mechanism works when the cache can hold the set; at 10 users the queue is short, so the
+  tail benefit is single-digit, as the 8B story predicts.
+- **The 20-user regression is not a memory-pressure artefact.** With the set fitting and
+  preemptions low, the prefix arm still lost 8–21% on P99 while tripling its hit rate and
+  completing ~9% more requests. More completions in a closed loop means the *mean* improved;
+  the *tail* got worse.
+- **The mechanism is stranded capacity, visible in every prefix arm.** All six prefix arms
+  show one cold backend 35–45% below the mean (min 114–238 against means of ~190/~370) with the
+  rest 5–20% above; every round-robin arm is flat. The arithmetic matches prefix assignment
+  granularity: 16 prefixes learned onto 8 backends by first hit gives most backends two
+  prefixes and at least one backend a single prefix. `router_service.cpp` bounded-load
+  diversion probes the next consistent-hash buckets and takes the first candidate under cap
+  (`bounded_load_select`): it pushes away from overloaded backends and never pulls toward the
+  coldest one; with ε 0.25 the other seven may run 25% over average before any diversion
+  fires, so a backend 40% under average is invisible to the policy. Load-aware fallbacks were
+  30% of prefix-arm requests and still left the capacity stranded. At 10 users idle capacity
+  is not the binding constraint, so hits win; at 20 users the fleet is queue-bound and a
+  stranded eighth of it becomes tail latency. Real workloads have skewed prefix popularity and
+  will produce the same effect without any benchmark artefact.
+
+**Consequences.** (1) The remedy is in dispatch, not in cache sizing: when an anchor is over
+cap, divert to the *least-loaded* under-cap candidate rather than the first hash probe, and
+consider a pull rule for backends far below average. (2) Leg V1 as written sweeps ε *looser*
+(0.5), which would strand more; the informative sweep is *tighter* (0.1). (3) The 13B 20-user
+row is the regression test for whichever fix lands: a consistent improvement there, on the
+fitted set, is the acceptance criterion. Archive: `docs/benchmarks/results/2026-10-02-fitted/`.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
@@ -97,15 +140,13 @@ now shows were measured in an eviction regime.
 
 ## Still open
 
-- **`fitted` suite** (13B inside its KV cache, 10u and 20u, ×3): decides whether the 13B
-  20-user regression is a memory-pressure artefact. `bench-runner.sh --suite fitted`.
-- **Leg V1, epsilon** (`bench-runner.sh --suite epsilon`): bounded-load ε 0.5 vs the shipped
-  0.25 at 13B 30u and 10u, compared against this campaign's prefix arms. Replaces the
-  factor/floor "threshold leg" (BACKLOG §25 item 5), which was inert under the shipped
-  `bounded_load` strategy; `bench.sh` now refuses factor/floor without `--hash-strategy jump`.
-  Pre-registered rule unchanged: adopt a looser default only if median P99 improves ≥10% with
-  no incomplete-rate regression. Given the 13B regime finding, run it after `fitted`, and on a
-  set that fits, or it too will measure eviction.
+- **Least-loaded diversion fix + re-run of the fitted 20-user row** as its acceptance test
+  (BACKLOG §27). The fitted suite ran 2026-10-02 and localised the regression to stranded
+  capacity in `bounded_load_select`; see the fitted section above.
+- **Leg V1, epsilon** (`bench-runner.sh --suite epsilon`): the shipped file sweeps ε 0.5
+  (looser). The fitted result says looser strands more capacity; sweep *tighter* (0.1) instead,
+  on the fitted set, after the diversion fix. The factor/floor "threshold leg" (BACKLOG §25
+  item 5) remains inert under `bounded_load`; `bench.sh` refuses it without `--hash-strategy jump`.
 - **Four-arm design** (direct-to-vLLM, random, least-loaded without affinity, prefix): still
   the only way to separate affinity from load balancing and to measure Ranvier's own cost.
   Needs a least-loaded mode and a no-proxy arm in `bench.sh`.

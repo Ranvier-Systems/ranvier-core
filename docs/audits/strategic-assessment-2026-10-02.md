@@ -134,9 +134,16 @@ with a fuzz target on the dispatch path, because `router_service.cpp` is where i
    scrape layer now exist; add them to CI, keep the preflight in the runbook, and treat a
    headline number without a manifest and a KV hit rate as not a result.
 
-## Pending evidence
+## Addendum (same day): the fitted suite landed
 
-`bench-runner.sh --suite fitted` (13B at 10 and 20 users with a 48k-token set that fits
-its cache) is running. If the 20-user regression disappears, the mechanism in §4 is
-confirmed and the KV-pressure refactor is the next engineering item. If it persists, the
-regression is in the routing policy and the four-arm design moves first.
+13B inside its cache: 10 users −5.8% P99, consistent (KV hits 17% → 65%); 20 users **+10.1%,
+consistent** (+10.1, +8.2, +21.4; KV hits 14% → 45%; preemptions single digits). The 20-user
+regression is therefore not memory pressure. All six prefix arms show one backend 35–45% below
+the mean while round-robin is flat; `bounded_load_select` pushes load away from over-cap
+anchors to the first under-cap hash probe and never pulls toward the coldest backend, so with
+ε 0.25 a stranded eighth of the fleet is invisible to the policy and becomes tail latency once
+the fleet is queue-bound. The §4 recommendation is revised in order: **least-loaded diversion
+first** (small change, acceptance test = fitted 20u turns positive), KV-aware dispatch second
+(it protects the eviction regime), and the epsilon leg re-aimed tighter rather than looser.
+The four-arm design remains the way to separate affinity from load balancing in general; the
+fitted suite has already done so for this one failure.

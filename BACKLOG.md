@@ -1405,12 +1405,22 @@ re-baseline (§25) — one configuration demonstrates the goal with a real cache
 KV hit 72→94%, P99 −17% ×3); every 13B row sat in an eviction regime (11,648 KV tokens/backend
 vs a ~250k-token hot set) where both arms were cache-cold and routing could not help.
 
+- [ ] **[STRATEGIC] Least-loaded diversion (fitted-suite finding, 2026-10-02).** `bounded_load_select`
+  (`router_service.cpp`) diverts an over-cap anchor to the FIRST under-cap consistent-hash probe;
+  it never pulls toward the coldest backend and only falls back to least-loaded when every backend
+  is over cap. All six fitted-suite prefix arms left one backend 35–45% below the mean (Gini
+  0.06–0.15 vs ≤0.055 under round-robin) with 30% of requests already diverted; at 20 users that
+  stranded eighth of the fleet is a consistent +10% P99 regression despite 3× the KV hit rate and
+  ~9% more completions. Fix: choose the least-loaded under-cap candidate when diverting (or P2C
+  among under-cap probes), and consider a pull rule for backends far below average. Acceptance
+  test: `--suite fitted` 13B 20u turns to a consistent improvement. Cheaper and better supported
+  than the KV-aware item below; do it first.
 - [ ] **[STRATEGIC] KV-aware dispatch.** Extend the backend load signal with the already-scraped
   `gpu_cache_usage_percent` (`health_service.cpp:425`, `vllm_metrics.hpp:21`) and add a
   `kv_pressure` candidate field + weight to `route_scorer.hpp`, so dispatch diverts off an anchor
-  whose KV is near full as it does off one over its in-flight allowance. Addresses the 13B/20u
-  +11% regression at its mechanism (affinity concentrating onto evicting backends). Gate on the
-  `fitted` suite result: if the regression vanishes when the set fits, this is next.
+  whose KV is near full as it does off one over its in-flight allowance. The fitted suite showed
+  the 13B/20u regression is stranded capacity, not preemption, so this is the second step: it
+  protects the eviction regime (default-set 13B rows) rather than fixing the 20u regression.
 - [ ] **[STRATEGIC] Runtime regime detection.** Compute hot-set tokens (ART working set) against
   per-backend KV capacity (vLLM reports it) and expose an operator-facing advisory: "fleet in
   eviction regime — affinity degraded". The bench banner already computes the ratio offline.
@@ -1424,9 +1434,10 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   affinity, prefix. Needs a least-loaded mode and a no-proxy arm in `bench.sh`. Then a capacity
   sweep (working set ÷ KV at fixed load) and a multi-turn workload. Supersedes the throughput
   "crossover" framing.
-- [ ] **[STRATEGIC] Re-scope GPU legs to a fitting set.** The "powered V0 rerun" (~9 GPU-h) and
-  the epsilon leg as written run 13B on the default 50-prefix set and would measure eviction
-  noise. Run them, if at all, with `--num-prefixes 16 --prefix-max-tokens 4000` or equivalent.
+- [ ] **[STRATEGIC] Re-scope GPU legs.** The "powered V0 rerun" (~9 GPU-h) and the epsilon leg
+  as written run 13B on the default 50-prefix set and would measure eviction noise; run them, if
+  at all, on the fitted set. The epsilon leg also sweeps the wrong direction: the fitted result
+  says looser ε strands more capacity, so sweep tighter (0.1), after the diversion fix.
 - [ ] **[STRATEGIC] Freeze sideways growth** until the core claim is settled: no new Intelligence
   Layer (§15), telemetry-export (§21) or model-template work; GIE EPP maintained, not expanded.
 - [ ] **[STRATEGIC] Benchmark code to data-plane standard.** Add `tests/integration/test_prom_scrape.py`,
