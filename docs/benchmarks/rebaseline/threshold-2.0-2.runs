@@ -4,4 +4,10 @@
 #   ./scripts/bench-runner.sh --suite custom \
 #       --file docs/benchmarks/rebaseline/threshold-2.0-2.runs \
 #       --repeat 3 --output-dir benchmark-reports/rebaseline/thr_2.0_2
---compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress --load-imbalance-factor 2.0 --load-imbalance-floor 2
+# !!! 2026-09-30 audit: --load-imbalance-factor/--floor are INERT under the shipped
+# bounded_load hash strategy (router_service.cpp compute_load_allowance); bench.sh now
+# REFUSES this combination. The line below adds --hash-strategy jump so the flags govern
+# the allowance — which means this leg answers the factor/floor question UNDER JUMP, not
+# under the shipped strategy. The live leg for the shipped strategy is the epsilon leg:
+#   ./scripts/bench-runner.sh --suite epsilon
+--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192 --prefix-ratio 0.9 --prompt-dist stress --hash-strategy jump --load-imbalance-factor 2.0 --load-imbalance-floor 2

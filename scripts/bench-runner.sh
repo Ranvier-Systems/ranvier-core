@@ -7,10 +7,12 @@
 # Tracks progress, captures results, and produces a summary report.
 #
 # Usage:
-#   ./scripts/bench-runner.sh                          # Run default suite
-#   ./scripts/bench-runner.sh --suite high             # High-priority runs only
-#   ./scripts/bench-runner.sh --suite medium            # High + medium priority
-#   ./scripts/bench-runner.sh --suite all               # All runs
+#   ./scripts/bench-runner.sh                          # Default: --suite rebaseline (x3 repeats)
+#   ./scripts/bench-runner.sh --suite rebaseline       # The citable 4-config matrix, A/B, x3
+#   ./scripts/bench-runner.sh --suite epsilon          # Leg V1: bounded-load epsilon 0.5, x3
+#   ./scripts/bench-runner.sh --suite fitted           # 13B (10u, 20u) with a prefix set that fits its KV cache, x3
+#   ./scripts/bench-runner.sh --suite low              # Exploratory: 70B, 64-user stress
+#   ./scripts/bench-runner.sh --suite all              # rebaseline + epsilon + low
 #   ./scripts/bench-runner.sh --suite custom --file runs.txt  # Custom run file
 #   ./scripts/bench-runner.sh --dry-run                # Preview what would run
 #   ./scripts/bench-runner.sh --resume 3               # Resume from run #3
@@ -48,7 +50,8 @@ ORIGINAL_CMD="$0 $*"
 # State
 RESUME_FROM=0
 DRY_RUN=false
-SUITE="high"
+SUITE="rebaseline"
+REPEAT_SET=false   # true when --repeat was passed; rebaseline/epsilon default to 3
 CUSTOM_FILE=""
 STOP_ON_FAILURE=false
 SKIP_RUNS_RAW=""   # comma-separated list from --skip
@@ -168,7 +171,7 @@ extract_metrics() {
         ttft_improv=$(grep "TTFT Improvement:" "$log_file" 2>/dev/null | tail -1 | grep -oP '\-?[0-9.]+(?=%)' || echo "")
         if [[ -n "$hit_rate" || -n "$ttft_improv" ]]; then
             echo -ne "    ${label:+${BOLD}${label}:${NC} }"
-            [[ -n "$hit_rate" ]] && echo -ne "Cache: ${hit_rate}%"
+            [[ -n "$hit_rate" ]] && echo -ne "Route consistency: ${hit_rate}%"
             [[ -n "$hit_rate" && -n "$cache_hits" ]] && echo -ne " (${cache_hits} hits)"
             [[ -n "$ttft_improv" ]] && echo -ne " | TTFT Improv: ${ttft_improv}%"
             echo ""
@@ -178,7 +181,8 @@ extract_metrics() {
 
     # Parse JSON with lightweight field extraction (no jq dependency)
     local hit_rate cache_hits ttft_improv total_reqs failed_reqs tokens_sec
-    hit_rate=$(echo "$json_line" | grep -oP '"cache_hit_rate_pct":\s*[0-9.]+' | grep -oP '[0-9.]+$' || echo "")
+    # route_consistency_pct since 2026-09-30; cache_hit_rate_pct in older logs.
+    hit_rate=$(echo "$json_line" | grep -oP '"(route_consistency_pct|cache_hit_rate_pct)":\s*[0-9.]+' | head -1 | grep -oP '[0-9.]+$' || echo "")
     cache_hits=$(echo "$json_line" | grep -oP '"cache_hits":\s*[0-9]+' | grep -oP '[0-9]+$' || echo "")
     ttft_improv=$(echo "$json_line" | grep -oP '"ttft_improvement_pct":\s*-?[0-9.]+' | grep -oP '\-?[0-9.]+$' || echo "")
     total_reqs=$(echo "$json_line" | grep -oP '"total_requests":\s*[0-9]+' | grep -oP '[0-9]+$' || echo "")
@@ -186,7 +190,7 @@ extract_metrics() {
     tokens_sec=$(echo "$json_line" | grep -oP '"tokens_per_second":\s*[0-9.]+' | grep -oP '[0-9.]+$' || echo "")
 
     echo -ne "    ${label:+${BOLD}${label}:${NC} }"
-    [[ -n "$hit_rate" ]] && echo -ne "Cache: ${hit_rate}%"
+    [[ -n "$hit_rate" ]] && echo -ne "Route consistency: ${hit_rate}%"
     [[ -n "$cache_hits" ]] && echo -ne " (${cache_hits} hits)"
     [[ -n "$ttft_improv" ]] && echo -ne " | TTFT Improv: ${ttft_improv}%"
     [[ -n "$tokens_sec" ]] && echo -ne " | Tok/s: ${tokens_sec}"
@@ -233,10 +237,7 @@ USAGE:
     ./scripts/bench-runner.sh [OPTIONS]
 
 OPTIONS:
-    --suite LEVEL       Which benchmark suite to run (default: high)
-                          high   - 3 high-priority runs (~45 min)
-                          medium - high + 3 medium-priority runs (~2.5 hours)
-                          all    - all 9 runs (~4+ hours)
+    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, low, all, custom
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
@@ -255,26 +256,65 @@ OPTIONS:
     -h, --help          Show this help
 
 BUILT-IN SUITES:
-    high (3 runs, ~1.5h):
-      1. 13B at 20 users (compare load-aware vs Jan baseline 38.9%)
-      2. 8B at 20 users  (compare load-aware vs Jan baseline 43.7%)
-      3. 13B at 10 users (compare load-aware vs Jan baseline 48.2%)
+    rebaseline (4 configs x 2 arms x 3 repeats, ~8h) — the DEFAULT:
+      The 2026-07-13 headline matrix, re-run on the fixed tooling (audit
+      2026-09-30: routing DB no longer carried across arms, seeded prefix
+      pool, exact TTFT percentiles, route consistency + KV hit rate).
+      1. 8B  20 users 10m   --compare --warmup
+      2. 13B 30 users 30m   --compare --warmup
+      3. 13B 20 users 10m   --compare --warmup
+      4. 13B 10 users 10m   --compare --warmup
+      Pre-registered rule: the July headline is REPRODUCED only if the
+      aggregate prints CONSISTENT IMPROVEMENT for 1 and 2 and CONSISTENT
+      REGRESSION for 4. MIXED or NO RELIABLE EFFECT is reported as such.
 
-    medium (adds 4 runs, ~4h total):
-      4. 13B 30-minute validated run at 30 users
-      5. 8B 30-minute validated run at 30 users
-      6. 13B prefix ratio 0.7
-      7. 13B prefix ratio 0.5
+    epsilon (2 configs x 2 arms x 3 repeats, ~4h) — Leg V1 of the load-gating
+      proposal, with the knob that actually moves diversion under the shipped
+      bounded_load strategy (--bounded-load-epsilon 0.5 vs the 0.25 default):
+      5. 13B 30 users 30m   --compare --warmup --bounded-load-epsilon 0.5
+      6. 13B 10 users 10m   --compare --warmup --bounded-load-epsilon 0.5
+      The treatment is each run's PREFIX arm; compare it against the
+      rebaseline suite's prefix arm for the same config:
+        results_parser.py aggregate <eps0.5 prefix dirs> --baseline <rebaseline prefix dirs>
+      Rule: adopt 0.5 only if median P99 improves >= 10% with no incomplete-
+      rate regression; record whether it WORSENS 13B/10u (Option 0 evidence).
+      For the factor/floor variant add --hash-strategy jump, or bench.sh refuses.
 
-    all (adds 4 more, ~6.5h total):
-      8.  13B client tokenization comparison
-      9.  8B high concurrency stress test (64 users)
-      10. 70B model test (TP=4, 2 backends on 8xA100 40GB)
-      11. 8B with 16K max prefix (tests larger-than-default prefixes)
+    fitted (2 configs x 2 arms x 3 repeats, ~3h) — 13B in the regime where routing
+      can matter. The rebaseline 13B rows run a ~250k-token hot set against
+      ~11.6k tokens of KV per backend (measured 2026-10-01 on A100-40GB: KV
+      hit rate 5% round-robin vs 14% prefix at 30 users, with preemptions),
+      so every backend evicts whatever the router does. These rows shrink
+      the set to 16 prefixes of 2000..4000 tokens (~48k, ~6k per backend):
+      7. 13B 10 users 10m   --compare --warmup --num-prefixes 16 --prefix-max-tokens 4000
+         A backend's share plus 10 users' in-flight requests fits comfortably.
+      8. 13B 20 users 10m   same set. Marginal: ~6k share + ~7.5k in-flight
+         slightly exceeds 11.6k, so expect some eviction; it is the load
+         gradient point between row 7 and the rebaseline rows, not a clean fit.
+      Compare row 7 with rebaseline row 4 and row 8 with rebaseline row 3 (same
+      load, default set). If the low-load regression persists on the fitted
+      set, it is not a cache-capacity artefact.
+
+    low (2 runs, exploratory, not part of any headline):
+      9.  70B model test (16 users, TP auto)
+      10. 8B high-concurrency stress (64 users, single arm)
+
+    all = rebaseline + epsilon + fitted + low.
+
+    Retired (see .dev-context/benchmark-accuracy-audit-2026-09-30.md):
+      - prefix-ratio 0.5/0.7 sweep: SHARED_PREFIX_RATIO only governs 20% of the
+        stress distribution, so those rows never measured what they said.
+      - client-tokenization comparison: client tokenization runs outside the
+        TTFT timer and server tokenization inside it (finding 13); re-add once
+        the timer is placed consistently.
+      - 8B 16K-prefix run: superseded by the KV-regime check (manifest now
+        records each backend's KV capacity next to the prefix working set).
+
+    rebaseline, epsilon and fitted default to --repeat 3; pass --repeat 1 for a smoke run.
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
-      add_run <priority> "<label>" <bench.sh args...>
+      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | low
     Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
@@ -284,12 +324,12 @@ CUSTOM RUN FILE FORMAT:
     --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 30 --max-model-len 8192
 
 EXAMPLES:
-    # Preview the default high-priority suite
+    # Preview the default rebaseline suite (12 runs: 4 configs x 3 repeats)
     ./scripts/bench-runner.sh --dry-run
 
-    # Run high-priority benchmarks
+    # Run the Leg V1 epsilon suite
     export HF_TOKEN=hf_xxx
-    ./scripts/bench-runner.sh --suite high
+    ./scripts/bench-runner.sh --suite epsilon
 
     # Run all benchmarks, stop if one fails
     ./scripts/bench-runner.sh --suite all --stop-on-failure
@@ -323,7 +363,7 @@ while [[ $# -gt 0 ]]; do
         --pause)            PAUSE_BETWEEN_RUNS="$2"; shift 2 ;;
         --stop-on-failure)  STOP_ON_FAILURE=true; shift ;;
         --output-dir)       RUNNER_OUTPUT_DIR="$2"; shift 2 ;;
-        --repeat)           REPEAT="$2"; shift 2 ;;
+        --repeat)           REPEAT="$2"; REPEAT_SET=true; shift 2 ;;
         -h|--help)          print_help; exit 0 ;;
         *)                  log_error "Unknown option: $1"; echo "Run with --help for usage."; exit 1 ;;
     esac
@@ -332,26 +372,25 @@ done
 # -----------------------------------------------------------------------------
 # Define benchmark suites
 # -----------------------------------------------------------------------------
-# Each run is defined as:  add_run <priority> <label> <bench.sh args...>
+# Each run is defined as:  add_run <suite> <label> <bench.sh args...>
 #
-# Priority levels (cumulative):
-#   high   = runs 1-3       (included in --suite high, medium, all)
-#   medium = runs 4-7       (included in --suite medium, all)
-#   low    = runs 8-10      (included in --suite all only)
+# Suites (not cumulative, except `all`):
+#   rebaseline = the citable 4-config A/B matrix        (--suite rebaseline, all)
+#   epsilon    = Leg V1 bounded-load epsilon 0.5 leg    (--suite epsilon, all)
+#   fitted     = 13B with a KV-fitting prefix set         (--suite fitted, all)
+#   low        = exploratory runs outside any headline  (--suite low, all)
 #
-# To add a new benchmark, append an add_run line at the end of the
-# appropriate priority section. Run numbers are assigned in order.
+# Run numbers are assigned in definition order within the selected suite.
 # Use --dry-run to verify numbering after changes.
 
 add_run() {
-    local priority="$1"
+    local suite="$1"
     local label="$2"
     shift 2
     local args="$*"
 
     case "$SUITE" in
-        high)   [[ "$priority" != "high" ]] && return ;;
-        medium) [[ "$priority" == "low" ]] && return ;;
+        rebaseline|epsilon|fitted|low) [[ "$suite" != "$SUITE" ]] && return ;;
         all)    ;;  # include everything
         *)      return ;;  # custom suite doesn't use add_run
     esac
@@ -364,54 +403,66 @@ define_runs() {
     RUNS=()
     LABELS=()
 
-    # --- High priority: re-run Jan baselines with load-aware routing ----------
-    add_run high "13B moderate load (20 users)" \
-        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-        --warmup --duration 10m --users 20 --max-model-len 8192
-
-    add_run high "8B moderate load (20 users)" \
+    # --- rebaseline: the 2026-07-13 headline matrix on the fixed tooling -----
+    # Same four configs, same durations and user counts, so the new numbers are
+    # comparable in design to the July campaign (not in value: those runs carried
+    # the routing DB across arms and generated different prefixes per arm).
+    add_run rebaseline "8B 20u/10m A/B" \
         --compare --model meta-llama/Llama-3.1-8B-Instruct \
         --warmup --duration 10m --users 20
 
-    add_run high "13B low load (10 users)" \
-        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-        --warmup --duration 10m --users 10 --max-model-len 8192
-
-    # --- Medium priority: long runs and prefix ratio sweep --------------------
-    add_run medium "13B 30min validated (30 users)" \
+    add_run rebaseline "13B 30u/30m A/B" \
         --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 30m --users 30 --max-model-len 8192
 
-    add_run medium "8B 30min validated (30 users)" \
-        --compare --model meta-llama/Llama-3.1-8B-Instruct \
-        --warmup --duration 30m --users 30
-
-    add_run medium "13B prefix ratio 0.7 (20 users)" \
+    add_run rebaseline "13B 20u/10m A/B" \
         --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-        --warmup --duration 10m --users 20 --prefix-ratio 0.7 --max-model-len 8192
+        --warmup --duration 10m --users 20 --max-model-len 8192
 
-    add_run medium "13B prefix ratio 0.5 (20 users)" \
+    add_run rebaseline "13B 10u/10m A/B" \
         --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-        --warmup --duration 10m --users 20 --prefix-ratio 0.5 --max-model-len 8192
+        --warmup --duration 10m --users 10 --max-model-len 8192
 
-    # --- Lower priority: client tokenization, stress, large models ------------
-    add_run low "13B client tokenization (30 users)" \
-        --compare --client-tokenize --model meta-llama/CodeLlama-13b-Instruct-hf \
-        --warmup --duration 10m --users 30 --max-model-len 8192
+    # --- epsilon: Leg V1 (prefix-routing-load-gating-proposal.md §5) ----------
+    # Treatment = the prefix arm at epsilon 0.5; baseline = the rebaseline
+    # suite's prefix arm at the shipped 0.25 for the same config.
+    add_run epsilon "13B 30u/30m A/B, bounded-load epsilon 0.5" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192 \
+        --bounded-load-epsilon 0.5
 
-    add_run low "8B high concurrency stress (64 users)" \
-        --warmup --duration 15m --users 64 --spawn-rate 4 \
-        --model meta-llama/Llama-3.1-8B-Instruct
+    add_run epsilon "13B 10u/10m A/B, bounded-load epsilon 0.5" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 10 --max-model-len 8192 \
+        --bounded-load-epsilon 0.5
 
+    # --- fitted: 13B inside its KV cache ----------------------------------------
+    # 16 prefixes x 2000..4000 tokens (~48k) against ~11.6k KV tokens/backend: a
+    # backend's share (~6k) plus 10 users' in-flight requests fits. Pairs with
+    # rebaseline row 4 to separate the low-load regression from cache capacity.
+    add_run fitted "13B 10u/10m A/B, fitted prefix set (16 x 2000..4000)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 10 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    # Same set at 20 users: a backend's ~6k share plus ~7.5k in-flight slightly
+    # exceeds 11.6k, so this is the gradient point between row 7 and the
+    # rebaseline rows rather than a clean fit. Pairs with rebaseline row 3.
+    add_run fitted "13B 20u/10m A/B, fitted prefix set (16 x 2000..4000, marginal)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    # --- low: exploratory, outside any headline --------------------------------
     # TP, max-model-len, and gpu-mem-util are auto-detected from GPU VRAM.
     # Explicit overrides: --tp 4 --max-model-len 4096 --gpu-mem-util 0.92 (for 40GB)
     add_run low "70B model test (16 users)" \
         --compare --model meta-llama/Llama-3.1-70B-Instruct \
         --warmup --duration 15m --users 16
 
-    add_run low "8B 16K prefix test (20 users)" \
-        --compare --model meta-llama/Llama-3.1-8B-Instruct \
-        --warmup --duration 10m --users 20 --prefix-max-tokens 16000
+    add_run low "8B high concurrency stress (64 users)" \
+        --warmup --duration 15m --users 64 --spawn-rate 4 \
+        --model meta-llama/Llama-3.1-8B-Instruct
 
     # --- Custom file ----------------------------------------------------------
     if [[ "$SUITE" == "custom" ]]; then
@@ -442,6 +493,12 @@ define_runs
 # machinery — adaptive ETA, --skip/--resume numbering, the SIGINT summary — works
 # unchanged. GROUP_OF[i] records which original config an expanded run belongs to,
 # so the post-suite aggregation can gather each config's repeats. See BACKLOG §25.
+# A single run is not a result (review F3): the headline suites default to
+# three repeats so the aggregate can issue a CONSISTENT / MIXED verdict.
+if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" ) ]]; then
+    REPEAT=3
+    log_info "Suite '$SUITE' defaults to --repeat 3 (pass --repeat 1 for a smoke run)"
+fi
 if ! [[ "$REPEAT" =~ ^[0-9]+$ ]] || [[ "$REPEAT" -lt 1 ]]; then
     log_error "--repeat must be a positive integer (got: $REPEAT)"
     exit 1
@@ -748,7 +805,8 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
                         # became five lines of numbers). Only the top-level values are wanted.
                         hr=$(echo "$json_line" | python3 -c 'import json,sys
 try:
-    v = json.loads(sys.stdin.read()).get("cache_hit_rate_pct")
+    j = json.loads(sys.stdin.read())
+    v = j.get("route_consistency_pct", j.get("cache_hit_rate_pct"))
     print("" if v is None else "%.1f" % v)
 except Exception:
     pass' 2>/dev/null || echo "")

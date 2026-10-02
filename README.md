@@ -73,22 +73,22 @@ Figures from the superseded February 2026 five-prefix campaign (such as "58–98
 
 ## Benchmark Results
 
-Two campaigns have been run on 8×A100 hardware. **The July 2026 re-baseline is the citable one.** The February 2026 numbers are kept below for history: they were measured on a 5-prefix synthetic workload that the project's own methodology review (`.dev-context/benchmark-tooling-review-2026-07-05.md`) found manufactures much of the headline win, and they should not be quoted as expected results.
+Three campaigns have been run on 8×A100 hardware. **The October 2026 re-baseline is the citable one.** The July 2026 campaign was measured before a tooling audit found that its arms were not isolated (routing state carried across arms, different prefixes per arm) and its labels were wrong (event counts as req/s, route consistency as "cache hit"); its one surviving row is reproduced below. The February 2026 numbers came from a 5-prefix synthetic workload that the project's own methodology review found manufactures much of the headline win. Neither earlier campaign should be quoted as expected results.
 
-### July 2026 re-baseline (citable)
+### October 2026 re-baseline (citable)
 
-Representative workload: 50 large shared prefixes; prefix-aware routing against round-robin on the same fleet; median of three runs per configuration; commit `817a1b5`. Write-up: [benchmark-results-current.md](docs/benchmarks/benchmark-results-current.md).
+Representative workload: 50 shared prefixes of 2,000–8,000 tokens; prefix-aware routing against round-robin on the same fleet; three repeats per configuration, alternating arm order; every repeat must agree for a verdict. KV hit rate is vLLM's own prefix-cache counter. Write-up with per-repeat numbers: [benchmark-results-current.md](docs/benchmarks/benchmark-results-current.md).
 
-| Model, load | Cache hit rate | P99 TTFT vs round-robin | Verdict |
+| Model, load | KV hit rate, round-robin → prefix | P99 TTFT vs round-robin | Verdict |
 |---|---|---|---|
-| Llama-3.1-8B, 20 users (~47 req/s) | ~3× higher | **−13.3%** | reliable improvement |
-| CodeLlama-13B, 30 users | ~3× higher | **−9.1%** | reliable improvement |
-| CodeLlama-13B, 20 users | ~3× higher | no reliable effect | interquartile range spans zero |
-| CodeLlama-13B, 10 users (~16 req/s) | ~3× higher | **+29%**, more timeouts | reliable regression |
+| Llama-3.1-8B, 20 users | 72% → 94% | **−17%** (all three repeats −6.5% or better) | consistent improvement |
+| CodeLlama-13B, 30 users | 5% → 14% | −2.4%, −1.6%, +3.6% | no reliable effect |
+| CodeLlama-13B, 20 users | 4% → 19% | **+11%** | consistent regression |
+| CodeLlama-13B, 10 users | 6% → 26% | +12%, −11%, +6% | no reliable effect |
 
-The effect is monotonic in cluster throughput. Prefix affinity pays when the GPUs are queue-bound, because a skipped prefill shortens the queue behind it, and costs a little when they are idle, because a skipped prefill is then worth less than the transient concentration affinity can cause. Cache-hit rate rose about threefold in every configuration and is decoupled from P99 at low load. Per-request routing overhead (about 1.7 ms at 30 users and about 16 ms at 10 users, against a P99 of several seconds) does not explain the regression; the leading hypothesis and its one-flag fix are written up in `.dev-context/prefix-routing-load-gating-proposal.md`. A first test of that fix on 2026-09-28 was inconclusive: it shrank the low-load regression from a reliable +9.7% to a statistically unreliable +3.4%.
+The deciding variable is whether a backend's KV cache can hold its share of the hot prefix set. On a 40 GB A100 an 8B backend holds about 142,000 tokens, so the 250,000-token set fits when split eight ways but not in one place: round-robin is already mostly cache-warm, affinity recovers the rest, and under a 20-user queue that is a sixth off the tail. A 13B backend holds about 11,600 tokens, less than its share of the set and, at 30 users, less than the in-flight requests alone; both arms run nearly cache-cold under constant preemption, and the routing policy's effect is small and unstable. The 13B regression at 20 users is consistent across repeats and has a plausible mechanism, affinity concentrating large-prefix requests onto backends that are already evicting; a follow-up run with a prefix set that fits the 13B cache is queued to test it.
 
-**What this does and does not show.** Ranvier reliably improves tail latency for prefix-heavy traffic on a saturated fleet. It has not been shown to help an under-utilized fleet, and it has not been compared head-to-head with other prefix-aware routers. A pre-registered comparison is the next planned GPU run.
+**What this does and does not show.** Prefix routing reliably improves tail latency for prefix-heavy traffic on a busy fleet whose caches can hold the hot set. It has not been shown to help, and may hurt, when the fleet is under KV-cache pressure. It has not been compared head-to-head with other prefix-aware routers or with a least-loaded policy without affinity.
 
 ### February 2026 campaign (superseded)
 
