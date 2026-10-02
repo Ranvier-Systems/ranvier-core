@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-10-02T02:11:12+00:00",
+  "commit": "de2f2dd",
+  "host": "150-136-114-223",
+  "command": "/home/ubuntu/ranvier-core/scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 10 --max-model-len 8192 --num-prefixes 16 --prefix-max-tokens 4000 --order rr-first --output-dir benchmark-reports",
+  "vllm_version": "0.15.1",
+  "hardware": { "gpu_name": "NVIDIA A100-SXM4-40GB", "gpu_count": "8" },
+  "regime": { "kv_cache_tokens_per_backend": {"1": 11680, "2": 11680, "3": 11680, "4": 11680, "5": 11680, "6": 11680, "7": 11680, "8": 11680}, "kv_cache_tokens_min": 11680, "prefix_working_set_tokens_est": 48000 },
+  "routing": {
+    "mode": "round_robin",
+    "load_aware_routing": "true",
+    "load_imbalance_factor": "2.0",
+    "load_imbalance_floor": "2",
+    "cache_residency_threshold": "0.2",
+    "hash_strategy": "bounded_load",
+    "bounded_load_epsilon": "0.25",
+    "cross_shard_load_sync": "false",
+    "min_token_length": "10",
+    "route_batch_flush_interval_ms": "20",
+    "enable_multi_depth_routing": "false",
+    "default_compression_ratio": "1.0",
+    "backpressure_enable_priority_queue": "false",
+    "backpressure_tier_capacity": "64,128,256,512",
+    "chat_template_format": "none",
+    "tokenizer_thread_pool_enabled": "true",
+    "health_vllm_metrics_timeout_ms": "1000"
+  },
+  "workload": {
+    "model": "meta-llama/CodeLlama-13b-Instruct-hf",
+    "num_backends": "8",
+    "users": "10",
+    "duration": "10m",
+    "spawn_rate": "2",
+    "prompt_distribution": "stress",
+    "shared_prefix_ratio": "0.9",
+    "num_large_prefixes": "16",
+    "prefix_seed": "42",
+    "max_output_tokens": "100",
+    "client_tokenize": "false"
+  }
+}
