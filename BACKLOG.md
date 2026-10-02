@@ -36,6 +36,8 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 23. [Holistic Audit Findings (2026-07-04)](#23-holistic-audit-findings-2026-07-04)
 24. [Adversarial Audit Findings — Pass A (2026-07-04)](#24-adversarial-audit-findings-pass-a-2026-07-04)
 25. [Benchmark Tooling P0 — Re-anchor the Truth (2026-07-06)](#25-benchmark-tooling-p0--re-anchor-the-truth-2026-07-06)
+26. [Kimi (Moonshot) Model Support (2026-07-18)](#26-kimi-moonshot-model-support-2026-07-18)
+27. [Strategic Assessment (2026-10-02)](#27-strategic-assessment-2026-10-02)
 
 ---
 
