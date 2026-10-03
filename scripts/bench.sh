@@ -257,6 +257,13 @@ BENCHMARK OPTIONS:
                         the locustfile's). Sets NUM_LARGE_PREFIXES for warm-up and both
                         arms; with --prefix-max-tokens it sizes the hot working set, so a
                         13B fleet (~11.6k KV tokens/backend) can be given a set that fits.
+    --pacing S          Open-loop load: every user starts a request every S seconds
+                        regardless of latency, so both arms carry the same offered load
+                        (users / S req/s). Default is the locustfile's closed-loop think
+                        time (0.5-2 s), under which the faster arm carries 5-7% more
+                        traffic — a tail confound once the fleet is queue-bound. Pick S
+                        above the slowest request (e.g. 20 users, --pacing 4.3 ≈ the
+                        4.65 req/s round-robin reached closed-loop at 13B/20u).
     --cache-residency-threshold F
                         Cache-residency downgrade threshold (#527). ART hits whose
                         backend reports residency < F are diverted. 0.0 disables
@@ -484,6 +491,7 @@ SPAWN_RATE="$DEFAULT_SPAWN_RATE"
 PROMPT_DIST="$DEFAULT_PROMPT_DIST"
 PREFIX_RATIO="$DEFAULT_PREFIX_RATIO"
 PREFIX_MAX_TOKENS=""
+PACING_S=""                 # --pacing: open-loop seconds between a user's request starts
 NUM_PREFIXES_FLAG=""        # --num-prefixes: exported as NUM_LARGE_PREFIXES after parsing
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 COMPARE=false
@@ -529,6 +537,7 @@ while [[ $# -gt 0 ]]; do
         --prompt-file)    PROMPT_FILE="$2"; shift 2 ;;
         --prefix-ratio)   PREFIX_RATIO="$2"; shift 2 ;;
         --prefix-max-tokens) PREFIX_MAX_TOKENS="$2"; shift 2 ;;
+        --pacing)         PACING_S="$2"; shift 2 ;;
         --num-prefixes)   NUM_PREFIXES_FLAG="$2"; shift 2 ;;
         --output-dir)     OUTPUT_DIR="$2"; shift 2 ;;
         --compare)        COMPARE=true; shift ;;
@@ -1812,6 +1821,7 @@ write_manifest() {
         printf '    "num_large_prefixes": "%s",\n' "$(_json_escape "${NUM_LARGE_PREFIXES:-50}")"
         printf '    "prefix_seed": "%s",\n' "$(_json_escape "${PREFIX_SEED:-42}")"
         printf '    "max_output_tokens": "%s",\n' "$(_json_escape "${MAX_TOKENS:-}")"
+        printf '    "pacing_s": "%s",\n' "$(_json_escape "${PACING_S:-0}")"
         printf '    "client_tokenize": "%s"' "$client_tok"
         if [[ "$PROMPT_DIST" == "churn" ]]; then
             printf ',\n    "churn": { "universe": "%s", "active": "%s", "rotation_step": "%s", "rotation_seconds": "%s", "seed": "%s" }\n' \
@@ -2023,6 +2033,7 @@ run_benchmark() {
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         -e MAX_OUTPUT_TOKENS="$MAX_TOKENS" \
+        -e BENCH_PACING_S="${PACING_S:-0}" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE="$PRIORITY_QUEUE" \
         -e SIMULATE_AGENTS="$( [[ "$PRIORITY_QUEUE" = true ]] && echo true || echo false )" \
@@ -2210,6 +2221,7 @@ run_warmup() {
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         -e MAX_OUTPUT_TOKENS="$MAX_TOKENS" \
+        -e BENCH_PACING_S="${PACING_S:-0}" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE="$PRIORITY_QUEUE" \
         -e SIMULATE_AGENTS="$( [[ "$PRIORITY_QUEUE" = true ]] && echo true || echo false )" \

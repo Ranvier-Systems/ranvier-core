@@ -164,7 +164,7 @@ from threading import Lock
 
 import requests
 from requests.exceptions import ReadTimeout, ConnectTimeout, Timeout
-from locust import HttpUser, task, between, events
+from locust import HttpUser, task, between, constant_pacing, events
 from locust.runners import MasterRunner, WorkerRunner
 from prom_scrape import (
     histogram_avg as prom_histogram_avg,
@@ -4016,10 +4016,21 @@ def on_test_stop(environment, **kwargs):
 # Locust User Class
 # ============================================================================
 
+# Open-loop pacing (BENCH_PACING_S > 0): each user issues one request every
+# BENCH_PACING_S seconds regardless of how long the previous one took, so the
+# OFFERED load is N_users / BENCH_PACING_S in both A/B arms. The default
+# between(0.5, 2) think time is a closed loop: a faster arm completes sooner,
+# its users come back sooner, and it ends up carrying 5-7% more traffic than
+# the slower arm (2026-10-02 fitted suite) — a confound at the tail once the
+# fleet is queue-bound. Pacing must exceed the slowest expected request or
+# Locust logs a warning and the loop closes again.
+_BENCH_PACING_S = float(os.environ.get("BENCH_PACING_S", "0") or 0)
+
+
 class RealBackendUser(HttpUser):
     """Simulates users sending chat completion requests to real vLLM backends."""
 
-    wait_time = between(0.5, 2)
+    wait_time = constant_pacing(_BENCH_PACING_S) if _BENCH_PACING_S > 0 else between(0.5, 2)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
