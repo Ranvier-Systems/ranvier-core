@@ -1442,8 +1442,8 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   a local decision and routes were learned only at first byte (~1 TTFT later), shards/nodes placed
   the same new prefix on different backends and each kept its LOCAL route. Fix: learn a placed miss
   at dispatch too (window → one 20 ms batch flush + gossip). **v2 run (token-weighted + eager
-  learn, 2026-10-03): +11.4, +12.5; consistency 37.9/40.8%, KV 29.8/31.0%, Gini 0.048/0.074 —
-  split persists, and `router_remote_routes_trust_refused_total` = 860/781/800 per arm on shard 0
+  learn, 2026-10-03): +11.4, +12.5, +3.9; consistency 37.9/40.8/41.5%, KV 29.8/31.0/37.6%, Gini
+  0.048/0.074/0.050 — split persists, and `router_remote_routes_trust_refused_total` = 860/781/800 per arm on shard 0
   (≈0 under hash placement) confirms it is cross-node: each node keeps its own LOCAL placement
   under T7 and refuses the others' forever. Third fix (branch): under `least_loaded`, a conflicting
   gossiped route is settled by lowest backend id on every node (`insert_if_trusted(...,

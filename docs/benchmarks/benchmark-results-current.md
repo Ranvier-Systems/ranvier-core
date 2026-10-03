@@ -272,10 +272,11 @@ Fresh instance, GHCR image from main (`ba00cb9`), `--suite placement`, 13B 20 us
 |-----|----------|----------|-------------------|-----------------|---------|-----------------|------------------------------------------|
 | 1 (rr-first) | +11.4% | −20.6% | 37.9% | 29.8% | 22.4% | 0.048 | 860 |
 | 2 (prefix-first) | +12.5% | −23.2% | 40.8% | 31.0% | 23.3% | 0.074 | 781 |
-| 3 | (pending) | | | | | | 800 |
+| 3 (rr-first) | +3.9% | −24.1% | 41.5% | 37.6% | 24.2% | 0.050 | 800 |
 
-Balance improved (Gini 0.048/0.074 vs 0.08–0.10) but affinity did not recover: consistency
-and KV hits are where the count-weighted build left them. Arithmetic: default arms divert ~30%
+Consistent regression (+11.4, +12.5, +3.9; median +11.4, the mildest set of the campaign).
+Balance improved (Gini 0.048–0.074 vs 0.08–0.10) but affinity did not recover: consistency
+and KV hits are mostly where the count-weighted build left them. Arithmetic: default arms divert ~30%
 and are ~50% consistent, so ~20% of requests change backend for other reasons (mostly first-seen
 one-offs); v2 arms divert 23% and are 39% consistent, leaving 38% — the extra ~18 points are
 pool prefixes served from more than one backend. The 20 ms intra-node window cannot produce
