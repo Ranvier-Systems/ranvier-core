@@ -1449,7 +1449,17 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   gossiped route is settled by lowest backend id on every node (`insert_if_trusted(...,
   converge_local_conflicts)`, counter `router_remote_routes_converged_total`); PUSH and the hash
   default untouched. Tell on the next run: refusals ≈ 0, converged in the tens, consistency ≥ ~48%,
-  KV ≈ 40%. Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
+  KV ≈ 40%. **v3 run (+ convergence, main `48471f4`, 2026-10-03): +8.1, +10.1, +3.4; consistency
+  56.5/59.1/58.2%, KV 47.7/42.4/46.7% (best of the campaign, above the hash default) but Gini
+  0.113/0.106/0.090 (worst), busiest backend 16–18.5% of requests vs quietest 8.4–8.9%, hot
+  backend moving between reps. Counters: converged 0/0/0, refused 219/222/247 — the rule never
+  fired. Cause: `apply_local_batch_to_tree` used plain latest-wins `insert`, so a placed miss landing
+  at the 20 ms flush moved the prefix back off a peer's lower-id route and the peer refused the
+  announcement forever. Fourth fix (branch): LOCAL learns go through the same lowest-id rule at
+  flush, losers dropped before fan-out/gossip (`router_local_routes_converged_total`); new gauge
+  `backend_resident_route_tokens` to separate uneven placement from a popular prefix. Tell for v4:
+  refusals ≈ 0, local-converged in the tens, token gauge even within one prefix, consistency ≥ 57%.
+  10u on v3: −13.2% P99 / −29.1% P50 / KV 66% (rep 1) — the regime where the queue is short. Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
   0.080 — the count-weighted build is a consistent regression (+6.6, +25.1, +13.3) with worse
   affinity than the default in all three. Leg B (in-flight signal, default placement): +14.2, −1.0
   (rep 2 lost to a silent compose failure, since fixed) — a real-time signal helps diversion at

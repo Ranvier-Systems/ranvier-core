@@ -2867,6 +2867,41 @@ TEST_F(BoundedLoadTest, LeastLoadedPlacementConvergesConflictingGossipRoutes) {
     EXPECT_EQ(RouterService::remote_routes_converged_for_testing(), 1u);
 }
 
+TEST_F(BoundedLoadTest, LeastLoadedPlacementLocalLearnYieldsToLowerGossipedRoute) {
+    // The eager learn is buffered at placement and lands ~20 ms later; if a
+    // peer's lower-id route arrived by gossip in between, the flush must not
+    // move the prefix back (placement v3, 2026-10-03: the flush used plain
+    // latest-wins, converged stayed 0 and ~220 announcements per node were
+    // refused). The losing learn is dropped from the batch so it is never
+    // fanned out or gossiped.
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    std::vector<int32_t> tokens = {8301, 8302, 8303, 8304};
+    RouterService::learn_remote_route_for_testing(tokens, 2);   // peer placed it first
+    RouterService::learn_route_for_testing(tokens, 3);          // our late local flush
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 2);
+    EXPECT_EQ(RouterService::local_routes_converged_for_testing(), 1u);
+
+    RouterService::learn_route_for_testing(tokens, 1);          // a lower id still wins
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 1);
+    EXPECT_EQ(RouterService::local_routes_converged_for_testing(), 1u);
+}
+
+TEST_F(BoundedLoadTest, HashPlacementLocalLearnStillOverridesGossip) {
+    // Default placement: the flush is the plain insert it always was (a
+    // node's own learn outranks a gossiped route, latest wins among LOCAL).
+    register_four_backends();
+    std::vector<int32_t> tokens = {8401, 8402, 8403, 8404};
+    RouterService::learn_remote_route_for_testing(tokens, 2);
+    RouterService::learn_route_for_testing(tokens, 3);
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 3);
+    EXPECT_EQ(RouterService::local_routes_converged_for_testing(), 0u);
+}
+
 TEST_F(BoundedLoadTest, LeastLoadedPlacementDoesNotRelearnASettledPrefix) {
     // A first-byte learn that disagrees with the settled (placed + converged)
     // backend is dropped while that backend is live, so a request dispatched

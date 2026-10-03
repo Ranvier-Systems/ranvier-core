@@ -2101,6 +2101,15 @@ run_benchmark() {
                 # node count reflects only nodes actually scraped.
                 rm -f "$node_file"
             fi
+            # Keep this arm's Ranvier log next to its metrics. The containers
+            # are recreated per arm and removed at the end of the suite, so
+            # the log is gone unless captured here; it holds the info-level
+            # route-learning lines ("Buffering route: N tokens -> backend B")
+            # that give the per-node route map the counters cannot (placement
+            # v3, 2026-10-03: the logs were wanted after the run and were gone).
+            if ! docker logs "$node" > "$REPORT_DIR/ranvier_node${node_idx}.log" 2>&1; then
+                rm -f "$REPORT_DIR/ranvier_node${node_idx}.log"
+            fi
         done
         # If nothing scraped at all, remove the empty combined file too.
         [[ -s "$REPORT_DIR/prometheus_metrics.txt" ]] || rm -f "$REPORT_DIR/prometheus_metrics.txt"

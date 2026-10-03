@@ -287,6 +287,23 @@ every node computes the same bucket). Two nodes that place the same new prefix d
 keep their own LOCAL route forever under the trust ladder (invariant T7), so the prefix stays
 warm on two or three backends and its hits are split for the whole run.
 
+**10 users, same build (reps 1–2 of 3; rep 3 pending):**
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Large-hit P99 |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|---------------|
+| 1 (rr-first) | +0.9% | −28.1% | 54.6% | 59.2% | 26.0% | 0.128 | +8.7% |
+| 2 (prefix-first) | −6.9% | −28.1% | 51.3% | 64.0% | 27.8% | 0.091 | +23.4% |
+
+Mixed, like every 10-user set of the campaign (fitted default −7.3/−5.8/−0.1, leg B −11.3/+8.3/−10.8):
+at ~1 in-flight per backend the queue that sets P99 at 20 users is mostly absent, so placement has
+little to fix and these rows say nothing about it either way. Affinity is **not** split at 10
+users (consistency 51–55%, KV 59–64%, both at the default-hash 10u level of 47–64%), which fits
+the mechanism: with half the arrival rate a new prefix is far less likely to reach two nodes
+inside the same first-byte window. Balance is no better than hash at this load (Gini 0.09–0.13);
+the ~70 one-off routes dominate placement when only 16 pool prefixes are in play. In both reps the
+large-prefix *hit* P99 is worse (+8.7, +23.4%) while miss P50 improves, the same shape as at 20
+users: the hits that queue behind a hot backend are the tail.
+
 **Second fix (branch, pending rebuild): converge conflicting routes by lowest backend id.**
 Under `least_loaded`, a gossiped REMOTE route that meets a LOCAL or REMOTE route to a
 different backend is settled by a total order — the lower backend id wins — on every node
@@ -297,20 +314,95 @@ touched; the default (hash) path keeps the plain trust ladder. Counter:
 the converged counter in the tens (once per conflicting prefix per node, not per
 re-announcement), route consistency back near 48%, KV hits near 40%.
 
+### Least-loaded placement v3, + gossip convergence (2026-10-03): split fixed, balance not
+
+Same instance, GHCR image from main (`48471f4`, convergence commit verified inside the image),
+`--suite placement`, 13B 20 users.
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Busiest / quietest backend |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------------|
+| 1 (rr-first) | +8.1% | −26.6% | **56.5%** | **47.7%** | 26.4% | **0.113** | b5 555 / b8 267 (18.5% / 8.9%) |
+| 2 (prefix-first) | +10.1% | −26.6% | **59.1%** | 42.4% | 25.3% | **0.106** | b5 474 / b8 250 (15.9% / 8.4%) |
+| 3 (rr-first) | +3.4% | −25.7% | **58.2%** | **46.7%** | 26.8% | **0.090** | b7 480 / b5 263 (16.2% / 8.9%) |
+
+**Verdict: ❌ not accepted** (+8.1, +10.1, +3.4; median +8.1). **Affinity is back and then
+some:** consistency 56–59% and KV hits 42–48% are the best 20-user numbers of the campaign
+(default hash ≈ 48% / 40%; v1–v2 ≈ 40% / 31%). The convergence rule did what it was built for.
+**Balance is the worst of the campaign:** Gini 0.090–0.113 against 0.05–0.10 for every earlier
+prefix arm, with the busiest backend taking 16–18.5% of requests and the quietest 8.4–8.9% in
+every rep. The hot backend moves between reps (b5, b5, b7), so this is a placement draw, not a
+hot prefix. P99 is that one queue again, and the three P99 deltas track the three Ginis.
+
+**10 users, same build:**
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Busiest / quietest backend |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------------|
+| 1 (rr-first) | **−13.2%** | −29.1% | 57.2% | 66.0% | 25.3% | 0.083 | b1/b6 223 / b5 132 (13.8% / 8.2%) |
+| 2 (prefix-first) | −3.0% | −28.3% | 55.2% | 66.1% | 27.2% | 0.118 | b1 280 / b5 133 (17.6% / 8.3%) |
+| 3 (rr-first) | +0.4% | −28.8% | 55.5% | **69.2%** | 28.8% | 0.141 | b5 284 / b2 138 (17.7% / 8.6%) |
+
+Verdict: ⚖️ no reliable effect on P99 (−13.2, −3.0, +0.4), the campaign's best 10-user P50 and
+KV figures (−28 to −29%, 66–69%), and the worst 10-user balance (Gini 0.08–0.14, the busiest
+backend about twice the quietest in every rep; hot backend b1/b6, b1, b5). The three P99 deltas
+again track the three Ginis. At 10 users the hot backend's queue is short enough that affinity
+wins or breaks even; at 20 it does not. Same mechanism, different regime: the placement draw is
+the only thing between a clean 10-user win and a +8% 20-user tail. The large-prefix *hit* P99 is
+worse in all three (+6.3, +18.4, +15.9%): the hits queuing behind the hot backend are the tail.
+
+**Counters (prefix arm of rep 3, shard 0 of each node):** `router_remote_routes_trust_refused_total`
+219 / 222 / 247, `router_remote_routes_converged_total` **0 / 0 / 0**,
+`router_miss_placements_rebalanced_total` 34 / 36 / 27. Node 1 resident routes per backend (all
+shards, all depths, one-offs included): b6 88, b7 72, b4 56, b2 56, b5 48, b1 32, b8 24, b3 24.
+
+**The convergence rule never fired.** Zero moves on every node while a quarter of v2's refusals
+remained means every conflict was being settled the other way round. Cause, found in the code:
+`apply_local_batch_to_tree` inserted this node's own learns with the plain `insert` — latest
+wins, no trust check, no convergence. A placed miss is learned at placement but *lands* at the
+next 20 ms flush, on all eight shards; if a peer's lower-id route had arrived by gossip in that
+window, the flush silently moved the prefix back to the higher id, announced it, the peer refused
+the announcement (that is the 220), and since the peer never re-announces, the split was
+permanent. The 57% consistency (up from 40%) came from the `learn_route_global` guard alone
+(first-byte learns stopped re-opening conflicts); the remaining split is the flush. The route
+counts above cannot say whether the leftover Gini is placement or popularity (one-off prompts are
+routes too), so the token tally is now exported per backend.
+
+**Fourth fix (branch):** under `least_loaded` the local flush goes through the same lowest-id
+rule (`insert_if_trusted(..., LOCAL, converge)`): a learn that meets a lower-id LOCAL or REMOTE
+route is dropped, removed from the batch before cross-shard fan-out and gossip, and counted in
+`router_local_routes_converged_total`; a lower-id learn still displaces a higher-id route. PUSH and
+the hash default are untouched. New gauge `backend_resident_route_tokens` (per backend, sum over
+shards) is the placement weight itself. Tell for v4: trust refusals ≈ 0, local-converged in the
+tens, consistency ≥ 57%, and the token gauge even to within one prefix across backends. If the
+tokens are even and traffic is still skewed, the residue is popularity (replication, BACKLOG
+§27); if the tokens are uneven, placement during the warm-up burst is still blind (24 shard-local
+tallies, gossip-interval window) and the post-hoc rebalance is the next step: once the tally has
+converged, move the heaviest prefix off the fullest backend when the gap exceeds one prefix,
+same deterministic rule on every node, one cache miss per move.
+
+
 **Resume checklist (next GPU session), in order:**
 
-1. Build from a checkout that contains the convergence commit (confirm with
-   `grep -c 'remote_routes_converged_total' ranvier_server` = 1 inside the image), or pull the
+1. Build from a checkout that contains the local-flush convergence commit (confirm with
+   `grep -c 'local_routes_converged_total' ranvier_server` = 1 inside the image), or pull the
    GHCR image once main carries it. The stale-image guard refuses an image older than the
    newest `src/` commit.
-2. `bench-runner.sh --suite placement --output-dir benchmark-reports-placement-v3`. Read in
-   this order: gossip trust refusals ≈ 0 and converged counter in the tens (split gone), route
-   consistency ≥ ~48% and KV hits ≈ 40%, prefix-arm Gini ≈ 0.03, then P99 (acceptance:
-   negative ×3 at 20u, P50 ≈ −25%).
-3. If balance and affinity recover but P99 stays ≥ 0: the remaining tail is the default divert
-   policy (24% of requests on the stale signal) plus the closed loop. Run the combo
+2. `bench-runner.sh --suite placement --output-dir benchmark-reports-placement-v4` (the 10-user
+   row carries no signal; `--repeat 3` on the 20-user line alone is enough). Read in this order
+   from the prefix arm's `prometheus_metrics_node*.txt`: `router_remote_routes_trust_refused_total`
+   ≈ 0 and `router_local_routes_converged_total` in the tens (split gone);
+   `backend_resident_route_tokens` summed over shards even to within one prefix (~4000 tokens)
+   across backends (placement balanced); then route consistency ≥ 57%, prefix-arm Gini ≈ 0.03,
+   then P99 (acceptance: negative ×3 at 20u, P50 ≈ −25%). Each arm's Ranvier container logs
+   are now saved as `ranvier_node{1,2,3}.log` in the run directory (the v3 logs were wanted after
+   the run and had been removed by the runner's teardown); the info-level "Buffering route: N
+   tokens -> backend B" lines give the per-node route map — the 16 pool prefixes have distinct
+   lengths, so N identifies the prefix — and three nodes that disagree on a prefix's backend is
+   the split seen directly.
+3. Tokens even but traffic skewed → popularity, not placement: replication (BACKLOG §27). Tokens
+   uneven → the warm-up burst still places blind: post-hoc rebalance (above). Balance and
+   affinity recovered but P99 ≥ 0 → the divert policy and the closed loop: run the combo
    (placement + in-flight knobs + `--bounded-load-epsilon 1.0`, 20u ×3) and the paced control
-   (`--pacing 4.3`, equal offered load) described in BACKLOG §27.
+   (`--pacing 4.3`) described in BACKLOG §27.
 4. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
    aggregates, manifests, runner summary) **before** terminating the instance.
 

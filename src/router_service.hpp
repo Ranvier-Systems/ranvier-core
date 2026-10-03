@@ -939,6 +939,11 @@ public:
     // a conflicting route to the lower backend id (miss_placement=least_loaded).
     static uint64_t remote_routes_converged_for_testing();
 
+    // Shard-local counter observer: this node's own learns dropped at batch
+    // flush because a lower backend id already held the prefix
+    // (miss_placement=least_loaded; see apply_local_batch_to_tree).
+    static uint64_t local_routes_converged_for_testing();
+
     // Resolve a key against the shard-local RadixTree (backend the tree would
     // route it to, or nullopt). Confirms which origin's route won a conflict.
     static std::optional<BackendId> lookup_backend_for_testing(const std::vector<int32_t>& tokens);
