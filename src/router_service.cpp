@@ -331,6 +331,7 @@ struct ShardLocalState {
         RoutingConfig::HashStrategy hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
         double bounded_load_epsilon = 0.25;
         uint64_t p2c_load_bias = 2;
+        RoutingConfig::MissPlacement miss_placement = RoutingConfig::MissPlacement::HASH;
         // Cross-shard load sync configuration
         bool cross_shard_load_sync = false;
         std::chrono::milliseconds cross_shard_load_sync_interval{100};
@@ -654,6 +655,7 @@ struct ShardLocalState {
         config.hash_strategy = cfg.hash_strategy;
         config.bounded_load_epsilon = cfg.bounded_load_epsilon;
         config.p2c_load_bias = cfg.p2c_load_bias;
+        config.miss_placement = cfg.miss_placement;
         // Cross-shard load sync configuration
         config.cross_shard_load_sync = cfg.cross_shard_load_sync;
         config.cross_shard_load_sync_interval = cfg.cross_shard_load_sync_interval;
@@ -709,6 +711,7 @@ struct ShardLocalState {
         config.hash_strategy = cfg.hash_strategy;
         config.bounded_load_epsilon = cfg.bounded_load_epsilon;
         config.p2c_load_bias = cfg.p2c_load_bias;
+        config.miss_placement = cfg.miss_placement;
         // Cross-shard load sync configuration
         config.cross_shard_load_sync = cfg.cross_shard_load_sync;
         config.cross_shard_load_sync_interval = cfg.cross_shard_load_sync_interval;
