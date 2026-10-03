@@ -99,10 +99,12 @@ struct RoutingConfig {
     //                 and the busiest backend's queue sets P99 (fitted-suite
     //                 leg A, 2026-10-02: pure affinity +8..12% P99 with one
     //                 backend at 23% of traffic and one at 0.6%).
-    // - LEAST_LOADED: the live candidate with the fewest learned routes
-    //                 (RadixTree::routes_by_backend — gossip-converged, so
-    //                 it reflects cluster placement), then the lowest
-    //                 capacity-adjusted load, then jump-probe order. A miss
+    // - LEAST_LOADED: the live candidate holding the fewest learned-route
+    //                 TOKENS (RadixTree::route_tokens_by_backend — sum of
+    //                 route key lengths, gossip-converged so it reflects
+    //                 cluster placement; a 3000-token prefix outweighs
+    //                 thirty 100-token one-offs), then fewest routes, then
+    //                 lowest capacity-adjusted load, then probe order. A miss
     //                 has no cache to preserve, so this costs nothing in
     //                 cache terms; ART hits are unaffected. Two nodes that
     //                 see a brand-new prefix simultaneously may place it on

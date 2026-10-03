@@ -1433,8 +1433,12 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   prefixes over 8 backends by hash left b7 with 4 prefixes (23% of requests) and b5 with 0 (0.6%),
   Gini 0.30 in all three repeats; the busiest backend's queue sets P99 while P50 keeps −28%.
   **Implemented (2026-10-03, same branch): `routing.miss_placement: least_loaded`** — a new prefix
-  is placed on the live candidate with the fewest learned routes (`RadixTree::routes_by_backend`),
-  then lowest capacity-adjusted load, then probe order; default `hash` unchanged. Acceptance:
+  is placed on the live candidate holding the fewest learned-route tokens
+  (`RadixTree::route_tokens_by_backend`, new), then fewest routes, then lowest capacity-adjusted
+  load, then probe order; default `hash` unchanged. First acceptance rep (count-weighted build,
+  20u): +6.6% P99, Gini 0.076 — the stress mix's ~70 short one-off routes outvoted the 16 long
+  prefixes in a count tally, hence the token weighting; re-run `--suite placement` on the
+  token-weighted build. Acceptance:
   `bench-runner.sh --suite placement` (fitted 20u and 10u with `--miss-placement least_loaded`):
   20u turns negative, prefix-arm Gini near round-robin's, P50 still ≈ −25%. Leg B (in-flight load
   signal) remains informative for the divert policy but no longer decides the design. Known

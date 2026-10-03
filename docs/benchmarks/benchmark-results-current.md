@@ -202,8 +202,11 @@ the cause (where prefixes are placed), on a signal that was not queue depth anyw
 
 **Fix under test: least-loaded cache-miss placement** (`routing.miss_placement: least_loaded`,
 same branch). A miss has no cache to preserve, so the new prefix goes to the live candidate
-with the fewest learned routes, then the lowest load, then probe order; 16 uniform prefixes
-land two per backend by construction and hits are untouched. Acceptance:
+holding the fewest learned-route tokens (then fewest routes, then lowest load, then probe
+order); 16 uniform prefixes land two per backend by construction and hits are untouched.
+First run (count-weighted, 2026-10-03, 20u rep 1): +6.6% P99, Gini 0.076, 203 misses placed
+off their hash bucket — the ~70 short one-off prompts the stress mix learns as routes outvoted
+the 16 long prefixes in a count tally, so the placement is now token-weighted. Acceptance:
 `bench-runner.sh --suite placement` — the fitted 20u row turns negative with the prefix arm's
 Gini near round-robin's (≤0.05) and P50 unchanged. Leg B (in-flight load signal for the
 divert policy) is still informative but no longer decides the design. Known limit: this

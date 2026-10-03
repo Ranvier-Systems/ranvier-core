@@ -309,8 +309,8 @@ BENCHMARK OPTIONS:
     --hash-strategy S   Ranvier hash strategy: bounded_load (default), p2c, jump, modular.
                         Sets RANVIER_HASH_STRATEGY for the cluster.
     --miss-placement M  Where a cache miss (new prefix) is placed: hash (default,
-                        the strategy's bucket) or least_loaded (fewest learned
-                        routes, then lowest load, then probe order). Sets
+                        the strategy's bucket) or least_loaded (fewest learned-route
+                        tokens, then fewest routes, lowest load, probe order). Sets
                         RANVIER_MISS_PLACEMENT. The fitted-suite leg A finding:
                         hash placement alone costs +8..12% P99 at 13B/20u.
     --bounded-load-epsilon E

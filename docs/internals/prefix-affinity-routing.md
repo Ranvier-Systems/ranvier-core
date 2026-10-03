@@ -287,8 +287,9 @@ RANVIER_BOUNDED_LOAD_EPSILON=0.25   # capacity headroom for BOUNDED_LOAD
 RANVIER_P2C_LOAD_BIAS=2             # primary affinity bias for P2C
 
 # Where a cache miss (prefix with no learned route) is placed:
-# "hash" (default, the strategy's bucket) or "least_loaded" (fewest learned
-# routes, then lowest load, then probe order). See "Cache-miss placement".
+# "hash" (default, the strategy's bucket) or "least_loaded" (fewest learned-route
+# tokens, then fewest routes, then lowest load, then probe order). See
+# "Cache-miss placement".
 RANVIER_MISS_PLACEMENT=hash
 
 # vLLM PagedAttention block alignment for the FNV-1a prefix hash (default: 16)
@@ -330,7 +331,7 @@ routing:
 | `hash_strategy` | `bounded_load` | `bounded_load`, `p2c`, `jump`, or `modular` |
 | `bounded_load_epsilon` | `0.25` | Per-backend capacity headroom = `ceil(avg_load * (1 + ε))` |
 | `p2c_load_bias` | `2` | Switch to secondary only when `secondary + bias < primary` |
-| `miss_placement` | `hash` | `hash` places a new prefix in its hash bucket; `least_loaded` on the candidate with the fewest learned routes, then lowest load, then probe order |
+| `miss_placement` | `hash` | `hash` places a new prefix in its hash bucket; `least_loaded` on the candidate holding the fewest learned-route tokens, then fewest routes, then lowest load, then probe order |
 | `enable_prefix_boundary` | `true` | Detect system message boundaries for multi-turn |
 | `min_prefix_boundary_tokens` | `4` | Minimum system message tokens to use as boundary |
 | `accept_client_prefix_boundary` | `false` | Accept client-provided `prefix_token_count` / `prefix_boundaries` |
@@ -386,7 +387,7 @@ Both `bounded_load` and `p2c` use **capacity-adjusted load** (active requests bl
 
 ### Cache-miss placement
 
-`miss_placement` (env `RANVIER_MISS_PLACEMENT`) decides where a prefix with **no learned route** goes. The default `hash` uses the strategy's bucket, which is cluster-consistent but places prefixes like balls into bins: with 16 prefixes over 8 backends the busiest backend holds about twice the mean, and because P99 TTFT is set by the busiest backend's queue, pure affinity lost 8–12% on P99 against round-robin in the 2026-10-02 fitted suite with one backend taking 23% of requests and another 0.6%. `least_loaded` places the new prefix on the live candidate with the fewest learned routes (`RadixTree::routes_by_backend`, which counts gossiped routes too and so converges on cluster placement), then the lowest capacity-adjusted load, then jump-probe order for determinism. A miss has no cache to preserve, so this costs nothing in cache terms; ART hits are untouched. Two nodes that see a brand-new prefix at the same instant may place it differently and each keep their LOCAL route, leaving the prefix warm on two backends. The counter `router_miss_placements_rebalanced_total` counts misses placed off their hash bucket. Placement balances prefix *count*, not popularity: a single prefix carrying a large share of traffic still needs replication, which this knob does not do.
+`miss_placement` (env `RANVIER_MISS_PLACEMENT`) decides where a prefix with **no learned route** goes. The default `hash` uses the strategy's bucket, which is cluster-consistent but places prefixes like balls into bins: with 16 prefixes over 8 backends the busiest backend holds about twice the mean, and because P99 TTFT is set by the busiest backend's queue, pure affinity lost 8–12% on P99 against round-robin in the 2026-10-02 fitted suite with one backend taking 23% of requests and another 0.6%. `least_loaded` places the new prefix on the live candidate holding the fewest learned-route **tokens** (`RadixTree::route_tokens_by_backend`, the sum of each live route's key length; it includes gossiped routes and so converges on cluster placement), then the fewest routes, then the lowest capacity-adjusted load, then jump-probe order for determinism. Tokens rather than counts because real traffic mixes long shared prefixes with short one-off prompts that are learned as routes too: the first placement run (2026-10-03) balanced counts, about 70 one-off routes outvoted the 16 long prefixes, and those landed almost as unevenly as by hash. A 3000-token prefix weighs thirty 100-token one-offs. A miss has no cache to preserve, so this costs nothing in cache terms; ART hits are untouched. Two nodes that see a brand-new prefix at the same instant may place it differently and each keep their LOCAL route, leaving the prefix warm on two backends. The counter `router_miss_placements_rebalanced_total` counts misses placed off their hash bucket. Placement balances prefix *count*, not popularity: a single prefix carrying a large share of traffic still needs replication, which this knob does not do.
 
 ### X-Backend-ID Header
 

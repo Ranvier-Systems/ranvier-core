@@ -248,9 +248,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Least-loaded cache-miss placement** (`routing.miss_placement: least_loaded`, env
   `RANVIER_MISS_PLACEMENT`, default `hash` = unchanged behavior) — a prefix with no
-  learned route is placed on the live backend with the fewest learned routes, then the
-  lowest capacity-adjusted load, then jump-probe order, instead of its consistent-hash
-  bucket. Motivated by the 2026-10-02 fitted-suite leg A: with every divert mechanism
+  learned route is placed on the live backend holding the fewest learned-route tokens
+  (`RadixTree::route_tokens_by_backend`, new: the sum of live route key lengths per
+  backend), then the fewest routes, then the lowest capacity-adjusted load, then
+  jump-probe order, instead of its consistent-hash bucket. Token-weighted so a long
+  shared prefix outweighs the short one-off prompts a real mix also learns as routes. Motivated by the 2026-10-02 fitted-suite leg A: with every divert mechanism
   off, prefix affinity still lost 8–12% P99 at 13B/20 users against round-robin,
   because hash placement of 16 prefixes over 8 backends left one backend holding four
   prefixes (23% of requests) and another none (0.6%), and the busiest backend's queue

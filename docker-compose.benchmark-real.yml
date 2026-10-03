@@ -189,8 +189,9 @@ services:
       # hash_strategy lets the factor/floor variant run under jump.
       - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
       - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
-      # Cache-miss placement: hash (bucket) or least_loaded (fewest learned routes,
-      # then lowest load). Must be listed here or the host env never reaches the server.
+      # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
+      # then fewest routes, then lowest load). Must be listed here or the host env never
+      # reaches the server.
       - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-hash}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
@@ -288,8 +289,9 @@ services:
       # hash_strategy lets the factor/floor variant run under jump.
       - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
       - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
-      # Cache-miss placement: hash (bucket) or least_loaded (fewest learned routes,
-      # then lowest load). Must be listed here or the host env never reaches the server.
+      # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
+      # then fewest routes, then lowest load). Must be listed here or the host env never
+      # reaches the server.
       - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-hash}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
@@ -387,8 +389,9 @@ services:
       # hash_strategy lets the factor/floor variant run under jump.
       - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
       - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
-      # Cache-miss placement: hash (bucket) or least_loaded (fewest learned routes,
-      # then lowest load). Must be listed here or the host env never reaches the server.
+      # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
+      # then fewest routes, then lowest load). Must be listed here or the host env never
+      # reaches the server.
       - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-hash}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"

@@ -469,7 +469,7 @@ define_runs() {
     # Leg A (2026-10-02) showed the 13B 20u regression is hash placement itself:
     # pure affinity, zero diverts, +8..12% P99 with one backend at 23% of requests
     # and one at 0.6%. --miss-placement least_loaded places each new prefix on the
-    # backend with the fewest learned routes. Acceptance: 20u turns negative with
+    # backend holding the fewest learned-route tokens. Acceptance: 20u turns negative with
     # the prefix arm's Gini near round-robin's and P50 still ~-25%.
     add_run placement "13B 20u/10m A/B, fitted set, miss placement least_loaded" \
         --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
