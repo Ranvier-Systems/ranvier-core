@@ -392,7 +392,12 @@ same deterministic rule on every node, one cache miss per move.
    ≈ 0 and `router_local_routes_converged_total` in the tens (split gone);
    `backend_resident_route_tokens` summed over shards even to within one prefix (~4000 tokens)
    across backends (placement balanced); then route consistency ≥ 57%, prefix-arm Gini ≈ 0.03,
-   then P99 (acceptance: negative ×3 at 20u, P50 ≈ −25%).
+   then P99 (acceptance: negative ×3 at 20u, P50 ≈ −25%). Each arm's Ranvier container logs
+   are now saved as `ranvier_node{1,2,3}.log` in the run directory (the v3 logs were wanted after
+   the run and had been removed by the runner's teardown); the info-level "Buffering route: N
+   tokens -> backend B" lines give the per-node route map — the 16 pool prefixes have distinct
+   lengths, so N identifies the prefix — and three nodes that disagree on a prefix's backend is
+   the split seen directly.
 3. Tokens even but traffic skewed → popularity, not placement: replication (BACKLOG §27). Tokens
    uneven → the warm-up burst still places blind: post-hoc rebalance (above). Balance and
    affinity recovered but P99 ≥ 0 → the divert policy and the closed loop: run the combo
