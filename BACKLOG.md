@@ -1441,9 +1441,15 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   route consistency 36.7% (default ~48%) and KV hits 28.7% (default 36–44%): because placement is
   a local decision and routes were learned only at first byte (~1 TTFT later), shards/nodes placed
   the same new prefix on different backends and each kept its LOCAL route. Fix: learn a placed miss
-  at dispatch too (window → one 20 ms batch flush + gossip). Re-run `--suite placement` on the
-  token-weighted, eager-learn build; route consistency back near 48%+ and KV hits near 40% are the
-  tell that the split is gone. Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
+  at dispatch too (window → one 20 ms batch flush + gossip). **v2 run (token-weighted + eager
+  learn, 2026-10-03): +11.4, +12.5, +3.9; consistency 37.9/40.8/41.5%, KV 29.8/31.0/37.6%, Gini
+  0.048/0.074/0.050 — split persists, and `router_remote_routes_trust_refused_total` = 860/781/800 per arm on shard 0
+  (≈0 under hash placement) confirms it is cross-node: each node keeps its own LOCAL placement
+  under T7 and refuses the others' forever. Third fix (branch): under `least_loaded`, a conflicting
+  gossiped route is settled by lowest backend id on every node (`insert_if_trusted(...,
+  converge_local_conflicts)`, counter `router_remote_routes_converged_total`); PUSH and the hash
+  default untouched. Tell on the next run: refusals ≈ 0, converged in the tens, consistency ≥ ~48%,
+  KV ≈ 40%. Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
   0.080 — the count-weighted build is a consistent regression (+6.6, +25.1, +13.3) with worse
   affinity than the default in all three. Leg B (in-flight signal, default placement): +14.2, −1.0
   (rep 2 lost to a silent compose failure, since fixed) — a real-time signal helps diversion at

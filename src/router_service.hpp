@@ -935,6 +935,10 @@ public:
     // REMOTE announcements refused by a higher-trust LOCAL/PUSH route.
     static uint64_t remote_routes_trust_refused_for_testing();
 
+    // Shard-local convergence counter observer: gossip REMOTE routes that moved
+    // a conflicting route to the lower backend id (miss_placement=least_loaded).
+    static uint64_t remote_routes_converged_for_testing();
+
     // Resolve a key against the shard-local RadixTree (backend the tree would
     // route it to, or nullopt). Confirms which origin's route won a conflict.
     static std::optional<BackendId> lookup_backend_for_testing(const std::vector<int32_t>& tokens);

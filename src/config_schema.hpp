@@ -110,11 +110,15 @@ struct RoutingConfig {
     //                 that see a brand-new prefix before its route propagates
     //                 place it independently (each keeps its LOCAL route under
     //                 the trust ladder; the prefix is then warm on two
-    //                 backends), so the HttpController learns a placed miss at
-    //                 dispatch rather than at first byte, shrinking that window
-    //                 from ~1 TTFT to one route-batch flush (20 ms) plus
-    //                 gossip. Balances prefix tokens, not popularity: a skewed
-    //                 hot prefix still needs replication (BACKLOG section 27).
+    //                 backends). Two mitigations: the HttpController learns a
+    //                 placed miss at dispatch rather than at first byte
+    //                 (window ~1 TTFT -> one 20 ms route-batch flush), and a
+    //                 gossiped route that still conflicts is settled by lowest
+    //                 backend id on every node (RadixTree::insert_if_trusted
+    //                 converge_local_conflicts) instead of refused, so the
+    //                 cluster converges on one backend. Balances prefix tokens,
+    //                 not popularity: a skewed hot prefix still needs
+    //                 replication (BACKLOG section 27).
     // Env: RANVIER_MISS_PLACEMENT=hash|least_loaded. YAML: routing.miss_placement.
     enum class MissPlacement { HASH, LEAST_LOADED };
     MissPlacement miss_placement = MissPlacement::HASH;
