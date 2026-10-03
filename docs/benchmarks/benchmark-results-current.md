@@ -287,6 +287,23 @@ every node computes the same bucket). Two nodes that place the same new prefix d
 keep their own LOCAL route forever under the trust ladder (invariant T7), so the prefix stays
 warm on two or three backends and its hits are split for the whole run.
 
+**10 users, same build (reps 1–2 of 3; rep 3 pending):**
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Large-hit P99 |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|---------------|
+| 1 (rr-first) | +0.9% | −28.1% | 54.6% | 59.2% | 26.0% | 0.128 | +8.7% |
+| 2 (prefix-first) | −6.9% | −28.1% | 51.3% | 64.0% | 27.8% | 0.091 | +23.4% |
+
+Mixed, like every 10-user set of the campaign (fitted default −7.3/−5.8/−0.1, leg B −11.3/+8.3/−10.8):
+at ~1 in-flight per backend the queue that sets P99 at 20 users is mostly absent, so placement has
+little to fix and these rows say nothing about it either way. Affinity is **not** split at 10
+users (consistency 51–55%, KV 59–64%, both at the default-hash 10u level of 47–64%), which fits
+the mechanism: with half the arrival rate a new prefix is far less likely to reach two nodes
+inside the same first-byte window. Balance is no better than hash at this load (Gini 0.09–0.13);
+the ~70 one-off routes dominate placement when only 16 pool prefixes are in play. In both reps the
+large-prefix *hit* P99 is worse (+8.7, +23.4%) while miss P50 improves, the same shape as at 20
+users: the hits that queue behind a hot backend are the tail.
+
 **Second fix (branch, pending rebuild): converge conflicting routes by lowest backend id.**
 Under `least_loaded`, a gossiped REMOTE route that meets a LOCAL or REMOTE route to a
 different backend is settled by a total order — the lower backend id wins — on every node
