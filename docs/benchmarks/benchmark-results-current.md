@@ -331,6 +331,39 @@ re-announcement), route consistency back near 48%, KV hits near 40%.
 4. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
    aggregates, manifests, runner summary) **before** terminating the instance.
 
+### Least-loaded placement v3, + gossip convergence (2026-10-03): split fixed, balance not
+
+Same instance, GHCR image from main (`48471f4`, convergence commit verified inside the image),
+`--suite placement`, 13B 20 users.
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Busiest / quietest backend |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------------|
+| 1 (rr-first) | +8.1% | −26.6% | **56.5%** | **47.7%** | 26.4% | **0.113** | 555 / 267 req (18.5% / 8.9%) |
+
+**Affinity is back and then some:** consistency 56.5% and KV hits 47.7% are the best 20-user
+numbers of the campaign (default hash ≈ 48% / 40%; v1–v2 ≈ 40% / 31%). The convergence rule did
+what it was built for. **Balance is the worst of the campaign:** Gini 0.113 against 0.05–0.10
+for every earlier prefix arm, with one backend taking 18.5% of requests and another 8.9%.
+P99 +8.1% is that one queue again.
+
+Reading: the v1/v2 split was *hiding* the placement. A prefix warm on two or three backends
+spreads its load even when its placement was poor; once every prefix lives on exactly one
+backend, the placement is what you see, and the token-weighted tally did not spread the 16
+pool prefixes. The suspect is the warm-up burst: all 16 are first seen inside the first second
+or two, across 24 shard-local trees on 3 nodes. Eager learn closes the cross-shard window to
+one 20 ms flush, but the cross-node window is still the gossip interval, and a shard deciding
+in that window sees a near-empty tally, equal (stale) load, and falls through to probe order —
+hash placement by another name, now made permanent by convergence. Confirm from the prefix-arm
+dump before building anything: `backend_resident_routes` summed over shards on one node should
+show the hot backend holding three or four pool prefixes' worth of routes and the quiet one
+about one; `router_remote_routes_trust_refused_total` should be near zero and
+`router_remote_routes_converged_total` in the tens.
+
+If confirmed, no greedy local placement can fix a simultaneous burst; the fix is a post-hoc
+one: once the tally has converged, move the heaviest prefix off the fullest backend when the
+gap exceeds one prefix (same deterministic rule on every node, one cache miss per move).
+See BACKLOG §27.
+
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
 Kept for the record; **do not cite.** The audit of 2026-09-30 found that these runs carried
