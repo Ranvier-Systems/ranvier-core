@@ -338,13 +338,17 @@ Same instance, GHCR image from main (`48471f4`, convergence commit verified insi
 
 | Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Busiest / quietest backend |
 |-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------------|
-| 1 (rr-first) | +8.1% | −26.6% | **56.5%** | **47.7%** | 26.4% | **0.113** | 555 / 267 req (18.5% / 8.9%) |
+| 1 (rr-first) | +8.1% | −26.6% | **56.5%** | **47.7%** | 26.4% | **0.113** | b5 555 / b8 267 (18.5% / 8.9%) |
+| 2 (prefix-first) | +10.1% | −26.6% | **59.1%** | 42.4% | 25.3% | **0.106** | b5 474 / b8 250 (15.9% / 8.4%) |
+| 3 (rr-first) | +3.4% | −25.7% | **58.2%** | **46.7%** | 26.8% | **0.090** | b7 480 / b5 263 (16.2% / 8.9%) |
 
-**Affinity is back and then some:** consistency 56.5% and KV hits 47.7% are the best 20-user
-numbers of the campaign (default hash ≈ 48% / 40%; v1–v2 ≈ 40% / 31%). The convergence rule did
-what it was built for. **Balance is the worst of the campaign:** Gini 0.113 against 0.05–0.10
-for every earlier prefix arm, with one backend taking 18.5% of requests and another 8.9%.
-P99 +8.1% is that one queue again.
+**Verdict: ❌ not accepted** (+8.1, +10.1, +3.4; median +8.1). **Affinity is back and then
+some:** consistency 56–59% and KV hits 42–48% are the best 20-user numbers of the campaign
+(default hash ≈ 48% / 40%; v1–v2 ≈ 40% / 31%). The convergence rule did what it was built for.
+**Balance is the worst of the campaign:** Gini 0.090–0.113 against 0.05–0.10 for every earlier
+prefix arm, with the busiest backend taking 16–18.5% of requests and the quietest 8.4–8.9% in
+every rep. The hot backend moves between reps (b5, b5, b7), so this is a placement draw, not a
+hot prefix. P99 is that one queue again, and the three P99 deltas track the three Ginis.
 
 Reading: the v1/v2 split was *hiding* the placement. A prefix warm on two or three backends
 spreads its load even when its placement was poor; once every prefix lives on exactly one
