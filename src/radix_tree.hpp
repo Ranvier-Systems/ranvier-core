@@ -395,7 +395,14 @@ public:
     // placement run: ~800 refusals per 10-minute arm on shard 0, the prefix
     // warm on two or three backends, route consistency 38% vs 48%). Both
     // sides apply the same rule, so the cluster converges on one backend and
-    // nothing flaps. PUSH routes are never touched.
+    // nothing flaps. PUSH routes are never touched. The same order applies to
+    // a LOCAL insert (the local batch flush under least-loaded placement): a
+    // LOCAL learn that meets a lower-id LOCAL or REMOTE route is REFUSED
+    // instead of overwriting it, otherwise the 20 ms between placement and
+    // flush re-splits every prefix a peer placed first (placement v3,
+    // 2026-10-03: converged = 0 while ~220 announcements per node were
+    // refused). Without the flag LOCAL keeps its plain ladder: it overwrites
+    // REMOTE and same-origin routes, latest wins.
     TrustInsertResult insert_if_trusted(std::span<const TokenId> tokens, BackendId backend,
                                         RouteOrigin origin,
                                         bool converge_local_conflicts = false) {
@@ -1702,10 +1709,16 @@ private:
             if (trust_result != nullptr && !is_new) {
                 const bool different_backend = node->leaf_value != backend;
                 // Convergence (see insert_if_trusted): a REMOTE announcement
-                // meeting a LOCAL or REMOTE route to a different backend is
-                // settled by lowest backend id. PUSH is outside the rule.
+                // or a LOCAL learn meeting a LOCAL or REMOTE route to a
+                // different backend is settled by lowest backend id. PUSH is
+                // outside the rule on both sides. LOCAL is included because the
+                // local batch flush lands a placed miss ~20 ms after the
+                // decision, by which time a peer's lower-id route may already
+                // hold the key: latest-wins there re-splits the prefix and the
+                // lower side never re-announces (placement v3, 2026-10-03:
+                // converged = 0, refusals ~220 per node).
                 const bool converge_case =
-                    converge && origin == RouteOrigin::REMOTE && different_backend &&
+                    converge && origin != RouteOrigin::PUSH && different_backend &&
                     node->origin != RouteOrigin::PUSH;
                 if (converge_case) {
                     if (backend < *node->leaf_value) {

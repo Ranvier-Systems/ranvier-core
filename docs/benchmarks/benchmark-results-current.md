@@ -316,68 +316,24 @@ re-announcement), route consistency back near 48%, KV hits near 40%.
 
 **Resume checklist (next GPU session), in order:**
 
-1. Build from a checkout that contains the convergence commit (confirm with
-   `grep -c 'remote_routes_converged_total' ranvier_server` = 1 inside the image), or pull the
+1. Build from a checkout that contains the local-flush convergence commit (confirm with
+   `grep -c 'local_routes_converged_total' ranvier_server` = 1 inside the image), or pull the
    GHCR image once main carries it. The stale-image guard refuses an image older than the
    newest `src/` commit.
-2. `bench-runner.sh --suite placement --output-dir benchmark-reports-placement-v3`. Read in
-   this order: gossip trust refusals ≈ 0 and converged counter in the tens (split gone), route
-   consistency ≥ ~48% and KV hits ≈ 40%, prefix-arm Gini ≈ 0.03, then P99 (acceptance:
-   negative ×3 at 20u, P50 ≈ −25%).
-3. If balance and affinity recover but P99 stays ≥ 0: the remaining tail is the default divert
-   policy (24% of requests on the stale signal) plus the closed loop. Run the combo
+2. `bench-runner.sh --suite placement --output-dir benchmark-reports-placement-v4` (the 10-user
+   row carries no signal; `--repeat 3` on the 20-user line alone is enough). Read in this order
+   from the prefix arm's `prometheus_metrics_node*.txt`: `router_remote_routes_trust_refused_total`
+   ≈ 0 and `router_local_routes_converged_total` in the tens (split gone);
+   `backend_resident_route_tokens` summed over shards even to within one prefix (~4000 tokens)
+   across backends (placement balanced); then route consistency ≥ 57%, prefix-arm Gini ≈ 0.03,
+   then P99 (acceptance: negative ×3 at 20u, P50 ≈ −25%).
+3. Tokens even but traffic skewed → popularity, not placement: replication (BACKLOG §27). Tokens
+   uneven → the warm-up burst still places blind: post-hoc rebalance (above). Balance and
+   affinity recovered but P99 ≥ 0 → the divert policy and the closed loop: run the combo
    (placement + in-flight knobs + `--bounded-load-epsilon 1.0`, 20u ×3) and the paced control
-   (`--pacing 4.3`, equal offered load) described in BACKLOG §27.
+   (`--pacing 4.3`) described in BACKLOG §27.
 4. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
    aggregates, manifests, runner summary) **before** terminating the instance.
-
-### Least-loaded placement v3, + gossip convergence (2026-10-03): split fixed, balance not
-
-Same instance, GHCR image from main (`48471f4`, convergence commit verified inside the image),
-`--suite placement`, 13B 20 users.
-
-| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Busiest / quietest backend |
-|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------------|
-| 1 (rr-first) | +8.1% | −26.6% | **56.5%** | **47.7%** | 26.4% | **0.113** | b5 555 / b8 267 (18.5% / 8.9%) |
-| 2 (prefix-first) | +10.1% | −26.6% | **59.1%** | 42.4% | 25.3% | **0.106** | b5 474 / b8 250 (15.9% / 8.4%) |
-| 3 (rr-first) | +3.4% | −25.7% | **58.2%** | **46.7%** | 26.8% | **0.090** | b7 480 / b5 263 (16.2% / 8.9%) |
-
-**Verdict: ❌ not accepted** (+8.1, +10.1, +3.4; median +8.1). **Affinity is back and then
-some:** consistency 56–59% and KV hits 42–48% are the best 20-user numbers of the campaign
-(default hash ≈ 48% / 40%; v1–v2 ≈ 40% / 31%). The convergence rule did what it was built for.
-**Balance is the worst of the campaign:** Gini 0.090–0.113 against 0.05–0.10 for every earlier
-prefix arm, with the busiest backend taking 16–18.5% of requests and the quietest 8.4–8.9% in
-every rep. The hot backend moves between reps (b5, b5, b7), so this is a placement draw, not a
-hot prefix. P99 is that one queue again, and the three P99 deltas track the three Ginis.
-
-**10 users, same build (rep 1 of 3):**
-
-| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Busiest / quietest backend |
-|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------------|
-| 1 (rr-first) | **−13.2%** | −29.1% | 57.2% | **66.0%** | 25.3% | 0.083 | b1/b6 223 / b5 132 (13.8% / 8.2%) |
-
-The best 10-user rep of the campaign on every axis (P99, P50, consistency, KV), and with the
-same uneven placement as the 20-user arms (Gini 0.083, busiest backend 1.7× the quietest). At
-10 users the hot backend's queue is short enough that affinity wins outright; at 20 it is not.
-Same mechanism, different regime: the placement draw is the only thing between the two rows.
-
-Reading: the v1/v2 split was *hiding* the placement. A prefix warm on two or three backends
-spreads its load even when its placement was poor; once every prefix lives on exactly one
-backend, the placement is what you see, and the token-weighted tally did not spread the 16
-pool prefixes. The suspect is the warm-up burst: all 16 are first seen inside the first second
-or two, across 24 shard-local trees on 3 nodes. Eager learn closes the cross-shard window to
-one 20 ms flush, but the cross-node window is still the gossip interval, and a shard deciding
-in that window sees a near-empty tally, equal (stale) load, and falls through to probe order —
-hash placement by another name, now made permanent by convergence. Confirm from the prefix-arm
-dump before building anything: `backend_resident_routes` summed over shards on one node should
-show the hot backend holding three or four pool prefixes' worth of routes and the quiet one
-about one; `router_remote_routes_trust_refused_total` should be near zero and
-`router_remote_routes_converged_total` in the tens.
-
-If confirmed, no greedy local placement can fix a simultaneous burst; the fix is a post-hoc
-one: once the tally has converged, move the heaviest prefix off the fullest backend when the
-gap exceeds one prefix (same deterministic rule on every node, one cache miss per move).
-See BACKLOG §27.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 

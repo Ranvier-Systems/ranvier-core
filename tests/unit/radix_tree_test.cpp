@@ -1376,6 +1376,54 @@ TEST_F(RadixTreeTest, ConvergeNeverTouchesPushRoutes) {
     EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 6);
 }
 
+// LOCAL inserts obey the same order under the flag: the local batch flush
+// lands a placed miss ~20 ms after the decision, and a peer's lower-id route
+// may already hold the key by then (placement v3, 2026-10-03: converged = 0,
+// ~220 refusals per node, because the flush used latest-wins).
+TEST_F(RadixTreeTest, ConvergeLocalYieldsToLowerRemoteBackend) {
+    EXPECT_EQ(tree.insert_if_trusted(tokens({1, 2, 3, 4}), 4, RouteOrigin::REMOTE, true),
+              TrustInsertResult::INSERTED_NEW);
+    auto r = tree.insert_if_trusted(tokens({1, 2, 3, 4}), 6, RouteOrigin::LOCAL, /*converge=*/true);
+    EXPECT_EQ(r, TrustInsertResult::REFUSED);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 4);
+    EXPECT_EQ(tree.routes_by_backend().at(4), 1u);
+    EXPECT_FALSE(tree.routes_by_backend().contains(6));
+}
+
+TEST_F(RadixTreeTest, ConvergeLocalMovesHigherRemoteBackend) {
+    EXPECT_EQ(tree.insert_if_trusted(tokens({1, 2, 3, 4}), 6, RouteOrigin::REMOTE, true),
+              TrustInsertResult::INSERTED_NEW);
+    auto r = tree.insert_if_trusted(tokens({1, 2, 3, 4}), 4, RouteOrigin::LOCAL, /*converge=*/true);
+    EXPECT_EQ(r, TrustInsertResult::OVERWROTE);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 4);
+    EXPECT_EQ(tree.route_count(), 1u);
+}
+
+TEST_F(RadixTreeTest, ConvergeLocalOverLocalIsLowestIdNotLatest) {
+    // Two shards placed the same new prefix inside one flush window.
+    tree.insert(tokens({1, 2, 3, 4}), 4, RouteOrigin::LOCAL);
+    EXPECT_EQ(tree.insert_if_trusted(tokens({1, 2, 3, 4}), 6, RouteOrigin::LOCAL, true),
+              TrustInsertResult::REFUSED);
+    EXPECT_EQ(tree.insert_if_trusted(tokens({1, 2, 3, 4}), 2, RouteOrigin::LOCAL, true),
+              TrustInsertResult::OVERWROTE);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 2);
+}
+
+TEST_F(RadixTreeTest, ConvergeLocalNeverTouchesPushRoutes) {
+    tree.insert(tokens({1, 2, 3, 4}), 6, RouteOrigin::PUSH);
+    EXPECT_EQ(tree.insert_if_trusted(tokens({1, 2, 3, 4}), 4, RouteOrigin::LOCAL, true),
+              TrustInsertResult::OVERWROTE);  // plain ladder: LOCAL outranks PUSH
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 4);
+}
+
+TEST_F(RadixTreeTest, ConvergeOffLocalOverRemoteIsLatestWins) {
+    EXPECT_EQ(tree.insert_if_trusted(tokens({1, 2, 3, 4}), 4, RouteOrigin::REMOTE),
+              TrustInsertResult::INSERTED_NEW);
+    EXPECT_EQ(tree.insert_if_trusted(tokens({1, 2, 3, 4}), 6, RouteOrigin::LOCAL),
+              TrustInsertResult::OVERWROTE);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 6);
+}
+
 TEST_F(RadixTreeTest, ConvergeOffKeepsTrustLadder) {
     tree.insert(tokens({1, 2, 3, 4}), 6, RouteOrigin::LOCAL);
     auto r = tree.insert_if_trusted(tokens({1, 2, 3, 4}), 4, RouteOrigin::REMOTE);

@@ -258,8 +258,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   instead of one TTFT, and a gossiped route that still conflicts with a node's own
   placement is settled by lowest backend id on every node (new
   `router_remote_routes_converged_total`) instead of refused under the trust ladder,
-  so the cluster converges on one backend per prefix. PUSH routes and the default
-  `hash` placement are untouched. Motivated by the 2026-10-02 fitted-suite leg A: with every divert mechanism
+  so the cluster converges on one backend per prefix. The node's own learns obey the
+  same order at the local batch flush: a learn that lands after a peer's lower-id
+  route arrived is dropped before fan-out and gossip (new
+  `router_local_routes_converged_total`) instead of moving the prefix back. New gauge
+  `backend_resident_route_tokens` (per backend) exports the placement weight. PUSH
+  routes and the default `hash` placement are untouched. Motivated by the 2026-10-02 fitted-suite leg A: with every divert mechanism
   off, prefix affinity still lost 8–12% P99 at 13B/20 users against round-robin,
   because hash placement of 16 prefixes over 8 backends left one backend holding four
   prefixes (23% of requests) and another none (0.6%), and the busiest backend's queue

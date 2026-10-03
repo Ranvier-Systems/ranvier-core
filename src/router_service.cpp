@@ -263,6 +263,7 @@ struct ShardLocalState {
         uint64_t native_materialize_trust_skips = 0; // Materializations refused by a higher-trust route
         uint64_t remote_routes_trust_refused = 0;    // Gossip REMOTE announcements refused by a higher-trust LOCAL/PUSH route
         uint64_t remote_routes_converged = 0;        // Gossip REMOTE announcements that moved a conflicting route to the lower backend id (miss_placement=least_loaded)
+        uint64_t local_routes_converged = 0;         // LOCAL learns dropped at batch flush because a lower backend id already held the prefix (miss_placement=least_loaded)
 
         void reset() {
             cache_hits = 0;
@@ -310,6 +311,7 @@ struct ShardLocalState {
             native_materialize_trust_skips = 0;
             remote_routes_trust_refused = 0;
             remote_routes_converged = 0;
+            local_routes_converged = 0;
         }
     } stats;
 
@@ -1006,6 +1008,22 @@ uint64_t get_resident_routes(BackendId id) {
     const auto& by_backend = g_shard_state->tree->routes_by_backend();
     auto it = by_backend.find(id);
     return it == by_backend.end() ? 0 : static_cast<uint64_t>(it->second);
+}
+
+// Live route key length (TokenIds) summed over the routes pinned to backend
+// `id` in this shard's ART: the weight least-loaded cache-miss placement
+// balances on (RadixTree::route_tokens_by_backend). Shard-local, lock-free
+// read; Prometheus sums across shards = cluster total. Exported so a placement
+// run can tell an uneven placement (uneven tokens) from a popular prefix (even
+// tokens, uneven traffic) — the route COUNT above cannot, because one-off
+// prompts are routes too.
+uint64_t get_resident_route_tokens(BackendId id) {
+    if (!g_shard_state || !g_shard_state->tree) {
+        return 0;
+    }
+    const auto& by_backend = g_shard_state->tree->route_tokens_by_backend();
+    auto it = by_backend.find(id);
+    return it == by_backend.end() ? 0 : it->second;
 }
 
 // Operator-declared GPU count for backend `id` on this shard (observe-only).
@@ -2226,6 +2244,12 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             seastar::metrics::description("Gossip REMOTE route announcements that moved a conflicting "
                                          "LOCAL/REMOTE route to the lower backend id "
                                          "(miss_placement=least_loaded convergence)")),
+        seastar::metrics::make_counter("router_local_routes_converged_total",
+            [] { return g_shard_state ? g_shard_state->stats.local_routes_converged : 0UL; },
+            seastar::metrics::description("This node's own route learns dropped at batch flush "
+                                         "because a lower backend id already held the prefix "
+                                         "(miss_placement=least_loaded convergence); the learn "
+                                         "yields instead of re-splitting the prefix")),
         seastar::metrics::make_counter("router_remote_routes_trust_refused_total",
             [] { return g_shard_state ? g_shard_state->stats.remote_routes_trust_refused : 0UL; },
             seastar::metrics::description("Gossip REMOTE route announcements refused because a "
@@ -4141,13 +4165,34 @@ seastar::future<> RouterService::flush_route_batch() {
 
 // Apply a batch of locally-learned routes to the local shard's RadixTree.
 // Similar to apply_route_batch_to_local_tree but uses LOCAL origin.
-static void apply_local_batch_to_tree(const std::vector<PendingLocalRoute>& batch) {
+// Applies a flushed batch of this node's own learns to this shard's tree.
+//
+// Under least-loaded cache-miss placement the batch is also FILTERED: a route
+// that loses to a lower backend id already holding its key is removed from
+// `batch` (counted in local_routes_converged), so the caller's cross-shard
+// fan-out and gossip never carry it. Placement is decided per shard and the
+// learn lands here ~20 ms later; in that window a peer's lower-id route may
+// already have arrived by gossip, and a plain latest-wins insert would move the
+// prefix back, announce the move, and leave the cluster split — the lower side
+// refuses the announcement (invariant T7 / the convergence order) and never
+// re-announces. Placement v3 (2026-10-03) showed exactly that:
+// router_remote_routes_converged_total = 0 on every node while ~220
+// announcements per node were refused. Under the default hash placement the
+// insert is unconditional, as before (every shard computes the same bucket, so
+// LOCAL-vs-LOCAL conflicts do not arise there).
+//
+// Rule #1: shard-local tree, no locks. Rule #4: one pass over the batch.
+static void apply_local_batch_to_tree(std::vector<PendingLocalRoute>& batch) {
     if (!g_shard_state) return;
     auto& state = shard_state();
     RadixTree* tree = state.tree.get();
     if (!tree) return;
 
-    for (const auto& route : batch) {
+    const bool converge =
+        state.config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED;
+    size_t write = 0;
+    for (size_t read = 0; read < batch.size(); ++read) {
+        const auto& route = batch[read];
         // LRU eviction: if at capacity, evict oldest routes first
         if (state.config.max_routes > 0) {
             while (tree->route_count() >= state.config.max_routes) {
@@ -4160,7 +4205,26 @@ static void apply_local_batch_to_tree(const std::vector<PendingLocalRoute>& batc
         }
 
         // Insert with LOCAL origin (direct request on this node)
-        tree->insert(route.tokens, route.backend, RouteOrigin::LOCAL);
+        std::optional<BackendId> prior;
+        if (converge) {
+            prior = tree->lookup(std::span<const TokenId>(route.tokens.data(), route.tokens.size()));
+            TrustInsertResult inserted = tree->insert_if_trusted(
+                std::span<const TokenId>(route.tokens.data(), route.tokens.size()),
+                route.backend, RouteOrigin::LOCAL, /*converge_local_conflicts=*/true);
+            if (inserted == TrustInsertResult::REFUSED) {
+                // A lower backend id already holds this prefix: the cluster has
+                // settled it there, this learn yields. Dropped from the batch so
+                // other shards and peers never see it.
+                state.stats.local_routes_converged++;
+                log_router.debug("Shard {}: local route ({} tokens) -> backend {} yields to settled "
+                                 "backend {} (miss_placement=least_loaded)",
+                                 seastar::this_shard_id(), route.tokens.size(), route.backend,
+                                 prior.value_or(-1));
+                continue;
+            }
+        } else {
+            tree->insert(route.tokens, route.backend, RouteOrigin::LOCAL);
+        }
 
         // Update prefix hash reverse index for O(1) eviction lookup.
         // Hash at the route's full stored depth — tokens are pre-truncated to
@@ -4170,10 +4234,19 @@ static void apply_local_batch_to_tree(const std::vector<PendingLocalRoute>& batc
             size_t prefix_len = route.tokens.size();
             if (prefix_len > 0) {
                 uint64_t ph = hash_prefix(route.tokens.data(), prefix_len, state.config.block_alignment);
-                state.prefix_hash_index[ph].insert(route.backend);
+                auto& claimants = state.prefix_hash_index[ph];
+                if (converge && prior.has_value() && *prior != route.backend) {
+                    claimants.erase(*prior);  // the route no longer points there
+                }
+                claimants.insert(route.backend);
             }
         }
+        if (write != read) {
+            batch[write] = std::move(batch[read]);
+        }
+        ++write;
     }
+    batch.resize(write);
 }
 
 // FNV-1a hash over raw token bytes (no block alignment, used only for dedup)
@@ -6044,6 +6117,11 @@ uint64_t RouterService::remote_routes_trust_refused_for_testing() {
 uint64_t RouterService::remote_routes_converged_for_testing() {
     if (!g_shard_state) return 0;
     return shard_state().stats.remote_routes_converged;
+}
+
+uint64_t RouterService::local_routes_converged_for_testing() {
+    if (!g_shard_state) return 0;
+    return shard_state().stats.local_routes_converged;
 }
 
 std::optional<BackendId> RouterService::lookup_backend_for_testing(
