@@ -262,6 +262,7 @@ struct ShardLocalState {
         uint64_t native_routes_materialized = 0;    // PUSH routes inserted from BlockStored token chains
         uint64_t native_materialize_trust_skips = 0; // Materializations refused by a higher-trust route
         uint64_t remote_routes_trust_refused = 0;    // Gossip REMOTE announcements refused by a higher-trust LOCAL/PUSH route
+        uint64_t remote_routes_converged = 0;        // Gossip REMOTE announcements that moved a conflicting route to the lower backend id (miss_placement=least_loaded)
 
         void reset() {
             cache_hits = 0;
@@ -308,6 +309,7 @@ struct ShardLocalState {
             native_routes_materialized = 0;
             native_materialize_trust_skips = 0;
             remote_routes_trust_refused = 0;
+            remote_routes_converged = 0;
         }
     } stats;
 
@@ -1386,11 +1388,28 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
         // re-confirmation still land (OVERWROTE / TOUCHED_SAME). This ends the
         // route-flap where two peers serving the same prefix ping-pong the
         // backend, each flip a KV-cache miss.
+        //
+        // Under least-loaded cache-miss placement the ladder alone splits
+        // prefixes across nodes (each node's own LOCAL placement wins locally
+        // and refuses the others' forever), so conflicts are instead settled
+        // by lowest backend id on every node — see RadixTree::insert_if_trusted.
+        const bool converge =
+            state.config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED;
+        std::optional<BackendId> prior;
+        if (converge) {
+            prior = tree->lookup(std::span<const TokenId>(route.tokens.data(), route.tokens.size()));
+        }
         TrustInsertResult inserted =
-            tree->insert_if_trusted(route.tokens, route.backend, RouteOrigin::REMOTE);
+            tree->insert_if_trusted(route.tokens, route.backend, RouteOrigin::REMOTE, converge);
         if (inserted == TrustInsertResult::REFUSED) {
             state.stats.remote_routes_trust_refused++;
             continue;  // route untouched — do not index a backend it never claimed
+        }
+        const bool converged_move =
+            converge && prior.has_value() && *prior != route.backend &&
+            inserted == TrustInsertResult::OVERWROTE;
+        if (converged_move) {
+            state.stats.remote_routes_converged++;
         }
 
         // Update prefix hash reverse index for O(1) eviction lookup. Gated on
@@ -1409,7 +1428,11 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
             size_t prefix_len = route.tokens.size();
             if (prefix_len > 0) {
                 uint64_t ph = hash_prefix(route.tokens.data(), prefix_len, state.config.block_alignment);
-                state.prefix_hash_index[ph].insert(route.backend);
+                auto& claimants = state.prefix_hash_index[ph];
+                if (converged_move) {
+                    claimants.erase(*prior);  // the route no longer points there
+                }
+                claimants.insert(route.backend);
             }
         }
     }
@@ -2198,6 +2221,11 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             [] { return g_shard_state ? g_shard_state->stats.native_materialize_trust_skips : 0UL; },
             seastar::metrics::description("Materializations refused because a higher-trust "
                                          "route holds the prefix")),
+        seastar::metrics::make_counter("router_remote_routes_converged_total",
+            [] { return g_shard_state ? g_shard_state->stats.remote_routes_converged : 0UL; },
+            seastar::metrics::description("Gossip REMOTE route announcements that moved a conflicting "
+                                         "LOCAL/REMOTE route to the lower backend id "
+                                         "(miss_placement=least_loaded convergence)")),
         seastar::metrics::make_counter("router_remote_routes_trust_refused_total",
             [] { return g_shard_state ? g_shard_state->stats.remote_routes_trust_refused : 0UL; },
             seastar::metrics::description("Gossip REMOTE route announcements refused because a "
@@ -3762,6 +3790,27 @@ seastar::future<bool> RouterService::learn_route_global(std::vector<int32_t> tok
             log_router.debug("[{}] Route dedup: prefix ({} tokens) -> backend {} already in ART, skipping",
                              request_id.empty() ? "N/A" : request_id, tokens.size(), backend);
             return seastar::make_ready_future<bool>(false);
+        }
+        // Under least-loaded placement the prefix's backend is settled by the
+        // placement plus cluster convergence (lowest backend id wins). A
+        // first-byte learn that disagrees — the request was dispatched before
+        // convergence landed — must not move it back: that re-opens the
+        // conflict for one gossip round per in-flight request. Skip it while
+        // the settled backend is live; a dead or draining one may be replaced.
+        if (existing.has_value() &&
+            cfg.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED) {
+            auto bit = state.backends.find(existing.value());
+            const bool settled_live = bit != state.backends.end() &&
+                                      !bit->second.is_draining &&
+                                      !state.dead_backends.contains(existing.value());
+            if (settled_live) {
+                state.stats.routes_deduplicated_pre_buffer++;
+                log_router.debug("[{}] Route settled: prefix ({} tokens) -> backend {} already placed; "
+                                 "not moving it to backend {} (miss_placement=least_loaded)",
+                                 request_id.empty() ? "N/A" : request_id, tokens.size(),
+                                 existing.value(), backend);
+                return seastar::make_ready_future<bool>(false);
+            }
         }
     }
 
@@ -5990,6 +6039,11 @@ bool RouterService::eager_learn_on_miss() {
 uint64_t RouterService::remote_routes_trust_refused_for_testing() {
     if (!g_shard_state) return 0;
     return shard_state().stats.remote_routes_trust_refused;
+}
+
+uint64_t RouterService::remote_routes_converged_for_testing() {
+    if (!g_shard_state) return 0;
+    return shard_state().stats.remote_routes_converged;
 }
 
 std::optional<BackendId> RouterService::lookup_backend_for_testing(

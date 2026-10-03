@@ -1338,6 +1338,51 @@ TEST_F(RadixTreeTest, TrustInsertNeverClobbersLocal) {
     EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 1);
 }
 
+// Convergence under least-loaded cache-miss placement: a REMOTE announcement
+// meeting a LOCAL or REMOTE route to a different backend is settled by lowest
+// backend id, on every node alike, so the cluster agrees on one backend.
+// Off by default: the plain trust ladder is unchanged.
+TEST_F(RadixTreeTest, ConvergeMovesLocalRouteToLowerRemoteBackend) {
+    tree.insert(tokens({1, 2, 3, 4}), 6, RouteOrigin::LOCAL);
+    auto r = tree.insert_if_trusted(tokens({1, 2, 3, 4}), 4, RouteOrigin::REMOTE, /*converge=*/true);
+    EXPECT_EQ(r, TrustInsertResult::OVERWROTE);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 4);
+    EXPECT_EQ(tree.route_count(), 1u);
+    EXPECT_EQ(tree.routes_by_backend().at(4), 1u);
+    EXPECT_FALSE(tree.routes_by_backend().contains(6));
+}
+
+TEST_F(RadixTreeTest, ConvergeRefusesHigherRemoteBackend) {
+    tree.insert(tokens({1, 2, 3, 4}), 4, RouteOrigin::LOCAL);
+    auto r = tree.insert_if_trusted(tokens({1, 2, 3, 4}), 6, RouteOrigin::REMOTE, /*converge=*/true);
+    EXPECT_EQ(r, TrustInsertResult::REFUSED);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 4);
+}
+
+TEST_F(RadixTreeTest, ConvergeRemoteOverRemoteIsLowestIdNotLatest) {
+    EXPECT_EQ(tree.insert_if_trusted(tokens({1, 2, 3, 4}), 6, RouteOrigin::REMOTE, true),
+              TrustInsertResult::INSERTED_NEW);
+    EXPECT_EQ(tree.insert_if_trusted(tokens({1, 2, 3, 4}), 4, RouteOrigin::REMOTE, true),
+              TrustInsertResult::OVERWROTE);
+    EXPECT_EQ(tree.insert_if_trusted(tokens({1, 2, 3, 4}), 7, RouteOrigin::REMOTE, true),
+              TrustInsertResult::REFUSED);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 4);
+}
+
+TEST_F(RadixTreeTest, ConvergeNeverTouchesPushRoutes) {
+    tree.insert(tokens({1, 2, 3, 4}), 6, RouteOrigin::PUSH);
+    auto r = tree.insert_if_trusted(tokens({1, 2, 3, 4}), 4, RouteOrigin::REMOTE, /*converge=*/true);
+    EXPECT_EQ(r, TrustInsertResult::REFUSED);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 6);
+}
+
+TEST_F(RadixTreeTest, ConvergeOffKeepsTrustLadder) {
+    tree.insert(tokens({1, 2, 3, 4}), 6, RouteOrigin::LOCAL);
+    auto r = tree.insert_if_trusted(tokens({1, 2, 3, 4}), 4, RouteOrigin::REMOTE);
+    EXPECT_EQ(r, TrustInsertResult::REFUSED);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value_or(0), 6);
+}
+
 TEST_F(RadixTreeTest, TrustInsertSameBackendBehindLocalTouches) {
     tree.insert(tokens({1, 2, 3, 4}), 1, RouteOrigin::LOCAL);
     auto r = tree.insert_if_trusted(tokens({1, 2, 3, 4}), 1, RouteOrigin::PUSH);

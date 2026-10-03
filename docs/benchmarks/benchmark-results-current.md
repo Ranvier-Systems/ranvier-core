@@ -261,18 +261,51 @@ rebuild (`d8bdde4`, `5769f4e`):
    local decision, and routes were learned only at first byte, ~1 TTFT after dispatch. In that
    window other shards and nodes placed the same new prefix elsewhere and each kept its LOCAL
    route, so prefixes were warm on two or three backends and hits were split — the consistency
-   and KV-hit drop. Fix: under `least_loaded` the controller also learns the placed miss at
-   dispatch, shrinking the window to one 20 ms route-batch flush plus gossip.
+   and KV-hit drop. First fix: under `least_loaded` the controller also learns the placed miss
+   at dispatch, shrinking the window to one 20 ms route-batch flush plus gossip.
+
+### Least-loaded placement v2, token-weighted + eager learn (2026-10-03): ❌ split persists
+
+Fresh instance, GHCR image from main (`ba00cb9`), `--suite placement`, 13B 20 users.
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Gossip trust refusals (shard 0, 3 nodes) |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|------------------------------------------|
+| 1 (rr-first) | +11.4% | −20.6% | 37.9% | 29.8% | 22.4% | 0.048 | 860 |
+| 2 (prefix-first) | +12.5% | −23.2% | 40.8% | 31.0% | 23.3% | 0.074 | 781 |
+| 3 | (pending) | | | | | | 800 |
+
+Balance improved (Gini 0.048/0.074 vs 0.08–0.10) but affinity did not recover: consistency
+and KV hits are where the count-weighted build left them. Arithmetic: default arms divert ~30%
+and are ~50% consistent, so ~20% of requests change backend for other reasons (mostly first-seen
+one-offs); v2 arms divert 23% and are 39% consistent, leaving 38% — the extra ~18 points are
+pool prefixes served from more than one backend. The 20 ms intra-node window cannot produce
+that; the cross-node path can. **Confirmed by the counter:** ~800 gossip REMOTE routes per arm
+were refused on shard 0 alone because a LOCAL route to a *different* backend already held the
+prefix (`router_remote_routes_trust_refused_total`; ~0 expected under hash placement, where
+every node computes the same bucket). Two nodes that place the same new prefix differently each
+keep their own LOCAL route forever under the trust ladder (invariant T7), so the prefix stays
+warm on two or three backends and its hits are split for the whole run.
+
+**Second fix (branch, pending rebuild): converge conflicting routes by lowest backend id.**
+Under `least_loaded`, a gossiped REMOTE route that meets a LOCAL or REMOTE route to a
+different backend is settled by a total order — the lower backend id wins — on every node
+alike (`RadixTree::insert_if_trusted(..., converge_local_conflicts)`). Both sides apply the
+same rule, so the cluster converges on one backend and nothing flaps; PUSH routes are never
+touched; the default (hash) path keeps the plain trust ladder. Counter:
+`router_remote_routes_converged_total`. The tell on the next run: trust refusals near zero,
+the converged counter in the tens (once per conflicting prefix per node, not per
+re-announcement), route consistency back near 48%, KV hits near 40%.
 
 **Resume checklist (next GPU session), in order:**
 
-1. `git fetch && git reset --hard origin/claude/sleepy-lamport-wxly0b`; `docker build -t
-   ranvier:latest -f Dockerfile.production .`; confirm `grep -c 'route_tokens=' ranvier_server`
-   is 1 inside the image. Pull before the first run: the stale-image guard refuses an image
-   older than the newest `src/` commit.
-2. `bench-runner.sh --suite placement --output-dir benchmark-reports-placement-v2`. Read in
-   this order: route consistency ≥ ~48% and KV hits ≈ 40% (split gone), prefix-arm Gini ≈ 0.03
-   (long prefixes two per backend), then P99 (acceptance: negative ×3 at 20u, P50 ≈ −25%).
+1. Build from a checkout that contains the convergence commit (confirm with
+   `grep -c 'remote_routes_converged_total' ranvier_server` = 1 inside the image), or pull the
+   GHCR image once main carries it. The stale-image guard refuses an image older than the
+   newest `src/` commit.
+2. `bench-runner.sh --suite placement --output-dir benchmark-reports-placement-v3`. Read in
+   this order: gossip trust refusals ≈ 0 and converged counter in the tens (split gone), route
+   consistency ≥ ~48% and KV hits ≈ 40%, prefix-arm Gini ≈ 0.03, then P99 (acceptance:
+   negative ×3 at 20u, P50 ≈ −25%).
 3. If balance and affinity recover but P99 stays ≥ 0: the remaining tail is the default divert
    policy (24% of requests on the stale signal) plus the closed loop. Run the combo
    (placement + in-flight knobs + `--bounded-load-epsilon 1.0`, 20u ×3) and the paced control

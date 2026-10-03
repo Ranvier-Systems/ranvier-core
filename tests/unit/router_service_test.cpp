@@ -2844,6 +2844,62 @@ TEST_F(BoundedLoadTest, LeastLoadedPlacementLeavesArtHitsAlone) {
     EXPECT_TRUE(r.art_hit);
 }
 
+TEST_F(BoundedLoadTest, LeastLoadedPlacementConvergesConflictingGossipRoutes) {
+    // Two nodes placed the same new prefix on different backends; each gossips
+    // its LOCAL route. Under least_loaded the receiver moves to the lower id
+    // instead of refusing, so the cluster converges and the prefix is warm on
+    // exactly one backend.
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    std::vector<int32_t> tokens = {8001, 8002, 8003, 8004};
+    RouterService::insert_route_for_testing(tokens, 3);            // our LOCAL placement
+    RouterService::learn_remote_route_for_testing(tokens, 2);      // peer placed it lower
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 2);
+    EXPECT_EQ(RouterService::remote_routes_converged_for_testing(), 1u);
+
+    RouterService::learn_remote_route_for_testing(tokens, 4);      // another peer, higher id
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 2);
+    EXPECT_EQ(RouterService::remote_routes_trust_refused_for_testing(), 1u);
+    EXPECT_EQ(RouterService::remote_routes_converged_for_testing(), 1u);
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementDoesNotRelearnASettledPrefix) {
+    // A first-byte learn that disagrees with the settled (placed + converged)
+    // backend is dropped while that backend is live, so a request dispatched
+    // before convergence cannot re-open the conflict.
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    std::vector<int32_t> tokens = {8201, 8202, 8203, 8204};
+    RouterService::insert_route_for_testing(tokens, 2);   // settled
+    // The guard short-circuits with a ready future (no buffering, no reactor
+    // needed), so .get() is safe here. The dead-backend branch buffers through
+    // the batch coroutine and is not exercised reactor-free.
+    auto fut = router_->learn_route_global(tokens, 3, "late-learn", 0);
+    ASSERT_TRUE(fut.available());
+    EXPECT_FALSE(fut.get());
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 2);
+}
+
+TEST_F(BoundedLoadTest, HashPlacementKeepsTrustLadderForGossipConflicts) {
+    // Default placement: a gossiped route for a different backend never
+    // displaces this node's LOCAL route (invariant T7 unchanged).
+    register_four_backends();
+    std::vector<int32_t> tokens = {8101, 8102, 8103, 8104};
+    RouterService::insert_route_for_testing(tokens, 3);
+    RouterService::learn_remote_route_for_testing(tokens, 2);
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 3);
+    EXPECT_EQ(RouterService::remote_routes_trust_refused_for_testing(), 1u);
+    EXPECT_EQ(RouterService::remote_routes_converged_for_testing(), 0u);
+}
+
 TEST_F(BoundedLoadTest, HashPlacementIgnoresRouteCounts) {
     // Default mode: a backend holding every learned route still receives the
     // prefixes whose hash bucket it is. (Pin so the knob is a real A/B.)
