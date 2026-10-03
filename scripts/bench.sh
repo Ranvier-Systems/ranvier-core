@@ -301,6 +301,11 @@ BENCHMARK OPTIONS:
                         bench.sh refuses to run a mislabelled combination.
     --hash-strategy S   Ranvier hash strategy: bounded_load (default), p2c, jump, modular.
                         Sets RANVIER_HASH_STRATEGY for the cluster.
+    --miss-placement M  Where a cache miss (new prefix) is placed: hash (default,
+                        the strategy's bucket) or least_loaded (fewest learned
+                        routes, then lowest load, then probe order). Sets
+                        RANVIER_MISS_PLACEMENT. The fitted-suite leg A finding:
+                        hash placement alone costs +8..12% P99 at 13B/20u.
     --bounded-load-epsilon E
                         Divert allowance under bounded_load: cap = avg * (1 + E)
                         (default: 0.25). Sets RANVIER_BOUNDED_LOAD_EPSILON.
@@ -498,6 +503,7 @@ LOAD_AWARE=true
 LOAD_IMBALANCE_FACTOR=""
 LOAD_IMBALANCE_FLOOR=""
 HASH_STRATEGY=""            # --hash-strategy: bounded_load | p2c | jump | modular
+MISS_PLACEMENT=""           # --miss-placement: hash | least_loaded
 BOUNDED_LOAD_EPSILON=""     # --bounded-load-epsilon: divert allowance under bounded_load
 CACHE_RESIDENCY_THRESHOLD=""
 COMPRESSION_RATIO=""
@@ -544,6 +550,7 @@ while [[ $# -gt 0 ]]; do
         --load-imbalance-factor) LOAD_IMBALANCE_FACTOR="$2"; shift 2 ;;
         --load-imbalance-floor)  LOAD_IMBALANCE_FLOOR="$2"; shift 2 ;;
         --hash-strategy)  HASH_STRATEGY="$2"; shift 2 ;;
+        --miss-placement) MISS_PLACEMENT="$2"; shift 2 ;;
         --bounded-load-epsilon) BOUNDED_LOAD_EPSILON="$2"; shift 2 ;;
         --cache-residency-threshold) CACHE_RESIDENCY_THRESHOLD="$2"; shift 2 ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
@@ -1502,6 +1509,14 @@ if [[ -n "$HASH_STRATEGY" ]]; then
     export RANVIER_HASH_STRATEGY="$HASH_STRATEGY"
     log_info "Hash strategy: $HASH_STRATEGY"
 fi
+if [[ -n "$MISS_PLACEMENT" ]]; then
+    case "$MISS_PLACEMENT" in
+        hash|least_loaded) ;;
+        *) log_error "--miss-placement must be hash or least_loaded (got: $MISS_PLACEMENT)"; exit 1 ;;
+    esac
+    export RANVIER_MISS_PLACEMENT="$MISS_PLACEMENT"
+    log_info "Cache-miss placement: $MISS_PLACEMENT"
+fi
 if [[ -n "$BOUNDED_LOAD_EPSILON" ]]; then
     export RANVIER_BOUNDED_LOAD_EPSILON="$BOUNDED_LOAD_EPSILON"
     log_info "Bounded-load epsilon: $BOUNDED_LOAD_EPSILON"
@@ -1769,6 +1784,7 @@ write_manifest() {
         # Defaults mirror docker-compose.benchmark-real.yml so an unset knob is
         # recorded as the value the server actually ran with.
         printf '    "hash_strategy": "%s",\n' "$(_json_escape "${RANVIER_HASH_STRATEGY:-bounded_load}")"
+        printf '    "miss_placement": "%s",\n' "$(_json_escape "${RANVIER_MISS_PLACEMENT:-hash}")"
         printf '    "bounded_load_epsilon": "%s",\n' "$(_json_escape "${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}")"
         printf '    "cross_shard_load_sync": "%s",\n' "$(_json_escape "${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}")"
         printf '    "gpu_load_weight": "%s",\n' "$(_json_escape "${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-10.0}")"

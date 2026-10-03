@@ -2732,6 +2732,110 @@ TEST_F(BoundedLoadTest, ArtHitOverAllowanceDivertsToColdestBackend) {
     EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 1u);
 }
 
+// ---- cache-miss placement: least_loaded (fitted-suite leg A, 2026-10-02) ----
+//
+// Pure affinity regressed P99 by 8-12% with zero diverts because hash placement
+// is balls-into-bins (16 prefixes over 8 backends: one backend at 23% of
+// requests, one at 0.6%). miss_placement=least_loaded places a NEW prefix on
+// the candidate with the fewest learned routes, then the lowest load, then
+// jump-probe order. Hits and the default (hash) placement are unchanged.
+
+TEST_F(BoundedLoadTest, DefaultMissPlacementIsHash) {
+    EXPECT_EQ(RoutingConfig{}.miss_placement, RoutingConfig::MissPlacement::HASH);
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementSpreadsNewPrefixesEvenly) {
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    // Eight distinct prefixes, each learned where it was placed (as the
+    // HttpController does on response). Balls-into-bins by hash would leave
+    // some backend with 0 and some with 3-4; least-loaded gives 2 each.
+    std::vector<int> placed(5, 0);
+    for (int p = 0; p < 8; ++p) {
+        std::vector<int32_t> tokens = {1000 + p * 10, 1001 + p * 10, 1002 + p * 10, 1003 + p * 10};
+        auto r = router_->get_backend_for_prefix(tokens, "place-" + std::to_string(p));
+        ASSERT_TRUE(r.backend_id.has_value());
+        EXPECT_FALSE(r.art_hit);
+        RouterService::insert_route_for_testing(tokens, *r.backend_id);
+        placed[static_cast<size_t>(*r.backend_id)]++;
+    }
+    for (BackendId id = 1; id <= 4; ++id) {
+        EXPECT_EQ(placed[static_cast<size_t>(id)], 2)
+            << "backend " << id << " should anchor exactly 2 of 8 prefixes";
+    }
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementBreaksRouteTiesByLoadThenProbeOrder) {
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    // No learned routes anywhere (all tie at 0); in-flight loads [2, 2, 1, 0]
+    // -> the idle backend 4 takes the new prefix regardless of its hash bucket.
+    std::vector<BackendRequestGuard> guards;
+    guards.emplace_back(1); guards.emplace_back(1);
+    guards.emplace_back(2); guards.emplace_back(2);
+    guards.emplace_back(3);
+    std::vector<int32_t> tokens = {2001, 2002, 2003, 2004};
+    auto r = router_->get_backend_for_prefix(tokens, "place-load");
+    ASSERT_TRUE(r.backend_id.has_value());
+    EXPECT_EQ(*r.backend_id, 4);
+
+    // Everything tied (no routes, no load): placement is deterministic for a
+    // given prefix, so the same prefix asked twice lands on the same backend.
+    guards.clear();
+    std::vector<int32_t> other = {2101, 2102, 2103, 2104};
+    auto a = router_->get_backend_for_prefix(other, "tie-a");
+    auto b = router_->get_backend_for_prefix(other, "tie-b");
+    ASSERT_TRUE(a.backend_id.has_value() && b.backend_id.has_value());
+    EXPECT_EQ(*a.backend_id, *b.backend_id);
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementLeavesArtHitsAlone) {
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    // Backend 1 anchors the most routes by far; a learned prefix still goes
+    // to it — placement only decides misses.
+    std::vector<int32_t> warm = {3001, 3002, 3003, 3004};
+    RouterService::insert_route_for_testing(warm, 1);
+    for (int p = 0; p < 5; ++p) {
+        std::vector<int32_t> t = {3100 + p * 10, 3101 + p * 10, 3102 + p * 10, 3103 + p * 10};
+        RouterService::insert_route_for_testing(t, 1);
+    }
+    auto r = router_->get_backend_for_prefix(warm, "hit");
+    ASSERT_TRUE(r.backend_id.has_value());
+    EXPECT_EQ(*r.backend_id, 1);
+    EXPECT_TRUE(r.art_hit);
+}
+
+TEST_F(BoundedLoadTest, HashPlacementIgnoresRouteCounts) {
+    // Default mode: a backend holding every learned route still receives the
+    // prefixes whose hash bucket it is. (Pin so the knob is a real A/B.)
+    register_four_backends();
+    std::vector<int32_t> tokens = {4001, 4002, 4003, 4004};
+    auto idle = router_->get_backend_for_prefix(tokens, "hash-probe");
+    ASSERT_TRUE(idle.backend_id.has_value());
+    const BackendId primary = *idle.backend_id;
+    for (int p = 0; p < 6; ++p) {
+        std::vector<int32_t> t = {4100 + p * 10, 4101 + p * 10, 4102 + p * 10, 4103 + p * 10};
+        RouterService::insert_route_for_testing(t, primary);
+    }
+    auto again = router_->get_backend_for_prefix(tokens, "hash-again");
+    ASSERT_TRUE(again.backend_id.has_value());
+    EXPECT_EQ(*again.backend_id, primary);
+    EXPECT_FALSE(again.art_hit);
+}
+
 // =============================================================================
 // 22. Hash Strategy: Power of Two Choices (P2C)
 // =============================================================================

@@ -286,6 +286,11 @@ RANVIER_HASH_STRATEGY=bounded_load
 RANVIER_BOUNDED_LOAD_EPSILON=0.25   # capacity headroom for BOUNDED_LOAD
 RANVIER_P2C_LOAD_BIAS=2             # primary affinity bias for P2C
 
+# Where a cache miss (prefix with no learned route) is placed:
+# "hash" (default, the strategy's bucket) or "least_loaded" (fewest learned
+# routes, then lowest load, then probe order). See "Cache-miss placement".
+RANVIER_MISS_PLACEMENT=hash
+
 # vLLM PagedAttention block alignment for the FNV-1a prefix hash (default: 16)
 RANVIER_BLOCK_ALIGNMENT=16
 
@@ -306,6 +311,7 @@ routing:
   hash_strategy: bounded_load   # bounded_load | p2c | jump | modular
   bounded_load_epsilon: 0.25
   p2c_load_bias: 2
+  miss_placement: hash          # hash | least_loaded (cache-miss placement)
   enable_prefix_boundary: true  # Detect system message boundaries
   min_prefix_boundary_tokens: 4
   accept_client_prefix_boundary: false  # Accept prefix_token_count / prefix_boundaries
@@ -324,6 +330,7 @@ routing:
 | `hash_strategy` | `bounded_load` | `bounded_load`, `p2c`, `jump`, or `modular` |
 | `bounded_load_epsilon` | `0.25` | Per-backend capacity headroom = `ceil(avg_load * (1 + ε))` |
 | `p2c_load_bias` | `2` | Switch to secondary only when `secondary + bias < primary` |
+| `miss_placement` | `hash` | `hash` places a new prefix in its hash bucket; `least_loaded` on the candidate with the fewest learned routes, then lowest load, then probe order |
 | `enable_prefix_boundary` | `true` | Detect system message boundaries for multi-turn |
 | `min_prefix_boundary_tokens` | `4` | Minimum system message tokens to use as boundary |
 | `accept_client_prefix_boundary` | `false` | Accept client-provided `prefix_token_count` / `prefix_boundaries` |
@@ -376,6 +383,10 @@ The 64-bit FNV-1a hash is fed into one of four bucket-selection strategies, conf
 `bounded_load_epsilon` (default `0.25`) and `p2c_load_bias` (default `2`) tune the corresponding strategies. All strategies honor the `load_aware_routing` toggle: when set to `false`, every strategy degrades to plain jump consistent hash with no diversion, giving operators a uniform escape hatch.
 
 Both `bounded_load` and `p2c` use **capacity-adjusted load** (active requests blended with cache headroom and GPU load) when `capacity_headroom_weight > 0` and headroom data is available, so backends near KV-cache exhaustion are deprioritized for large requests.
+
+### Cache-miss placement
+
+`miss_placement` (env `RANVIER_MISS_PLACEMENT`) decides where a prefix with **no learned route** goes. The default `hash` uses the strategy's bucket, which is cluster-consistent but places prefixes like balls into bins: with 16 prefixes over 8 backends the busiest backend holds about twice the mean, and because P99 TTFT is set by the busiest backend's queue, pure affinity lost 8–12% on P99 against round-robin in the 2026-10-02 fitted suite with one backend taking 23% of requests and another 0.6%. `least_loaded` places the new prefix on the live candidate with the fewest learned routes (`RadixTree::routes_by_backend`, which counts gossiped routes too and so converges on cluster placement), then the lowest capacity-adjusted load, then jump-probe order for determinism. A miss has no cache to preserve, so this costs nothing in cache terms; ART hits are untouched. Two nodes that see a brand-new prefix at the same instant may place it differently and each keep their LOCAL route, leaving the prefix warm on two backends. The counter `router_miss_placements_rebalanced_total` counts misses placed off their hash bucket. Placement balances prefix *count*, not popularity: a single prefix carrying a large share of traffic still needs replication, which this knob does not do.
 
 ### X-Backend-ID Header
 

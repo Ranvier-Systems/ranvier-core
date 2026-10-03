@@ -269,6 +269,14 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint64_t>("RANVIER_P2C_LOAD_BIAS")) {
         routing.p2c_load_bias = *v;
     }
+    // Cache-miss placement (hash bucket vs least-loaded candidate)
+    if (auto v = get_env("RANVIER_MISS_PLACEMENT")) {
+        if (*v == "hash") {
+            routing.miss_placement = RoutingConfig::MissPlacement::HASH;
+        } else if (*v == "least_loaded") {
+            routing.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+        }
+    }
 
     // Timeout overrides
     if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
@@ -1166,6 +1174,15 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             }
             if (r["p2c_load_bias"]) {
                 config.routing.p2c_load_bias = r["p2c_load_bias"].as<uint64_t>();
+            }
+            // Cache-miss placement
+            if (r["miss_placement"]) {
+                std::string placement = r["miss_placement"].as<std::string>();
+                if (placement == "hash") {
+                    config.routing.miss_placement = RoutingConfig::MissPlacement::HASH;
+                } else if (placement == "least_loaded") {
+                    config.routing.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+                }
             }
             // GPU load integration (vLLM-aware routing)
             if (r["gpu_load_weight"]) {
