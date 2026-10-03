@@ -919,6 +919,18 @@ public:
     // from the anchor (bounded-load, P2C, scorer load term).
     static uint64_t load_aware_fallbacks_for_testing();
 
+    // True when cache misses are placed least-loaded (routing.miss_placement =
+    // least_loaded). The HttpController then learns a placed miss at DISPATCH
+    // rather than at first byte: hash placement needs no coordination (every
+    // shard computes the same bucket), but least-loaded placement is a local
+    // decision, and until the route propagates every shard and node that sees
+    // the same new prefix places it independently. Learning at first byte left
+    // that window at ~1 TTFT (~1 s at 13B); the first placement run (2026-10-03)
+    // split prefixes across backends and route consistency fell from ~48% to
+    // 37-42%. Learning at dispatch shrinks the window to one route-batch flush
+    // (route_batch_flush_interval, 20 ms) plus gossip.
+    static bool eager_learn_on_miss();
+
     // Shard-local trust-ladder refusal counter observer (invariant T7): gossip
     // REMOTE announcements refused by a higher-trust LOCAL/PUSH route.
     static uint64_t remote_routes_trust_refused_for_testing();

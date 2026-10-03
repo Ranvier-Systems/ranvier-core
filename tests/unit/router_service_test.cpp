@@ -2769,6 +2769,32 @@ TEST_F(BoundedLoadTest, LeastLoadedPlacementSpreadsNewPrefixesEvenly) {
     }
 }
 
+TEST_F(BoundedLoadTest, LeastLoadedPlacementWeighsRoutesByTokens) {
+    // The first placement run (2026-10-03) balanced route COUNTS, and ~70
+    // short one-off prompts outvoted the 16 long shared prefixes. Placement
+    // must weigh routes by key length: a backend holding one 64-token route
+    // is fuller than one holding eight 4-token routes.
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+
+    std::vector<int32_t> long_route(64);
+    for (int i = 0; i < 64; ++i) long_route[static_cast<size_t>(i)] = 5000 + i;
+    RouterService::insert_route_for_testing(long_route, 1);          // b1: 1 route, 64 tokens
+    for (int p = 0; p < 8; ++p) {
+        std::vector<int32_t> t = {6000 + p * 10, 6001 + p * 10, 6002 + p * 10, 6003 + p * 10};
+        RouterService::insert_route_for_testing(t, 2);              // b2: 8 routes, 32 tokens
+    }
+
+    std::vector<int32_t> fresh = {7001, 7002, 7003, 7004};
+    auto r = router_->get_backend_for_prefix(fresh, "place-tokens");
+    ASSERT_TRUE(r.backend_id.has_value());
+    EXPECT_EQ(*r.backend_id, 2) << "fewer route tokens wins over fewer routes";
+}
+
 TEST_F(BoundedLoadTest, LeastLoadedPlacementBreaksRouteTiesByLoadThenProbeOrder) {
     cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
     router_.reset();

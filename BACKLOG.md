@@ -1433,12 +1433,29 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   prefixes over 8 backends by hash left b7 with 4 prefixes (23% of requests) and b5 with 0 (0.6%),
   Gini 0.30 in all three repeats; the busiest backend's queue sets P99 while P50 keeps −28%.
   **Implemented (2026-10-03, same branch): `routing.miss_placement: least_loaded`** — a new prefix
-  is placed on the live candidate with the fewest learned routes (`RadixTree::routes_by_backend`),
-  then lowest capacity-adjusted load, then probe order; default `hash` unchanged. Acceptance:
-  `bench-runner.sh --suite placement` (fitted 20u and 10u with `--miss-placement least_loaded`):
-  20u turns negative, prefix-arm Gini near round-robin's, P50 still ≈ −25%. Leg B (in-flight load
-  signal) remains informative for the divert policy but no longer decides the design. Known
-  limit: balances prefix count, not popularity — hot-prefix replication is the follow-on.
+  is placed on the live candidate holding the fewest learned-route tokens
+  (`RadixTree::route_tokens_by_backend`, new), then fewest routes, then lowest capacity-adjusted
+  load, then probe order; default `hash` unchanged. First acceptance rep (count-weighted build,
+  20u): +6.6% P99, Gini 0.076 — the stress mix's ~70 short one-off routes outvoted the 16 long
+  prefixes in a count tally, hence the token weighting. Rep 2 (count-weighted): +25.1%, Gini 0.104,
+  route consistency 36.7% (default ~48%) and KV hits 28.7% (default 36–44%): because placement is
+  a local decision and routes were learned only at first byte (~1 TTFT later), shards/nodes placed
+  the same new prefix on different backends and each kept its LOCAL route. Fix: learn a placed miss
+  at dispatch too (window → one 20 ms batch flush + gossip). Re-run `--suite placement` on the
+  token-weighted, eager-learn build; route consistency back near 48%+ and KV hits near 40% are the
+  tell that the split is gone. Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
+  0.080 — the count-weighted build is a consistent regression (+6.6, +25.1, +13.3) with worse
+  affinity than the default in all three. Leg B (in-flight signal, default placement): +14.2, −1.0
+  (rep 2 lost to a silent compose failure, since fixed) — a real-time signal helps diversion at
+  the cost of affinity; ε 0.25 is uncalibrated at ~1 in-flight per backend per node.
+  **Resume (next GPU session):** rebuild from the branch tip (`d8bdde4` token weighting +
+  `5769f4e` eager learn), re-run `--suite placement`; read route consistency (≥ ~48%) and KV hits
+  (≈ 40%) first, then Gini (≈ 0.03), then P99 (acceptance: negative ×3 at 20u, P50 ≈ −25%). If
+  balance/affinity recover but P99 does not: combo (placement + in-flight knobs +
+  `--bounded-load-epsilon 1.0`) and paced control (`--pacing 4.3`). Archive run dirs before
+  terminating the instance — the 2026-10-02/03 raw runs were lost that way; numbers live in
+  `docs/benchmarks/benchmark-results-current.md`. Known limit: balances prefix tokens, not
+  popularity — hot-prefix replication is the follow-on.
 - [ ] **[STRATEGIC] KV-aware dispatch.** Extend the backend load signal with the already-scraped
   `gpu_cache_usage_percent` (`health_service.cpp:425`, `vllm_metrics.hpp:21`) and add a
   `kv_pressure` candidate field + weight to `route_scorer.hpp`, so dispatch diverts off an anchor

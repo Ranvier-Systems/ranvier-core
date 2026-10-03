@@ -1632,12 +1632,17 @@ static BackendId p2c_select(
 // new prefix can go wherever the fleet is lightest at no cache cost; once the
 // route is learned (and gossiped) every hit follows it.
 //
-// Order: fewest learned routes (RadixTree::routes_by_backend — counts LOCAL,
-// PUSH and gossiped REMOTE routes, so it converges on cluster placement),
+// Order: fewest learned-route TOKENS (RadixTree::route_tokens_by_backend —
+// the sum of each live route's key length; counts LOCAL, PUSH and gossiped
+// REMOTE routes, so it converges on cluster placement), then fewest routes,
 // then lowest capacity-adjusted load, then jump-probe order so equal states
-// place deterministically. Route count leads load because new prefixes
-// arrive in bursts (benchmark warm-up, deploy) when every in-flight count is
-// ~0 and a load-first rule would collapse back to probe order.
+// place deterministically. Tokens lead counts because a workload mixes
+// one-off short prompts with long shared prefixes: the first placement run
+// (2026-10-03) balanced route COUNTS, which ~70 short one-off routes
+// dominated, and the 16 long prefixes landed as unevenly as by hash. A
+// 3000-token prefix must weigh thirty 100-token one-offs. Routes lead load
+// because new prefixes arrive in bursts (warm-up, deploy) when every
+// in-flight count is ~0 and a load-first rule would collapse to probe order.
 //
 // Rule #1: Lock-free — shard-local tree and load reads.
 // Rule #4: loops bounded by candidates.size() (<= 64, discovery cap).
@@ -1654,6 +1659,8 @@ static BackendId least_loaded_placement(
     const RadixTree* tree = g_shard_state ? g_shard_state->tree.get() : nullptr;
     const std::unordered_map<BackendId, size_t>* routes_by_backend =
         tree ? &tree->routes_by_backend() : nullptr;
+    const std::unordered_map<BackendId, uint64_t>* tokens_by_backend =
+        tree ? &tree->route_tokens_by_backend() : nullptr;
 
     std::vector<uint32_t> probe_rank(static_cast<size_t>(n),
                                      std::numeric_limits<uint32_t>::max());
@@ -1670,27 +1677,42 @@ static BackendId least_loaded_placement(
         auto it = routes_by_backend->find(id);
         return it == routes_by_backend->end() ? 0 : it->second;
     };
+    auto tokens_of = [tokens_by_backend](BackendId id) -> uint64_t {
+        if (!tokens_by_backend) return 0;
+        auto it = tokens_by_backend->find(id);
+        return it == tokens_by_backend->end() ? 0 : it->second;
+    };
 
     size_t best = 0;
+    uint64_t best_tokens = tokens_of(candidates[0]);
     size_t best_routes = routes_of(candidates[0]);
     uint64_t best_load = get_capacity_adjusted_load(candidates[0], estimated_cost);
     for (size_t i = 1; i < static_cast<size_t>(n); ++i) {
+        const uint64_t tokens = tokens_of(candidates[i]);
         const size_t routes = routes_of(candidates[i]);
         const uint64_t load = get_capacity_adjusted_load(candidates[i], estimated_cost);
-        const bool better =
-            routes < best_routes ||
-            (routes == best_routes && load < best_load) ||
-            (routes == best_routes && load == best_load && probe_rank[i] < probe_rank[best]);
+        bool better = false;
+        if (tokens != best_tokens) {
+            better = tokens < best_tokens;
+        } else if (routes != best_routes) {
+            better = routes < best_routes;
+        } else if (load != best_load) {
+            better = load < best_load;
+        } else {
+            better = probe_rank[i] < probe_rank[best];
+        }
         if (better) {
             best = i;
+            best_tokens = tokens;
             best_routes = routes;
             best_load = load;
         }
     }
 
-    log_router.debug("[{}] Miss placement (least-loaded): backend {} (routes={}, load={}, "
-                     "probe_rank={})",
-                     request_id, candidates[best], best_routes, best_load, probe_rank[best]);
+    log_router.debug("[{}] Miss placement (least-loaded): backend {} (route_tokens={}, routes={}, "
+                     "load={}, probe_rank={})",
+                     request_id, candidates[best], best_tokens, best_routes, best_load,
+                     probe_rank[best]);
     return candidates[best];
 }
 
@@ -5958,6 +5980,11 @@ uint64_t RouterService::headroom_redirects_for_testing() {
 uint64_t RouterService::load_aware_fallbacks_for_testing() {
     if (!g_shard_state) return 0;
     return shard_state().stats.load_aware_fallbacks;
+}
+
+bool RouterService::eager_learn_on_miss() {
+    if (!g_shard_state) return false;
+    return shard_state().config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED;
 }
 
 uint64_t RouterService::remote_routes_trust_refused_for_testing() {

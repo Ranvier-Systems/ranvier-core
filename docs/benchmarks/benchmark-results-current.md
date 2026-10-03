@@ -174,8 +174,10 @@ Round-robin arms: Gini 0.021–0.043 throughout. KV hit rates were unchanged bet
   right target; a fleet-wide in-flight view (gossip) is then the code change. If the tail
   persists, randomise the divert target among under-cap candidates (herd-breaker).
 
-Archive: `docs/benchmarks/results/2026-10-02-fitted-acceptance/` (old-binary control and
-new-binary runs; manifests carry `server_image` so the binary is identifiable).
+Raw runs were **not archived**: the instance was terminated on 2026-10-03 before the copy
+step ran, so every number in this and the following sections is transcribed from the per-run
+`compare_*.txt` files as they were read during the campaign. Manifests for later campaigns carry
+`server_image`, so the binary behind a run is identifiable from now on.
 
 ### Leg A, no-divert control (2026-10-02/03): the regression is placement, not diversion
 
@@ -202,13 +204,81 @@ the cause (where prefixes are placed), on a signal that was not queue depth anyw
 
 **Fix under test: least-loaded cache-miss placement** (`routing.miss_placement: least_loaded`,
 same branch). A miss has no cache to preserve, so the new prefix goes to the live candidate
-with the fewest learned routes, then the lowest load, then probe order; 16 uniform prefixes
-land two per backend by construction and hits are untouched. Acceptance:
+holding the fewest learned-route tokens (then fewest routes, then lowest load, then probe
+order); 16 uniform prefixes land two per backend by construction and hits are untouched.
+First run (count-weighted, 2026-10-03, 20u rep 1): +6.6% P99, Gini 0.076, 203 misses placed
+off their hash bucket — the ~70 short one-off prompts the stress mix learns as routes outvoted
+the 16 long prefixes in a count tally, so the placement is now token-weighted. Acceptance:
 `bench-runner.sh --suite placement` — the fitted 20u row turns negative with the prefix arm's
 Gini near round-robin's (≤0.05) and P50 unchanged. Leg B (in-flight load signal for the
 divert policy) is still informative but no longer decides the design. Known limit: this
 balances prefix count, not popularity; a hot prefix carrying a quarter of the traffic will
 need replication across backends, which is the next item.
+
+### Leg B, in-flight load signal (2026-10-03): the divert policy with a real queue signal
+
+Same row, default placement, `RANVIER_ROUTING_GPU_LOAD_WEIGHT=0 RANVIER_CAPACITY_HEADROOM_WEIGHT=0
+RANVIER_CROSS_SHARD_LOAD_SYNC=true`, so bounded-load reads node-local in-flight requests instead
+of the 5 s-stale scraped score. Three repeats scheduled; repeat 2 died two minutes in when a
+per-arm `docker compose up` failed silently under `set -e` (fixed in `bench.sh` the same day).
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|
+| 1 | +14.2% | −20.0% | 39.1% | 35.6% | 31.8% | 0.042 |
+| 3 | **−1.0%** | −22.1% | 41.5% | 27.0% | 28.9% | 0.061 |
+
+Verdict over two: mixed. Repeat 3 is the first 20-user prefix arm of the campaign whose tail
+matched round-robin's, and it paid for it in affinity (consistency 41% vs the default's 48–53%,
+KV hits 27% vs 36–44%, P50 −22% vs −25..−28%). The divert rate did not move: at ~0.8 in-flight
+requests per backend per node, `bounded_load_epsilon` 0.25 gives a cap of 1–2, so nearly any
+load at all diverts. Takeaways: a real-time signal lets diversion do its job (pull toward
+round-robin's balance when a backend queues), epsilon 0.25 is uncalibrated for small-integer
+loads, and the default scraped signal is not queue depth.
+
+### Least-loaded placement, count-weighted (2026-10-03): ❌ not accepted; two defects found
+
+`--suite placement` on the first placement build (`b66fa80`: fewest learned **routes**, then
+load, then probe order), 13B 20 users ×3. The 10-user rows ran but were not read before the
+instance was terminated.
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Misses placed off hash bucket |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|-------------------------------|
+| 1 (rr-first) | +6.6% | −23.7% | 41.6% | 32.0% | 24.9% | 0.076 | 203 |
+| 2 (prefix-first) | +25.1% | −19.7% | 36.7% | 28.7% | 23.2% | 0.104 | — |
+| 3 (rr-first) | +13.3% | −20.9% | 37.1% | 30.1% | 24.3% | 0.080 | — |
+
+Consistent regression, and **worse affinity than the default** (consistency 37–42% vs 47–53%,
+KV hits 29–32% vs 36–44%) in all three. Two defects, both fixed on the branch and pending a
+rebuild (`d8bdde4`, `5769f4e`):
+
+1. **Count-weighting.** 203 misses were placed, not 16: the stress mix is 30% short/medium
+   one-off prompts, each learned as a route, so ~70 one-off routes outvoted the 16 long
+   prefixes in a per-backend route count and the long prefixes landed almost as unevenly as
+   by hash (Gini 0.08–0.10). Fix: weigh routes by key length in tokens
+   (`RadixTree::route_tokens_by_backend`); a 3000-token prefix outweighs thirty 100-token
+   one-offs.
+2. **Divergent placement.** Hash placement needs no coordination; least-loaded placement is a
+   local decision, and routes were learned only at first byte, ~1 TTFT after dispatch. In that
+   window other shards and nodes placed the same new prefix elsewhere and each kept its LOCAL
+   route, so prefixes were warm on two or three backends and hits were split — the consistency
+   and KV-hit drop. Fix: under `least_loaded` the controller also learns the placed miss at
+   dispatch, shrinking the window to one 20 ms route-batch flush plus gossip.
+
+**Resume checklist (next GPU session), in order:**
+
+1. `git fetch && git reset --hard origin/claude/sleepy-lamport-wxly0b`; `docker build -t
+   ranvier:latest -f Dockerfile.production .`; confirm `grep -c 'route_tokens=' ranvier_server`
+   is 1 inside the image. Pull before the first run: the stale-image guard refuses an image
+   older than the newest `src/` commit.
+2. `bench-runner.sh --suite placement --output-dir benchmark-reports-placement-v2`. Read in
+   this order: route consistency ≥ ~48% and KV hits ≈ 40% (split gone), prefix-arm Gini ≈ 0.03
+   (long prefixes two per backend), then P99 (acceptance: negative ×3 at 20u, P50 ≈ −25%).
+3. If balance and affinity recover but P99 stays ≥ 0: the remaining tail is the default divert
+   policy (24% of requests on the stale signal) plus the closed loop. Run the combo
+   (placement + in-flight knobs + `--bounded-load-epsilon 1.0`, 20u ×3) and the paced control
+   (`--pacing 4.3`, equal offered load) described in BACKLOG §27.
+4. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
+   aggregates, manifests, runner summary) **before** terminating the instance.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
@@ -232,10 +302,11 @@ now shows were measured in an eviction regime.
 
 ## Still open
 
-- **13B 20-user fitted regression: acceptance run for least-loaded cache-miss placement**
-  (`bench-runner.sh --suite placement`, BACKLOG §27). Leg A settled the mechanism as hash
-  placement (balls-into-bins); the least-loaded diversion fix failed its acceptance run on
-  2026-10-02; leg B (in-flight load signal for the divert policy) is informative but secondary.
+- **13B 20-user fitted regression: re-run `--suite placement` on the token-weighted,
+  eager-learn build** (BACKLOG §27; resume checklist above). Leg A settled the mechanism as
+  hash placement; the least-loaded diversion fix and the count-weighted placement build both
+  failed their acceptance runs; leg B showed a real-time load signal helps diversion at the
+  cost of affinity and that ε 0.25 is uncalibrated for small-integer loads.
 - **Leg V1, epsilon** (`bench-runner.sh --suite epsilon`): the shipped file sweeps ε 0.5
   (looser). The fitted result says looser strands more capacity; sweep *tighter* (0.1) instead,
   on the fitted set, after the diversion fix. The factor/floor "threshold leg" (BACKLOG §25

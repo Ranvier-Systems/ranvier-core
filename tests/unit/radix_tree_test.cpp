@@ -246,7 +246,48 @@ size_t sum_by_backend(const RadixTree& t) {
 
 TEST_F(RadixTreeTest, ResidentRoutesEmptyInitially) {
     EXPECT_TRUE(tree.routes_by_backend().empty());
+    EXPECT_TRUE(tree.route_tokens_by_backend().empty());
     EXPECT_EQ(sum_by_backend(tree), tree.route_count());
+}
+
+// Token tally: the per-backend sum of live route key lengths, kept in
+// lockstep with the count tally. Cache-miss placement balances on it so one
+// long shared prefix outweighs many short one-off prompts.
+TEST_F(RadixTreeTest, ResidentRouteTokensSumKeyLengthsPerBackend) {
+    tree.insert(tokens({1, 2, 3}), 1);           // 3 tokens
+    tree.insert(tokens({4, 5, 6, 7, 8}), 1);     // 5 tokens
+    tree.insert(tokens({9, 10}), 2);             // 2 tokens
+
+    const auto& by_tokens = tree.route_tokens_by_backend();
+    ASSERT_TRUE(by_tokens.contains(1));
+    ASSERT_TRUE(by_tokens.contains(2));
+    EXPECT_EQ(by_tokens.at(1), 8u);
+    EXPECT_EQ(by_tokens.at(2), 2u);
+}
+
+TEST_F(RadixTreeTest, ResidentRouteTokensFollowOverwriteAndRemoval) {
+    tree.insert(tokens({1, 2, 3, 4}), 1);
+    tree.insert(tokens({5, 6}), 2);
+    tree.insert(tokens({1, 2, 3, 4}), 2);         // moves 4 tokens from 1 to 2
+
+    const auto& by_tokens = tree.route_tokens_by_backend();
+    EXPECT_FALSE(by_tokens.contains(1));          // self-cleaned with the count
+    EXPECT_EQ(by_tokens.at(2), 6u);
+
+    auto cutoff = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    tree.remove_expired(cutoff);
+    EXPECT_TRUE(tree.route_tokens_by_backend().empty());
+}
+
+TEST_F(RadixTreeTest, ResidentRouteTokensEvictOldestDecrements) {
+    tree.insert(tokens({1, 2, 3}), 1);           // oldest (LRU tail)
+    tree.insert(tokens({4, 5, 6, 7}), 2);
+
+    ASSERT_TRUE(tree.evict_oldest());
+
+    const auto& by_tokens = tree.route_tokens_by_backend();
+    EXPECT_FALSE(by_tokens.contains(1));
+    EXPECT_EQ(by_tokens.at(2), 4u);
 }
 
 TEST_F(RadixTreeTest, ResidentRoutesCountsPerBackend) {
