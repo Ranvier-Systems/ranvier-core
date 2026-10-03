@@ -350,6 +350,17 @@ prefix arm, with the busiest backend taking 16–18.5% of requests and the quiet
 every rep. The hot backend moves between reps (b5, b5, b7), so this is a placement draw, not a
 hot prefix. P99 is that one queue again, and the three P99 deltas track the three Ginis.
 
+**10 users, same build (rep 1 of 3):**
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Busiest / quietest backend |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------------|
+| 1 (rr-first) | **−13.2%** | −29.1% | 57.2% | **66.0%** | 25.3% | 0.083 | b1/b6 223 / b5 132 (13.8% / 8.2%) |
+
+The best 10-user rep of the campaign on every axis (P99, P50, consistency, KV), and with the
+same uneven placement as the 20-user arms (Gini 0.083, busiest backend 1.7× the quietest). At
+10 users the hot backend's queue is short enough that affinity wins outright; at 20 it is not.
+Same mechanism, different regime: the placement draw is the only thing between the two rows.
+
 Reading: the v1/v2 split was *hiding* the placement. A prefix warm on two or three backends
 spreads its load even when its placement was poor; once every prefix lives on exactly one
 backend, the placement is what you see, and the token-weighted tally did not spread the 16
