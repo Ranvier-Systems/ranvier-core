@@ -2257,15 +2257,37 @@ restart_ranvier_with_mode() {
 
     # Stop and remove existing containers. Removal also discards the routing DB
     # (container-local tmpfs), so the new arm starts with an empty ART.
-    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
-        stop ranvier1 ranvier2 ranvier3 2>/dev/null
-    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
-        rm -f ranvier1 ranvier2 ranvier3 2>/dev/null
+    # These three compose calls used to run with stderr discarded under set -e,
+    # so a transient failure (a name still held by a container being removed, a
+    # network with a lingering endpoint) killed the whole run with no message
+    # (leg B rep 2, 2026-10-03: exit 1 two minutes in, nothing logged). stop/rm
+    # are best effort; up is retried and its error shown.
+    local out
+    if ! out=$($DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+                 stop ranvier1 ranvier2 ranvier3 2>&1); then
+        log_warn "compose stop (ignored): $(echo "$out" | tail -2 | tr '\n' ' ')"
+    fi
+    if ! out=$($DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+                 rm -f ranvier1 ranvier2 ranvier3 2>&1); then
+        log_warn "compose rm (ignored): $(echo "$out" | tail -2 | tr '\n' ' ')"
+    fi
 
     # Restart with the desired routing mode
     export RANVIER_ROUTING_MODE="$MODE"
-    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
-        up -d ranvier1 ranvier2 ranvier3 2>/dev/null
+    local UP_OK=false attempt
+    for attempt in 1 2 3; do
+        if out=$($DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+                   up -d ranvier1 ranvier2 ranvier3 2>&1); then
+            UP_OK=true
+            break
+        fi
+        log_warn "compose up (attempt $attempt/3) failed: $(echo "$out" | tail -3 | tr '\n' ' ')"
+        [[ $attempt -lt 3 ]] && sleep 5
+    done
+    if [[ "$UP_OK" != true ]]; then
+        log_error "Ranvier containers did not start after 3 attempts (mode=$MODE); last error above"
+        exit 1
+    fi
 
     # Wait for all 3 nodes to be healthy
     local MAX_WAIT=60
