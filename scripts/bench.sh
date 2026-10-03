@@ -257,6 +257,13 @@ BENCHMARK OPTIONS:
                         the locustfile's). Sets NUM_LARGE_PREFIXES for warm-up and both
                         arms; with --prefix-max-tokens it sizes the hot working set, so a
                         13B fleet (~11.6k KV tokens/backend) can be given a set that fits.
+    --pacing S          Open-loop load: every user starts a request every S seconds
+                        regardless of latency, so both arms carry the same offered load
+                        (users / S req/s). Default is the locustfile's closed-loop think
+                        time (0.5-2 s), under which the faster arm carries 5-7% more
+                        traffic — a tail confound once the fleet is queue-bound. Pick S
+                        above the slowest request (e.g. 20 users, --pacing 4.3 ≈ the
+                        4.65 req/s round-robin reached closed-loop at 13B/20u).
     --cache-residency-threshold F
                         Cache-residency downgrade threshold (#527). ART hits whose
                         backend reports residency < F are diverted. 0.0 disables
@@ -301,6 +308,11 @@ BENCHMARK OPTIONS:
                         bench.sh refuses to run a mislabelled combination.
     --hash-strategy S   Ranvier hash strategy: bounded_load (default), p2c, jump, modular.
                         Sets RANVIER_HASH_STRATEGY for the cluster.
+    --miss-placement M  Where a cache miss (new prefix) is placed: hash (default,
+                        the strategy's bucket) or least_loaded (fewest learned
+                        routes, then lowest load, then probe order). Sets
+                        RANVIER_MISS_PLACEMENT. The fitted-suite leg A finding:
+                        hash placement alone costs +8..12% P99 at 13B/20u.
     --bounded-load-epsilon E
                         Divert allowance under bounded_load: cap = avg * (1 + E)
                         (default: 0.25). Sets RANVIER_BOUNDED_LOAD_EPSILON.
@@ -479,6 +491,7 @@ SPAWN_RATE="$DEFAULT_SPAWN_RATE"
 PROMPT_DIST="$DEFAULT_PROMPT_DIST"
 PREFIX_RATIO="$DEFAULT_PREFIX_RATIO"
 PREFIX_MAX_TOKENS=""
+PACING_S=""                 # --pacing: open-loop seconds between a user's request starts
 NUM_PREFIXES_FLAG=""        # --num-prefixes: exported as NUM_LARGE_PREFIXES after parsing
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 COMPARE=false
@@ -498,6 +511,7 @@ LOAD_AWARE=true
 LOAD_IMBALANCE_FACTOR=""
 LOAD_IMBALANCE_FLOOR=""
 HASH_STRATEGY=""            # --hash-strategy: bounded_load | p2c | jump | modular
+MISS_PLACEMENT=""           # --miss-placement: hash | least_loaded
 BOUNDED_LOAD_EPSILON=""     # --bounded-load-epsilon: divert allowance under bounded_load
 CACHE_RESIDENCY_THRESHOLD=""
 COMPRESSION_RATIO=""
@@ -523,6 +537,7 @@ while [[ $# -gt 0 ]]; do
         --prompt-file)    PROMPT_FILE="$2"; shift 2 ;;
         --prefix-ratio)   PREFIX_RATIO="$2"; shift 2 ;;
         --prefix-max-tokens) PREFIX_MAX_TOKENS="$2"; shift 2 ;;
+        --pacing)         PACING_S="$2"; shift 2 ;;
         --num-prefixes)   NUM_PREFIXES_FLAG="$2"; shift 2 ;;
         --output-dir)     OUTPUT_DIR="$2"; shift 2 ;;
         --compare)        COMPARE=true; shift ;;
@@ -544,6 +559,7 @@ while [[ $# -gt 0 ]]; do
         --load-imbalance-factor) LOAD_IMBALANCE_FACTOR="$2"; shift 2 ;;
         --load-imbalance-floor)  LOAD_IMBALANCE_FLOOR="$2"; shift 2 ;;
         --hash-strategy)  HASH_STRATEGY="$2"; shift 2 ;;
+        --miss-placement) MISS_PLACEMENT="$2"; shift 2 ;;
         --bounded-load-epsilon) BOUNDED_LOAD_EPSILON="$2"; shift 2 ;;
         --cache-residency-threshold) CACHE_RESIDENCY_THRESHOLD="$2"; shift 2 ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
@@ -1502,6 +1518,14 @@ if [[ -n "$HASH_STRATEGY" ]]; then
     export RANVIER_HASH_STRATEGY="$HASH_STRATEGY"
     log_info "Hash strategy: $HASH_STRATEGY"
 fi
+if [[ -n "$MISS_PLACEMENT" ]]; then
+    case "$MISS_PLACEMENT" in
+        hash|least_loaded) ;;
+        *) log_error "--miss-placement must be hash or least_loaded (got: $MISS_PLACEMENT)"; exit 1 ;;
+    esac
+    export RANVIER_MISS_PLACEMENT="$MISS_PLACEMENT"
+    log_info "Cache-miss placement: $MISS_PLACEMENT"
+fi
 if [[ -n "$BOUNDED_LOAD_EPSILON" ]]; then
     export RANVIER_BOUNDED_LOAD_EPSILON="$BOUNDED_LOAD_EPSILON"
     log_info "Bounded-load epsilon: $BOUNDED_LOAD_EPSILON"
@@ -1769,6 +1793,7 @@ write_manifest() {
         # Defaults mirror docker-compose.benchmark-real.yml so an unset knob is
         # recorded as the value the server actually ran with.
         printf '    "hash_strategy": "%s",\n' "$(_json_escape "${RANVIER_HASH_STRATEGY:-bounded_load}")"
+        printf '    "miss_placement": "%s",\n' "$(_json_escape "${RANVIER_MISS_PLACEMENT:-hash}")"
         printf '    "bounded_load_epsilon": "%s",\n' "$(_json_escape "${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}")"
         printf '    "cross_shard_load_sync": "%s",\n' "$(_json_escape "${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}")"
         printf '    "gpu_load_weight": "%s",\n' "$(_json_escape "${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-10.0}")"
@@ -1796,6 +1821,7 @@ write_manifest() {
         printf '    "num_large_prefixes": "%s",\n' "$(_json_escape "${NUM_LARGE_PREFIXES:-50}")"
         printf '    "prefix_seed": "%s",\n' "$(_json_escape "${PREFIX_SEED:-42}")"
         printf '    "max_output_tokens": "%s",\n' "$(_json_escape "${MAX_TOKENS:-}")"
+        printf '    "pacing_s": "%s",\n' "$(_json_escape "${PACING_S:-0}")"
         printf '    "client_tokenize": "%s"' "$client_tok"
         if [[ "$PROMPT_DIST" == "churn" ]]; then
             printf ',\n    "churn": { "universe": "%s", "active": "%s", "rotation_step": "%s", "rotation_seconds": "%s", "seed": "%s" }\n' \
@@ -2007,6 +2033,7 @@ run_benchmark() {
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         -e MAX_OUTPUT_TOKENS="$MAX_TOKENS" \
+        -e BENCH_PACING_S="${PACING_S:-0}" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE="$PRIORITY_QUEUE" \
         -e SIMULATE_AGENTS="$( [[ "$PRIORITY_QUEUE" = true ]] && echo true || echo false )" \
@@ -2194,6 +2221,7 @@ run_warmup() {
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         -e MAX_OUTPUT_TOKENS="$MAX_TOKENS" \
+        -e BENCH_PACING_S="${PACING_S:-0}" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE="$PRIORITY_QUEUE" \
         -e SIMULATE_AGENTS="$( [[ "$PRIORITY_QUEUE" = true ]] && echo true || echo false )" \
@@ -2229,15 +2257,37 @@ restart_ranvier_with_mode() {
 
     # Stop and remove existing containers. Removal also discards the routing DB
     # (container-local tmpfs), so the new arm starts with an empty ART.
-    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
-        stop ranvier1 ranvier2 ranvier3 2>/dev/null
-    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
-        rm -f ranvier1 ranvier2 ranvier3 2>/dev/null
+    # These three compose calls used to run with stderr discarded under set -e,
+    # so a transient failure (a name still held by a container being removed, a
+    # network with a lingering endpoint) killed the whole run with no message
+    # (leg B rep 2, 2026-10-03: exit 1 two minutes in, nothing logged). stop/rm
+    # are best effort; up is retried and its error shown.
+    local out
+    if ! out=$($DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+                 stop ranvier1 ranvier2 ranvier3 2>&1); then
+        log_warn "compose stop (ignored): $(echo "$out" | tail -2 | tr '\n' ' ')"
+    fi
+    if ! out=$($DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+                 rm -f ranvier1 ranvier2 ranvier3 2>&1); then
+        log_warn "compose rm (ignored): $(echo "$out" | tail -2 | tr '\n' ' ')"
+    fi
 
     # Restart with the desired routing mode
     export RANVIER_ROUTING_MODE="$MODE"
-    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
-        up -d ranvier1 ranvier2 ranvier3 2>/dev/null
+    local UP_OK=false attempt
+    for attempt in 1 2 3; do
+        if out=$($DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+                   up -d ranvier1 ranvier2 ranvier3 2>&1); then
+            UP_OK=true
+            break
+        fi
+        log_warn "compose up (attempt $attempt/3) failed: $(echo "$out" | tail -3 | tr '\n' ' ')"
+        [[ $attempt -lt 3 ]] && sleep 5
+    done
+    if [[ "$UP_OK" != true ]]; then
+        log_error "Ranvier containers did not start after 3 attempts (mode=$MODE); last error above"
+        exit 1
+    fi
 
     # Wait for all 3 nodes to be healthy
     local MAX_WAIT=60

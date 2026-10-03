@@ -238,7 +238,7 @@ USAGE:
     ./scripts/bench-runner.sh [OPTIONS]
 
 OPTIONS:
-    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, low, all, custom
+    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, low, all, custom
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
@@ -316,11 +316,15 @@ BUILT-IN SUITES:
       - 8B 16K-prefix run: superseded by the KV-regime check (manifest now
         records each backend's KV capacity next to the prefix working set).
 
-    rebaseline, epsilon and fitted default to --repeat 3; pass --repeat 1 for a smoke run.
+    placement (2 configs x 2 arms x 3 repeats, ~3h) — the fitted 20u and 10u rows with
+      --miss-placement least_loaded: the acceptance test for least-loaded cache-miss
+      placement (BACKLOG section 27). Same binary as fitted; the knob is the A/B.
+
+    rebaseline, epsilon, fitted and placement default to --repeat 3; pass --repeat 1 for a smoke run.
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
-      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | low
+      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | low
     Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
@@ -385,6 +389,7 @@ done
 #   rebaseline = the citable 4-config A/B matrix        (--suite rebaseline, all)
 #   epsilon    = Leg V1 bounded-load epsilon 0.5 leg    (--suite epsilon, all)
 #   fitted     = 13B with a KV-fitting prefix set         (--suite fitted, all)
+#   placement  = fitted set, --miss-placement least_loaded (--suite placement)
 #   low        = exploratory runs outside any headline  (--suite low, all)
 #
 # Run numbers are assigned in definition order within the selected suite.
@@ -397,7 +402,7 @@ add_run() {
     local args="$*"
 
     case "$SUITE" in
-        rebaseline|epsilon|fitted|low) [[ "$suite" != "$SUITE" ]] && return ;;
+        rebaseline|epsilon|fitted|placement|low) [[ "$suite" != "$SUITE" ]] && return ;;
         all)    ;;  # include everything
         *)      return ;;  # custom suite doesn't use add_run
     esac
@@ -460,6 +465,24 @@ define_runs() {
         --warmup --duration 10m --users 20 --max-model-len 8192 \
         --num-prefixes 16 --prefix-max-tokens 4000
 
+    # --- placement: least-loaded cache-miss placement on the fitted set -----------
+    # Leg A (2026-10-02) showed the 13B 20u regression is hash placement itself:
+    # pure affinity, zero diverts, +8..12% P99 with one backend at 23% of requests
+    # and one at 0.6%. --miss-placement least_loaded places each new prefix on the
+    # backend with the fewest learned routes. Acceptance: 20u turns negative with
+    # the prefix arm's Gini near round-robin's and P50 still ~-25%.
+    add_run placement "13B 20u/10m A/B, fitted set, miss placement least_loaded" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000 \
+        --miss-placement least_loaded
+
+    add_run placement "13B 10u/10m A/B, fitted set, miss placement least_loaded" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 10 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000 \
+        --miss-placement least_loaded
+
     # --- low: exploratory, outside any headline --------------------------------
     # TP, max-model-len, and gpu-mem-util are auto-detected from GPU VRAM.
     # Explicit overrides: --tp 4 --max-model-len 4096 --gpu-mem-util 0.92 (for 40GB)
@@ -502,7 +525,7 @@ define_runs
 # so the post-suite aggregation can gather each config's repeats. See BACKLOG §25.
 # A single run is not a result (review F3): the headline suites default to
 # three repeats so the aggregate can issue a CONSISTENT / MIXED verdict.
-if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" ) ]]; then
+if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" || "$SUITE" == "placement" ) ]]; then
     REPEAT=3
     log_info "Suite '$SUITE' defaults to --repeat 3 (pass --repeat 1 for a smoke run)"
 fi

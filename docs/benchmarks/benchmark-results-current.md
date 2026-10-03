@@ -177,6 +177,39 @@ Round-robin arms: Gini 0.021–0.043 throughout. KV hit rates were unchanged bet
 Archive: `docs/benchmarks/results/2026-10-02-fitted-acceptance/` (old-binary control and
 new-binary runs; manifests carry `server_image` so the binary is identifiable).
 
+### Leg A, no-divert control (2026-10-02/03): the regression is placement, not diversion
+
+Same box, same binary, 13B 20 users on the fitted set, `--no-load-aware
+--cache-residency-threshold 0.0`: zero load diverts, zero residency downgrades, 97% route
+consistency. Three repeats, alternating arm order.
+
+| Rep | P99 TTFT | P50 TTFT | KV hit RR → prefix | Throughput | Prefix-arm Gini | Busiest / idlest backend |
+|-----|----------|----------|--------------------|------------|-----------------|--------------------------|
+| 1 (rr-first) | **+8.2%** | −28.5% | 11 → 55% | +6.5% | 0.305 | b7 684 (23%) / b5 18 (0.6%) |
+| 2 (prefix-first) | **+12.3%** | −28.5% | 14 → 61% | +7.2% | 0.295 | b7 669 (22%) / b5 20 (0.7%) |
+| 3 (rr-first) | **+11.3%** | −28.9% | 14 → 56% | +4.9% | 0.296 | b7 674 (23%) / b5 18 (0.6%) |
+
+**What leg A settles.** With every divert mechanism off, prefix affinity regresses P99 by the
+same 8–12% as it did with either divert policy. The cause is hash placement itself. The
+workload picks one of 16 prefixes uniformly; by hash they landed 4/3/2/2/2/1/1/0 on the eight
+backends (the completion shares read it straight off: 23/18/14/14/11/8.5/6.5/0.6%), the same
+placement in all three repeats because the hash is deterministic. The backend holding four
+prefixes runs at twice the fleet's mean concurrency all run long, and P99 TTFT is the busiest
+backend's queue. Round-robin keeps every backend at the mean. So affinity pays at the tail
+exactly what it gains at the median: P50 −28%, throughput +5–7%, P99 +8–12%. Both divert
+policies failed because they were treating the symptom (completion imbalance) downstream of
+the cause (where prefixes are placed), on a signal that was not queue depth anyway.
+
+**Fix under test: least-loaded cache-miss placement** (`routing.miss_placement: least_loaded`,
+same branch). A miss has no cache to preserve, so the new prefix goes to the live candidate
+with the fewest learned routes, then the lowest load, then probe order; 16 uniform prefixes
+land two per backend by construction and hits are untouched. Acceptance:
+`bench-runner.sh --suite placement` — the fitted 20u row turns negative with the prefix arm's
+Gini near round-robin's (≤0.05) and P50 unchanged. Leg B (in-flight load signal for the
+divert policy) is still informative but no longer decides the design. Known limit: this
+balances prefix count, not popularity; a hot prefix carrying a quarter of the traffic will
+need replication across backends, which is the next item.
+
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
 Kept for the record; **do not cite.** The audit of 2026-09-30 found that these runs carried
@@ -199,10 +232,10 @@ now shows were measured in an eviction regime.
 
 ## Still open
 
-- **13B 20-user fitted regression: legs A (no-divert control) and B (in-flight load signal)**
-  (BACKLOG §27). The least-loaded diversion fix failed its acceptance run on 2026-10-02 (see
-  the acceptance section above); the regression's mechanism is still open between "affinity
-  concentration itself" and "diverts triggered by a stale scraped signal".
+- **13B 20-user fitted regression: acceptance run for least-loaded cache-miss placement**
+  (`bench-runner.sh --suite placement`, BACKLOG §27). Leg A settled the mechanism as hash
+  placement (balls-into-bins); the least-loaded diversion fix failed its acceptance run on
+  2026-10-02; leg B (in-flight load signal for the divert policy) is informative but secondary.
 - **Leg V1, epsilon** (`bench-runner.sh --suite epsilon`): the shipped file sweeps ε 0.5
   (looser). The fitted result says looser strands more capacity; sweep *tighter* (0.1) instead,
   on the fitted set, after the diversion fix. The factor/floor "threshold leg" (BACKLOG §25

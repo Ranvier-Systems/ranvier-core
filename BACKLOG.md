@@ -1426,12 +1426,19 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   scraped KV pressure, and least-loaded herds them onto one backend per node per scrape. Details:
   `docs/benchmarks/benchmark-results-current.md` (acceptance section). The code change is held on
   the branch; the tooling beside it (stale-image refusal, `--build-image`, manifest `server_image`,
-  compose load-signal knobs) should merge regardless. **Next:** leg A, no-divert control
-  (`RANVIER_LOAD_AWARE_ROUTING=false`, 20u ×3) — if also ≈+10%, the cause is affinity
-  concentration and the levers are ε or prefix spread; leg B, in-flight signal
-  (`RANVIER_ROUTING_GPU_LOAD_WEIGHT=0 RANVIER_CAPACITY_HEADROOM_WEIGHT=0
-  RANVIER_CROSS_SHARD_LOAD_SYNC=true`, 20u ×3) — if diverts stop being the tail, build the
-  fleet-wide in-flight view (gossip); else randomise the divert target among under-cap candidates.
+  compose load-signal knobs) should merge regardless.
+  **Leg A (no-divert control, 2026-10-02/03): +8.2, +12.3, +11.3.** Pure affinity
+  (`--no-load-aware --cache-residency-threshold 0.0`, 0 diverts, 97% route consistency) regresses
+  P99 by the same amount as either divert policy. The cause is hash placement itself: 16 uniform
+  prefixes over 8 backends by hash left b7 with 4 prefixes (23% of requests) and b5 with 0 (0.6%),
+  Gini 0.30 in all three repeats; the busiest backend's queue sets P99 while P50 keeps −28%.
+  **Implemented (2026-10-03, same branch): `routing.miss_placement: least_loaded`** — a new prefix
+  is placed on the live candidate with the fewest learned routes (`RadixTree::routes_by_backend`),
+  then lowest capacity-adjusted load, then probe order; default `hash` unchanged. Acceptance:
+  `bench-runner.sh --suite placement` (fitted 20u and 10u with `--miss-placement least_loaded`):
+  20u turns negative, prefix-arm Gini near round-robin's, P50 still ≈ −25%. Leg B (in-flight load
+  signal) remains informative for the divert policy but no longer decides the design. Known
+  limit: balances prefix count, not popularity — hot-prefix replication is the follow-on.
 - [ ] **[STRATEGIC] KV-aware dispatch.** Extend the backend load signal with the already-scraped
   `gpu_cache_usage_percent` (`health_service.cpp:425`, `vllm_metrics.hpp:21`) and add a
   `kv_pressure` candidate field + weight to `route_scorer.hpp`, so dispatch diverts off an anchor

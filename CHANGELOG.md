@@ -246,6 +246,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Least-loaded cache-miss placement** (`routing.miss_placement: least_loaded`, env
+  `RANVIER_MISS_PLACEMENT`, default `hash` = unchanged behavior) — a prefix with no
+  learned route is placed on the live backend with the fewest learned routes, then the
+  lowest capacity-adjusted load, then jump-probe order, instead of its consistent-hash
+  bucket. Motivated by the 2026-10-02 fitted-suite leg A: with every divert mechanism
+  off, prefix affinity still lost 8–12% P99 at 13B/20 users against round-robin,
+  because hash placement of 16 prefixes over 8 backends left one backend holding four
+  prefixes (23% of requests) and another none (0.6%), and the busiest backend's queue
+  sets the tail. A miss has no cache to preserve, so placement is free in cache terms;
+  hits are untouched. New counter `router_miss_placements_rebalanced_total`;
+  `bench.sh --miss-placement`, `bench-runner.sh --suite placement` (the acceptance
+  test: fitted 13B 20u turns negative with the prefix arm's Gini near round-robin's).
+  Balances prefix count, not popularity; hot-prefix replication is a separate item.
+
 - **Bounded-load diversion targets the least-loaded backend** — `bounded_load_select`
   used to send an over-cap primary to the first under-cap bucket in jump-probe order,
   and the route scorer's dispatch tie order reproduced the same rule for ART-hit

@@ -92,6 +92,29 @@ struct RoutingConfig {
     // Only switch to secondary when: secondary_load + p2c_load_bias < primary_load.
     uint64_t p2c_load_bias = 2;
 
+    // Cache-miss placement: where a prefix with no learned route is placed.
+    // - HASH:         the hash strategy's bucket. Cluster-consistent, but
+    //                 placement is balls-into-bins: 16 prefixes over 8
+    //                 backends give a busiest backend holding ~2x the mean,
+    //                 and the busiest backend's queue sets P99 (fitted-suite
+    //                 leg A, 2026-10-02: pure affinity +8..12% P99 with one
+    //                 backend at 23% of traffic and one at 0.6%).
+    // - LEAST_LOADED: the live candidate with the fewest learned routes
+    //                 (RadixTree::routes_by_backend — gossip-converged, so
+    //                 it reflects cluster placement), then the lowest
+    //                 capacity-adjusted load, then jump-probe order. A miss
+    //                 has no cache to preserve, so this costs nothing in
+    //                 cache terms; ART hits are unaffected. Two nodes that
+    //                 see a brand-new prefix simultaneously may place it on
+    //                 different backends (each keeps its LOCAL route under
+    //                 the trust ladder; the prefix is then warm on two
+    //                 backends) — the price of balance. Balances prefix
+    //                 count, not popularity: a skewed hot prefix still needs
+    //                 replication (BACKLOG section 27).
+    // Env: RANVIER_MISS_PLACEMENT=hash|least_loaded. YAML: routing.miss_placement.
+    enum class MissPlacement { HASH, LEAST_LOADED };
+    MissPlacement miss_placement = MissPlacement::HASH;
+
     // Prefix boundary detection for multi-turn conversations
     // When enabled, system messages are tokenized separately to identify the "shared prefix"
     // boundary. Routes are stored at this boundary instead of prefix_token_length, improving
