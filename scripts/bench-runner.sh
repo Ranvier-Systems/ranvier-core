@@ -54,6 +54,7 @@ SUITE="rebaseline"
 REPEAT_SET=false   # true when --repeat was passed; rebaseline/epsilon default to 3
 CUSTOM_FILE=""
 STOP_ON_FAILURE=false
+BUILD_IMAGE=false
 SKIP_RUNS_RAW=""   # comma-separated list from --skip
 REPEAT=1           # --repeat N: run each config N times, then aggregate (median/IQR)
 
@@ -245,6 +246,11 @@ OPTIONS:
     --skip LIST         Skip specific runs by number (comma-separated, e.g., --skip 9,10)
     --pause SECONDS     Pause between runs for GPU cooldown (default: 60)
     --stop-on-failure   Stop the suite if any run fails (default: continue)
+    --build-image       Build ranvier:latest from this checkout once, before the
+                        first run. REQUIRED when the suite is the acceptance test
+                        for a C++ change on a branch: bench.sh otherwise reuses
+                        whatever ranvier:latest exists (and refuses if it predates
+                        the newest src/ commit).
     --output-dir DIR    Output directory (default: benchmark-reports)
     --repeat N          Run each config N times, then aggregate median/IQR per
                         config and print a verdict (default: 1). Variance is the
@@ -362,6 +368,7 @@ while [[ $# -gt 0 ]]; do
         --skip)             SKIP_RUNS_RAW="$2"; shift 2 ;;
         --pause)            PAUSE_BETWEEN_RUNS="$2"; shift 2 ;;
         --stop-on-failure)  STOP_ON_FAILURE=true; shift ;;
+        --build-image)      BUILD_IMAGE=true; shift ;;
         --output-dir)       RUNNER_OUTPUT_DIR="$2"; shift 2 ;;
         --repeat)           REPEAT="$2"; REPEAT_SET=true; shift 2 ;;
         -h|--help)          print_help; exit 0 ;;
@@ -655,6 +662,22 @@ echo "Suite: $SUITE ($TOTAL_RUNS runs)"
 echo "Estimated total time: $(fmt_duration $TOTAL_EST)"
 echo "============================================="
 echo ""
+
+# -----------------------------------------------------------------------------
+# Server image: build once from this checkout when asked. Every bench.sh run
+# then reuses it (and passes bench.sh's freshness check).
+# -----------------------------------------------------------------------------
+if [[ "$BUILD_IMAGE" = true ]]; then
+    log_info "Building ranvier:latest from commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown) (--build-image)..."
+    BUILD_START_TS=$(date +%s)
+    if docker build -t ranvier:latest -f "${SCRIPT_DIR}/../Dockerfile.production" "${SCRIPT_DIR}/.." > "${RUNNER_OUTPUT_DIR}/image_build.log" 2>&1; then
+        log_ok "ranvier:latest built in $(fmt_duration $(( $(date +%s) - BUILD_START_TS ))) (log: ${RUNNER_OUTPUT_DIR}/image_build.log)"
+    else
+        log_error "Image build failed — tail of ${RUNNER_OUTPUT_DIR}/image_build.log:"
+        tail -20 "${RUNNER_OUTPUT_DIR}/image_build.log"
+        exit 1
+    fi
+fi
 
 # -----------------------------------------------------------------------------
 # Execute runs

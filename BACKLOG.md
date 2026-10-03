@@ -1415,6 +1415,23 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   among under-cap probes), and consider a pull rule for backends far below average. Acceptance
   test: `--suite fitted` 13B 20u turns to a consistent improvement. Cheaper and better supported
   than the KV-aware item below; do it first.
+  **Implemented and acceptance-tested 2026-10-02: FAILED.** Branch `claude/sleepy-lamport-wxly0b`
+  (`f47c998`) diverts an over-cap primary to the least-loaded live candidate and ranks load ahead of
+  `probe_rank` in the scorer. Same-box fitted suite, 13B 20u, three repeats each: old rule +11.7,
+  +11.0, +3.9; new rule +10.5, +24.1, +17.5 (P99 TTFT vs round-robin). The new rule tightened the
+  prefix-arm spread (Gini 0.049–0.075 vs 0.075–0.105) without moving the tail, so stranded
+  capacity is a symptom, not the mechanism. Root finding: with 24 shards and cross-shard sync off,
+  "load" is ~entirely the 5 s-stale scraped vLLM score (×10) plus KV headroom (×5), identical on
+  every shard of a node; ~88% of shard-0 load diverts carried a GPU score. Diverts fire at ~30% on
+  scraped KV pressure, and least-loaded herds them onto one backend per node per scrape. Details:
+  `docs/benchmarks/benchmark-results-current.md` (acceptance section). The code change is held on
+  the branch; the tooling beside it (stale-image refusal, `--build-image`, manifest `server_image`,
+  compose load-signal knobs) should merge regardless. **Next:** leg A, no-divert control
+  (`RANVIER_LOAD_AWARE_ROUTING=false`, 20u ×3) — if also ≈+10%, the cause is affinity
+  concentration and the levers are ε or prefix spread; leg B, in-flight signal
+  (`RANVIER_ROUTING_GPU_LOAD_WEIGHT=0 RANVIER_CAPACITY_HEADROOM_WEIGHT=0
+  RANVIER_CROSS_SHARD_LOAD_SYNC=true`, 20u ×3) — if diverts stop being the tail, build the
+  fleet-wide in-flight view (gossip); else randomise the divert target among under-cap candidates.
 - [ ] **[STRATEGIC] KV-aware dispatch.** Extend the backend load signal with the already-scraped
   `gpu_cache_usage_percent` (`health_service.cpp:425`, `vllm_metrics.hpp:21`) and add a
   `kv_pressure` candidate field + weight to `route_scorer.hpp`, so dispatch diverts off an anchor

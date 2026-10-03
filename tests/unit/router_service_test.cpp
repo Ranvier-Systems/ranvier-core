@@ -2614,6 +2614,124 @@ TEST_F(BoundedLoadTest, NoARTOverrideWhenLoadAwareDisabled) {
     EXPECT_TRUE(result.art_hit);
 }
 
+// ---- least-loaded diversion (fitted-suite finding, 2026-10-02) ----
+//
+// An over-cap primary diverts to the LEAST-LOADED live candidate, not to the
+// first under-cap bucket in jump-probe order. The former rule pushed load away
+// from hot anchors but never pulled it toward the coldest backend, leaving one
+// backend 35-45% below the fleet mean in every fitted-suite prefix arm.
+
+TEST_F(BoundedLoadTest, OverCapPrimaryDivertsToColdestBackend) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {71, 72, 73, 74, 75};
+
+    // Discover the primary hash bucket while the fleet is idle.
+    auto idle = router_->get_backend_for_prefix(tokens, "ll-probe");
+    ASSERT_TRUE(idle.backend_id.has_value());
+    const BackendId primary = idle.backend_id.value();
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 0u);
+
+    // Loads: primary 6, two peers 2 each, one peer 0. avg = 2.5,
+    // cap = ceil(2.5 * 1.25) = 4; 6 >= 4 forfeits the primary. Both warm peers
+    // are under cap, so the first-under-cap rule could have landed on either;
+    // least-loaded must land on the idle one.
+    std::vector<BackendId> peers;
+    for (BackendId id = 1; id <= 4; ++id) {
+        if (id != primary) peers.push_back(id);
+    }
+    const BackendId coldest = peers[2];
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 6; ++i) guards.emplace_back(primary);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(peers[0]);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(peers[1]);
+
+    auto result = router_->get_backend_for_prefix(tokens, "ll-divert");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), coldest)
+        << "primary=" << primary << " must divert to the idle backend, not the "
+           "first under-cap probe";
+    EXPECT_FALSE(result.art_hit);
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 1u);
+}
+
+TEST_F(BoundedLoadTest, UnderCapPrimaryKeepsAffinityEvenWithColderPeer) {
+    // No pull rule: while the primary is under cap, a colder peer does not
+    // attract the request. Affinity only breaks at the cap.
+    register_four_backends();
+    std::vector<int32_t> tokens = {81, 82, 83, 84, 85};
+
+    auto idle = router_->get_backend_for_prefix(tokens, "keep-probe");
+    ASSERT_TRUE(idle.backend_id.has_value());
+    const BackendId primary = idle.backend_id.value();
+
+    // Loads: primary 1, two peers 2 each, one peer 0. avg = 1.25,
+    // cap = ceil(1.25 * 1.25) = 2; 1 < 2 keeps the primary although a peer
+    // sits at 0.
+    std::vector<BackendId> peers;
+    for (BackendId id = 1; id <= 4; ++id) {
+        if (id != primary) peers.push_back(id);
+    }
+    std::vector<BackendRequestGuard> guards;
+    guards.emplace_back(primary);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(peers[0]);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(peers[1]);
+
+    auto result = router_->get_backend_for_prefix(tokens, "keep");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), primary);
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 0u);
+}
+
+TEST_F(BoundedLoadTest, UniformSaturationStaysOnPrimaryWithoutCountingDivert) {
+    // epsilon 0 makes cap == avg, so a uniformly loaded fleet puts every
+    // backend at cap. Nothing is colder than the primary: stay put, and do
+    // not count a divert that did not happen.
+    cfg_.bounded_load_epsilon = 0.0;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+    std::vector<int32_t> tokens = {91, 92, 93, 94, 95};
+
+    auto idle = router_->get_backend_for_prefix(tokens, "sat-probe");
+    ASSERT_TRUE(idle.backend_id.has_value());
+    const BackendId primary = idle.backend_id.value();
+
+    std::vector<BackendRequestGuard> guards;
+    for (BackendId id = 1; id <= 4; ++id) {
+        guards.emplace_back(id);
+        guards.emplace_back(id);
+    }
+
+    auto result = router_->get_backend_for_prefix(tokens, "sat");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), primary);
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 0u);
+}
+
+TEST_F(BoundedLoadTest, ArtHitOverAllowanceDivertsToColdestBackend) {
+    // Same rule on the ART-hit path, which goes through the scorer: the
+    // under-allowance candidates tie on score and the least-loaded key wins
+    // ahead of probe rank.
+    register_four_backends();
+    std::vector<int32_t> tokens = {101, 102, 103, 104, 105};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Loads [1:6, 2:2, 3:2, 4:0]: allowance = cap - 1 = 3; 6 > 3 forfeits the
+    // warm route; backend 4 is the coldest under-allowance candidate.
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 6; ++i) guards.emplace_back(1);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(2);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(3);
+
+    auto result = router_->route_request(tokens, "art-coldest");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 4);
+    EXPECT_TRUE(result.cache_hit);
+    EXPECT_EQ(result.original_selected, 1) << "load diverts are transient, never learned";
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 1u);
+}
+
 // =============================================================================
 // 22. Hash Strategy: Power of Two Choices (P2C)
 // =============================================================================

@@ -335,6 +335,10 @@ OTHER OPTIONS:
                         which tracks main). REQUIRED when benchmarking C++
                         changes from a branch — otherwise the run silently
                         uses a stale server build.
+    --allow-stale-image Run even when the existing ranvier:latest predates the
+                        newest server-source commit in this checkout. Without
+                        it bench.sh refuses, because the run would benchmark a
+                        server build that does not contain the change under test.
     --skip-setup        Skip system configuration (for repeated runs)
     --dry-run           Show what would be done without executing
     --no-log            Disable full output logging (logging is ON by default)
@@ -506,6 +510,7 @@ TP_SIZE=1
 GPU_MEM_UTIL="0.85"
 CPUSET_OVERRIDE=""
 BUILD_IMAGE=false
+ALLOW_STALE_IMAGE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -550,6 +555,7 @@ while [[ $# -gt 0 ]]; do
         --cpuset)          CPUSET_OVERRIDE="$2"; shift 2 ;;
         --priority-queue) PRIORITY_QUEUE=true; shift ;;
         --build-image)    BUILD_IMAGE=true; shift ;;
+        --allow-stale-image) ALLOW_STALE_IMAGE=true; shift ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -1413,16 +1419,50 @@ elif ! docker image inspect ranvier:latest &> /dev/null; then
     log_info "Pulling Ranvier image from GHCR..."
     if docker pull "$GHCR_IMAGE" > /dev/null 2>&1; then
         docker tag "$GHCR_IMAGE" ranvier:latest
-        log_ok "Ranvier image pulled from GHCR"
+        PULLED_FROM_GHCR=true
+        log_ok "Ranvier image pulled from GHCR (tracks main — not this branch's C++ changes)"
     else
         log_warn "GHCR pull failed, building locally..."
         docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
+        BUILT_FALLBACK=true
         log_ok "Ranvier image built"
     fi
 else
-    IMAGE_CREATED=$(docker image inspect -f '{{.Created}}' ranvier:latest 2>/dev/null | cut -dT -f1)
-    log_info "Using existing ranvier:latest (created ${IMAGE_CREATED:-unknown}) — pass --build-image to rebuild from this checkout"
+    # Reusing an existing image is the classic way to benchmark the wrong
+    # server: the checkout moves (branch with C++ changes) but ranvier:latest
+    # does not, and the manifest still records the checkout's commit. Refuse
+    # when the image predates the newest commit that touched the server
+    # sources, unless --allow-stale-image says the operator knows.
+    IMAGE_CREATED_RAW=$(docker image inspect -f '{{.Created}}' ranvier:latest 2>/dev/null)
+    IMAGE_CREATED=$(echo "$IMAGE_CREATED_RAW" | cut -dT -f1)
+    IMAGE_TS=$(date -d "$IMAGE_CREATED_RAW" +%s 2>/dev/null || echo 0)
+    SRC_TS=$(git log -1 --format=%ct -- src CMakeLists.txt Dockerfile.production 2>/dev/null || echo 0)
+    SRC_DESC=$(git log -1 --format='%h %s' -- src CMakeLists.txt Dockerfile.production 2>/dev/null || echo unknown)
+    if [[ "$IMAGE_TS" -gt 0 && "$SRC_TS" -gt 0 && "$IMAGE_TS" -lt "$SRC_TS" ]]; then
+        if [[ "$ALLOW_STALE_IMAGE" = true ]]; then
+            log_warn "ranvier:latest (built $(date -d "@$IMAGE_TS" '+%Y-%m-%d %H:%M' 2>/dev/null)) predates the newest server-source commit ($SRC_DESC); running anyway (--allow-stale-image). The manifest records this."
+        else
+            log_error "ranvier:latest was built $(date -d "@$IMAGE_TS" '+%Y-%m-%d %H:%M' 2>/dev/null), BEFORE the newest commit touching src/ in this checkout:"
+            log_error "  $SRC_DESC ($(date -d "@$SRC_TS" '+%Y-%m-%d %H:%M' 2>/dev/null))"
+            log_error "The run would benchmark a server that does not contain that change, while the manifest records this commit."
+            log_error "Fix: ./scripts/bench.sh --build-image ...   (or: docker build -t ranvier:latest -f Dockerfile.production .)"
+            log_error "Override only if you know the image is right: --allow-stale-image"
+            exit 1
+        fi
+    else
+        log_info "Using existing ranvier:latest (created ${IMAGE_CREATED:-unknown}; newest server-source commit: $SRC_DESC) — pass --build-image to rebuild from this checkout"
+    fi
+    if [[ -n "$(git status --porcelain -- src CMakeLists.txt 2>/dev/null)" ]]; then
+        log_warn "Uncommitted changes under src/ — the existing image cannot contain them; pass --build-image if they are the change under test."
+    fi
 fi
+
+# Record what server actually ran, independent of the checkout's commit.
+SERVER_IMAGE_ID=$(docker image inspect -f '{{.Id}}' ranvier:latest 2>/dev/null | sed 's/^sha256://' | cut -c1-12)
+SERVER_IMAGE_CREATED=$(docker image inspect -f '{{.Created}}' ranvier:latest 2>/dev/null)
+SERVER_IMAGE_SOURCE="existing"
+[[ "$BUILD_IMAGE" = true || "${DEBUG_BUILD:-}" == "true" || "${BUILT_FALLBACK:-false}" = true ]] && SERVER_IMAGE_SOURCE="built_from_checkout"
+[[ "${PULLED_FROM_GHCR:-false}" = true ]] && SERVER_IMAGE_SOURCE="ghcr_main"
 
 # Build locust image unconditionally: the locustfiles are baked into the image
 # (Dockerfile.locust COPY), so reusing a stale image silently runs an outdated
@@ -1437,10 +1477,16 @@ if [[ "$MULTI_DEPTH" = true ]]; then
     log_info "Multi-depth routing enabled (Option C)"
 fi
 
-# Export load-aware routing settings for docker-compose
+# Export load-aware routing settings for docker-compose. --no-load-aware wins;
+# otherwise an explicit host env RANVIER_LOAD_AWARE_ROUTING=false is honored
+# (it used to be silently overwritten to true, which turned a "pure affinity"
+# leg into another default-config run; the manifest records the effective value).
 if [[ "$LOAD_AWARE" = false ]]; then
     export RANVIER_LOAD_AWARE_ROUTING=false
-    log_info "Load-aware routing disabled (pure affinity mode)"
+    log_info "Load-aware routing disabled (pure affinity mode, --no-load-aware)"
+elif [[ "${RANVIER_LOAD_AWARE_ROUTING:-true}" == "false" ]]; then
+    export RANVIER_LOAD_AWARE_ROUTING=false
+    log_info "Load-aware routing disabled (pure affinity mode, RANVIER_LOAD_AWARE_ROUTING=false in env)"
 else
     export RANVIER_LOAD_AWARE_ROUTING=true
 fi
@@ -1470,10 +1516,10 @@ fi
 
 # Effective routing config the server is about to launch with. Printed at
 # second 0 so a misconfigured load-aware experiment is caught immediately
-# rather than after a 30-minute run. NOTE: these flags (--no-load-aware,
-# --load-imbalance-factor/floor) are the ONLY supported way to override
-# load-aware behavior — a bare `RANVIER_LOAD_AWARE_ROUTING=... ./bench.sh`
-# env prefix is overwritten by the export above and has no effect.
+# rather than after a 30-minute run. --no-load-aware and
+# --load-imbalance-factor/floor are the preferred way to override load-aware
+# behavior; a `RANVIER_LOAD_AWARE_ROUTING=false ./bench.sh` env prefix is
+# honored too (see the export above).
 # KV-cache regime. Prefix routing can only pay off when the hot prefix set does
 # not fit in one backend's KV cache but does fit when split across backends;
 # below that, round-robin already hits, and above it every backend thrashes
@@ -1698,6 +1744,12 @@ write_manifest() {
         printf '  "schema_version": 1,\n'
         printf '  "timestamp": "%s",\n' "$(_json_escape "$ts")"
         printf '  "commit": "%s",\n' "$(_json_escape "$commit")"
+        # The server that actually ran. "commit" above is the CHECKOUT; the
+        # image may be older (reused) or built from main (GHCR). Readers must
+        # not infer the server's code from "commit" when source != built_from_checkout.
+        printf '  "server_image": { "id": "%s", "created": "%s", "source": "%s", "stale_override": %s },\n' \
+            "$(_json_escape "${SERVER_IMAGE_ID:-unknown}")" "$(_json_escape "${SERVER_IMAGE_CREATED:-unknown}")" \
+            "$(_json_escape "${SERVER_IMAGE_SOURCE:-unknown}")" "$([[ "${ALLOW_STALE_IMAGE:-false}" = true ]] && echo true || echo false)"
         printf '  "host": "%s",\n' "$(_json_escape "$host")"
         printf '  "command": "%s",\n' "$(_json_escape "$ORIGINAL_CMD")"
         printf '  "vllm_version": "%s",\n' "$(_json_escape "$VLLM_VERSION")"
@@ -1719,6 +1771,9 @@ write_manifest() {
         printf '    "hash_strategy": "%s",\n' "$(_json_escape "${RANVIER_HASH_STRATEGY:-bounded_load}")"
         printf '    "bounded_load_epsilon": "%s",\n' "$(_json_escape "${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}")"
         printf '    "cross_shard_load_sync": "%s",\n' "$(_json_escape "${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}")"
+        printf '    "gpu_load_weight": "%s",\n' "$(_json_escape "${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-10.0}")"
+        printf '    "capacity_headroom_weight": "%s",\n' "$(_json_escape "${RANVIER_CAPACITY_HEADROOM_WEIGHT:-5.0}")"
+        printf '    "health_check_interval_s": "%s",\n' "$(_json_escape "${RANVIER_HEALTH_CHECK_INTERVAL:-5}")"
         printf '    "min_token_length": "%s",\n' "$(_json_escape "${RANVIER_MIN_TOKEN_LENGTH:-10}")"
         printf '    "route_batch_flush_interval_ms": "%s",\n' "$(_json_escape "${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}")"
         printf '    "enable_multi_depth_routing": "%s",\n' "$(_json_escape "${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}")"

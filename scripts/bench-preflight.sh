@@ -142,6 +142,29 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+section "6b. Server image freshness (is ranvier:latest built from THIS checkout's src/?)"
+if docker ps >/dev/null 2>&1; then
+    if created=$(docker image inspect -f '{{.Created}}' ranvier:latest 2>/dev/null); then
+        img_ts=$(date -d "$created" +%s 2>/dev/null || echo 0)
+        src_ts=$(git log -1 --format=%ct -- src CMakeLists.txt Dockerfile.production 2>/dev/null || echo 0)
+        src_desc=$(git log -1 --format='%h %s' -- src CMakeLists.txt Dockerfile.production 2>/dev/null || echo unknown)
+        if [[ "$img_ts" -gt 0 && "$src_ts" -gt 0 && "$img_ts" -lt "$src_ts" ]]; then
+            bad "ranvier:latest (built $(date -d "@$img_ts" '+%Y-%m-%d %H:%M')) predates the newest src/ commit: $src_desc"
+            echo "        the suite would benchmark a server WITHOUT that change; run: ./scripts/bench-runner.sh --build-image ... (or docker build -t ranvier:latest -f Dockerfile.production .)"
+        else
+            ok "ranvier:latest built $(date -d "@$img_ts" '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown), at or after the newest src/ commit ($src_desc)"
+        fi
+        if [[ -n "$(git status --porcelain -- src CMakeLists.txt 2>/dev/null)" ]]; then
+            warn "uncommitted changes under src/: the image cannot contain them"
+        fi
+    else
+        warn "no ranvier:latest image yet; bench.sh will pull GHCR (built from MAIN) unless you pass --build-image"
+    fi
+else
+    warn "docker not usable; skipping server image freshness check"
+fi
+
+# -----------------------------------------------------------------------------
 section "7. Runner dry run for --suite $SUITE"
 if out=$(./scripts/bench-runner.sh --suite "$SUITE" --dry-run 2>&1); then
     n=$(echo "$out" | grep -oE 'Suite: [a-z]+ \([0-9]+ runs\)' | head -1)

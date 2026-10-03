@@ -198,6 +198,16 @@ services:
       # cache-usage signal at peak pressure (the instants residency routing
       # needs). 1000ms keeps the scrape honest under benchmark load.
       - RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}
+      # What "load" means to bounded-load/P2C in this stack. With cross-shard sync
+      # off, each of the 24 shards (3 nodes x 8) sees ~1/24 of the in-flight
+      # requests, so the composite load is dominated by the scraped vLLM score
+      # (gpu_load_weight x [0.7 queue + 0.3 KV usage]) plus the KV-headroom term
+      # (capacity_headroom_weight x KV usage), refreshed every health scrape and
+      # identical on every shard of a node. Set both weights to 0 (and sync on)
+      # to make load mean in-flight requests. Defaults match the shipped values.
+      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-10.0}
+      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-5.0}
+      - RANVIER_HEALTH_CHECK_INTERVAL=${RANVIER_HEALTH_CHECK_INTERVAL:-5}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
       # Priority queue scheduler
@@ -284,6 +294,16 @@ services:
       # cache-usage signal at peak pressure (the instants residency routing
       # needs). 1000ms keeps the scrape honest under benchmark load.
       - RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}
+      # What "load" means to bounded-load/P2C in this stack. With cross-shard sync
+      # off, each of the 24 shards (3 nodes x 8) sees ~1/24 of the in-flight
+      # requests, so the composite load is dominated by the scraped vLLM score
+      # (gpu_load_weight x [0.7 queue + 0.3 KV usage]) plus the KV-headroom term
+      # (capacity_headroom_weight x KV usage), refreshed every health scrape and
+      # identical on every shard of a node. Set both weights to 0 (and sync on)
+      # to make load mean in-flight requests. Defaults match the shipped values.
+      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-10.0}
+      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-5.0}
+      - RANVIER_HEALTH_CHECK_INTERVAL=${RANVIER_HEALTH_CHECK_INTERVAL:-5}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
       # Priority queue scheduler
@@ -370,6 +390,16 @@ services:
       # cache-usage signal at peak pressure (the instants residency routing
       # needs). 1000ms keeps the scrape honest under benchmark load.
       - RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}
+      # What "load" means to bounded-load/P2C in this stack. With cross-shard sync
+      # off, each of the 24 shards (3 nodes x 8) sees ~1/24 of the in-flight
+      # requests, so the composite load is dominated by the scraped vLLM score
+      # (gpu_load_weight x [0.7 queue + 0.3 KV usage]) plus the KV-headroom term
+      # (capacity_headroom_weight x KV usage), refreshed every health scrape and
+      # identical on every shard of a node. Set both weights to 0 (and sync on)
+      # to make load mean in-flight requests. Defaults match the shipped values.
+      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-10.0}
+      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-5.0}
+      - RANVIER_HEALTH_CHECK_INTERVAL=${RANVIER_HEALTH_CHECK_INTERVAL:-5}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
       # Priority queue scheduler

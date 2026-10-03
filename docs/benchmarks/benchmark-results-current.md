@@ -111,12 +111,71 @@ pressure was largely relieved.
   stranded eighth of it becomes tail latency. Real workloads have skewed prefix popularity and
   will produce the same effect without any benchmark artefact.
 
-**Consequences.** (1) The remedy is in dispatch, not in cache sizing: when an anchor is over
-cap, divert to the *least-loaded* under-cap candidate rather than the first hash probe, and
-consider a pull rule for backends far below average. (2) Leg V1 as written sweeps ε *looser*
-(0.5), which would strand more; the informative sweep is *tighter* (0.1). (3) The 13B 20-user
-row is the regression test for whichever fix lands: a consistent improvement there, on the
-fitted set, is the acceptance criterion. Archive: `docs/benchmarks/results/2026-10-02-fitted/`.
+**Consequences.** (1) The remedy was expected to be in dispatch: when an anchor is over cap,
+divert to the *least-loaded* under-cap candidate rather than the first hash probe. **Tested the
+same day and it did not hold; see the acceptance section below.** (2) Leg V1 as written sweeps
+ε *looser* (0.5), which would strand more; the informative sweep is *tighter* (0.1). (3) The 13B
+20-user row remains the regression test for whichever fix lands: a consistent improvement
+there, on the fitted set, is the acceptance criterion. Archive:
+`docs/benchmarks/results/2026-10-02-fitted/`.
+
+### Least-loaded diversion: acceptance run (2026-10-02, same box, ❌ failed)
+
+Branch `claude/sleepy-lamport-wxly0b` (commit `f47c998`) changed `bounded_load_select` and the
+scorer tie order so an over-cap anchor diverts to the least-loaded candidate instead of the first
+under-cap jump probe. Both binaries ran the fitted suite on the same 8×A100 instance the same
+evening (old binary first, by accident of a stale `ranvier:latest`; the run was kept as the
+control). Three repeats per row, alternating arm order, all arms valid.
+
+| Config | Binary | P99 TTFT per repeat | Verdict | P50 TTFT | Diverts | Prefix-arm Gini per repeat |
+|--------|--------|---------------------|---------|----------|---------|----------------------------|
+| 13B 10u | old (first-under-cap) | −10.7, +7.6, +0.8 | mixed | −27% ×3 | 29–33% | 0.103, 0.081, 0.114 |
+| 13B 10u | new (least-loaded) | −11.3, +8.3, −10.8 | mixed | −27% ×3 | 33% ×3 | 0.084, 0.098, 0.091 |
+| 13B 20u | old (first-under-cap) | +11.7, +11.0, +3.9 | ❌ consistent regression | −24% ×3 | 29–33% | 0.075, 0.103, 0.105 |
+| 13B 20u | new (least-loaded) | **+10.5, +24.1, +17.5** | ❌ consistent regression | −24% ×3 | 29–30% | 0.049, 0.075, 0.063 |
+
+Round-robin arms: Gini 0.021–0.043 throughout. KV hit rates were unchanged between binaries
+(10u ≈ 17% → 47–64%; 20u ≈ 11% → 31–44%).
+
+**What the acceptance run settles.**
+
+- **Where diverts land does not set the tail.** The new rule tightened the 20-user prefix-arm
+  spread in two of three repeats (Gini 0.049/0.063 vs 0.075–0.105) and P99 did not move; in
+  the one repeat where the spread stayed at the old level, P99 was the worst of the day. The
+  "stranded capacity" reading of the fitted suite is therefore not the whole mechanism: the
+  completion-count imbalance is a symptom that can be removed without touching the tail.
+- **The tail is queueing on both hits and diverts.** At 20 users the prefix arm's
+  route-consistent P99 was better than round-robin's in one repeat (−15%) and worse in two
+  (+19%, +48%); route-changed P99 was worse in all three (+22% to +25%). Cache hits are faster
+  at the median in every repeat (−3% to −5%) and slower at the tail in most.
+- **"Load" in this deployment is not queue depth.** Three Ranvier nodes × 8 shards = 24
+  shards with `RANVIER_CROSS_SHARD_LOAD_SYNC=false`: each shard sees ~1/24 of the in-flight
+  requests, so the in-flight term of the composite load is almost always 0. The value the
+  bounded-load cap and the least-loaded pick actually read is `gpu_load_weight` (10) × the
+  scraped vLLM score (0.7 × queue pressure + 0.3 × KV usage) plus `capacity_headroom_weight` (5)
+  × KV usage, refreshed by the 5 s health scrape and identical on every shard of a node. The
+  shard-0 counters confirm it: 132/151 and 156/175 load diverts in the first two new-binary
+  prefix arms (~88%) carried a GPU score at decision time. Consequences: diverts fire at ~30% of
+  requests at every concurrency because the trigger is scraped KV pressure, not a queue; and
+  "least loaded" is the same backend for every shard of a node for 5 s, so the new rule herds
+  diverts where the old rule stranded a backend. Same P99 cost, different shape.
+- **The fix is held on the branch, not merged.** The tooling changes beside it (stale-image
+  refusal, `--build-image`, manifest `server_image`, load-signal knobs in the compose file)
+  stand on their own.
+
+**Next legs (configuration only, 20-user row ×3 each, ~80 min each):**
+
+- **A. No-divert control** (`RANVIER_LOAD_AWARE_ROUTING=false`): pure affinity. If this is
+  also ≈+10%, the regression is affinity concentration itself (16 hot prefixes pinned onto 8
+  backends) and no divert-target rule can fix it; the levers are ε or a prefix-spread policy.
+- **B. In-flight signal** (`RANVIER_ROUTING_GPU_LOAD_WEIGHT=0 RANVIER_CAPACITY_HEADROOM_WEIGHT=0
+  RANVIER_CROSS_SHARD_LOAD_SYNC=true`): diverts triggered and targeted by node-local in-flight
+  counts. If diverts stop being the tail, the signal was the problem and least-loaded is the
+  right target; a fleet-wide in-flight view (gossip) is then the code change. If the tail
+  persists, randomise the divert target among under-cap candidates (herd-breaker).
+
+Archive: `docs/benchmarks/results/2026-10-02-fitted-acceptance/` (old-binary control and
+new-binary runs; manifests carry `server_image` so the binary is identifiable).
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
@@ -140,9 +199,10 @@ now shows were measured in an eviction regime.
 
 ## Still open
 
-- **Least-loaded diversion fix + re-run of the fitted 20-user row** as its acceptance test
-  (BACKLOG §27). The fitted suite ran 2026-10-02 and localised the regression to stranded
-  capacity in `bounded_load_select`; see the fitted section above.
+- **13B 20-user fitted regression: legs A (no-divert control) and B (in-flight load signal)**
+  (BACKLOG §27). The least-loaded diversion fix failed its acceptance run on 2026-10-02 (see
+  the acceptance section above); the regression's mechanism is still open between "affinity
+  concentration itself" and "diverts triggered by a stale scraped signal".
 - **Leg V1, epsilon** (`bench-runner.sh --suite epsilon`): the shipped file sweeps ε 0.5
   (looser). The fitted result says looser strands more capacity; sweep *tighter* (0.1) instead,
   on the fitted set, after the diversion fix. The factor/floor "threshold leg" (BACKLOG §25

@@ -449,7 +449,7 @@ dispatch score(b) = prefix_weight * affinity(b)
                   [+ price terms on the miss path]
 ```
 
-At the neutral defaults (`prefix_weight 0`, `load_weight 1`) the anchor keeps its seat exactly while at or under the allowance, and forfeits past it — the same keep/divert frontier as the per-strategy rules. Divert targets are encoded in the deterministic tie-break order: first-under-cap in jump-probe order for bounded-load, least-loaded (then lowest id) for the others. The median allowance auto-adapts to any workload, model size, or cluster size — no per-model tuning needed; `bounded_load`/`p2c` use capacity-adjusted load, `jump`/`modular` use composite load (`local_active_requests + gpu_load_score * gpu_load_weight`).
+At the neutral defaults (`prefix_weight 0`, `load_weight 1`) the anchor keeps its seat exactly while at or under the allowance, and forfeits past it — the same keep/divert frontier as the per-strategy rules. Divert targets are encoded in the deterministic tie-break order: least-loaded for every strategy, with jump-probe order breaking equal loads under bounded-load (then lowest id). Bounded-load used to spill to the first under-cap bucket in probe order; that pushed load off hot anchors without ever pulling it toward the coldest backend and stranded one backend per fleet in the 2026-10-02 fitted suite (BACKLOG §27), so the divert now goes to the coldest candidate. The median allowance auto-adapts to any workload, model size, or cluster size — no per-model tuning needed; `bounded_load`/`p2c` use capacity-adjusted load, `jump`/`modular` use composite load (`local_active_requests + gpu_load_score * gpu_load_weight`).
 
 See `route_scorer.hpp` for the scorer and `compute_load_allowance()` in `router_service.cpp` for the allowance math; the miss-path hash strategies keep their own integrated load logic — see `bounded_load_select()` and `p2c_select()`.
 
@@ -532,7 +532,7 @@ dispatch(b)  = placement(b)
              - cost_weight * cost_hinge(b)
 ```
 
-`placement` argmax → `original_selected` (the learn target, stable inputs only); `dispatch` argmax → the backend serving this request. Tie-breaks are deterministic: placement prefers the anchor then lower composite load then lower id; dispatch prefers a clean placement winner (no forfeited term), then jump-probe order, then lower cost pressure, then lower load, then lower id.
+`placement` argmax → `original_selected` (the learn target, stable inputs only); `dispatch` argmax → the backend serving this request. Tie-breaks are deterministic: placement prefers the anchor then lower composite load then lower id; dispatch prefers a clean placement winner (no forfeited term), then lower cost pressure, then lower load, then jump-probe order, then lower id.
 
 | Weight | Default | Env | Meaning |
 |--------|---------|-----|---------|

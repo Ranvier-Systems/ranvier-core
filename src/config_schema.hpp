@@ -70,6 +70,8 @@ struct RoutingConfig {
     //                 Uses separate load_aware_routing threshold for load balancing.
     // - BOUNDED_LOAD: Jump hash + capacity cap (Mirrokni et al. 2018).
     //                 Each backend capped at ceil(avg_load * (1 + epsilon)).
+    //                 An over-cap primary diverts to the least-loaded live
+    //                 backend (probe order breaks equal loads).
     //                 Subsumes load_aware_routing — no separate threshold needed.
     // - P2C:          Power-of-two-choices with primary affinity bias.
     //                 Hashes to 2 candidates, prefers primary unless secondary
