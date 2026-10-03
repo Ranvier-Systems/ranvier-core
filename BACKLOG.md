@@ -1437,8 +1437,13 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   (`RadixTree::route_tokens_by_backend`, new), then fewest routes, then lowest capacity-adjusted
   load, then probe order; default `hash` unchanged. First acceptance rep (count-weighted build,
   20u): +6.6% P99, Gini 0.076 — the stress mix's ~70 short one-off routes outvoted the 16 long
-  prefixes in a count tally, hence the token weighting; re-run `--suite placement` on the
-  token-weighted build. Acceptance:
+  prefixes in a count tally, hence the token weighting. Rep 2 (count-weighted): +25.1%, Gini 0.104,
+  route consistency 36.7% (default ~48%) and KV hits 28.7% (default 36–44%): because placement is
+  a local decision and routes were learned only at first byte (~1 TTFT later), shards/nodes placed
+  the same new prefix on different backends and each kept its LOCAL route. Fix: learn a placed miss
+  at dispatch too (window → one 20 ms batch flush + gossip). Re-run `--suite placement` on the
+  token-weighted, eager-learn build; route consistency back near 48%+ and KV hits near 40% are the
+  tell that the split is gone. Acceptance:
   `bench-runner.sh --suite placement` (fitted 20u and 10u with `--miss-placement least_loaded`):
   20u turns negative, prefix-arm Gini near round-robin's, P50 still ≈ −25%. Leg B (in-flight load
   signal) remains informative for the divert policy but no longer decides the design. Known

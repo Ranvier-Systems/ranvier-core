@@ -5982,6 +5982,11 @@ uint64_t RouterService::load_aware_fallbacks_for_testing() {
     return shard_state().stats.load_aware_fallbacks;
 }
 
+bool RouterService::eager_learn_on_miss() {
+    if (!g_shard_state) return false;
+    return shard_state().config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED;
+}
+
 uint64_t RouterService::remote_routes_trust_refused_for_testing() {
     if (!g_shard_state) return 0;
     return shard_state().stats.remote_routes_trust_refused;

@@ -106,13 +106,15 @@ struct RoutingConfig {
     //                 thirty 100-token one-offs), then fewest routes, then
     //                 lowest capacity-adjusted load, then probe order. A miss
     //                 has no cache to preserve, so this costs nothing in
-    //                 cache terms; ART hits are unaffected. Two nodes that
-    //                 see a brand-new prefix simultaneously may place it on
-    //                 different backends (each keeps its LOCAL route under
+    //                 cache terms; ART hits are unaffected. Shards and nodes
+    //                 that see a brand-new prefix before its route propagates
+    //                 place it independently (each keeps its LOCAL route under
     //                 the trust ladder; the prefix is then warm on two
-    //                 backends) — the price of balance. Balances prefix
-    //                 count, not popularity: a skewed hot prefix still needs
-    //                 replication (BACKLOG section 27).
+    //                 backends), so the HttpController learns a placed miss at
+    //                 dispatch rather than at first byte, shrinking that window
+    //                 from ~1 TTFT to one route-batch flush (20 ms) plus
+    //                 gossip. Balances prefix tokens, not popularity: a skewed
+    //                 hot prefix still needs replication (BACKLOG section 27).
     // Env: RANVIER_MISS_PLACEMENT=hash|least_loaded. YAML: routing.miss_placement.
     enum class MissPlacement { HASH, LEAST_LOADED };
     MissPlacement miss_placement = MissPlacement::HASH;
