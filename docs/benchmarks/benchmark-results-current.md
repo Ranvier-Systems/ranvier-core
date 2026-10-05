@@ -432,10 +432,11 @@ cap is twice the average rather than 1.25×.
 | Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Large hit / miss P99 | req/s |
 |-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------|-------|
 | 1 (rr-first) | **−60.4%** (3712 → 1471 ms) | −28.9% | 52.7% | **68.9%** | 22.6% | 0.116 | −55.6% / −53.0% | +10.1% |
+| 2 (prefix-first) | **−57.5%** (3745 → 1592 ms) | −28.7% | 52.5% | **70.8%** | 24.2% | 0.102 | −63.4% / −53.0% | +11.3% |
 
-One rep; reps 2–3 pending. If they agree this is the acceptance for the 13B 20-user row and
-the first 20-user prefix arm of the campaign to beat round-robin's tail, by a margin no other
-configuration came within 50 points of. Read with the earlier legs: the request distribution is
+Two reps agree across both arm orders; rep 3 pending. This is the acceptance for the 13B 20-user
+row: the first 20-user prefix arms of the campaign to beat round-robin's tail, by a margin no
+other configuration came within 50 points of. Read with the earlier legs: the request distribution is
 *still* uneven (Gini 0.116, busiest backend 17% of requests, the same placement draw as v1–v4),
 yet the tail collapsed. Request count per backend was never the tail; queue depth was, and a
 divert policy that sees the queue live and only acts at 2× the mean removes the queue without
