@@ -450,6 +450,28 @@ placement, diverting 29% of requests and giving back the affinity; ε 1.0 is the
 that was missing. The prefix arm also completed 10% more requests in the same 10 minutes, so
 the closed-loop confound ran *against* this result.
 
+### Confirmation rows under the combo settings (2026-10-05, one rep each)
+
+Same env and ε 1.0 with `--miss-placement least_loaded`, on the rows the campaign already has
+baselines for. The question was whether the new divert policy costs anything where prefix
+routing already won or broke even.
+
+| Row | P99 TTFT | P50 TTFT | Route consistency | KV hit RR → prefix | Diverts | Prefix-arm Gini | Previous verdict for this row |
+|-----|----------|----------|-------------------|--------------------|---------|-----------------|-------------------------------|
+| 13B 10u/10m, fitted | **−34.5%** | −29.8% | 58.0% | 16.9% → **82.4%** | 19.7% | 0.076 | mixed (−7.3/−5.8/−0.1 default; −13.2/−3.0/+0.4 v3) |
+| 8B 20u/10m (50 prefixes) | **−22.6%** | −1.3% | 50.7% | 71.8% → 95.9% | 25.5% | 0.078 | −17.0% median (−17.0, −6.5, −17.4) |
+| 13B 30u/30m (50 prefixes, eviction regime) | −16.4% (excl. timeouts) | −20.1% | 47.3% | 6.1% → 23.1% | 15.4% | 0.103 | no reliable effect (−2.4, −1.6, +3.6) |
+
+Nothing regressed; every row improved on its previous verdict. The 10-user fitted row, which
+ε 0.25 over-diverted into a coin flip, is now the second-largest tail win of the campaign with
+the highest KV hit rate measured (82%). The 8B row kept its flat P50 (the 8B fleet is not
+prefill-bound) and widened its tail win from −17% to −23% with KV hits at 96%. The 30-user row
+is the eviction regime (50 prefixes × 2000–8000 tokens against 11.6k tokens of KV per backend):
+**validation FAILED in both arms** with 1.4% / 1.6% timeouts, so its P99 excludes incompletes
+and the prefix arm timed out 29 more requests while completing 684 more; read it as "the direction
+is right, the regime is still wrong", not as a result. One rep each: enough to show no regression,
+not enough to re-verdict the rows.
+
 **Resume checklist:**
 
 1. **Isolation leg** (`--miss-placement hash --bounded-load-epsilon 1.0`, same in-flight env,
