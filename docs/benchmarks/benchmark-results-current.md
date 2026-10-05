@@ -380,31 +380,58 @@ converged, move the heaviest prefix off the fullest backend when the gap exceeds
 same deterministic rule on every node, one cache miss per move.
 
 
-**Resume checklist (next GPU session), in order:**
+### Least-loaded placement v4, + local-flush convergence (2026-10-05): ❌ split gone, tally blind
 
-1. Build from a checkout that contains the local-flush convergence commit (confirm with
-   `grep -c 'local_routes_converged_total' ranvier_server` = 1 inside the image), or pull the
-   GHCR image once main carries it. The stale-image guard refuses an image older than the
-   newest `src/` commit.
-2. `bench-runner.sh --suite placement --output-dir benchmark-reports-placement-v4` (the 10-user
-   row carries no signal; `--repeat 3` on the 20-user line alone is enough). Read in this order
-   from the prefix arm's `prometheus_metrics_node*.txt`: `router_remote_routes_trust_refused_total`
-   ≈ 0 and `router_local_routes_converged_total` in the tens (split gone);
-   `backend_resident_route_tokens` summed over shards even to within one prefix (~4000 tokens)
-   across backends (placement balanced); then route consistency ≥ 57%, prefix-arm Gini ≈ 0.03,
-   then P99 (acceptance: negative ×3 at 20u, P50 ≈ −25%). Each arm's Ranvier container logs
-   are now saved as `ranvier_node{1,2,3}.log` in the run directory (the v3 logs were wanted after
-   the run and had been removed by the runner's teardown); the info-level "Buffering route: N
-   tokens -> backend B" lines give the per-node route map — the 16 pool prefixes have distinct
-   lengths, so N identifies the prefix — and three nodes that disagree on a prefix's backend is
-   the split seen directly.
-3. Tokens even but traffic skewed → popularity, not placement: replication (BACKLOG §27). Tokens
-   uneven → the warm-up burst still places blind: post-hoc rebalance (above). Balance and
-   affinity recovered but P99 ≥ 0 → the divert policy and the closed loop: run the combo
-   (placement + in-flight knobs + `--bounded-load-epsilon 1.0`, 20u ×3) and the paced control
-   (`--pacing 4.3`) described in BACKLOG §27.
-4. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
-   aggregates, manifests, runner summary) **before** terminating the instance.
+Fresh instance, GHCR image from main (`f272e6c`, local-flush fix verified inside the image),
+13B 20 users, custom run file (20u only). Rep 3 died 47 s in: vLLM on GPU 2 failed engine-core
+initialization at startup (vLLM, not Ranvier; the runner does not retry a backend start).
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Busiest / quietest backend |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------------|
+| 1 (rr-first) | +20.9% | −25.7% | 56.9% | 42.1% | 24.6% | 0.075 | b8 432 / b3 294 (14.6% / 9.9%) |
+| 2 (prefix-first) | +13.1% | −25.4% | 56.2% | 43.8% | 28.5% | 0.097 | b3 466 / b5 257 (15.7% / 8.7%) |
+
+**Counters (prefix arms, shard 0 of each node):** `router_remote_routes_trust_refused_total`
+**0 / 0 / 0** (both reps), `router_local_routes_converged_total` 25 / 19 / 21 and 25 / 25 / 28,
+`router_remote_routes_converged_total` 0, `router_miss_placements_rebalanced_total` 25–39.
+**The split is gone**: every conflict is now settled at the local flush, nothing is refused, and
+the three nodes agree on every prefix. Consistency did not rise above v3's 57%, so there was no
+remaining split to recover; what is left of the 43% "route-changed" is the 25–28% divert rate
+plus first-seen misses and one-offs.
+
+**Token gauge (node 1, `backend_resident_route_tokens` summed over 8 shards):** rep 1
+5888 / 5248 / 4736 / 4480 / 4352 / 4224 / 4096 / 4096; rep 2 5376 / 5376 / 4480 / 4352 / 4352 /
+4352 / 4352 / 4224. Per shard that is ~4600 tokens in total across ~50 routes, about 90 tokens a
+route, and the per-backend values are all multiples of 128 ± a few one-offs. **Routes are keyed
+on the first 128 tokens of the prompt, not on the 2000–4000-token system prefix.** Partial
+tokenization stops near `prefix_token_length` (128), the system-message boundary lies past the
+tokenized span and is never found, and `learn_route_global` truncates to 128. So a pool prefix
+and a one-off prompt weigh the same, the token-weighted tally *is* the count-weighted tally, and
+it was balanced to within one route-unit in both reps while traffic ran 1.5–1.8× between the
+busiest and quietest backend. The placement weight is uncorrelated with load by construction.
+That is the finding of the whole placement line: a single-home placement that balances anything
+derived from the route table cannot balance this workload, because the route table does not know
+which routes carry traffic. v1–v4 and the hash default all sit in the same +3…+21% band at 20u.
+
+**Verdict for the placement line: stop.** The two fixes that were real (eager learn, gossip and
+local-flush convergence) stay: they remove a genuine split and cost nothing under `hash`. The
+knob itself is not a default. What would still move the 20-user row is (a) a placement weight the
+route table can carry — the request's estimated prompt tokens or observed hits per route, which
+means a gossip wire change so every node weighs the same — or (b) replication of the hot prefixes,
+or (c) a divert policy with a live queue signal (leg B rep 3 was the one near-zero 20u prefix arm).
+(c) is the only one that is an experiment rather than a feature: the combo leg below.
+
+**Resume checklist (if the box is still up, else next GPU session):**
+
+1. Combo leg, 20u ×3: placement (no split) + live in-flight load signal + calibrated epsilon.
+   `RANVIER_ROUTING_GPU_LOAD_WEIGHT=0 RANVIER_CAPACITY_HEADROOM_WEIGHT=0 RANVIER_CROSS_SHARD_LOAD_SYNC=true`
+   with `--miss-placement least_loaded --bounded-load-epsilon 1.0`. Check the manifest shows
+   `cross_shard_load_sync: true` and `gpu_load_weight: 0`. Read diverts (expect well under 25%),
+   then P99. A negative ×3 here is the acceptance; anything else closes the 13B 20u row as "no
+   reliable effect, mechanism known" (BACKLOG §27) and the remaining levers are features (a)/(b).
+2. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
+   aggregates, manifests, `prometheus_metrics_node*.txt`, `ranvier_node*.log`) **before**
+   terminating the instance.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
