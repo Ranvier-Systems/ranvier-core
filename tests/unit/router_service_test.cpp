@@ -48,6 +48,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -681,6 +685,7 @@ TEST_F(RouterServiceTest, ResidencyWeightModulatesAffinityContinuously) {
 TEST_F(RouterServiceTest, BoundedLoadArtOverCapDivertsOffWarmBackend) {
     cfg_.load_aware_routing = true;
     cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+    cfg_.bounded_load_epsilon = 0.25;  // the cap arithmetic below assumes 1.25x (default is 1.0 since 2026-10-05)
     recreate_router(cfg_);
     register_three_backends();
     std::vector<int32_t> tokens = {155, 156, 157, 158};
@@ -2376,8 +2381,11 @@ TEST(RoutingConfigTest, DefaultValues) {
     EXPECT_EQ(cfg.block_alignment, 16u);
     EXPECT_TRUE(cfg.is_prefix_mode());
     EXPECT_EQ(cfg.hash_strategy, RoutingConfig::HashStrategy::BOUNDED_LOAD);
-    EXPECT_DOUBLE_EQ(cfg.bounded_load_epsilon, 0.25);
+    EXPECT_DOUBLE_EQ(cfg.bounded_load_epsilon, 1.0);   // 2026-10-05: was 0.25 (see config_schema.hpp)
     EXPECT_EQ(cfg.p2c_load_bias, 2u);
+    EXPECT_TRUE(cfg.cross_shard_load_sync);              // 2026-10-05: node-local in-flight signal on
+    EXPECT_DOUBLE_EQ(cfg.gpu_load_weight, 0.0);          // 2026-10-05: scraped score out of the divert signal
+    EXPECT_DOUBLE_EQ(cfg.capacity_headroom_weight, 0.0);
 }
 
 // =============================================================================
@@ -2423,6 +2431,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -2740,8 +2752,9 @@ TEST_F(BoundedLoadTest, ArtHitOverAllowanceDivertsToColdestBackend) {
 // the candidate with the fewest learned routes, then the lowest load, then
 // jump-probe order. Hits and the default (hash) placement are unchanged.
 
-TEST_F(BoundedLoadTest, DefaultMissPlacementIsHash) {
-    EXPECT_EQ(RoutingConfig{}.miss_placement, RoutingConfig::MissPlacement::HASH);
+TEST_F(BoundedLoadTest, DefaultMissPlacementIsLeastLoaded) {
+    // 2026-10-05: was HASH. See the MissPlacement comment in config_schema.hpp.
+    EXPECT_EQ(RoutingConfig{}.miss_placement, RoutingConfig::MissPlacement::LEAST_LOADED);
 }
 
 TEST_F(BoundedLoadTest, LeastLoadedPlacementSpreadsNewPrefixesEvenly) {
@@ -2892,8 +2905,12 @@ TEST_F(BoundedLoadTest, LeastLoadedPlacementLocalLearnYieldsToLowerGossipedRoute
 }
 
 TEST_F(BoundedLoadTest, HashPlacementLocalLearnStillOverridesGossip) {
-    // Default placement: the flush is the plain insert it always was (a
+    // Hash placement: the flush is the plain insert it always was (a
     // node's own learn outranks a gossiped route, latest wins among LOCAL).
+    cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
     register_four_backends();
     std::vector<int32_t> tokens = {8401, 8402, 8403, 8404};
     RouterService::learn_remote_route_for_testing(tokens, 2);
@@ -2924,8 +2941,12 @@ TEST_F(BoundedLoadTest, LeastLoadedPlacementDoesNotRelearnASettledPrefix) {
 }
 
 TEST_F(BoundedLoadTest, HashPlacementKeepsTrustLadderForGossipConflicts) {
-    // Default placement: a gossiped route for a different backend never
+    // Hash placement: a gossiped route for a different backend never
     // displaces this node's LOCAL route (invariant T7 unchanged).
+    cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
     register_four_backends();
     std::vector<int32_t> tokens = {8101, 8102, 8103, 8104};
     RouterService::insert_route_for_testing(tokens, 3);
@@ -2936,8 +2957,12 @@ TEST_F(BoundedLoadTest, HashPlacementKeepsTrustLadderForGossipConflicts) {
 }
 
 TEST_F(BoundedLoadTest, HashPlacementIgnoresRouteCounts) {
-    // Default mode: a backend holding every learned route still receives the
+    // Hash mode: a backend holding every learned route still receives the
     // prefixes whose hash bucket it is. (Pin so the knob is a real A/B.)
+    cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
     register_four_backends();
     std::vector<int32_t> tokens = {4001, 4002, 4003, 4004};
     auto idle = router_->get_backend_for_prefix(tokens, "hash-probe");
@@ -2964,6 +2989,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -3083,6 +3112,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -3135,6 +3168,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -3401,6 +3438,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -3532,6 +3573,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -4016,6 +4061,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -4337,6 +4386,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);

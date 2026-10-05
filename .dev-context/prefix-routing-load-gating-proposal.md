@@ -4,6 +4,11 @@
 **Motivating data:** 2026-07 50-prefix re-baseline, commit `817a1b5`, 8×A100, median-of-3
 A/B (prefix vs round-robin). See `docs/benchmarks/benchmark-results-current.md`.
 **Author context:** requested via BACKLOG §25 follow-up (the 30–47% fallback finding).
+**Outcome (2026-10-05):** the two cheap things recommended below were right. `cross_shard_load_sync`
+on (plus the scraped GPU/KV terms out of the divert signal) and ε 1.0 instead of 0.25 took the 13B
+20-user fitted row from +3…+21% P99 (twelve runs of placement and divert variants) to −57.5%
+median ×3; 13B/10u −34.5%. Both are now defaults. No load gate was built. Record:
+`docs/benchmarks/benchmark-results-current.md`.
 
 ---
 

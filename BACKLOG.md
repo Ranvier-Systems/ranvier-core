@@ -1459,7 +1459,32 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   flush, losers dropped before fan-out/gossip (`router_local_routes_converged_total`); new gauge
   `backend_resident_route_tokens` to separate uneven placement from a popular prefix. Tell for v4:
   refusals ≈ 0, local-converged in the tens, token gauge even within one prefix, consistency ≥ 57%.
-  10u on v3: −13.2% P99 / −29.1% P50 / KV 66% (rep 1) — the regime where the queue is short. Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
+  10u on v3: −13.2% P99 / −29.1% P50 / KV 66% (rep 1) — the regime where the queue is short.
+  **v4 (+ local-flush convergence, 2026-10-05): +20.9, +13.1 (rep 3 lost to a vLLM start
+  failure); refusals 0/0/0, local-converged ~25 per node — split gone; consistency 57% (ceiling,
+  the rest is 25–28% diverts + first-seen). Token gauge: routes are 128-token keys (partial
+  tokenization never reaches the system-message boundary), so the token tally equals the count
+  tally, was balanced within one route-unit, and traffic still ran 1.5–1.8× busiest/quietest.
+  A placement weight derived from the route table cannot balance this workload. Placement line
+  closed; convergence fixes stay. Remaining levers: route weight carried over gossip (estimated
+  prompt tokens or hits), replication, or the live-queue divert policy (combo leg).**
+  **Combo leg (2026-10-05, split-free placement + `RANVIER_CROSS_SHARD_LOAD_SYNC=true`, GPU-score
+  and headroom weights 0, ε 1.0): −60.4 / −57.5 / −55.2% P99, P50 −28..−29%, KV 69–73%, diverts
+  23–27%, +10% req/s, 3/3 across arm orders — the 13B 20u row's acceptance. Request Gini stayed
+  0.09–0.12: the tail was queue depth, not request count, and a divert policy that sees the queue
+  live and acts only at 2× the mean removes it without giving back affinity (consistency 50–53%).
+  Next: isolation leg (hash placement, same signal and ε) to decide whether the shipping change is
+  two defaults or three; then 8B 20u / 13B 10u / 13B 30u under the new defaults.**
+  **Confirmation rows (one rep each, same settings): 13B 10u −34.5% (KV 82%), 8B 20u −22.6%
+  (was −17%), 13B 30u −16.4% excl. timeouts (both arms 1.4–1.6% incompletes, eviction regime).
+  Nothing regressed. Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
+  `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
+  `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement
+  contributes.** **Isolation leg: −48.4 / −51.8 / −53.5 (median −51.8) with hash placement:
+  the divert policy is ~50 of the 57 points; placement adds the rest via fewer diverts (KV 69–73%
+  vs 49–55%, consistency 50–53% vs 39–45%, diverts 23–27% vs 30–33%, ranges non-overlapping).
+  `miss_placement: least_loaded` ships as the fifth default. 13B 20u row: closed. Next: the
+  rebaseline suite unflagged ×3 under the shipping defaults, and a fitted 30u row.** Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
   0.080 — the count-weighted build is a consistent regression (+6.6, +25.1, +13.3) with worse
   affinity than the default in all three. Leg B (in-flight signal, default placement): +14.2, −1.0
   (rep 2 lost to a silent compose failure, since fixed) — a real-time signal helps diversion at

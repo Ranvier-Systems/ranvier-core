@@ -144,7 +144,7 @@ where `cost_scale = min(estimated_cost / max_cost_per_backend, 1.0)`. Larger req
 
 **Tests:** 8 new tests in `tests/unit/router_service_test.cpp` covering headroom penalty, weight=0 bypass, no-data fallback, cost amplification, compressed backends, P2C strategy, and zero-cost baseline.
 
-**Configuration:** `routing.capacity_headroom_weight` (default 5.0). Set to 0.0 to disable. Higher values give cache fullness more influence on routing.
+**Configuration:** `routing.capacity_headroom_weight` (default **0.0** since 2026-10-05; was 5.0). 0.0 disables the penalty; set > 0 to re-enable. It reads the 5 s-stale scraped KV usage, identical across a node's shards, which as a divert input herded rather than balanced on the 13B fitted suite; the node-local in-flight signal replaced it (see `docs/internals/prefix-affinity-routing.md`, "Load signal and divert threshold"). Higher values give cache fullness more influence on routing.
 
 **Complexity:** Medium. New cache + broadcast (mirrors existing GPU load pattern). Zero new async boundaries on hot path — all reads are shard-local.
 

@@ -12,16 +12,75 @@ routing config). When a default changes, prior entries move to
 | `NUM_LARGE_PREFIXES` | **50** (≥ backend count; not the deprecated 5) | `tests/integration/locustfile_real.py` |
 | `SHARED_PREFIX_RATIO` | **0.9** | `tests/integration/locustfile_real.py` / `bench.sh --prefix-ratio` |
 | Route-batch flush interval | **20ms** | `src/config_schema.hpp`, `docker-compose.benchmark-real.yml` |
-| Load-aware routing | **ON**, `load_imbalance_factor` 2.0 / floor 2 | `src/config_schema.hpp` |
+| Load-aware routing | **ON**, `bounded_load` ε **1.0** (was 0.25 until 2026-10-05), `load_imbalance_factor` 2.0 / floor 2 | `src/config_schema.hpp` |
+| Divert load signal | **node-local in-flight count** (`cross_shard_load_sync` true, 100 ms); scraped GPU score and KV headroom weights **0** (were 10 / 5 until 2026-10-05) | `src/config_schema.hpp` |
+| Cache-miss placement | **`least_loaded`** with eager learn and gossip + local-flush convergence (was `hash` until 2026-10-05) | `src/config_schema.hpp` |
 | Cache-residency weight | **0.2** | `src/config_schema.hpp` |
 | Prompt distribution | `stress` (large-prefix) | `bench.sh --prompt-dist` |
 
+> **Routing defaults changed on 2026-10-05.** Every entry dated before that was measured under
+> the previous divert signal and threshold (scraped GPU score + one shard's in-flight count,
+> ε 0.25, hash placement). They stay on this page because they are the record of how the new
+> defaults were arrived at, from the 2026-10-01 re-baseline through the placement line to the
+> combo, isolation and confirmation legs. The first full matrix under the shipped defaults at
+> three repeats is the next item on the resume checklist and will replace the 2026-10-01 table as
+> the citable one.
+>
 > **Flush reconciliation:** 20ms is the shipped default. The historical guide contained a
 > contradiction — an early section declared "10ms confirmed as the correct default," a later
 > section changed it to 20ms, and the 20ms change shipped. Both dated sections are preserved
 > in the history archive; **20ms is current.**
 
-## Representative-workload headline (measured 2026-10-01, fixed tooling)
+## Headline (2026-10-05): the 13B rows were the divert policy, not the affinity
+
+Under the defaults shipped on 2026-10-05 (node-local in-flight load signal, divert only at twice
+the mean, least-loaded placement with convergence) the configuration that had regressed in every
+campaign, CodeLlama-13B at 20 users, improved P99 TTFT by **−60.4 / −57.5 / −55.2%** against
+round-robin across three repeats and both arm orders, with P50 −28% and KV prefix hits 69–73%
+(fitted 16-prefix set). One confirmation repeat each: 13B 10 users −34.5% (KV 82%), 8B 20 users
+−22.6% (was −17%), 13B 30 users −16.4% in the eviction regime. The isolation leg (hash placement,
+same signal) gave −51.8% median, so the divert policy is most of the win and placement the rest.
+The request distribution across backends stayed uneven in every one of these arms; the tail was
+queue depth, not request count. Full sections below: "Combo leg", "Confirmation rows",
+"Isolation leg".
+
+### The campaign at a glance (CodeLlama-13B, 20 users, 8×A100, 3 Ranvier nodes)
+
+Every leg of the 2026-10-01..05 campaign on the one row that resisted, in the order it was run.
+Fitted 16-prefix set (2000–4000 tokens) unless noted; prefix arm vs round-robin, 10-minute arms,
+alternating arm order. Consistency, KV hits, diverts and Gini are the prefix arm's. P99 of the
+previous-default rows had **+3…+21%** across twelve runs; the shipping defaults give **−55…−60%**.
+
+| # | Leg (date) | What changed vs the row above | P99 TTFT per rep | Median | Consistency | KV hit | Diverts | Gini | Verdict |
+|---|------------|-------------------------------|------------------|--------|-------------|--------|---------|------|---------|
+| 1 | Re-baseline, 50 prefixes (10-01) | previous defaults, unfitted set | +17.4 / +11.0 / +4.6 | **+11.0%** | ~48% | 19% | ~30% | — | ❌ regression |
+| 2 | Fitted set (10-02) | 16 prefixes that fit the 13B cache | +10.1 / +8.2 / +21.4 | +10.1% | 48–53% | 45% | ~30% | 0.06–0.10 | ❌ regression |
+| 3 | Least-loaded diversion (10-02) | divert target = coldest instead of first-under-cap | +10.5 / +24.1 / +17.5 | +17.5% | — | 29–30% | ~30% | 0.05–0.08 | ❌ regression |
+| 4 | Leg A, no diverts (10-02/03) | pure affinity, every divert mechanism off | +8.2 / +12.3 / +11.3 | +11.3% | — | 55–61% | 0% | 0.30 | ❌ placement is the mechanism |
+| 5 | Leg B, in-flight signal (10-03) | live node-local in-flight count, ε 0.25, hash placement | +14.2 / lost / −1.0 | — | 39–42% | 27–36% | 29–32% | 0.04–0.06 | ⚖️ mixed, n=2; first near-zero |
+| 6 | Placement v1 (10-03) | least-loaded placement, count-weighted | +6.6 / +25.1 / +13.3 | +13.3% | 37–42% | 29–32% | 23–25% | 0.08–0.10 | ❌ one-offs outvote prefixes |
+| 7 | Placement v2 (10-03) | token-weighted + eager learn at dispatch | +11.4 / +12.5 / +3.9 | +11.4% | 38–42% | 30–38% | 22–24% | 0.05–0.07 | ❌ split: ~800 trust refusals/node |
+| 8 | Placement v3 (10-03) | + gossip convergence (lowest id wins) | +8.1 / +10.1 / +3.4 | +8.1% | 56–59% | 42–48% | 25–27% | 0.09–0.11 | ❌ converged = 0 (local flush bypassed it) |
+| 9 | Placement v4 (10-05) | + local-flush convergence | +20.9 / +13.1 / (vLLM start failure) | — | 56–57% | 42–44% | 25–29% | 0.08–0.10 | ❌ split gone; token tally blind (128-token keys) |
+| 10 | Isolation (10-05) | live signal + ε 1.0, **hash** placement | −48.4 / −51.8 / −53.5 | **−51.8%** | 39–45% | 49–55% | 30–33% | 0.05–0.10 | ✅ divert policy is most of the win |
+| 11 | **Combo = shipping defaults (10-05)** | live signal + ε 1.0 + **least-loaded** placement with convergence | **−60.4 / −57.5 / −55.2** | **−57.5%** | 50–53% | **69–73%** | 23–27% | 0.09–0.12 | ✅ **accepted** |
+
+The other rows, previous defaults vs shipping defaults (shipping-default rows are one repeat):
+
+| Row | Previous defaults, P99 per rep | Shipping defaults, P99 | KV hit, RR → prefix (shipping) |
+|-----|-------------------------------|------------------------|--------------------------------|
+| 13B 10u, fitted | −7.3 / −5.8 / −0.1 (default); −13.2 / −3.0 / +0.4 (v3) | **−34.5%** | 17% → 82% |
+| 8B 20u, 50 prefixes | **−17.0 / −6.5 / −17.4** | **−22.6%** | 72% → 96% |
+| 13B 30u/30m, 50 prefixes (eviction regime) | −2.4 / −1.6 / +3.6 | −16.4%, timeouts in both arms | 6% → 23% |
+
+Reading down the first table: rows 2–9 all balance *something derived from the route table or the
+hash* and all land in the same band, because the per-backend request Gini (0.05–0.12) was never
+the tail; row 4 shows that with zero diverts, and row 9 shows that even a tally balanced to one
+route-unit leaves traffic 1.8× apart. Rows 10–11 change what the divert policy *sees* and *when it
+acts*, and the tail collapses while Gini stays where it was. Placement earns its place in row 11
+over row 10 by needing fewer diverts: 15–20 points more KV hits for 6 points more P99.
+
+## Representative-workload re-baseline (measured 2026-10-01, fixed tooling, previous defaults)
 
 **Prefix-aware routing's P99 effect depends on whether the backends' KV cache can hold the hot
 prefix set.** Where it can (Llama-3.1-8B on A100-40GB), prefix routing cut P99 TTFT by **17%**
@@ -68,7 +127,10 @@ the main run, repeat 1 of each row. P99 TTFT is the exact percentile over every 
   consistent and has a plausible mechanism: affinity concentrates large-prefix requests onto
   the same backends, and under KV pressure that concentration means more preemption there. The
   load-aware fallback watches in-flight counts, not KV occupancy, so it does not see it.
-  Whether that holds is the question the `fitted` suite answers (below).
+  Whether that holds is the question the `fitted` suite answers (below). *Resolved 2026-10-05:*
+  the mechanism was the divert policy's signal and threshold, not KV occupancy; the fallback was
+  reading a 5 s-stale score and one shard's share of the queue, at a threshold that fired on
+  nearly any load. With the live node-local count and ε 1.0 the same row is −57.5% (headline).
 
 ### Fitted suite (measured 2026-10-02): 13B inside its KV cache
 
@@ -380,31 +442,144 @@ converged, move the heaviest prefix off the fullest backend when the gap exceeds
 same deterministic rule on every node, one cache miss per move.
 
 
-**Resume checklist (next GPU session), in order:**
+### Least-loaded placement v4, + local-flush convergence (2026-10-05): ❌ split gone, tally blind
 
-1. Build from a checkout that contains the local-flush convergence commit (confirm with
-   `grep -c 'local_routes_converged_total' ranvier_server` = 1 inside the image), or pull the
-   GHCR image once main carries it. The stale-image guard refuses an image older than the
-   newest `src/` commit.
-2. `bench-runner.sh --suite placement --output-dir benchmark-reports-placement-v4` (the 10-user
-   row carries no signal; `--repeat 3` on the 20-user line alone is enough). Read in this order
-   from the prefix arm's `prometheus_metrics_node*.txt`: `router_remote_routes_trust_refused_total`
-   ≈ 0 and `router_local_routes_converged_total` in the tens (split gone);
-   `backend_resident_route_tokens` summed over shards even to within one prefix (~4000 tokens)
-   across backends (placement balanced); then route consistency ≥ 57%, prefix-arm Gini ≈ 0.03,
-   then P99 (acceptance: negative ×3 at 20u, P50 ≈ −25%). Each arm's Ranvier container logs
-   are now saved as `ranvier_node{1,2,3}.log` in the run directory (the v3 logs were wanted after
-   the run and had been removed by the runner's teardown); the info-level "Buffering route: N
-   tokens -> backend B" lines give the per-node route map — the 16 pool prefixes have distinct
-   lengths, so N identifies the prefix — and three nodes that disagree on a prefix's backend is
-   the split seen directly.
-3. Tokens even but traffic skewed → popularity, not placement: replication (BACKLOG §27). Tokens
-   uneven → the warm-up burst still places blind: post-hoc rebalance (above). Balance and
-   affinity recovered but P99 ≥ 0 → the divert policy and the closed loop: run the combo
-   (placement + in-flight knobs + `--bounded-load-epsilon 1.0`, 20u ×3) and the paced control
-   (`--pacing 4.3`) described in BACKLOG §27.
-4. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
-   aggregates, manifests, runner summary) **before** terminating the instance.
+Fresh instance, GHCR image from main (`f272e6c`, local-flush fix verified inside the image),
+13B 20 users, custom run file (20u only). Rep 3 died 47 s in: vLLM on GPU 2 failed engine-core
+initialization at startup (vLLM, not Ranvier; the runner does not retry a backend start).
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Busiest / quietest backend |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------------|
+| 1 (rr-first) | +20.9% | −25.7% | 56.9% | 42.1% | 24.6% | 0.075 | b8 432 / b3 294 (14.6% / 9.9%) |
+| 2 (prefix-first) | +13.1% | −25.4% | 56.2% | 43.8% | 28.5% | 0.097 | b3 466 / b5 257 (15.7% / 8.7%) |
+
+**Counters (prefix arms, shard 0 of each node):** `router_remote_routes_trust_refused_total`
+**0 / 0 / 0** (both reps), `router_local_routes_converged_total` 25 / 19 / 21 and 25 / 25 / 28,
+`router_remote_routes_converged_total` 0, `router_miss_placements_rebalanced_total` 25–39.
+**The split is gone**: every conflict is now settled at the local flush, nothing is refused, and
+the three nodes agree on every prefix. Consistency did not rise above v3's 57%, so there was no
+remaining split to recover; what is left of the 43% "route-changed" is the 25–28% divert rate
+plus first-seen misses and one-offs.
+
+**Token gauge (node 1, `backend_resident_route_tokens` summed over 8 shards):** rep 1
+5888 / 5248 / 4736 / 4480 / 4352 / 4224 / 4096 / 4096; rep 2 5376 / 5376 / 4480 / 4352 / 4352 /
+4352 / 4352 / 4224. Per shard that is ~4600 tokens in total across ~50 routes, about 90 tokens a
+route, and the per-backend values are all multiples of 128 ± a few one-offs. **Routes are keyed
+on the first 128 tokens of the prompt, not on the 2000–4000-token system prefix.** Partial
+tokenization stops near `prefix_token_length` (128), the system-message boundary lies past the
+tokenized span and is never found, and `learn_route_global` truncates to 128. So a pool prefix
+and a one-off prompt weigh the same, the token-weighted tally *is* the count-weighted tally, and
+it was balanced to within one route-unit in both reps while traffic ran 1.5–1.8× between the
+busiest and quietest backend. The placement weight is uncorrelated with load by construction.
+That is the finding of the whole placement line: a single-home placement that balances anything
+derived from the route table cannot balance this workload, because the route table does not know
+which routes carry traffic. v1–v4 and the hash default all sit in the same +3…+21% band at 20u.
+
+**Verdict for the placement line: stop.** The two fixes that were real (eager learn, gossip and
+local-flush convergence) stay: they remove a genuine split and cost nothing under `hash`. The
+knob itself is not a default. What would still move the 20-user row is (a) a placement weight the
+route table can carry — the request's estimated prompt tokens or observed hits per route, which
+means a gossip wire change so every node weighs the same — or (b) replication of the hot prefixes,
+or (c) a divert policy with a live queue signal (leg B rep 3 was the one near-zero 20u prefix arm).
+(c) is the only one that is an experiment rather than a feature: the combo leg below.
+
+### Combo leg: split-free placement + live in-flight signal + ε 1.0 (2026-10-05)
+
+Same box and image as v4, 13B 20 users, `RANVIER_ROUTING_GPU_LOAD_WEIGHT=0
+RANVIER_CAPACITY_HEADROOM_WEIGHT=0 RANVIER_CROSS_SHARD_LOAD_SYNC=true` with
+`--miss-placement least_loaded --bounded-load-epsilon 1.0` (manifest checked: all four recorded).
+Bounded-load reads node-local in-flight requests instead of the 5 s-stale scraped score, and the
+cap is twice the average rather than 1.25×.
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Large hit / miss P99 | req/s |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------|-------|
+| 1 (rr-first) | **−60.4%** (3712 → 1471 ms) | −28.9% | 52.7% | **68.9%** | 22.6% | 0.116 | −55.6% / −53.0% | +10.1% |
+| 2 (prefix-first) | **−57.5%** (3745 → 1592 ms) | −28.7% | 52.5% | **70.8%** | 24.2% | 0.102 | −63.4% / −53.0% | +11.3% |
+| 3 (rr-first) | **−55.2%** (3277 → 1469 ms) | −28.2% | 49.6% | **73.2%** | 26.7% | 0.092 | −60.7% / −54.5% | +10.3% |
+
+**Verdict: ✅ consistent improvement, −57.5% median P99 (IQR −58.9…−56.3), 3/3 across both arm
+orders.** This is the acceptance for the 13B 20-user row and the first 20-user prefix arms of the
+campaign to beat round-robin's tail, by a margin no other configuration came within 50 points of.
+P50 −28 to −29% (the campaign's usual), KV hits 69–73% (the highest of any 20-user arm), both the
+large-hit and large-miss P99 down by more than half, and the prefix arm completed 10–11% more
+requests in the same ten minutes, so the closed-loop confound ran against the result. Read with the earlier legs: the request distribution is
+*still* uneven (Gini 0.116, busiest backend 17% of requests, the same placement draw as v1–v4),
+yet the tail collapsed. Request count per backend was never the tail; queue depth was, and a
+divert policy that sees the queue live and only acts at 2× the mean removes the queue without
+removing affinity (consistency 53% against 57% for the no-divert placement arms, KV hits the
+highest of any 20-user arm). Leg B rep 3 (−1.0%) was the same signal with ε 0.25 and hash
+placement, diverting 29% of requests and giving back the affinity; ε 1.0 is the calibration
+that was missing. The prefix arm also completed 10% more requests in the same 10 minutes, so
+the closed-loop confound ran *against* this result.
+
+### Confirmation rows under the combo settings (2026-10-05, one rep each)
+
+Same env and ε 1.0 with `--miss-placement least_loaded`, on the rows the campaign already has
+baselines for. The question was whether the new divert policy costs anything where prefix
+routing already won or broke even.
+
+| Row | P99 TTFT | P50 TTFT | Route consistency | KV hit RR → prefix | Diverts | Prefix-arm Gini | Previous verdict for this row |
+|-----|----------|----------|-------------------|--------------------|---------|-----------------|-------------------------------|
+| 13B 10u/10m, fitted | **−34.5%** | −29.8% | 58.0% | 16.9% → **82.4%** | 19.7% | 0.076 | mixed (−7.3/−5.8/−0.1 default; −13.2/−3.0/+0.4 v3) |
+| 8B 20u/10m (50 prefixes) | **−22.6%** | −1.3% | 50.7% | 71.8% → 95.9% | 25.5% | 0.078 | −17.0% median (−17.0, −6.5, −17.4) |
+| 13B 30u/30m (50 prefixes, eviction regime) | −16.4% (excl. timeouts) | −20.1% | 47.3% | 6.1% → 23.1% | 15.4% | 0.103 | no reliable effect (−2.4, −1.6, +3.6) |
+
+Nothing regressed; every row improved on its previous verdict. The 10-user fitted row, which
+ε 0.25 over-diverted into a coin flip, is now the second-largest tail win of the campaign with
+the highest KV hit rate measured (82%). The 8B row kept its flat P50 (the 8B fleet is not
+prefill-bound) and widened its tail win from −17% to −23% with KV hits at 96%. The 30-user row
+is the eviction regime (50 prefixes × 2000–8000 tokens against 11.6k tokens of KV per backend):
+**validation FAILED in both arms** with 1.4% / 1.6% timeouts, so its P99 excludes incompletes
+and the prefix arm timed out 29 more requests while completing 684 more; read it as "the direction
+is right, the regime is still wrong", not as a result. One rep each: enough to show no regression,
+not enough to re-verdict the rows.
+
+### Isolation leg: hash placement + live in-flight signal + ε 1.0 (2026-10-05)
+
+The combo minus placement: `--miss-placement hash`, same env and ε 1.0, 13B 20 users ×3.
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Large hit / miss P99 |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------|
+| 1 (rr-first) | −48.4% | −27.4% | 42.4% | 49.2% | 30.6% | 0.062 | −52.7% / −30.4% |
+| 2 (prefix-first) | −51.8% | −27.7% | 38.8% | 54.7% | 32.7% | 0.054 | −60.2% / −45.1% |
+| 3 (rr-first) | −53.5% | −27.6% | 45.2% | 55.4% | 29.6% | 0.099 | −55.0% / −51.5% |
+
+**Verdict: ✅ consistent improvement, −51.8% median P99 (3/3).** Side by side with the combo:
+
+| | Hash placement | Least-loaded placement (combo) |
+|---|---|---|
+| P99 TTFT, 3 reps | −48.4 / −51.8 / −53.5 (median −51.8) | −60.4 / −57.5 / −55.2 (median **−57.5**) |
+| Route consistency | 39–45% | 50–53% |
+| KV hit (prefix) | 49–55% | **69–73%** |
+| Diverts | 30–33% | 23–27% |
+| P50 TTFT | −27.5% | −28.5% |
+
+The live divert policy is most of the tail win: about 50 of the 57 points. Split-free placement
+adds the rest and does it by needing fewer diverts: one home per prefix means fewer hot-backend
+collisions to divert away from, so 6–8 points more consistency, 15–20 points more KV hits, 5–7
+points fewer diverts, and 4–9 points more P99, with the ranges not overlapping (hash's best
+−53.5 vs the combo's worst −55.2) on the same box, image and day. Placement alone could not move
+the tail (v1–v4); the divert policy alone leaves a third of requests diverted. Together is the
+measured configuration, and every confirmation row above was run with it.
+
+**Shipping (branch): all three.** `cross_shard_load_sync` true, `gpu_load_weight` 0,
+`capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 **and** `miss_placement` `least_loaded`
+become the defaults. The hash placement stays one env var away (`RANVIER_MISS_PLACEMENT=hash`) and
+is the right choice on a single-node deployment with no gossip, where the convergence rules have
+nothing to do.
+
+**Resume checklist (next GPU session):**
+
+1. Merge the defaults, pull the published image, and run the rebaseline suite unflagged
+   (`bench-runner.sh --suite rebaseline`): the four README rows at three repeats each under the
+   shipping configuration, which the confirmation rows above measured once. That table replaces
+   the 2026-10-01 re-baseline as the citable one.
+2. The 13B 30u/30m row times out in both arms (eviction regime, 50 prefixes × 2000–8000 tokens
+   against 11.6k tokens of KV per backend). Add a fitted 30-user row (`--num-prefixes 16
+   --prefix-max-tokens 4000`) so the high-load regime has a valid measurement.
+3. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
+   aggregates, manifests, `prometheus_metrics_node*.txt`, `ranvier_node*.log`) **before**
+   terminating the instance. Outstanding from this box: placement-v4, combo, isolate, confirm.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
@@ -428,11 +603,12 @@ now shows were measured in an eviction regime.
 
 ## Still open
 
-- **13B 20-user fitted regression: re-run `--suite placement` on the token-weighted,
-  eager-learn build** (BACKLOG §27; resume checklist above). Leg A settled the mechanism as
-  hash placement; the least-loaded diversion fix and the count-weighted placement build both
-  failed their acceptance runs; leg B showed a real-time load signal helps diversion at the
-  cost of affinity and that ε 0.25 is uncalibrated for small-integer loads.
+- **13B 20-user fitted regression: resolved by the combo leg (2026-10-05): −60.4 / −57.5 /
+  −55.2% P99** with the node-local in-flight load signal (`RANVIER_CROSS_SHARD_LOAD_SYNC=true`,
+  GPU-score and headroom weights 0) and `bounded_load_epsilon` 1.0 on top of split-free
+  least-loaded placement. Open: the isolation leg (same without placement) decides whether the
+  shipping change is two defaults or three; then one rep each of 8B 20u, 13B 10u and 13B 30u
+  under the new defaults (resume checklist above).
 - **Leg V1, epsilon** (`bench-runner.sh --suite epsilon`): the shipped file sweeps ε 0.5
   (looser). The fitted result says looser strands more capacity; sweep *tighter* (0.1) instead,
   on the fitted set, after the diversion fix. The factor/floor "threshold leg" (BACKLOG §25

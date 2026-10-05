@@ -6,6 +6,16 @@ Prompted by the 2026-10-01 re-baseline, the first GPU campaign on tooling the 20
 audit had fixed. Evidence is cited inline; every number traces to a file in this tree or
 to `docs/benchmarks/results/2026-10-01-rebaseline/`.
 
+> **Addendum, 2026-10-05.** The 13B 20-user regression this assessment cites (+17.4 / +11.0 /
+> +4.6) is resolved: it was the load-divert policy, not affinity concentrating onto evicting
+> backends. Bounded-load diversion read a 5 s-stale scraped score plus one shard's share of the
+> node's in-flight count, at ε 0.25, and diverted 25–30% of requests without reaching the tail.
+> With the node-local in-flight signal, ε 1.0 and least-loaded placement with convergence (now the
+> defaults), the same row is **−57.5% median P99** across three repeats, 13B/10u −34.5%, 8B/20u
+> −22.6%. The §4 recommendation to give the scorer a KV-occupancy term still stands for the
+> eviction regime (13B/30u, 50 prefixes, timeouts in both arms), but it was not what the 20-user
+> row needed. Record: `docs/benchmarks/benchmark-results-current.md`, 2026-10-03..05 sections.
+
 ## Scorecard
 
 | Area | Grade | One line |

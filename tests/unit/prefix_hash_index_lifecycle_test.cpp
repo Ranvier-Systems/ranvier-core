@@ -27,6 +27,10 @@ class PrefixHashIndexLifecycleTest : public ::testing::Test {
 protected:
     void SetUp() override {
         RoutingConfig cfg;
+        // Trust-ladder and index-lifecycle semantics are tested under hash
+        // placement; the default is least_loaded since 2026-10-05 (which turns
+        // REMOTE-over-REMOTE into lowest-id-wins). Pin so the assertions hold.
+        cfg.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg.max_routes = 10000;
         cfg.prefix_token_length = 128;
         cfg.block_alignment = 16;
@@ -174,6 +178,7 @@ TEST_F(PrefixHashIndexLifecycleTest, NativeFreshEntriesSurviveRebuild) {
 // of tripping MAX_ENTRIES_PER_BACKEND early.
 TEST_F(PrefixHashIndexLifecycleTest, FreshnessDisabledDropsNativeEntriesAndCounter) {
     RoutingConfig cfg;
+    cfg.miss_placement = RoutingConfig::MissPlacement::HASH;  // same pin as the fixture
     cfg.max_routes = 10000;
     cfg.prefix_token_length = 128;
     cfg.block_alignment = 16;
