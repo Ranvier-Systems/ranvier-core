@@ -72,16 +72,20 @@ These are the citable figures (median of three `--compare` repeats; see
 February 2026 numbers quoted in older copies of this guide came from a five-prefix
 workload the project has since deprecated and are not expected results.
 
-| Config | P99 TTFT vs round-robin | Verdict | Route consistency |
-|--------|-------------------------|---------|-------------------|
-| Llama-3.1-8B, 20 users | **−13.3%** | consistent improvement | 12% → 48% |
-| CodeLlama-13B, 30 users | **−9.1%** | consistent improvement | 12% → 38% |
-| CodeLlama-13B, 20 users | +3.8% | no reliable effect | 12% → 43% |
-| CodeLlama-13B, 10 users | **+29%** | consistent regression | 12% → 49% |
+| Config | P99 TTFT vs round-robin | Verdict | KV hit rate, RR → prefix |
+|--------|-------------------------|---------|--------------------------|
+| CodeLlama-13B, 20 users, fitted 16-prefix set (2026-10-05 defaults) | **−57.5%** median (−60.4, −57.5, −55.2) | consistent improvement, 3/3 | 12–14% → 69–73% |
+| CodeLlama-13B, 10 users, fitted (2026-10-05 defaults, 1 repeat) | −34.5% | confirmation | 17% → 82% |
+| Llama-3.1-8B, 20 users (2026-10-05 defaults, 1 repeat) | −22.6% | confirmation | 72% → 96% |
+| Llama-3.1-8B, 20 users (2026-10-01 re-baseline, previous defaults) | **−17.0%** median | consistent improvement, 3/3 | 72% → 94% |
+| CodeLlama-13B, 20 users (2026-10-01 re-baseline, previous defaults) | +11.0% median | consistent regression, 3/3 | 4% → 19% |
 
-The effect tracks cluster throughput: prefix affinity pays when the GPUs are
-queue-bound and costs tail latency when they are idle. Expect route consistency to
-rise about threefold in every configuration regardless of the P99 outcome.
+The 2026-10-01 13B regression was the load-divert policy reading a stale signal at too tight a
+threshold, not the affinity; the 2026-10-05 defaults (node-local in-flight signal, ε 1.0,
+least-loaded placement) resolved it. Expect route consistency to rise about fourfold and the
+per-backend request distribution to stay uneven (Gini 0.09–0.12) in every prefix arm; the tail
+is set by queue depth, which the divert policy now sees live. The 13B 30-user row (50 prefixes,
+eviction regime) times out in both arms and is directional only.
 
 ## Interpreting Results
 
@@ -92,7 +96,7 @@ rise about threefold in every configuration regardless of the P99 outcome.
 | **Route consistency** | % of requests that landed on the same backend as the previous request with that prefix. A client-side affinity proxy, ~1/N under round-robin; roughly 3× higher with prefix routing. Logs before 2026-09-30 label this "cache hit rate". |
 | **KV prefix-cache hit rate** | vLLM's own `prefix_cache_hits/queries` counters differenced over the run (token-level). The real cache signal; reported since 2026-09-30 when backends expose it. |
 | **TTFT (Time-To-First-Token)** | Latency until the first SSE chunk. Lower = better. Quote the "raw samples" line, not Locust's approximated table (±50 ms above 1 s). |
-| **P99 TTFT** | Tail latency. −9% to −13% vs round-robin under sustained load; a regression at light load (July 2026). |
+| **P99 TTFT** | Tail latency. −22% (8B) to −58% (13B, fitted set) vs round-robin under the 2026-10-05 defaults; the July 2026 light-load regression and the October 1 13B regression were the previous divert policy. |
 | **Throughput (req/s)** | HTTP requests/sec from the Aggregated row. Before 2026-09-30 this row also counted derived samples and read ~6× high. |
 | **Incomplete rate** | Requests that got HTTP 200 but no first token. Compare across arms; a difference here changes how to read P99. |
 

@@ -12,16 +12,39 @@ routing config). When a default changes, prior entries move to
 | `NUM_LARGE_PREFIXES` | **50** (≥ backend count; not the deprecated 5) | `tests/integration/locustfile_real.py` |
 | `SHARED_PREFIX_RATIO` | **0.9** | `tests/integration/locustfile_real.py` / `bench.sh --prefix-ratio` |
 | Route-batch flush interval | **20ms** | `src/config_schema.hpp`, `docker-compose.benchmark-real.yml` |
-| Load-aware routing | **ON**, `load_imbalance_factor` 2.0 / floor 2 | `src/config_schema.hpp` |
+| Load-aware routing | **ON**, `bounded_load` ε **1.0** (was 0.25 until 2026-10-05), `load_imbalance_factor` 2.0 / floor 2 | `src/config_schema.hpp` |
+| Divert load signal | **node-local in-flight count** (`cross_shard_load_sync` true, 100 ms); scraped GPU score and KV headroom weights **0** (were 10 / 5 until 2026-10-05) | `src/config_schema.hpp` |
+| Cache-miss placement | **`least_loaded`** with eager learn and gossip + local-flush convergence (was `hash` until 2026-10-05) | `src/config_schema.hpp` |
 | Cache-residency weight | **0.2** | `src/config_schema.hpp` |
 | Prompt distribution | `stress` (large-prefix) | `bench.sh --prompt-dist` |
 
+> **Routing defaults changed on 2026-10-05.** Every entry dated before that was measured under
+> the previous divert signal and threshold (scraped GPU score + one shard's in-flight count,
+> ε 0.25, hash placement). They stay on this page because they are the record of how the new
+> defaults were arrived at, from the 2026-10-01 re-baseline through the placement line to the
+> combo, isolation and confirmation legs. The first full matrix under the shipped defaults at
+> three repeats is the next item on the resume checklist and will replace the 2026-10-01 table as
+> the citable one.
+>
 > **Flush reconciliation:** 20ms is the shipped default. The historical guide contained a
 > contradiction — an early section declared "10ms confirmed as the correct default," a later
 > section changed it to 20ms, and the 20ms change shipped. Both dated sections are preserved
 > in the history archive; **20ms is current.**
 
-## Representative-workload headline (measured 2026-10-01, fixed tooling)
+## Headline (2026-10-05): the 13B rows were the divert policy, not the affinity
+
+Under the defaults shipped on 2026-10-05 (node-local in-flight load signal, divert only at twice
+the mean, least-loaded placement with convergence) the configuration that had regressed in every
+campaign, CodeLlama-13B at 20 users, improved P99 TTFT by **−60.4 / −57.5 / −55.2%** against
+round-robin across three repeats and both arm orders, with P50 −28% and KV prefix hits 69–73%
+(fitted 16-prefix set). One confirmation repeat each: 13B 10 users −34.5% (KV 82%), 8B 20 users
+−22.6% (was −17%), 13B 30 users −16.4% in the eviction regime. The isolation leg (hash placement,
+same signal) gave −51.8% median, so the divert policy is most of the win and placement the rest.
+The request distribution across backends stayed uneven in every one of these arms; the tail was
+queue depth, not request count. Full sections below: "Combo leg", "Confirmation rows",
+"Isolation leg".
+
+## Representative-workload re-baseline (measured 2026-10-01, fixed tooling, previous defaults)
 
 **Prefix-aware routing's P99 effect depends on whether the backends' KV cache can hold the hot
 prefix set.** Where it can (Llama-3.1-8B on A100-40GB), prefix routing cut P99 TTFT by **17%**
@@ -68,7 +91,10 @@ the main run, repeat 1 of each row. P99 TTFT is the exact percentile over every 
   consistent and has a plausible mechanism: affinity concentrates large-prefix requests onto
   the same backends, and under KV pressure that concentration means more preemption there. The
   load-aware fallback watches in-flight counts, not KV occupancy, so it does not see it.
-  Whether that holds is the question the `fitted` suite answers (below).
+  Whether that holds is the question the `fitted` suite answers (below). *Resolved 2026-10-05:*
+  the mechanism was the divert policy's signal and threshold, not KV occupancy; the fallback was
+  reading a 5 s-stale score and one shard's share of the queue, at a threshold that fired on
+  nearly any load. With the live node-local count and ε 1.0 the same row is −57.5% (headline).
 
 ### Fitted suite (measured 2026-10-02): 13B inside its KV cache
 
