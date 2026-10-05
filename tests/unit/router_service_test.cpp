@@ -681,6 +681,7 @@ TEST_F(RouterServiceTest, ResidencyWeightModulatesAffinityContinuously) {
 TEST_F(RouterServiceTest, BoundedLoadArtOverCapDivertsOffWarmBackend) {
     cfg_.load_aware_routing = true;
     cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+    cfg_.bounded_load_epsilon = 0.25;  // the cap arithmetic below assumes 1.25x (default is 1.0 since 2026-10-05)
     recreate_router(cfg_);
     register_three_backends();
     std::vector<int32_t> tokens = {155, 156, 157, 158};
@@ -2376,8 +2377,11 @@ TEST(RoutingConfigTest, DefaultValues) {
     EXPECT_EQ(cfg.block_alignment, 16u);
     EXPECT_TRUE(cfg.is_prefix_mode());
     EXPECT_EQ(cfg.hash_strategy, RoutingConfig::HashStrategy::BOUNDED_LOAD);
-    EXPECT_DOUBLE_EQ(cfg.bounded_load_epsilon, 0.25);
+    EXPECT_DOUBLE_EQ(cfg.bounded_load_epsilon, 1.0);   // 2026-10-05: was 0.25 (see config_schema.hpp)
     EXPECT_EQ(cfg.p2c_load_bias, 2u);
+    EXPECT_TRUE(cfg.cross_shard_load_sync);              // 2026-10-05: node-local in-flight signal on
+    EXPECT_DOUBLE_EQ(cfg.gpu_load_weight, 0.0);          // 2026-10-05: scraped score out of the divert signal
+    EXPECT_DOUBLE_EQ(cfg.capacity_headroom_weight, 0.0);
 }
 
 // =============================================================================

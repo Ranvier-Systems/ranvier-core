@@ -85,7 +85,18 @@ struct RoutingConfig {
     // Each backend accepts at most ceil(avg_load * (1 + epsilon)) in-flight requests.
     // Lower epsilon = tighter balance but more affinity breaks.
     // Typical values: 0.25 (tight), 0.5 (moderate), 1.0 (loose).
-    double bounded_load_epsilon = 0.25;
+    //
+    // Default 1.0 (was 0.25 until 2026-10-05). Loads here are small integers:
+    // at ~1 in-flight request per backend per node, 0.25 gives a cap of 1-2 and
+    // nearly any load at all diverts (25-30% of requests on the 13B fitted
+    // suite), which spends the affinity without touching the tail. At 1.0 a
+    // divert needs a backend at twice the mean, i.e. a real queue. Measured
+    // with the node-local in-flight signal below (13B 20 users, 8xA100, 3
+    // repeats, both arm orders): P99 TTFT -60.4 / -57.5 / -55.2% against
+    // round-robin, P50 -28%, KV prefix hits 69-73%, diverts 23-27%; 13B 10u
+    // -34.5%, 8B 20u -22.6%, no row regressed. The previous default gave
+    // +3..+21% on the same 20-user row across twelve runs.
+    double bounded_load_epsilon = 1.0;
 
     // P2C load bias: minimum load difference to prefer secondary over primary.
     // Higher bias = stronger affinity to primary (hash-preferred) backend.
@@ -171,7 +182,17 @@ struct RoutingConfig {
     // gpu_load_cache_ttl: How long to trust cached GPU load scores before
     //   treating them as stale. Should be ≥2x the health check interval to
     //   tolerate one missed scrape cycle.
-    double gpu_load_weight = 10.0;              // Scaling factor for GPU load score in composite
+    //
+    // Default 0.0 (was 10.0 until 2026-10-05): the scraped score is refreshed
+    // once per health interval (5 s), is identical on every shard of a node,
+    // and is a blend of queue and KV usage, not queue depth. As the divert
+    // signal it moved every backend's load together, so bounded-load either
+    // never diverted or diverted everything (fitted-suite legs, 2026-10-02/03).
+    // The node-local in-flight count (cross_shard_load_sync below) is the
+    // signal that lets diversion remove a queue without removing affinity.
+    // Set > 0 to blend the GPU score back in; the health scrape still runs
+    // for observability and residency routing either way.
+    double gpu_load_weight = 0.0;               // Scaling factor for GPU load score in composite
     std::chrono::seconds gpu_load_cache_ttl{30}; // Staleness threshold for GPU load cache (default: 2x typical scrape interval)
 
     // =========================================================================
@@ -195,10 +216,15 @@ struct RoutingConfig {
     // the reactor and inflate alien::run_on() completion latency (e.g.,
     // tokenization P50 from 12ms to 40ms).
     //
-    // Disabled by default until validated in production benchmarks.
-    // Enable via RANVIER_CROSS_SHARD_LOAD_SYNC=true with an appropriate
-    // interval for your shard count and request rate.
-    bool cross_shard_load_sync = false;                                    // Enable cross-shard load broadcasts
+    // Enabled by default since 2026-10-05: validated on the 13B fitted suite
+    // (8xA100, 3 nodes x 8 shards), where the node-local in-flight count is
+    // the signal that let bounded-load diversion take P99 TTFT from +3..+21%
+    // to -55..-60% against round-robin (see bounded_load_epsilon). The 100 ms
+    // interval costs ~1,120 SMP messages/s on 8 shards; a single-shard
+    // process skips the timer. Disable via RANVIER_CROSS_SHARD_LOAD_SYNC=false
+    // to fall back to shard-local counts (each shard sees only its own
+    // in-flight requests, ~1/shards of the node's).
+    bool cross_shard_load_sync = true;                                     // Enable cross-shard load broadcasts
     std::chrono::milliseconds cross_shard_load_sync_interval{100};         // Broadcast interval (ms)
 
     // =========================================================================
@@ -237,8 +263,14 @@ struct RoutingConfig {
     // capacity_headroom_weight: Scaling factor that converts effective cache
     //   pressure (0.0–1.0) into a load penalty comparable to active_requests.
     //   Higher values make cache fullness a stronger routing signal.
-    //   Set to 0.0 to disable capacity-aware hash fallback (default behavior).
-    double capacity_headroom_weight = 5.0;  // Env: RANVIER_CAPACITY_HEADROOM_WEIGHT
+    //   0.0 disables capacity-aware hash fallback.
+    //
+    // Default 0.0 (was 5.0 until 2026-10-05): like gpu_load_weight this reads
+    // the 5 s-stale scraped KV usage, identical across a node's shards, so as
+    // a divert input it herded rather than balanced. The 2026-10-05 result
+    // (bounded_load_epsilon comment) was measured with it off. Set > 0 to
+    // re-enable; residency routing (cache_residency_threshold) is separate.
+    double capacity_headroom_weight = 0.0;  // Env: RANVIER_CAPACITY_HEADROOM_WEIGHT
 
     // =========================================================================
     // Cache-Residency-Aware Routing

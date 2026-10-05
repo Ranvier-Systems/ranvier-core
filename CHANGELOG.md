@@ -246,6 +246,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Routing defaults: node-local in-flight load signal, scraped GPU/KV terms out of the
+  divert signal, bounded-load ε 1.0** (`cross_shard_load_sync` false → **true**,
+  `gpu_load_weight` 10 → **0**, `capacity_headroom_weight` 5 → **0**,
+  `bounded_load_epsilon` 0.25 → **1.0**). Bounded-load diversion was reading a 5 s-stale
+  scraped score that moved every backend together plus one shard's share of the node's
+  in-flight count, and at ε 0.25 the cap at ~1 in-flight per backend was 1–2, so it diverted
+  25–30% of requests without reaching the tail. With the node's live queue as the signal and
+  a divert only at twice the mean, the 13B 20-user fitted row went from +3…+21% P99 TTFT
+  against round-robin (twelve runs of placement and divert variants) to **−60.4 / −57.5 /
+  −55.2%** across three repeats and both arm orders, P50 −28%, KV prefix hits 69–73%; 13B 10
+  users −34.5% (was mixed), 8B 20 users −22.6% (was −17%), 13B 30 users −16.4% (was no effect).
+  The scrape still runs for observability and residency routing; the old behaviour is four env
+  vars away (`RANVIER_CROSS_SHARD_LOAD_SYNC=false RANVIER_ROUTING_GPU_LOAD_WEIGHT=10
+  RANVIER_CAPACITY_HEADROOM_WEIGHT=5 RANVIER_BOUNDED_LOAD_EPSILON=0.25`). The benchmark
+  compose and `bench.sh` manifest defaults follow. `miss_placement` stays `hash` pending the
+  isolation leg (docs/benchmarks/benchmark-results-current.md).
+
 - **Least-loaded cache-miss placement** (`routing.miss_placement: least_loaded`, env
   `RANVIER_MISS_PLACEMENT`, default `hash` = unchanged behavior) — a prefix with no
   learned route is placed on the live backend holding the fewest learned-route tokens

@@ -176,7 +176,7 @@ services:
       # Route batch flush interval (ms) - lower values improve cache affinity at cost of SMP overhead
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
-      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
+      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-true}
       # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
@@ -187,7 +187,7 @@ services:
       # jump/modular allowance; under the shipped BOUNDED_LOAD strategy the allowance comes
       # from bounded_load_epsilon — the epsilon sweep is what actually moves diversion.
       # hash_strategy lets the factor/floor variant run under jump.
-      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
+      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-1.0}
       - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
       # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
       # then fewest routes, then lowest load). Must be listed here or the host env never
@@ -209,8 +209,8 @@ services:
       # (capacity_headroom_weight x KV usage), refreshed every health scrape and
       # identical on every shard of a node. Set both weights to 0 (and sync on)
       # to make load mean in-flight requests. Defaults match the shipped values.
-      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-10.0}
-      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-5.0}
+      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-0}
+      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-0}
       - RANVIER_HEALTH_CHECK_INTERVAL=${RANVIER_HEALTH_CHECK_INTERVAL:-5}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
@@ -276,7 +276,7 @@ services:
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
-      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
+      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-true}
       # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
@@ -287,7 +287,7 @@ services:
       # jump/modular allowance; under the shipped BOUNDED_LOAD strategy the allowance comes
       # from bounded_load_epsilon — the epsilon sweep is what actually moves diversion.
       # hash_strategy lets the factor/floor variant run under jump.
-      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
+      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-1.0}
       - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
       # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
       # then fewest routes, then lowest load). Must be listed here or the host env never
@@ -309,8 +309,8 @@ services:
       # (capacity_headroom_weight x KV usage), refreshed every health scrape and
       # identical on every shard of a node. Set both weights to 0 (and sync on)
       # to make load mean in-flight requests. Defaults match the shipped values.
-      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-10.0}
-      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-5.0}
+      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-0}
+      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-0}
       - RANVIER_HEALTH_CHECK_INTERVAL=${RANVIER_HEALTH_CHECK_INTERVAL:-5}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
@@ -376,7 +376,7 @@ services:
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
-      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
+      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-true}
       # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
@@ -387,7 +387,7 @@ services:
       # jump/modular allowance; under the shipped BOUNDED_LOAD strategy the allowance comes
       # from bounded_load_epsilon — the epsilon sweep is what actually moves diversion.
       # hash_strategy lets the factor/floor variant run under jump.
-      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
+      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-1.0}
       - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
       # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
       # then fewest routes, then lowest load). Must be listed here or the host env never
@@ -409,8 +409,8 @@ services:
       # (capacity_headroom_weight x KV usage), refreshed every health scrape and
       # identical on every shard of a node. Set both weights to 0 (and sync on)
       # to make load mean in-flight requests. Defaults match the shipped values.
-      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-10.0}
-      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-5.0}
+      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-0}
+      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-0}
       - RANVIER_HEALTH_CHECK_INTERVAL=${RANVIER_HEALTH_CHECK_INTERVAL:-5}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}

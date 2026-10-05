@@ -1474,7 +1474,13 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   0.09–0.12: the tail was queue depth, not request count, and a divert policy that sees the queue
   live and acts only at 2× the mean removes it without giving back affinity (consistency 50–53%).
   Next: isolation leg (hash placement, same signal and ε) to decide whether the shipping change is
-  two defaults or three; then 8B 20u / 13B 10u / 13B 30u under the new defaults.** Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
+  two defaults or three; then 8B 20u / 13B 10u / 13B 30u under the new defaults.**
+  **Confirmation rows (one rep each, same settings): 13B 10u −34.5% (KV 82%), 8B 20u −22.6%
+  (was −17%), 13B 30u −16.4% excl. timeouts (both arms 1.4–1.6% incompletes, eviction regime).
+  Nothing regressed. Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
+  `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
+  `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement
+  contributes.** Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
   0.080 — the count-weighted build is a consistent regression (+6.6, +25.1, +13.3) with worse
   affinity than the default in all three. Leg B (in-flight signal, default placement): +14.2, −1.0
   (rep 2 lost to a silent compose failure, since fixed) — a real-time signal helps diversion at

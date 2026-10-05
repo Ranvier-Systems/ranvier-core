@@ -337,10 +337,10 @@ struct ShardLocalState {
         uint64_t p2c_load_bias = 2;
         RoutingConfig::MissPlacement miss_placement = RoutingConfig::MissPlacement::HASH;
         // Cross-shard load sync configuration
-        bool cross_shard_load_sync = false;
+        bool cross_shard_load_sync = true;   // mirrors RoutingConfig (default on since 2026-10-05)
         std::chrono::milliseconds cross_shard_load_sync_interval{100};
         // GPU load integration (vLLM-aware routing)
-        double gpu_load_weight = 10.0;
+        double gpu_load_weight = 0.0;   // mirrors RoutingConfig (default 0 since 2026-10-05)
         std::chrono::seconds gpu_load_cache_ttl{30};
         // Cost-based routing configuration
         bool cost_routing_enabled = false;
@@ -349,7 +349,7 @@ struct ShardLocalState {
         bool cost_routing_fast_lane = true;
         double cost_routing_imbalance_factor = 2.0;
         // Capacity-aware hash fallback
-        double capacity_headroom_weight = 5.0;
+        double capacity_headroom_weight = 0.0;   // mirrors RoutingConfig (default 0 since 2026-10-05)
         // Compression-aware route TTL
         double max_ttl_multiplier = 4.0;
         // Cache-residency-aware routing: minimum gossiped residency below which
