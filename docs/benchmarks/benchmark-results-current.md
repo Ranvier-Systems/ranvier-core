@@ -44,6 +44,42 @@ The request distribution across backends stayed uneven in every one of these arm
 queue depth, not request count. Full sections below: "Combo leg", "Confirmation rows",
 "Isolation leg".
 
+### The campaign at a glance (CodeLlama-13B, 20 users, 8×A100, 3 Ranvier nodes)
+
+Every leg of the 2026-10-01..05 campaign on the one row that resisted, in the order it was run.
+Fitted 16-prefix set (2000–4000 tokens) unless noted; prefix arm vs round-robin, 10-minute arms,
+alternating arm order. Consistency, KV hits, diverts and Gini are the prefix arm's. P99 of the
+previous-default rows had **+3…+21%** across twelve runs; the shipping defaults give **−55…−60%**.
+
+| # | Leg (date) | What changed vs the row above | P99 TTFT per rep | Median | Consistency | KV hit | Diverts | Gini | Verdict |
+|---|------------|-------------------------------|------------------|--------|-------------|--------|---------|------|---------|
+| 1 | Re-baseline, 50 prefixes (10-01) | previous defaults, unfitted set | +17.4 / +11.0 / +4.6 | **+11.0%** | ~48% | 19% | ~30% | — | ❌ regression |
+| 2 | Fitted set (10-02) | 16 prefixes that fit the 13B cache | +10.1 / +8.2 / +21.4 | +10.1% | 48–53% | 45% | ~30% | 0.06–0.10 | ❌ regression |
+| 3 | Least-loaded diversion (10-02) | divert target = coldest instead of first-under-cap | +10.5 / +24.1 / +17.5 | +17.5% | — | 29–30% | ~30% | 0.05–0.08 | ❌ regression |
+| 4 | Leg A, no diverts (10-02/03) | pure affinity, every divert mechanism off | +8.2 / +12.3 / +11.3 | +11.3% | — | 55–61% | 0% | 0.30 | ❌ placement is the mechanism |
+| 5 | Leg B, in-flight signal (10-03) | live node-local in-flight count, ε 0.25, hash placement | +14.2 / lost / −1.0 | — | 39–42% | 27–36% | 29–32% | 0.04–0.06 | ⚖️ mixed, n=2; first near-zero |
+| 6 | Placement v1 (10-03) | least-loaded placement, count-weighted | +6.6 / +25.1 / +13.3 | +13.3% | 37–42% | 29–32% | 23–25% | 0.08–0.10 | ❌ one-offs outvote prefixes |
+| 7 | Placement v2 (10-03) | token-weighted + eager learn at dispatch | +11.4 / +12.5 / +3.9 | +11.4% | 38–42% | 30–38% | 22–24% | 0.05–0.07 | ❌ split: ~800 trust refusals/node |
+| 8 | Placement v3 (10-03) | + gossip convergence (lowest id wins) | +8.1 / +10.1 / +3.4 | +8.1% | 56–59% | 42–48% | 25–27% | 0.09–0.11 | ❌ converged = 0 (local flush bypassed it) |
+| 9 | Placement v4 (10-05) | + local-flush convergence | +20.9 / +13.1 / (vLLM start failure) | — | 56–57% | 42–44% | 25–29% | 0.08–0.10 | ❌ split gone; token tally blind (128-token keys) |
+| 10 | Isolation (10-05) | live signal + ε 1.0, **hash** placement | −48.4 / −51.8 / −53.5 | **−51.8%** | 39–45% | 49–55% | 30–33% | 0.05–0.10 | ✅ divert policy is most of the win |
+| 11 | **Combo = shipping defaults (10-05)** | live signal + ε 1.0 + **least-loaded** placement with convergence | **−60.4 / −57.5 / −55.2** | **−57.5%** | 50–53% | **69–73%** | 23–27% | 0.09–0.12 | ✅ **accepted** |
+
+The other rows, previous defaults vs shipping defaults (shipping-default rows are one repeat):
+
+| Row | Previous defaults, P99 per rep | Shipping defaults, P99 | KV hit, RR → prefix (shipping) |
+|-----|-------------------------------|------------------------|--------------------------------|
+| 13B 10u, fitted | −7.3 / −5.8 / −0.1 (default); −13.2 / −3.0 / +0.4 (v3) | **−34.5%** | 17% → 82% |
+| 8B 20u, 50 prefixes | **−17.0 / −6.5 / −17.4** | **−22.6%** | 72% → 96% |
+| 13B 30u/30m, 50 prefixes (eviction regime) | −2.4 / −1.6 / +3.6 | −16.4%, timeouts in both arms | 6% → 23% |
+
+Reading down the first table: rows 2–9 all balance *something derived from the route table or the
+hash* and all land in the same band, because the per-backend request Gini (0.05–0.12) was never
+the tail; row 4 shows that with zero diverts, and row 9 shows that even a tally balanced to one
+route-unit leaves traffic 1.8× apart. Rows 10–11 change what the divert policy *sees* and *when it
+acts*, and the tail collapses while Gini stays where it was. Placement earns its place in row 11
+over row 10 by needing fewer diverts: 15–20 points more KV hits for 6 points more P99.
+
 ## Representative-workload re-baseline (measured 2026-10-01, fixed tooling, previous defaults)
 
 **Prefix-aware routing's P99 effect depends on whether the backends' KV cache can hold the hot
