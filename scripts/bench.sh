@@ -1793,7 +1793,7 @@ write_manifest() {
         # Defaults mirror docker-compose.benchmark-real.yml so an unset knob is
         # recorded as the value the server actually ran with.
         printf '    "hash_strategy": "%s",\n' "$(_json_escape "${RANVIER_HASH_STRATEGY:-bounded_load}")"
-        printf '    "miss_placement": "%s",\n' "$(_json_escape "${RANVIER_MISS_PLACEMENT:-hash}")"
+        printf '    "miss_placement": "%s",\n' "$(_json_escape "${RANVIER_MISS_PLACEMENT:-least_loaded}")"
         printf '    "bounded_load_epsilon": "%s",\n' "$(_json_escape "${RANVIER_BOUNDED_LOAD_EPSILON:-1.0}")"
         printf '    "cross_shard_load_sync": "%s",\n' "$(_json_escape "${RANVIER_CROSS_SHARD_LOAD_SYNC:-true}")"
         printf '    "gpu_load_weight": "%s",\n' "$(_json_escape "${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-0}")"

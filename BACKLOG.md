@@ -1480,7 +1480,11 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   Nothing regressed. Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
   `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
   `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement
-  contributes.** Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
+  contributes.** **Isolation leg: −48.4 / −51.8 / −53.5 (median −51.8) with hash placement:
+  the divert policy is ~50 of the 57 points; placement adds the rest via fewer diverts (KV 69–73%
+  vs 49–55%, consistency 50–53% vs 39–45%, diverts 23–27% vs 30–33%, ranges non-overlapping).
+  `miss_placement: least_loaded` ships as the fifth default. 13B 20u row: closed. Next: the
+  rebaseline suite unflagged ×3 under the shipping defaults, and a fitted 30u row.** Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
   0.080 — the count-weighted build is a consistent regression (+6.6, +25.1, +13.3) with worse
   affinity than the default in all three. Leg B (in-flight signal, default placement): +14.2, −1.0
   (rep 2 lost to a silent compose failure, since fixed) — a real-time signal helps diversion at

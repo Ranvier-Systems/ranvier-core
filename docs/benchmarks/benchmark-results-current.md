@@ -472,18 +472,52 @@ and the prefix arm timed out 29 more requests while completing 684 more; read it
 is right, the regime is still wrong", not as a result. One rep each: enough to show no regression,
 not enough to re-verdict the rows.
 
-**Resume checklist:**
+### Isolation leg: hash placement + live in-flight signal + ε 1.0 (2026-10-05)
 
-1. **Isolation leg** (`--miss-placement hash --bounded-load-epsilon 1.0`, same in-flight env,
-   20u ×3): the combo minus placement. Hash matching the combo (≤ −50%) means the shipping change
-   is two routing defaults, the in-flight signal and ε 1.0, with no placement knob; hash clearly
-   worse means least-loaded placement and its convergence fixes are load-bearing and become a
-   third default.
-2. **Confirm nothing else regressed under the new defaults:** 8B 20u (was −17%) and 13B 10u and
-   30u with the same env, one rep each at first. The 10u row is where ε 0.25 over-diverted before.
+The combo minus placement: `--miss-placement hash`, same env and ε 1.0, 13B 20 users ×3.
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Large hit / miss P99 |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------|
+| 1 (rr-first) | −48.4% | −27.4% | 42.4% | 49.2% | 30.6% | 0.062 | −52.7% / −30.4% |
+| 2 (prefix-first) | −51.8% | −27.7% | 38.8% | 54.7% | 32.7% | 0.054 | −60.2% / −45.1% |
+| 3 (rr-first) | −53.5% | −27.6% | 45.2% | 55.4% | 29.6% | 0.099 | −55.0% / −51.5% |
+
+**Verdict: ✅ consistent improvement, −51.8% median P99 (3/3).** Side by side with the combo:
+
+| | Hash placement | Least-loaded placement (combo) |
+|---|---|---|
+| P99 TTFT, 3 reps | −48.4 / −51.8 / −53.5 (median −51.8) | −60.4 / −57.5 / −55.2 (median **−57.5**) |
+| Route consistency | 39–45% | 50–53% |
+| KV hit (prefix) | 49–55% | **69–73%** |
+| Diverts | 30–33% | 23–27% |
+| P50 TTFT | −27.5% | −28.5% |
+
+The live divert policy is most of the tail win: about 50 of the 57 points. Split-free placement
+adds the rest and does it by needing fewer diverts: one home per prefix means fewer hot-backend
+collisions to divert away from, so 6–8 points more consistency, 15–20 points more KV hits, 5–7
+points fewer diverts, and 4–9 points more P99, with the ranges not overlapping (hash's best
+−53.5 vs the combo's worst −55.2) on the same box, image and day. Placement alone could not move
+the tail (v1–v4); the divert policy alone leaves a third of requests diverted. Together is the
+measured configuration, and every confirmation row above was run with it.
+
+**Shipping (branch): all three.** `cross_shard_load_sync` true, `gpu_load_weight` 0,
+`capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 **and** `miss_placement` `least_loaded`
+become the defaults. The hash placement stays one env var away (`RANVIER_MISS_PLACEMENT=hash`) and
+is the right choice on a single-node deployment with no gossip, where the convergence rules have
+nothing to do.
+
+**Resume checklist (next GPU session):**
+
+1. Merge the defaults, pull the published image, and run the rebaseline suite unflagged
+   (`bench-runner.sh --suite rebaseline`): the four README rows at three repeats each under the
+   shipping configuration, which the confirmation rows above measured once. That table replaces
+   the 2026-10-01 re-baseline as the citable one.
+2. The 13B 30u/30m row times out in both arms (eviction regime, 50 prefixes × 2000–8000 tokens
+   against 11.6k tokens of KV per backend). Add a fitted 30-user row (`--num-prefixes 16
+   --prefix-max-tokens 4000`) so the high-load regime has a valid measurement.
 3. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
    aggregates, manifests, `prometheus_metrics_node*.txt`, `ranvier_node*.log`) **before**
-   terminating the instance.
+   terminating the instance. Outstanding from this box: placement-v4, combo, isolate, confirm.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 

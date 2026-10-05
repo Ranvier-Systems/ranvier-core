@@ -131,8 +131,19 @@ struct RoutingConfig {
     //                 not popularity: a skewed hot prefix still needs
     //                 replication (BACKLOG section 27).
     // Env: RANVIER_MISS_PLACEMENT=hash|least_loaded. YAML: routing.miss_placement.
+    //
+    // Default LEAST_LOADED since 2026-10-05 (was HASH). On its own, placement
+    // never moved the tail (four variants, +3..+21% P99 at 13B 20 users): the
+    // route table cannot see which routes carry traffic. With the live divert
+    // policy (bounded_load_epsilon, cross_shard_load_sync) it earns its place by
+    // needing fewer diverts: one home per prefix, so against hash placement
+    // under the same signal, 3 repeats each, same box and day: P99 -57.5% vs
+    // -51.8% median, KV prefix hits 69-73% vs 49-55%, route consistency 50-53%
+    // vs 39-45%, diverts 23-27% vs 30-33%. HASH stays one env var away and is
+    // the right choice on a single node without gossip, where the convergence
+    // rules have nothing to do.
     enum class MissPlacement { HASH, LEAST_LOADED };
-    MissPlacement miss_placement = MissPlacement::HASH;
+    MissPlacement miss_placement = MissPlacement::LEAST_LOADED;
 
     // Prefix boundary detection for multi-turn conversations
     // When enabled, system messages are tokenized separately to identify the "shared prefix"

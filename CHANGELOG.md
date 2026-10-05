@@ -260,8 +260,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The scrape still runs for observability and residency routing; the old behaviour is four env
   vars away (`RANVIER_CROSS_SHARD_LOAD_SYNC=false RANVIER_ROUTING_GPU_LOAD_WEIGHT=10
   RANVIER_CAPACITY_HEADROOM_WEIGHT=5 RANVIER_BOUNDED_LOAD_EPSILON=0.25`). The benchmark
-  compose and `bench.sh` manifest defaults follow. `miss_placement` stays `hash` pending the
-  isolation leg (docs/benchmarks/benchmark-results-current.md).
+  compose and `bench.sh` manifest defaults follow.
+- **`miss_placement` defaults to `least_loaded`** (was `hash`). On its own, least-loaded
+  placement never moved the 13B 20-user tail (four variants, +3…+21%): the route table cannot
+  see which routes carry traffic. Under the live divert policy above it earns its place by
+  needing fewer diverts, one home per prefix: against `hash` with the same signal, three
+  repeats each on the same box and day, P99 −57.5% vs −51.8% median, KV prefix hits 69–73% vs
+  49–55%, route consistency 50–53% vs 39–45%, diverts 23–27% vs 30–33%. The eager learn and
+  both convergence rules (gossip and local flush) are what make it split-free. `hash` is one
+  env var away (`RANVIER_MISS_PLACEMENT=hash`) and is the right choice on a single node without
+  gossip. Details: docs/benchmarks/benchmark-results-current.md (combo, isolation and
+  confirmation legs, 2026-10-05).
 
 - **Least-loaded cache-miss placement** (`routing.miss_placement: least_loaded`, env
   `RANVIER_MISS_PLACEMENT`, default `hash` = unchanged behavior) — a prefix with no

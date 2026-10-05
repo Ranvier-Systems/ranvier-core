@@ -192,7 +192,7 @@ services:
       # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
       # then fewest routes, then lowest load). Must be listed here or the host env never
       # reaches the server.
-      - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-hash}
+      - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-least_loaded}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
@@ -292,7 +292,7 @@ services:
       # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
       # then fewest routes, then lowest load). Must be listed here or the host env never
       # reaches the server.
-      - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-hash}
+      - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-least_loaded}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
@@ -392,7 +392,7 @@ services:
       # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
       # then fewest routes, then lowest load). Must be listed here or the host env never
       # reaches the server.
-      - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-hash}
+      - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-least_loaded}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
