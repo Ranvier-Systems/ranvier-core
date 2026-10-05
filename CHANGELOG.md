@@ -267,7 +267,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   needing fewer diverts, one home per prefix: against `hash` with the same signal, three
   repeats each on the same box and day, P99 −57.5% vs −51.8% median, KV prefix hits 69–73% vs
   49–55%, route consistency 50–53% vs 39–45%, diverts 23–27% vs 30–33%. The eager learn and
-  both convergence rules (gossip and local flush) are what make it split-free. `hash` is one
+  both convergence rules (gossip and local flush) are what make it split-free; a learn that
+  yields at the flush is one that meets a lower-id route for a different backend, and learns
+  shorter than `block_alignment` (which store nothing under either placement) still ride the
+  batch to other shards and over gossip exactly as before. `hash` is one
   env var away (`RANVIER_MISS_PLACEMENT=hash`) and is the right choice on a single node without
   gossip. Details: docs/benchmarks/benchmark-results-current.md (combo, isolation and
   confirmation legs, 2026-10-05).

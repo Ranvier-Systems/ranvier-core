@@ -4211,10 +4211,18 @@ static void apply_local_batch_to_tree(std::vector<PendingLocalRoute>& batch) {
             TrustInsertResult inserted = tree->insert_if_trusted(
                 std::span<const TokenId>(route.tokens.data(), route.tokens.size()),
                 route.backend, RouteOrigin::LOCAL, /*converge_local_conflicts=*/true);
-            if (inserted == TrustInsertResult::REFUSED) {
-                // A lower backend id already holds this prefix: the cluster has
-                // settled it there, this learn yields. Dropped from the batch so
-                // other shards and peers never see it.
+            // REFUSED means one of two things. With a prior route to a different
+            // backend it is the convergence rule: a lower id holds the key and
+            // this learn yields, dropped from the batch so no shard or peer sees
+            // it. Without a prior route it is a key shorter than block_alignment,
+            // which insert_if_trusted refuses where the plain insert() silently
+            // stores nothing: that route must stay in the batch exactly as under
+            // hash placement (fanned out and gossiped; peers apply the same
+            // no-op), or a cluster whose prompts are shorter than one block never
+            // announces anything (integration test_07_gossip_counters_increment,
+            // 2026-10-05).
+            if (inserted == TrustInsertResult::REFUSED &&
+                prior.has_value() && *prior != route.backend) {
                 state.stats.local_routes_converged++;
                 log_router.debug("Shard {}: local route ({} tokens) -> backend {} yields to settled "
                                  "backend {} (miss_placement=least_loaded)",

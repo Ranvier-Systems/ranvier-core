@@ -2904,6 +2904,27 @@ TEST_F(BoundedLoadTest, LeastLoadedPlacementLocalLearnYieldsToLowerGossipedRoute
     EXPECT_EQ(RouterService::local_routes_converged_for_testing(), 1u);
 }
 
+TEST_F(BoundedLoadTest, LeastLoadedPlacementKeepsSubAlignmentLearnsInTheBatch) {
+    // A learn shorter than block_alignment stores nothing (plain insert() and
+    // insert_if_trusted() both refuse it), but under hash placement it still
+    // rode the batch to the other shards and over gossip. The least-loaded
+    // flush must not read that refusal as a convergence yield: the counter
+    // stays at zero and nothing is dropped. (Caught by the mock-cluster
+    // integration suite, whose prompts are shorter than one 16-token block:
+    // router_cluster_sync_sent stayed at 0, 2026-10-05.)
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    cfg_.block_alignment = 16;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    std::vector<int32_t> tokens = {8501, 8502, 8503, 8504, 8505};  // 5 < 16: aligned length 0
+    RouterService::learn_route_for_testing(tokens, 2);
+    EXPECT_EQ(RouterService::local_routes_converged_for_testing(), 0u);
+    EXPECT_FALSE(RouterService::lookup_backend_for_testing(tokens).has_value());
+}
+
 TEST_F(BoundedLoadTest, HashPlacementLocalLearnStillOverridesGossip) {
     // Hash placement: the flush is the plain insert it always was (a
     // node's own learn outranks a gossiped route, latest wins among LOCAL).
