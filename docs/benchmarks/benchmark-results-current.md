@@ -433,10 +433,14 @@ cap is twice the average rather than 1.25×.
 |-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------|-------|
 | 1 (rr-first) | **−60.4%** (3712 → 1471 ms) | −28.9% | 52.7% | **68.9%** | 22.6% | 0.116 | −55.6% / −53.0% | +10.1% |
 | 2 (prefix-first) | **−57.5%** (3745 → 1592 ms) | −28.7% | 52.5% | **70.8%** | 24.2% | 0.102 | −63.4% / −53.0% | +11.3% |
+| 3 (rr-first) | **−55.2%** (3277 → 1469 ms) | −28.2% | 49.6% | **73.2%** | 26.7% | 0.092 | −60.7% / −54.5% | +10.3% |
 
-Two reps agree across both arm orders; rep 3 pending. This is the acceptance for the 13B 20-user
-row: the first 20-user prefix arms of the campaign to beat round-robin's tail, by a margin no
-other configuration came within 50 points of. Read with the earlier legs: the request distribution is
+**Verdict: ✅ consistent improvement, −57.5% median P99 (IQR −58.9…−56.3), 3/3 across both arm
+orders.** This is the acceptance for the 13B 20-user row and the first 20-user prefix arms of the
+campaign to beat round-robin's tail, by a margin no other configuration came within 50 points of.
+P50 −28 to −29% (the campaign's usual), KV hits 69–73% (the highest of any 20-user arm), both the
+large-hit and large-miss P99 down by more than half, and the prefix arm completed 10–11% more
+requests in the same ten minutes, so the closed-loop confound ran against the result. Read with the earlier legs: the request distribution is
 *still* uneven (Gini 0.116, busiest backend 17% of requests, the same placement draw as v1–v4),
 yet the tail collapsed. Request count per backend was never the tail; queue depth was, and a
 divert policy that sees the queue live and only acts at 2× the mean removes the queue without
@@ -446,15 +450,16 @@ placement, diverting 29% of requests and giving back the affinity; ε 1.0 is the
 that was missing. The prefix arm also completed 10% more requests in the same 10 minutes, so
 the closed-loop confound ran *against* this result.
 
-**Resume checklist (if the box is still up, else next GPU session):**
+**Resume checklist:**
 
-1. Combo leg, 20u ×3: placement (no split) + live in-flight load signal + calibrated epsilon.
-   `RANVIER_ROUTING_GPU_LOAD_WEIGHT=0 RANVIER_CAPACITY_HEADROOM_WEIGHT=0 RANVIER_CROSS_SHARD_LOAD_SYNC=true`
-   with `--miss-placement least_loaded --bounded-load-epsilon 1.0`. Check the manifest shows
-   `cross_shard_load_sync: true` and `gpu_load_weight: 0`. Read diverts (expect well under 25%),
-   then P99. A negative ×3 here is the acceptance; anything else closes the 13B 20u row as "no
-   reliable effect, mechanism known" (BACKLOG §27) and the remaining levers are features (a)/(b).
-2. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
+1. **Isolation leg** (`--miss-placement hash --bounded-load-epsilon 1.0`, same in-flight env,
+   20u ×3): the combo minus placement. Hash matching the combo (≤ −50%) means the shipping change
+   is two routing defaults, the in-flight signal and ε 1.0, with no placement knob; hash clearly
+   worse means least-loaded placement and its convergence fixes are load-bearing and become a
+   third default.
+2. **Confirm nothing else regressed under the new defaults:** 8B 20u (was −17%) and 13B 10u and
+   30u with the same env, one rep each at first. The 10u row is where ε 0.25 over-diverted before.
+3. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
    aggregates, manifests, `prometheus_metrics_node*.txt`, `ranvier_node*.log`) **before**
    terminating the instance.
 
@@ -480,11 +485,12 @@ now shows were measured in an eviction regime.
 
 ## Still open
 
-- **13B 20-user fitted regression: re-run `--suite placement` on the token-weighted,
-  eager-learn build** (BACKLOG §27; resume checklist above). Leg A settled the mechanism as
-  hash placement; the least-loaded diversion fix and the count-weighted placement build both
-  failed their acceptance runs; leg B showed a real-time load signal helps diversion at the
-  cost of affinity and that ε 0.25 is uncalibrated for small-integer loads.
+- **13B 20-user fitted regression: resolved by the combo leg (2026-10-05): −60.4 / −57.5 /
+  −55.2% P99** with the node-local in-flight load signal (`RANVIER_CROSS_SHARD_LOAD_SYNC=true`,
+  GPU-score and headroom weights 0) and `bounded_load_epsilon` 1.0 on top of split-free
+  least-loaded placement. Open: the isolation leg (same without placement) decides whether the
+  shipping change is two defaults or three; then one rep each of 8B 20u, 13B 10u and 13B 30u
+  under the new defaults (resume checklist above).
 - **Leg V1, epsilon** (`bench-runner.sh --suite epsilon`): the shipped file sweeps ε 0.5
   (looser). The fitted result says looser strands more capacity; sweep *tighter* (0.1) instead,
   on the fitted set, after the diversion fix. The factor/floor "threshold leg" (BACKLOG §25

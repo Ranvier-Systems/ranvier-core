@@ -1467,7 +1467,14 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   tally, was balanced within one route-unit, and traffic still ran 1.5–1.8× busiest/quietest.
   A placement weight derived from the route table cannot balance this workload. Placement line
   closed; convergence fixes stay. Remaining levers: route weight carried over gossip (estimated
-  prompt tokens or hits), replication, or the live-queue divert policy (combo leg).** Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
+  prompt tokens or hits), replication, or the live-queue divert policy (combo leg).**
+  **Combo leg (2026-10-05, split-free placement + `RANVIER_CROSS_SHARD_LOAD_SYNC=true`, GPU-score
+  and headroom weights 0, ε 1.0): −60.4 / −57.5 / −55.2% P99, P50 −28..−29%, KV 69–73%, diverts
+  23–27%, +10% req/s, 3/3 across arm orders — the 13B 20u row's acceptance. Request Gini stayed
+  0.09–0.12: the tail was queue depth, not request count, and a divert policy that sees the queue
+  live and acts only at 2× the mean removes it without giving back affinity (consistency 50–53%).
+  Next: isolation leg (hash placement, same signal and ε) to decide whether the shipping change is
+  two defaults or three; then 8B 20u / 13B 10u / 13B 30u under the new defaults.** Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
   0.080 — the count-weighted build is a consistent regression (+6.6, +25.1, +13.3) with worse
   affinity than the default in all three. Leg B (in-flight signal, default placement): +14.2, −1.0
   (rep 2 lost to a silent compose failure, since fixed) — a real-time signal helps diversion at
