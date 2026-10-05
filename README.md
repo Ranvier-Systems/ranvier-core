@@ -92,6 +92,20 @@ A follow-up "fitted" suite (October 2026) shrank the prefix set to 16 prefixes t
 
 **What this does and does not show.** Prefix routing reliably improves tail latency for prefix-heavy traffic on a busy fleet whose caches can hold the hot set. It has not been shown to help, and may hurt, when the fleet is under KV-cache pressure or when a few prefixes carry most of the traffic, because affinity can leave one backend with a longer queue than round-robin would. It has not been compared head-to-head with other prefix-aware routers or with a least-loaded policy without affinity.
 
+### October 5 2026: new routing defaults (13B rows resolved)
+
+The 13B regression above was traced to the divert policy, not to prefix affinity: bounded-load diversion read a 5-second-stale GPU score plus one shard's share of a node's in-flight count, and at ε 0.25 it diverted 25–30% of requests without reaching the tail. The defaults now read the node's live in-flight count, divert only at twice the mean (ε 1.0), and place new prefixes least-loaded with cluster-wide convergence. Same fleet and method as the re-baseline, fitted prefix set (16 prefixes × 2,000–4,000 tokens) where noted; **the three-repeat rows are citable, the one-repeat rows are confirmation and will be re-run at three repeats.**
+
+| Model, load | KV hit rate, round-robin → prefix | P99 TTFT vs round-robin | P50 TTFT | Repeats |
+|---|---|---|---|---|
+| CodeLlama-13B, 20 users, fitted | 12–14% → **69–73%** | **−57.5%** median (−60.4, −57.5, −55.2) | −28% | 3, both arm orders |
+| CodeLlama-13B, 20 users, fitted, hash placement (isolation) | 10–14% → 49–55% | −51.8% median (−48.4, −51.8, −53.5) | −28% | 3 |
+| CodeLlama-13B, 10 users, fitted | 17% → 82% | −34.5% | −30% | 1 |
+| Llama-3.1-8B, 20 users | 72% → 96% | −22.6% | −1% | 1 |
+| CodeLlama-13B, 30 users, 30 min (eviction regime) | 6% → 23% | −16.4% excl. 1.4–1.6% timeouts in both arms | −20% | 1 |
+
+The request distribution across backends stays uneven under prefix affinity (Gini 0.09–0.12 vs 0.02–0.03 for round-robin); the tail was queue depth, not request count, and a divert policy that sees the queue live removes it without giving back affinity (route consistency 50–53%). Full record, counters and every intermediate leg: [benchmark-results-current.md](docs/benchmarks/benchmark-results-current.md).
+
 ### February 2026 campaign (superseded)
 
 5-prefix workload, 30-minute runs. Earlier release notes and posts cite these figures. Treat them as an upper bound from a favourable synthetic case, not as expected results.
