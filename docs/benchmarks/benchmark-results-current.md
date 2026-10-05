@@ -421,6 +421,30 @@ means a gossip wire change so every node weighs the same — or (b) replication 
 or (c) a divert policy with a live queue signal (leg B rep 3 was the one near-zero 20u prefix arm).
 (c) is the only one that is an experiment rather than a feature: the combo leg below.
 
+### Combo leg: split-free placement + live in-flight signal + ε 1.0 (2026-10-05)
+
+Same box and image as v4, 13B 20 users, `RANVIER_ROUTING_GPU_LOAD_WEIGHT=0
+RANVIER_CAPACITY_HEADROOM_WEIGHT=0 RANVIER_CROSS_SHARD_LOAD_SYNC=true` with
+`--miss-placement least_loaded --bounded-load-epsilon 1.0` (manifest checked: all four recorded).
+Bounded-load reads node-local in-flight requests instead of the 5 s-stale scraped score, and the
+cap is twice the average rather than 1.25×.
+
+| Rep | P99 TTFT | P50 TTFT | Route consistency | KV hit (prefix) | Diverts | Prefix-arm Gini | Large hit / miss P99 | req/s |
+|-----|----------|----------|-------------------|-----------------|---------|-----------------|----------------------|-------|
+| 1 (rr-first) | **−60.4%** (3712 → 1471 ms) | −28.9% | 52.7% | **68.9%** | 22.6% | 0.116 | −55.6% / −53.0% | +10.1% |
+
+One rep; reps 2–3 pending. If they agree this is the acceptance for the 13B 20-user row and
+the first 20-user prefix arm of the campaign to beat round-robin's tail, by a margin no other
+configuration came within 50 points of. Read with the earlier legs: the request distribution is
+*still* uneven (Gini 0.116, busiest backend 17% of requests, the same placement draw as v1–v4),
+yet the tail collapsed. Request count per backend was never the tail; queue depth was, and a
+divert policy that sees the queue live and only acts at 2× the mean removes the queue without
+removing affinity (consistency 53% against 57% for the no-divert placement arms, KV hits the
+highest of any 20-user arm). Leg B rep 3 (−1.0%) was the same signal with ε 0.25 and hash
+placement, diverting 29% of requests and giving back the affinity; ε 1.0 is the calibration
+that was missing. The prefix arm also completed 10% more requests in the same 10 minutes, so
+the closed-loop confound ran *against* this result.
+
 **Resume checklist (if the box is still up, else next GPU session):**
 
 1. Combo leg, 20u ×3: placement (no split) + live in-flight load signal + calibrated epsilon.
