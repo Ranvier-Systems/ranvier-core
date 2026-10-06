@@ -61,8 +61,8 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 |--------|----------|-------|
 | **Radix Tree Lookup** | < 50μs | Pure routing decision, O(L) in prefix length; component micro-benchmark (`make bench-hot-prefix`) |
 | **Per-request Routing Decision** | ~0.2 ms P50, ~10 ms P99 | Router-side time including tokenization (the P99 is boundary-detection tokenization); Prometheus histogram estimates from the October 2026 13B fitted suite, the same at 10 and 20 users ([raw compare files](docs/benchmarks/results/2026-10-02-fitted/)) |
-| **KV-cache hit rate vs round-robin** | 72% → 94% (8B) | vLLM's own prefix-cache counter; 13B rose too (e.g. 17% → 65% on a prefix set that fits its cache) |
-| **P99 TTFT vs round-robin** | −17% (8B) … −58% (13B, 20 users) under the October 5 defaults; −17% … +11% under the previous ones | Depends on model, KV headroom and load: see [Benchmark Results](#benchmark-results) |
+| **KV-cache hit rate vs round-robin** | 72% → 94% (8B); 12% → 70% (13B) | vLLM's own prefix-cache counter, token-level, median of three repeats |
+| **P99 TTFT vs round-robin** | −17% (8B) · −57% (13B, 20 users) | Median of three repeats, both arm orders. Earlier campaigns regressed the 13B row; the diagnosis and every intermediate run are in [Benchmark Results](#benchmark-results) |
 
 Figures from the superseded February and July 2026 campaigns (such as "58–98% cache hit rate", "~7 ms P50 overhead", "~2–16 ms overhead" and "+29% P99 at low load") are no longer quoted here; see [Benchmark Results](#benchmark-results) for why.
 
