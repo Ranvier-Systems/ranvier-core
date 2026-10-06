@@ -577,9 +577,12 @@ nothing to do.
 2. The 13B 30u/30m row times out in both arms (eviction regime, 50 prefixes × 2000–8000 tokens
    against 11.6k tokens of KV per backend). Add a fitted 30-user row (`--num-prefixes 16
    --prefix-max-tokens 4000`) so the high-load regime has a valid measurement.
-3. Archive every run directory into `docs/benchmarks/results/<date>-<leg>/` (compare files,
-   aggregates, manifests, `prometheus_metrics_node*.txt`, `ranvier_node*.log`) **before**
-   terminating the instance. Outstanding from this box: placement-v4, combo, isolate, confirm.
+3. Archive every run directory's summaries with
+   `./scripts/bench-archive.sh <run-dir> <date>-<leg>` (compare files, runner summary,
+   aggregates, per-arm manifests, prefix-arm Prometheus dumps; `--with-logs` for the per-node
+   Ranvier logs, `--date-prefix YYYYMMDD` for a directory holding several campaigns) **before**
+   terminating the instance, and tar the raw run directories onto the release as an asset
+   (`gh release upload vX.Y.Z <tarball>`): a suite is 50–100 MB raw and a few hundred KB summarised.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
