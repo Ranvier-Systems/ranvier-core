@@ -10,8 +10,8 @@
 #     the PR ref rather than the published :latest tag.
 #
 # Fail conditions:
-#   - P99 latency regresses >10% AND by >3 ms (the mock-backend P99 is ~20 ms,
-#     so the percentage alone is inside runner jitter)
+#   - P99 latency regresses >10% AND by >10 ms (the mock-backend P99 is ~20 ms
+#     and swings 8..30 ms run to run on identical code)
 #   - Throughput drops >5%
 #
 # NOTE: Uses pre-built ranvier image from GHCR by default to avoid long C++
@@ -61,7 +61,10 @@ env:
   P99_REGRESSION_THRESHOLD: 10
   # P99 fails only when it regresses by more than the percentage AND this many
   # milliseconds. The mock-backend P99 is ~20 ms, so 10% alone is 2 ms: jitter.
-  P99_ABS_FLOOR_MS: 3
+  # Observed on identical code (2026-10-01..06, one 4-vCPU runner hosting three
+  # Ranvier nodes, two mock backends and Locust): 8, 10, 17, 18, 20, 20, 24, 27
+  # and 30 ms, with failures that a re-run of the same image did not reproduce.
+  P99_ABS_FLOOR_MS: 10
   THROUGHPUT_REGRESSION_THRESHOLD: 5
 
 jobs:
