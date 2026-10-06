@@ -1,12 +1,12 @@
 # Ranvier Core
 
-> **Prefix-aware routing for self-hosted LLM fleets, in C++20 on Seastar.** On the representative 50-prefix workload (8×A100, October 2026) it raised vLLM's KV-cache hit rate from 72% to 94% and cut P99 time-to-first-token by 17% on Llama-3.1-8B. On CodeLlama-13B the first campaign regressed P99 by about 10% at 20 users; that was traced to the load-divert policy reading a stale signal at too tight a threshold, and under the defaults shipped on October 5 the same configuration cut P99 by 55–60% (three repeats) with KV hits rising from 12% to 70%.
+> **Prefix-aware routing for self-hosted LLM fleets, in C++20 on Seastar.** Ranvier sends requests that share a prompt prefix to the backend that already holds it in KV cache, and diverts only when a backend is genuinely queued. Against round-robin on an 8×A100 fleet that raises vLLM's prefix-cache hit rate four to five times and cuts P99 time-to-first-token by 17% on Llama-3.1-8B and 57% on CodeLlama-13B. Every number, and the campaign that produced it: [Benchmark Results](#benchmark-results).
 >
 > *Named for the Nodes of Ranvier—enabling signals to jump gaps, just as Ranvier enables inference to skip redundant computation.*
 
 A high-performance LLM traffic controller that reduces GPU cache thrashing by routing requests based on **Token Prefixes** rather than connection availability.
 
-**Best for:** RAG, multi-turn chat with system prompts, few-shot learning. **Less benefit for:** short prompts (<500 tokens), small models (<8B).
+**Best for:** RAG with shared context, multi-turn chat with large system prompts, few-shot prompts with shared examples; any workload with 2K+ token shared prefixes. **Less benefit for:** short prompts, or a fleet whose KV cache cannot hold its share of the shared prefixes (both arms then run cache-cold).
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://isocpp.org/)
@@ -51,7 +51,7 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 ### Key Architecture
 * **Adaptive Radix Tree (ART):** Uses a cache-oblivious Radix Tree to map `TokenPrefix -> GPU_ID`. Lookups are $O(L)$ where $L$ is the prefix length, independent of total keys.
 * **Seastar Framework:** Built on a shared-nothing, thread-per-core architecture. No locks, no atomics, massive concurrency.
-* **Model Agnostic:** Uses HuggingFace `tokenizer.json` definitions to adapt to any model architecture (Llama 3, Mistral, GPT-4o) dynamically.
+* **Model Agnostic:** Uses HuggingFace `tokenizer.json` definitions to adapt to any model architecture (Llama 3, Mistral, Qwen, Kimi) dynamically.
 
 ---
 
@@ -61,23 +61,37 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 |--------|----------|-------|
 | **Radix Tree Lookup** | < 50μs | Pure routing decision, O(L) in prefix length; component micro-benchmark (`make bench-hot-prefix`) |
 | **Per-request Routing Decision** | ~0.2 ms P50, ~10 ms P99 | Router-side time including tokenization (the P99 is boundary-detection tokenization); Prometheus histogram estimates from the October 2026 13B fitted suite, the same at 10 and 20 users ([raw compare files](docs/benchmarks/results/2026-10-02-fitted/)) |
-| **KV-cache hit rate vs round-robin** | 72% → 94% (8B) | vLLM's own prefix-cache counter; 13B rose too (e.g. 17% → 65% on a prefix set that fits its cache) |
-| **P99 TTFT vs round-robin** | −17% (8B) … −58% (13B, 20 users) under the October 5 defaults; −17% … +11% under the previous ones | Depends on model, KV headroom and load: see [Benchmark Results](#benchmark-results) |
+| **KV-cache hit rate vs round-robin** | 72% → 94% (8B); 12% → 70% (13B) | vLLM's own prefix-cache counter, token-level, median of three repeats |
+| **P99 TTFT vs round-robin** | −17% (8B) · −57% (13B, 20 users) | Median of three repeats, both arm orders. Earlier campaigns regressed the 13B row; the diagnosis and every intermediate run are in [Benchmark Results](#benchmark-results) |
 
 Figures from the superseded February and July 2026 campaigns (such as "58–98% cache hit rate", "~7 ms P50 overhead", "~2–16 ms overhead" and "+29% P99 at low load") are no longer quoted here; see [Benchmark Results](#benchmark-results) for why.
 
 **Design Principles:**
 * **Minimized Copying:** Uses `string_view` parsing with single network buffer copy; Radix lookups use `std::span` for zero-copy token access.
 * **Shared-Nothing Architecture:** Thread-per-core via Seastar; no locks on the hot path. Each shard maintains its own routing tree.
-* **Near-Linear Scaling:** Throughput scales well up to 4-8 cores; diminishing returns beyond due to cross-shard route learning broadcasts.
+* **Per-Core Independence:** Each shard owns its routing tree and in-flight counts; the only cross-shard traffic is the batched route flush (every 20 ms) and the in-flight load broadcast (every 100 ms).
 
 ---
 
 ## Benchmark Results
 
-Three campaigns have been run on 8×A100 hardware. **The October 2026 re-baseline is the citable one.** The July 2026 campaign was measured before a tooling audit found that its arms were not isolated (routing state carried across arms, different prefixes per arm) and its labels were wrong (event counts as req/s, route consistency as "cache hit"); only its 8B row reproduced on fixed tooling, and its 13B rows (including a +29% P99 regression at 10 users) did not. The February 2026 numbers came from a 5-prefix synthetic workload that the project's own methodology review found manufactures much of the headline win. Neither earlier campaign should be quoted as expected results.
+Four campaigns have been run on 8×A100 hardware. **The October 2026 results are the citable ones:** the current-defaults table for what 2.2.0 does, the October 1 re-baseline for the previous defaults it replaced. The July 2026 campaign was measured before a tooling audit found that its arms were not isolated (routing state carried across arms, different prefixes per arm) and its labels were wrong (event counts as req/s, route consistency as "cache hit"); only its 8B row reproduced on fixed tooling, and its 13B rows (including a +29% P99 regression at 10 users) did not. The February 2026 numbers came from a 5-prefix synthetic workload that the project's own methodology review found manufactures much of the headline win. Neither earlier campaign should be quoted as expected results.
 
-### October 1 2026 re-baseline (citable; previous routing defaults)
+### Current routing defaults (2.2.0, measured October 2026)
+
+Under the previous defaults (next section) CodeLlama-13B regressed at 20 users in every campaign. The cause was the divert policy, not prefix affinity: bounded-load diversion read a 5-second-stale GPU score plus one shard's share of a node's in-flight count, and at ε 0.25 it diverted 25–30% of requests without reaching the tail. The defaults now read the node's live in-flight count, divert only at twice the mean (ε 1.0), and place new prefixes least-loaded with cluster-wide convergence. Same fleet and method as the re-baseline; fitted prefix set (16 prefixes × 2,000–4,000 tokens) where noted. **The three-repeat rows are citable; the one-repeat rows are confirmation and will be re-run at three repeats.**
+
+| Model, load | KV hit rate, round-robin → prefix | P99 TTFT vs round-robin | P50 TTFT | Repeats |
+|---|---|---|---|---|
+| CodeLlama-13B, 20 users, fitted | 12–14% → **69–73%** | **−57.5%** median (−60.4, −57.5, −55.2) | −28% | 3, both arm orders |
+| CodeLlama-13B, 20 users, fitted, hash placement (isolation) | 10–14% → 49–55% | −51.8% median (−48.4, −51.8, −53.5) | −28% | 3 |
+| CodeLlama-13B, 10 users, fitted | 17% → 82% | −34.5% | −30% | 1 |
+| Llama-3.1-8B, 20 users | 72% → 96% | −22.6% | −1% | 1 |
+| CodeLlama-13B, 30 users, 30 min (eviction regime) | 6% → 23% | −16.4% excl. 1.4–1.6% timeouts in both arms | −20% | 1 |
+
+The request distribution across backends stays uneven under prefix affinity (Gini 0.09–0.12 vs 0.02–0.03 for round-robin); the tail was queue depth, not request count, and a divert policy that sees the queue live removes it without giving back affinity (route consistency 50–53%). Full record, counters and every intermediate leg: [benchmark-results-current.md](docs/benchmarks/benchmark-results-current.md).
+
+### Previous routing defaults: October 1 2026 re-baseline
 
 Representative workload: 50 shared prefixes of 2,000–8,000 tokens; prefix-aware routing against round-robin on the same fleet; three repeats per configuration, alternating arm order; every repeat must agree for a verdict. KV hit rate is vLLM's own prefix-cache counter. Write-up with per-repeat numbers: [benchmark-results-current.md](docs/benchmarks/benchmark-results-current.md).
 
@@ -90,23 +104,9 @@ Representative workload: 50 shared prefixes of 2,000–8,000 tokens; prefix-awar
 
 The deciding variable is whether a backend's KV cache can hold its share of the hot prefix set. On a 40 GB A100 an 8B backend holds about 142,000 tokens, so the 250,000-token set fits when split eight ways but not in one place: round-robin is already mostly cache-warm, affinity recovers the rest, and under a 20-user queue that is a sixth off the tail. A 13B backend holds about 11,600 tokens, less than its share of the set and, at 30 users, less than the in-flight requests alone; both arms run nearly cache-cold under constant preemption, and the routing policy's effect is small and unstable. The 13B regression at 20 users is consistent across repeats.
 
-A follow-up "fitted" suite (October 2026) shrank the prefix set to 16 prefixes that fit the 13B cache. At 10 users prefix routing then improved P99 by 5.8% (median, all three repeats agreeing) with KV hits rising from 17% to 65%. At 20 users P99 still regressed by about 10% while P50 improved about 25%. With all load diversion switched off the regression stayed, which places the cause in prefix placement: hashing 16 prefixes onto 8 backends gave one backend four prefixes and another none, and the busiest backend's queue sets the tail. Least-loaded placement of new prefixes (`routing.miss_placement: least_loaded`, off by default) is being tested as the fix; see [benchmark-results-current.md](docs/benchmarks/benchmark-results-current.md) for each run.
+A follow-up "fitted" suite (October 2026) shrank the prefix set to 16 prefixes that fit the 13B cache. At 10 users prefix routing then improved P99 by 5.8% (median, all three repeats agreeing) with KV hits rising from 17% to 65%. At 20 users P99 still regressed by about 10% while P50 improved about 25%. With all load diversion switched off the regression stayed, which places the cause in prefix placement: hashing 16 prefixes onto 8 backends gave one backend four prefixes and another none, and the busiest backend's queue sets the tail. Least-loaded placement of new prefixes became part of the fix and is the default since 2.2.0; the rest of the diagnosis is in the current-defaults section above, and every run is in [benchmark-results-current.md](docs/benchmarks/benchmark-results-current.md).
 
-**What this does and does not show.** Prefix routing reliably improves tail latency for prefix-heavy traffic on a busy fleet whose caches can hold the hot set, and under the October 5 defaults (next section) it did so on every configuration measured, including the 13B rows that regressed here. Affinity does concentrate requests unevenly across backends (the per-backend request Gini is 3–5× round-robin's in every prefix arm); what decides the tail is whether the divert policy sees the resulting queue live and acts only on a real one. The eviction regime (13B at 30 users, 50 prefixes) is still measured with timeouts in both arms, so its number is directional. It has not been compared head-to-head with other prefix-aware routers or with a least-loaded policy without affinity.
-
-### October 5 2026: new routing defaults (13B rows resolved)
-
-The 13B regression above was traced to the divert policy, not to prefix affinity: bounded-load diversion read a 5-second-stale GPU score plus one shard's share of a node's in-flight count, and at ε 0.25 it diverted 25–30% of requests without reaching the tail. The defaults now read the node's live in-flight count, divert only at twice the mean (ε 1.0), and place new prefixes least-loaded with cluster-wide convergence. Same fleet and method as the re-baseline, fitted prefix set (16 prefixes × 2,000–4,000 tokens) where noted; **the three-repeat rows are citable, the one-repeat rows are confirmation and will be re-run at three repeats.**
-
-| Model, load | KV hit rate, round-robin → prefix | P99 TTFT vs round-robin | P50 TTFT | Repeats |
-|---|---|---|---|---|
-| CodeLlama-13B, 20 users, fitted | 12–14% → **69–73%** | **−57.5%** median (−60.4, −57.5, −55.2) | −28% | 3, both arm orders |
-| CodeLlama-13B, 20 users, fitted, hash placement (isolation) | 10–14% → 49–55% | −51.8% median (−48.4, −51.8, −53.5) | −28% | 3 |
-| CodeLlama-13B, 10 users, fitted | 17% → 82% | −34.5% | −30% | 1 |
-| Llama-3.1-8B, 20 users | 72% → 96% | −22.6% | −1% | 1 |
-| CodeLlama-13B, 30 users, 30 min (eviction regime) | 6% → 23% | −16.4% excl. 1.4–1.6% timeouts in both arms | −20% | 1 |
-
-The request distribution across backends stays uneven under prefix affinity (Gini 0.09–0.12 vs 0.02–0.03 for round-robin); the tail was queue depth, not request count, and a divert policy that sees the queue live removes it without giving back affinity (route consistency 50–53%). Full record, counters and every intermediate leg: [benchmark-results-current.md](docs/benchmarks/benchmark-results-current.md).
+**What this does and does not show.** Prefix routing reliably improves tail latency for prefix-heavy traffic on a busy fleet whose caches can hold the hot set, and under the current defaults (above) it did so on every configuration measured, including the 13B rows that regressed here. Affinity does concentrate requests unevenly across backends (the per-backend request Gini is 3–5× round-robin's in every prefix arm); what decides the tail is whether the divert policy sees the resulting queue live and acts only on a real one. The eviction regime (13B at 30 users, 50 prefixes) is still measured with timeouts in both arms, so its number is directional. It has not been compared head-to-head with other prefix-aware routers or with a least-loaded policy without affinity.
 
 ### February 2026 campaign (superseded)
 
@@ -120,8 +120,6 @@ The request distribution across backends stays uneven under prefix affinity (Gin
 
 <sub>Hardware: 70B on 80GB A100s (TP=2, 4 backends); 13B/8B on 40GB A100s (8 backends).</sub>
 
-**Best suited for:** RAG with shared context documents, multi-turn chat with large system prompts, few-shot prompts with shared examples, and any workload with 2K+ token shared prefixes on a fleet that runs hot.
-
 See the [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for methodology and [Benchmark Reproduction](docs/guides/benchmark-reproduction.md) to run it yourself.
 
 ---
@@ -129,7 +127,7 @@ See the [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for methodo
 ## Architecture & Capabilities
 
 **Shipped in 2.2.0 (2026-10-06):**
-- Routing defaults that read the node's live in-flight count, divert only at twice the mean, and place new prefixes least-loaded with cluster-wide convergence: CodeLlama-13B at 20 users went from +11% to −57.5% P99 TTFT against round-robin (three repeats), and no measured configuration regressed
+- Routing defaults that read the node's live in-flight count, divert only at twice the mean, and place new prefixes least-loaded with cluster-wide convergence; measured in [Benchmark Results](#benchmark-results)
 - A unified weighted route scorer replacing the sequential override chain, with per-signal weights
 - Gateway API Inference Extension Endpoint-Picker mode (build-gated, off by default), with an integration test and an overhead microbenchmark
 - Native vLLM KV-event subscriber: verified residency, route materialization and replay (opt-in, not yet exercised on GPU hardware)
@@ -167,20 +165,27 @@ Other backends with prefix/KV cache reuse (SGLang RadixAttention, TensorRT-LLM, 
 ---
 
 ## Configuration
-Ranvier maps generic HTTP endpoints to specific Tokenizer/Model backends.
+
+A minimal config: where to listen, which tokenizer matches the served model, how to route, and the backends. Static backends as below, or Kubernetes EndpointSlice discovery instead (see [Deployment](#deployment)). Every key and its default is in `src/config_schema.hpp`; every key can also be set by a `RANVIER_*` environment variable.
 
 ```yaml
 # config.yaml
-routes:
-  - path: "/v1/chat/completions"
-    model: "meta-llama/Meta-Llama-3-8B"
-    backend_pool: "h100-cluster-a"
-    # Ranvier uses this to tokenize the raw HTTP body
-    tokenizer_config: "./tokenizers/llama-3.json"
+server:
+  api_port: 8080
+  metrics_port: 9180
 
-    # Optimization settings
-    min_prefix_length: 64   # Don't route on "Hello", wait for context
-    block_alignment: 16     # Align with vLLM PagedAttention blocks
+assets:
+  tokenizer_path: ./assets/llama-3.json   # the served model's HuggingFace tokenizer.json
+
+routing:
+  routing_mode: prefix          # prefix | hash | random
+  prefix_token_length: 128      # routing-key depth when no system-message boundary is found
+  block_alignment: 16           # vLLM PagedAttention block size
+  min_token_length: 32          # do not learn routes for very short prompts
+
+backends:
+  - { id: 1, host: 10.0.0.11, port: 8000 }
+  - { id: 2, host: 10.0.0.12, port: 8000 }
 ```
 
 ```mermaid
@@ -192,8 +197,8 @@ graph TD
         Tokenizer -->|Tokens| Radix["Radix Tree (ART)"]
         Radix -->|Lookup| Cache{"Known Prefix?"}
         Cache -- Yes --> Route["Route to Cached Backend"]
-        Cache -- No --> Hash["Consistent Hash (FNV-1a)"]
-        Hash --> Route
+        Cache -- No --> Place["Least-loaded placement (hash fallback)"]
+        Place --> Route
         Route -->|Learn| Radix
     end
 
