@@ -1,6 +1,6 @@
 # Ranvier Core
 
-> **Prefix-aware routing for self-hosted LLM fleets, in C++20 on Seastar.** On the representative 50-prefix workload (8×A100, October 2026) it raised vLLM's KV-cache hit rate from 72% to 94% and cut P99 time-to-first-token by 17% on Llama-3.1-8B. On CodeLlama-13B the first campaign regressed P99 by about 10% at 20 users; that was traced to the load-divert policy reading a stale signal at too tight a threshold, and under the defaults shipped on October 5 the same configuration cut P99 by 55–60% (three repeats) with KV hits rising from 12% to 70%.
+> **Prefix-aware routing for self-hosted LLM fleets, in C++20 on Seastar.** Ranvier sends requests that share a prompt prefix to the backend that already holds it in KV cache, and diverts only when a backend is genuinely queued. Against round-robin on an 8×A100 fleet that raises vLLM's prefix-cache hit rate four to five times and cuts P99 time-to-first-token by 17% on Llama-3.1-8B and 57% on CodeLlama-13B. Every number, and the campaign that produced it: [Benchmark Results](#benchmark-results).
 >
 > *Named for the Nodes of Ranvier—enabling signals to jump gaps, just as Ranvier enables inference to skip redundant computation.*
 
