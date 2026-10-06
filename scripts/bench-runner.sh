@@ -9,10 +9,10 @@
 # Usage:
 #   ./scripts/bench-runner.sh                          # Default: --suite rebaseline (x3 repeats)
 #   ./scripts/bench-runner.sh --suite rebaseline       # The citable 4-config matrix, A/B, x3
-#   ./scripts/bench-runner.sh --suite epsilon          # Leg V1: bounded-load epsilon 0.5, x3
-#   ./scripts/bench-runner.sh --suite fitted           # 13B (10u, 20u) with a prefix set that fits its KV cache, x3
+#   ./scripts/bench-runner.sh --suite epsilon          # Historical Leg V1: bounded-load epsilon 0.5, x3
+#   ./scripts/bench-runner.sh --suite fitted           # 13B (10u, 20u, 30u) with a prefix set that fits its KV cache, x3
 #   ./scripts/bench-runner.sh --suite low              # Exploratory: 70B, 64-user stress
-#   ./scripts/bench-runner.sh --suite all              # rebaseline + epsilon + low
+#   ./scripts/bench-runner.sh --suite all              # rebaseline + epsilon + fitted + low
 #   ./scripts/bench-runner.sh --suite custom --file runs.txt  # Custom run file
 #   ./scripts/bench-runner.sh --dry-run                # Preview what would run
 #   ./scripts/bench-runner.sh --resume 3               # Resume from run #3
@@ -266,6 +266,9 @@ BUILT-IN SUITES:
       The 2026-07-13 headline matrix, re-run on the fixed tooling (audit
       2026-09-30: routing DB no longer carried across arms, seeded prefix
       pool, exact TTFT percentiles, route consistency + KV hit rate).
+      Unflagged, so the prefix arm runs whatever defaults the image ships
+      (2.2.0: epsilon 1.0, live in-flight signal, least-loaded placement).
+      Run it after every defaults change; it is the citable README table.
       1. 8B  20 users 10m   --compare --warmup
       2. 13B 30 users 30m   --compare --warmup
       3. 13B 20 users 10m   --compare --warmup
@@ -274,9 +277,12 @@ BUILT-IN SUITES:
       aggregate prints CONSISTENT IMPROVEMENT for 1 and 2 and CONSISTENT
       REGRESSION for 4. MIXED or NO RELIABLE EFFECT is reported as such.
 
-    epsilon (2 configs x 2 arms x 3 repeats, ~4h) — Leg V1 of the load-gating
-      proposal, with the knob that actually moves diversion under the shipped
-      bounded_load strategy (--bounded-load-epsilon 0.5 vs the 0.25 default):
+    epsilon (2 configs x 2 arms x 3 repeats, ~4h) — HISTORICAL. Leg V1 of the
+      load-gating proposal, designed when 0.25 was the default: the knob that
+      actually moves diversion under the shipped bounded_load strategy
+      (--bounded-load-epsilon 0.5 vs the then-default 0.25). Since 2.2.0 the
+      default is 1.0, so this suite now pins a TIGHTER threshold than
+      shipping; the open question is 0.1 on the fitted set, not 0.5.
       5. 13B 30 users 30m   --compare --warmup --bounded-load-epsilon 0.5
       6. 13B 10 users 10m   --compare --warmup --bounded-load-epsilon 0.5
       The treatment is each run's PREFIX arm; compare it against the
@@ -286,7 +292,7 @@ BUILT-IN SUITES:
       rate regression; record whether it WORSENS 13B/10u (Option 0 evidence).
       For the factor/floor variant add --hash-strategy jump, or bench.sh refuses.
 
-    fitted (2 configs x 2 arms x 3 repeats, ~3h) — 13B in the regime where routing
+    fitted (3 configs x 2 arms x 3 repeats, ~6.5h) — 13B in the regime where routing
       can matter. The rebaseline 13B rows run a ~250k-token hot set against
       ~11.6k tokens of KV per backend (measured 2026-10-01 on A100-40GB: KV
       hit rate 5% round-robin vs 14% prefix at 30 users, with preemptions),
@@ -297,13 +303,20 @@ BUILT-IN SUITES:
       8. 13B 20 users 10m   same set. Marginal: ~6k share + ~7.5k in-flight
          slightly exceeds 11.6k, so expect some eviction; it is the load
          gradient point between row 7 and the rebaseline rows, not a clean fit.
-      Compare row 7 with rebaseline row 4 and row 8 with rebaseline row 3 (same
-      load, default set). If the low-load regression persists on the fitted
-      set, it is not a cache-capacity artefact.
+      9. 13B 30 users 30m   same set. The rebaseline 30u row times out in both
+         arms (eviction regime: 50 prefixes x 2000..8000 tokens against 11.6k
+         KV tokens per backend); this row gives the high-load regime a
+         measurement without timeouts. Added 2026-10-06, not yet measured.
+      Compare row 7 with rebaseline row 4, row 8 with rebaseline row 3 and
+      row 9 with rebaseline row 2 (same load, default set). If the low-load
+      regression persists on the fitted set, it is not a cache-capacity
+      artefact. (Resolved 2026-10-05: it was the divert policy, see
+      docs/benchmarks/benchmark-results-current.md; rows 7 and 8 under the
+      2.2.0 defaults measured -34.5% and -57.5% median P99.)
 
     low (2 runs, exploratory, not part of any headline):
-      9.  70B model test (16 users, TP auto)
-      10. 8B high-concurrency stress (64 users, single arm)
+      10. 70B model test (16 users, TP auto)
+      11. 8B high-concurrency stress (64 users, single arm)
 
     all = rebaseline + epsilon + fitted + low.
 
@@ -316,9 +329,12 @@ BUILT-IN SUITES:
       - 8B 16K-prefix run: superseded by the KV-regime check (manifest now
         records each backend's KV capacity next to the prefix working set).
 
-    placement (2 configs x 2 arms x 3 repeats, ~3h) — the fitted 20u and 10u rows with
-      --miss-placement least_loaded: the acceptance test for least-loaded cache-miss
-      placement (BACKLOG section 27). Same binary as fitted; the knob is the A/B.
+    placement (2 configs x 2 arms x 3 repeats, ~3h) — HISTORICAL. The fitted 20u
+      and 10u rows with --miss-placement least_loaded: the acceptance test for
+      least-loaded cache-miss placement (BACKLOG section 27), run as v1..v4 on
+      2026-10-03..05. least_loaded is the default since 2.2.0, so this suite is
+      now identical to fitted on a 2.2.0 image; keep it for re-running the leg
+      against an older image or with --miss-placement hash on the rr arm.
 
     rebaseline, epsilon, fitted and placement default to --repeat 3; pass --repeat 1 for a smoke run.
 
@@ -389,7 +405,7 @@ done
 #   rebaseline = the citable 4-config A/B matrix        (--suite rebaseline, all)
 #   epsilon    = Leg V1 bounded-load epsilon 0.5 leg    (--suite epsilon, all)
 #   fitted     = 13B with a KV-fitting prefix set         (--suite fitted, all)
-#   placement  = fitted set, --miss-placement least_loaded (--suite placement)
+#   placement  = fitted set, --miss-placement least_loaded (--suite placement; historical, default since 2.2.0)
 #   low        = exploratory runs outside any headline  (--suite low, all)
 #
 # Run numbers are assigned in definition order within the selected suite.
@@ -436,8 +452,10 @@ define_runs() {
         --warmup --duration 10m --users 10 --max-model-len 8192
 
     # --- epsilon: Leg V1 (prefix-routing-load-gating-proposal.md §5) ----------
-    # Treatment = the prefix arm at epsilon 0.5; baseline = the rebaseline
-    # suite's prefix arm at the shipped 0.25 for the same config.
+    # Historical. Treatment = the prefix arm at epsilon 0.5; baseline = the
+    # rebaseline suite's prefix arm at the 0.25 that shipped before 2.2.0.
+    # The default is 1.0 since 2.2.0 (combo leg, 2026-10-05), so 0.5 is now
+    # tighter than shipping, not looser.
     add_run epsilon "13B 30u/30m A/B, bounded-load epsilon 0.5" \
         --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 30m --users 30 --max-model-len 8192 \
@@ -465,7 +483,20 @@ define_runs() {
         --warmup --duration 10m --users 20 --max-model-len 8192 \
         --num-prefixes 16 --prefix-max-tokens 4000
 
+    # Same set at 30 users for 30 minutes. The rebaseline 30u/30m row times out
+    # in both arms (eviction regime), so the high-load point of the matrix had
+    # no valid measurement; on the fitted set the hot set fits and the row
+    # reports real TTFT percentiles. Pairs with rebaseline row 2. Added
+    # 2026-10-06 (resume checklist item 2); not yet measured.
+    add_run fitted "13B 30u/30m A/B, fitted prefix set (16 x 2000..4000)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
     # --- placement: least-loaded cache-miss placement on the fitted set -----------
+    # Historical (v1..v4, 2026-10-03..05): least_loaded is the default since
+    # 2.2.0, so on a 2.2.0 image these rows are the fitted rows. Kept so the
+    # leg can be re-run against an older image.
     # Leg A (2026-10-02) showed the 13B 20u regression is hash placement itself:
     # pure affinity, zero diverts, +8..12% P99 with one backend at 23% of requests
     # and one at 0.6%. --miss-placement least_loaded places each new prefix on the

@@ -592,8 +592,10 @@ nothing to do.
    shipping configuration, which the confirmation rows above measured once. That table replaces
    the 2026-10-01 re-baseline as the citable one.
 2. The 13B 30u/30m row times out in both arms (eviction regime, 50 prefixes × 2000–8000 tokens
-   against 11.6k tokens of KV per backend). Add a fitted 30-user row (`--num-prefixes 16
-   --prefix-max-tokens 4000`) so the high-load regime has a valid measurement.
+   against 11.6k tokens of KV per backend). The `fitted` suite now carries a 13B 30u/30m row
+   (row 9, `--num-prefixes 16 --prefix-max-tokens 4000`, added 2026-10-06, not yet measured) so
+   the high-load regime has a valid measurement: run `bench-runner.sh --suite fitted` (~6.5 h,
+   three configs × 3) after the rebaseline suite.
 3. Archive every run directory's summaries with
    `./scripts/bench-archive.sh <run-dir> <date>-<leg>` (compare files, runner summary,
    aggregates, per-arm manifests, prefix-arm Prometheus dumps; `--with-logs` for the per-node
