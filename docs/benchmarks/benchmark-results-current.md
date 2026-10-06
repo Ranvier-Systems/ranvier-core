@@ -236,10 +236,27 @@ Round-robin arms: Gini 0.021–0.043 throughout. KV hit rates were unchanged bet
   right target; a fleet-wide in-flight view (gossip) is then the code change. If the tail
   persists, randomise the divert target among under-cap candidates (herd-breaker).
 
-Raw runs were **not archived**: the instance was terminated on 2026-10-03 before the copy
-step ran, so every number in this and the following sections is transcribed from the per-run
-`compare_*.txt` files as they were read during the campaign. Manifests for later campaigns carry
-`server_image`, so the binary behind a run is identifiable from now on.
+Every leg of the campaign is archived (the run directories had been copied off each instance
+before termination after all): summaries in this tree, raw data as a release asset.
+
+| Leg | Summaries (compare files, manifests, aggregates, prefix-arm Prometheus dumps) |
+|-----|-------------------------------------------------------------------------------|
+| Re-baseline, 50 prefixes (2026-10-01) | `results/2026-10-01-rebaseline/` |
+| Fitted set + diversion acceptance (2026-10-02) | `results/2026-10-02-fitted/` |
+| Leg A, no diverts | `results/2026-10-02-legA-nodivert/` |
+| Leg B, in-flight signal | `results/2026-10-03-legB-inflight/` |
+| Placement v1, v2, v3 | `results/2026-10-03-placement-v1/`, `-v2/`, `-v3/` |
+| Placement v4 | `results/2026-10-05-placement-v4/` |
+| Combo (the shipping defaults) | `results/2026-10-05-combo/` |
+| Isolation (hash placement + live signal) | `results/2026-10-05-isolation/` |
+| Confirmation rows | `results/2026-10-05-confirm/` |
+
+The raw run directories (Locust CSVs, per-request logs, vLLM logs, per-node Ranvier logs where
+captured; 4.6 GB, 610 MB compressed) are attached to the
+[v2.2.0 release](https://github.com/Ranvier-Systems/ranvier-core/releases/tag/v2.2.0) as
+`ranvier-benchmark-runs-2026-10.tar.gz`. New runs are archived with
+`scripts/bench-archive.sh`. Manifests from 2026-10-02 on carry `server_image`, so the binary
+behind a run is identifiable.
 
 ### Leg A, no-divert control (2026-10-02/03): the regression is placement, not diversion
 
