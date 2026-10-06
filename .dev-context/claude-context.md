@@ -427,7 +427,7 @@ Local equivalents of the verification workflows, and when to run which: see the 
 
 ## Deployment
 
-- **Docker:** `ghcr.io/ranvier-systems/ranvier:2.1.0` (latest release; `:latest` tracks unreleased `main`; requires `--cap-add=IPC_LOCK`)
+- **Docker:** `ghcr.io/ranvier-systems/ranvier:2.2.0` (latest release; `:latest` tracks unreleased `main`; requires `--cap-add=IPC_LOCK`)
 - **Kubernetes:** Helm chart in `deploy/helm/ranvier/` (StatefulSet, HPA, service discovery)
 - **Local development:** Docker Compose via `docker-compose.test.yml` (3 nodes + 2 backends)
 

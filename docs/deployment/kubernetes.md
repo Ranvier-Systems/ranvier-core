@@ -375,7 +375,7 @@ replicaCount: 3
 
 image:
   repository: ghcr.io/ranvier-systems/ranvier
-  tag: "2.1.0"
+  tag: "2.2.0"
 
 resources:
   requests:

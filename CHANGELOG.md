@@ -6,12 +6,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-> **Note (2026-09-05).** The entries below have merged to `main` but have not been
-> exercised on GPU hardware since the 2026-07-13 re-baseline (BACKLOG §25). They will
-> be cut as 2.2.0 once each has a recorded run or is explicitly marked
-> hardware-independent. Release notes further down quote a 33–44% TTFT improvement
-> measured on a 5-prefix workload that the 2026-07-05 methodology review deprecated;
-> the citable figures are in README → Benchmark Results.
+Nothing yet.
+
+## [2.2.0] - 2026-10-06
+
+Routing release. The load-divert policy now reads the node's live in-flight count
+instead of a 5-second-stale scraped GPU score, diverts only at twice the mean
+instead of on nearly any load, and places new prefixes least-loaded with
+cluster-wide convergence. On the configuration that had regressed in every earlier
+campaign (CodeLlama-13B, 20 users, 8×A100, 3 Ranvier nodes) P99 time-to-first-token
+went from +11% against round-robin to **−57.5% median across three repeats and both
+arm orders**, with P50 −28% and vLLM's KV prefix-cache hit rate 12% → 70%. Nothing
+measured regressed: 13B 10 users −34.5%, Llama-8B 20 users −22.6% (was −17%), 13B
+30 users −16.4% in the eviction regime. Record and every intermediate leg:
+`docs/benchmarks/benchmark-results-current.md`. Also in this release: the Gateway API
+Inference Extension Endpoint-Picker mode, the native vLLM KV-event subscriber,
+prefill/decode pool roles, the unified route scorer, and the embeddability seams
+(admission policy, usage ledger, response-side usage, OpenTelemetry GenAI).
+
+### Upgrade notes
+
+Five routing defaults changed. Every multi-shard deployment gets the new divert
+behaviour on upgrade; no config key was renamed or removed.
+
+| Key | 2.1.0 | 2.2.0 | Env to restore 2.1.0 |
+|-----|-------|-------|----------------------|
+| `routing.cross_shard_load_sync` | `false` | `true` | `RANVIER_CROSS_SHARD_LOAD_SYNC=false` |
+| `routing.gpu_load_weight` | `10` | `0` | `RANVIER_ROUTING_GPU_LOAD_WEIGHT=10` |
+| `routing.capacity_headroom_weight` | `5` | `0` | `RANVIER_CAPACITY_HEADROOM_WEIGHT=5` |
+| `routing.bounded_load_epsilon` | `0.25` | `1.0` | `RANVIER_BOUNDED_LOAD_EPSILON=0.25` |
+| `routing.miss_placement` | `hash` | `least_loaded` | `RANVIER_MISS_PLACEMENT=hash` |
+
+- Cross-shard load sync broadcasts each shard's in-flight counts every 100 ms:
+  about 1,100 SMP messages per second on 8 shards. A single-shard process skips
+  the timer. Lower `cross_shard_load_sync_interval` only with a reason.
+- The vLLM metrics scrape still runs; the GPU score and KV usage now feed
+  observability and residency routing only, not the divert decision. Set the two
+  weights above zero to blend them back in.
+- `miss_placement: hash` remains the right choice on a single node without gossip,
+  where the convergence rules have nothing to do.
+- Gossip peers on 2.1.0 and 2.2.0 interoperate: the route-announcement wire format
+  is unchanged. A mixed cluster converges only once every node runs 2.2.0, since
+  2.1.0 nodes keep the plain trust ladder.
+
+### Measurement status
+
+The 2026-09-05 release gate asked that each entry have a recorded GPU run or be
+marked hardware-independent. As of this release:
+
+- **Measured on 8×A100, October 2026:** the five routing defaults, least-loaded
+  cache-miss placement with eager learn and both convergence rules, the
+  bounded-load divert target, the unified route scorer (every run went through it).
+  Three repeats for 13B/20 users; one confirmation repeat each for 13B/10u, 8B/20u
+  and 13B/30u. The full matrix at three repeats under these defaults is the next
+  benchmark session.
+- **Hardware-independent:** request-admission policy seam, response-side usage
+  accounting, usage-ledger sink, OpenTelemetry GenAI conventions, GIE EPP bridge,
+  server, integration test and overhead microbenchmark, inline-vs-sidecar scope and
+  Phase 1 harness.
+- **Not yet exercised on GPU hardware, ship as experimental:** Kimi (Moonshot)
+  templates; native KV-event mode parts 1 and 2 (the October campaigns ran with the
+  subscriber off and the residency signal never crossed its threshold);
+  disaggregated prefill/decode pool roles. Each is opt-in and off by default.
 
 ### Added
 
@@ -276,7 +332,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   confirmation legs, 2026-10-05).
 
 - **Least-loaded cache-miss placement** (`routing.miss_placement: least_loaded`, env
-  `RANVIER_MISS_PLACEMENT`, default `hash` = unchanged behavior) — a prefix with no
+  `RANVIER_MISS_PLACEMENT`; introduced with default `hash`, made the default in this
+  release, see above) — a prefix with no
   learned route is placed on the live backend holding the fewest learned-route tokens
   (`RadixTree::route_tokens_by_backend`, new: the sum of live route key lengths per
   backend), then the fewest routes, then the lowest capacity-adjusted load, then
@@ -315,9 +372,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer counts a divert. **Acceptance run failed** (same box, 13B 20u P99 vs
   round-robin: +10.5, +24.1, +17.5 against +11.7, +11.0, +3.9 for the previous rule):
   the change balances completions without moving the tail, because in the benchmark
-  deployment "load" is the 5 s-stale scraped vLLM score rather than queue depth. Held
-  on the branch pending the no-divert and in-flight-signal legs; see BACKLOG §27 and
-  the acceptance section of `docs/benchmarks/benchmark-results-current.md`.
+  deployment "load" was the 5 s-stale scraped vLLM score rather than queue depth. It
+  ships in this release under the new defaults above, where "load" is the node-local
+  in-flight count and the divert target is the backend that is actually coldest; see
+  BACKLOG §27 and `docs/benchmarks/benchmark-results-current.md`.
 
 - **Unified weighted route scorer** (BACKLOG §20.1 P0.2) — The post-anchor
   routing decision is now one weighted ranking over the live candidates
