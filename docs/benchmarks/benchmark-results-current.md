@@ -22,9 +22,9 @@ routing config). When a default changes, prior entries move to
 > the previous divert signal and threshold (scraped GPU score + one shard's in-flight count,
 > ε 0.25, hash placement). They stay on this page because they are the record of how the new
 > defaults were arrived at, from the 2026-10-01 re-baseline through the placement line to the
-> combo, isolation and confirmation legs. The first full matrix under the shipped defaults at
-> three repeats is the next item on the resume checklist and will replace the 2026-10-01 table as
-> the citable one.
+> combo, isolation and confirmation legs. The full matrix under the shipped defaults at three
+> repeats was measured on 2026-10-06 ("Standard matrix under the shipping defaults", below) and
+> is the citable table; the 2026-10-01 table is the previous-defaults record.
 >
 > **Flush reconciliation:** 20ms is the shipped default. The historical guide contained a
 > contradiction — an early section declared "10ms confirmed as the correct default," a later
@@ -42,7 +42,75 @@ round-robin across three repeats and both arm orders, with P50 −28% and KV pre
 same signal) gave −51.8% median, so the divert policy is most of the win and placement the rest.
 The request distribution across backends stayed uneven in every one of these arms; the tail was
 queue depth, not request count. Full sections below: "Combo leg", "Confirmation rows",
-"Isolation leg".
+"Isolation leg". *2026-10-06:* the standard 50-prefix matrix re-run at three repeats under the
+shipping defaults improved every one of its twelve repeats: 8B 20u −26.7%, 13B 30u −14.1%,
+13B 20u −21.0%, 13B 10u −38.8% (medians); next section.
+
+## Standard matrix under the shipping defaults (measured 2026-10-06, release 2.2.0) — the citable table
+
+`bench-runner.sh --suite rebaseline`, unflagged, image `ghcr.io/ranvier-systems/ranvier:2.2.0`
+(commit `7925c8d` checked out on the host), fresh 8×A100 instance in a different region from the
+2026-10-01..05 campaign (same instance type; the per-arm manifests record the GPU and KV capacity).
+Same matrix, durations, user counts, prefix set (50 prefixes × 2000–8000 tokens, ratio 0.9) and
+method (alternating arm order, per-arm warm-up, exact TTFT percentiles, vLLM KV counters) as the
+2026-10-01 re-baseline. Only the routing defaults differ: ε 1.0, live node-local in-flight signal,
+least-loaded placement. 12 of 12 configured runs completed; rep 2 of the 13B 20u row failed 47 s
+into start-up (before vLLM was up) and was re-run by hand with the same arguments and arm order
+after the suite, so every row has three repeats and both arm orders. Verdicts are the runner's
+aggregate (median of per-repeat %change; CONSISTENT when all three share a sign).
+
+| Config | P99 TTFT, prefix vs RR, per repeat | Median (IQR) | P50 TTFT | Throughput | KV hit, RR → prefix | Incompletes RR / prefix | Verdict |
+|--------|------------------------------------|--------------|----------|------------|---------------------|-------------------------|---------|
+| **8B 20u/10m** | −26.7, −17.7, −27.1 | **−26.7%** (−26.9…−22.2) | −0.7% | +1…+2% | 72–76% → 93–97% | 0 / 0 | ✅ consistent improvement, 3/3 |
+| **13B 30u/30m** | −14.1, −17.9, −13.1 | **−14.1%** (−16.0…−13.6) | −18…−22% | +5…+6% | 5–6% → 17–21% | 1.3–1.5% / 1.4–1.8% | ✅ consistent improvement, 3/3; P99 of completed requests |
+| **13B 20u/10m** | −18.4, −27.9, −21.0 | **−21.0%** (−24.4…−19.7) | −18…−24% | +5…+7% | 6–8% → 23–29% | 1.5–1.8% / 1.4–1.7% | ✅ consistent improvement, 3/3 |
+| **13B 10u/10m** | −38.8, −46.8, −36.8 | **−38.8%** (−42.8…−37.8) | −7…−11% | +1…+4% | 6–8% → 26–41% | 1.7–1.8% / 1.0–1.9% | ✅ consistent improvement, 3/3 |
+
+Against the 2026-10-01 table (same matrix, previous defaults): 8B −17.0% → −26.7%; 13B 30u
+−1.6% (no reliable effect) → −14.1%; 13B 20u **+11.0%** (consistent regression) → −21.0%; 13B
+10u +12.2 / −10.8 / +6.1 (no reliable effect) → −38.8%. The round-robin arms reproduce the
+2026-10-01 box on every control (8B RR P50 400–402 ms, P99 842–892 ms; 13B KV hits 5–8%;
+route consistency 12%), so the region change shows up nowhere in the baseline.
+
+**What the counters say.** Diverts (`load_aware_fallbacks_total` / requests) fell from 30–49%
+under the previous defaults to 15–26%: 8B 25–26%, 13B 30u 15–17%, 13B 20u 21–23%, 13B 10u
+19–21%. Per-backend request Gini on the prefix arm is 0.09–0.16 against 0.01–0.04 for round-robin,
+as in every leg of the campaign: affinity still concentrates requests, and the tail falls anyway.
+Residency downgrades fired at 2.6% on the 30-user row (cache pressure present) and 0.5–1.6%
+elsewhere. The hit buckets carry the win: Large/Xlarge *hit* P99 fell 20–53% in every 13B rep
+while *miss* P50 was flat to +11% (an ART hit whose KV was already evicted lands on a warm, busy
+backend). The 22 ms routing-decision P99 on every prefix arm is the boundary-detect tokenization
+tail, unchanged since 2026-10-01 and about 3% of the 8B prefix arm's P99.
+
+**Two caveats that belong next to the numbers.**
+
+- *The 30-user row is still the eviction regime.* Both arms time out on more than 1% of requests,
+  so the true P99 of either arm is the client timeout; the printed P99 is the 99th percentile of
+  completed requests, and the prefix arm leaves 0.1–0.4 points more incomplete in all three reps.
+  The figures that do not depend on that exclusion agree: P50 −18…−22%, 5–6% more requests
+  served in the same 30 minutes. Cite this row as P50 and throughput with the P99 qualified, never
+  as a bare P99. At 20 and 10 users the prefix arm timed out *less* in two of three reps each, so
+  the extra timeouts are confined to full load, where the 2× cap lets a hot backend run a deeper
+  queue while it is also evicting. The fitted 30u row (`fitted` suite, row 9) is the test of whether
+  that persists when the cache fits; a tighter ε sweep (0.1) belongs there, not on the 10u rows.
+- *Arm order matters where the cache fits.* vLLM's KV cache is not reset between arms, so the arm
+  that runs second inherits the first arm's warm cache. On 8B the prefix-first rep was the weakest
+  (−17.7 vs −26.7 / −27.1; RR KV hit 76.3% vs 72–73%, RR P99 843 vs 882–890 ms), exactly as on
+  2026-10-01 (−6.5 prefix-first vs −17.0 / −17.4). In the 13B eviction regime there is nothing to
+  inherit (RR KV hit 5.8% either order) and the prefix-first rep was the *strongest* at 20 users.
+  With three repeats the median is always an rr-first value; report the range. Fix queued for the
+  tooling pass: reset vLLM's prefix cache between arms and say so in the compare header.
+
+**Tooling notes from this run.** The compare file's `Validation` column is an absolute gate (P99
+over 5,000 ms fails the arm), not an incomplete-rate check: the 30u row fails both arms, the 10u row
+passes both, and the 20u row reads FAILED → PASSED because the prefix arm pulled a 5.1 s tail under
+5 s. `Xlarge Hit P50` printed `N/A` for the round-robin arm in five compares with 82–659 samples;
+the value is `None` in that arm's per-bucket stats and the cause is not yet traced. The runner
+summary's per-arm "improv" column is the locust hit-vs-miss improvement, not the A/B result.
+
+Archive: `docs/benchmarks/results/2026-10-06-rebaseline-2.2.0/` (compare files, runner summary,
+aggregates, manifests, prefix-arm Prometheus dumps); raw run directories to be attached to the
+next release.
 
 ### The campaign at a glance (CodeLlama-13B, 20 users, 8×A100, 3 Ranvier nodes)
 
@@ -65,13 +133,15 @@ previous-default rows had **+3…+21%** across twelve runs; the shipping default
 | 10 | Isolation (10-05) | live signal + ε 1.0, **hash** placement | −48.4 / −51.8 / −53.5 | **−51.8%** | 39–45% | 49–55% | 30–33% | 0.05–0.10 | ✅ divert policy is most of the win |
 | 11 | **Combo = shipping defaults (10-05)** | live signal + ε 1.0 + **least-loaded** placement with convergence | **−60.4 / −57.5 / −55.2** | **−57.5%** | 50–53% | **69–73%** | 23–27% | 0.09–0.12 | ✅ **accepted** |
 
-The other rows, previous defaults vs shipping defaults (shipping-default rows are one repeat):
+The other rows, previous defaults vs shipping defaults (confirmation repeat of 2026-10-05, then
+the three-repeat matrix of 2026-10-06 where the row is in it):
 
-| Row | Previous defaults, P99 per rep | Shipping defaults, P99 | KV hit, RR → prefix (shipping) |
-|-----|-------------------------------|------------------------|--------------------------------|
-| 13B 10u, fitted | −7.3 / −5.8 / −0.1 (default); −13.2 / −3.0 / +0.4 (v3) | **−34.5%** | 17% → 82% |
-| 8B 20u, 50 prefixes | **−17.0 / −6.5 / −17.4** | **−22.6%** | 72% → 96% |
-| 13B 30u/30m, 50 prefixes (eviction regime) | −2.4 / −1.6 / +3.6 | −16.4%, timeouts in both arms | 6% → 23% |
+| Row | Previous defaults, P99 per rep | Shipping defaults, confirmation (1 rep) | Shipping defaults, matrix (3 reps, 10-06) | KV hit, RR → prefix (shipping) |
+|-----|-------------------------------|------------------------------------------|--------------------------------------------|--------------------------------|
+| 13B 10u, fitted | −7.3 / −5.8 / −0.1 (default); −13.2 / −3.0 / +0.4 (v3) | **−34.5%** | — (50-prefix row: **−38.8%**) | 17% → 82% |
+| 8B 20u, 50 prefixes | **−17.0 / −6.5 / −17.4** | −22.6% | **−26.7%** | 72% → 96% |
+| 13B 20u, 50 prefixes | **+17.4 / +11.0 / +4.6** | — | **−21.0%** | 7% → 26% |
+| 13B 30u/30m, 50 prefixes (eviction regime) | −2.4 / −1.6 / +3.6 | −16.4%, timeouts in both arms | **−14.1%**, timeouts in both arms | 6% → 20% |
 
 Reading down the first table: rows 2–9 all balance *something derived from the route table or the
 hash* and all land in the same band, because the per-backend request Gini (0.05–0.12) was never
@@ -250,6 +320,7 @@ before termination after all): summaries in this tree, raw data as a release ass
 | Combo (the shipping defaults) | `results/2026-10-05-combo/` |
 | Isolation (hash placement + live signal) | `results/2026-10-05-isolation/` |
 | Confirmation rows | `results/2026-10-05-confirm/` |
+| Standard matrix under 2.2.0 defaults (2026-10-06) | `results/2026-10-06-rebaseline-2.2.0/` |
 
 The raw run directories (Locust CSVs, per-request logs, vLLM logs, per-node Ranvier logs where
 captured; 4.6 GB, 610 MB compressed) are attached to the
@@ -587,16 +658,20 @@ nothing to do.
 
 **Resume checklist (next GPU session):**
 
-1. Merge the defaults, pull the published image, and run the rebaseline suite unflagged
-   (`bench-runner.sh --suite rebaseline`): the four README rows at three repeats each under the
-   shipping configuration, which the confirmation rows above measured once. That table replaces
-   the 2026-10-01 re-baseline as the citable one.
+1. ~~Rebaseline suite unflagged under the shipping defaults.~~ Done 2026-10-06 ("Standard matrix
+   under the shipping defaults", above).
 2. The 13B 30u/30m row times out in both arms (eviction regime, 50 prefixes × 2000–8000 tokens
    against 11.6k tokens of KV per backend). The `fitted` suite now carries a 13B 30u/30m row
-   (row 9, `--num-prefixes 16 --prefix-max-tokens 4000`, added 2026-10-06, not yet measured) so
-   the high-load regime has a valid measurement: run `bench-runner.sh --suite fitted` (~6.5 h,
-   three configs × 3) after the rebaseline suite.
-3. Archive every run directory's summaries with
+   (row 9, `--num-prefixes 16 --prefix-max-tokens 4000`, added 2026-10-06) so the high-load
+   regime has a valid measurement, and the 10u/20u fitted rows get their three repeats under the
+   shipping defaults: `bench-runner.sh --suite fitted` (~6.5 h, three configs × 3). The specific
+   question for row 9: does the prefix arm's 0.1–0.4-point timeout excess at 30 users disappear
+   when the cache fits? If not, sweep ε 0.1 on that row.
+3. Tooling, before the next campaign: reset vLLM's prefix cache between arms (the second arm
+   inherits a warm cache; 8B prefix-first reps are ~9 points weaker) and record it in the compare
+   header; trace the `Xlarge Hit P50 = N/A` on round-robin arms; find why rebaseline run 8 died
+   47 s into start-up; print rr-first and prefix-first medians separately in the aggregate.
+4. Archive every run directory's summaries with
    `./scripts/bench-archive.sh <run-dir> <date>-<leg>` (compare files, runner summary,
    aggregates, per-arm manifests, prefix-arm Prometheus dumps; `--with-logs` for the per-node
    Ranvier logs, `--date-prefix YYYYMMDD` for a directory holding several campaigns) **before**
