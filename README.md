@@ -20,11 +20,13 @@ Run with Docker — no configuration needed:
 
 ```bash
 docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 \
-  ghcr.io/ranvier-systems/ranvier:2.1.0
+  ghcr.io/ranvier-systems/ranvier:2.2.0
 ```
 
-`2.1.0` is the latest release (2026-04-11). The `:latest` tag tracks `main`, which carries
+`2.2.0` is the latest release (2026-10-06). The `:latest` tag tracks `main`, which carries
 unreleased changes; read [CHANGELOG → Unreleased](CHANGELOG.md#unreleased) before using it.
+Upgrading from 2.1.0 changes five routing defaults; see
+[CHANGELOG → 2.2.0 → Upgrade notes](CHANGELOG.md#220---2026-10-06).
 
 Point your client at `http://localhost:8080` and start sending requests.
 For deployment options (Kubernetes, building from source), see [Deployment](#deployment) below.
@@ -126,6 +128,15 @@ See the [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for methodo
 
 ## Architecture & Capabilities
 
+**Shipped in 2.2.0 (2026-10-06):**
+- Routing defaults that read the node's live in-flight count, divert only at twice the mean, and place new prefixes least-loaded with cluster-wide convergence: CodeLlama-13B at 20 users went from +11% to −57.5% P99 TTFT against round-robin (three repeats), and no measured configuration regressed
+- A unified weighted route scorer replacing the sequential override chain, with per-signal weights
+- Gateway API Inference Extension Endpoint-Picker mode (build-gated, off by default), with an integration test and an overhead microbenchmark
+- Native vLLM KV-event subscriber: verified residency, route materialization and replay (opt-in, not yet exercised on GPU hardware)
+- Disaggregated prefill/decode pool roles (opt-in, not yet exercised on GPU hardware)
+- Embeddability seams: request-admission policy, usage-ledger sink, response-side usage accounting, OpenTelemetry GenAI semantic conventions
+- Kimi (Moonshot) chat-template support with a tokenizer-parity harness (not yet exercised on GPU hardware)
+
 **Shipped in 2.1.0 (2026-04-11):**
 - Token-prefix routing via an Adaptive Radix Tree, with consistent-hash and random fallbacks, and passive route learning from backend responses
 - Partial tokenization for routing: a byte-budgeted prefix is tokenized for the routing decision and full tokenization is deferred until it is needed
@@ -135,7 +146,7 @@ See the [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for methodo
 - Ranvier Local: discovery of local backends such as Ollama and LM Studio
 - Kubernetes EndpointSlice discovery and a Helm chart
 
-**On `main`, unreleased:** a Gateway API Inference Extension Endpoint Picker mode (build-gated, off by default), a native vLLM KV-event subscriber, disaggregated prefill/decode pool roles, a unified weighted route scorer, an admission-policy seam, response-side usage accounting, OpenTelemetry GenAI semantic conventions, and Kimi (Moonshot) chat-template support with a tokenizer-parity harness. See [CHANGELOG → Unreleased](CHANGELOG.md#unreleased). The opt-in features among them (Endpoint Picker mode, the KV-event subscriber, pool roles) were off in the October 2026 GPU campaigns and have not been benchmarked on GPU hardware.
+**Measurement status of 2.2.0:** the routing defaults, placement and scorer were measured on 8×A100 in October 2026 (three repeats for 13B/20 users, one confirmation repeat for the other rows). The opt-in features (Endpoint Picker mode, the KV-event subscriber, pool roles, Kimi templates) were off in those campaigns and have not been exercised on GPU hardware; they ship as experimental. See [CHANGELOG → 2.2.0 → Measurement status](CHANGELOG.md#220---2026-10-06).
 
 The roadmap that produced 2.0.0 is in [VISION.md](docs/architecture/VISION.md).
 
@@ -208,7 +219,7 @@ Pre-built images are available on GitHub Container Registry (linux/amd64, linux/
 
 ```bash
 # Pull the latest release
-docker pull ghcr.io/ranvier-systems/ranvier:2.1.0
+docker pull ghcr.io/ranvier-systems/ranvier:2.2.0
 
 # Pull whatever is on main (unreleased; see CHANGELOG → Unreleased)
 docker pull ghcr.io/ranvier-systems/ranvier:latest
@@ -217,7 +228,7 @@ docker pull ghcr.io/ranvier-systems/ranvier:latest
 docker pull ghcr.io/ranvier-systems/ranvier:sha-abc1234
 
 # Run with required IPC_LOCK capability
-docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ghcr.io/ranvier-systems/ranvier:2.1.0
+docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ghcr.io/ranvier-systems/ranvier:2.2.0
 ```
 
 Build from source (optional):
@@ -300,7 +311,7 @@ See [Kubernetes Deployment Guide](docs/deployment/kubernetes.md) for detailed co
 
 ## Project status
 
-- **Latest release:** 2.1.0 (2026-04-11), on the [Releases page](https://github.com/Ranvier-Systems/ranvier-core/releases) and in [CHANGELOG.md](CHANGELOG.md). `main` carries unreleased work.
+- **Latest release:** 2.2.0 (2026-10-06), on the [Releases page](https://github.com/Ranvier-Systems/ranvier-core/releases) and in [CHANGELOG.md](CHANGELOG.md). `main` carries unreleased work.
 - **Maintainer:** one, part-time. Issues and pull requests are welcome; expect a response within a week rather than a day. See [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Security:** see [SECURITY.md](SECURITY.md) for how to report a vulnerability and for the known hardening gaps. In short: backend connections are not yet encrypted, so terminate TLS in front of Ranvier, and do not expose the metrics/admin port publicly.
 - **Provenance:** a large share of this codebase was written with AI coding agents working under the maintainer's direction and review. Every change goes through the same CI (unit tests, sanitizers, fuzzers) and the Seastar rules in `.dev-context/claude-context.md`, and contributions are held to the same bar whether or not an agent helped write them.
