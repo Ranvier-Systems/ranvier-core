@@ -44,7 +44,8 @@ The request distribution across backends stayed uneven in every one of these arm
 queue depth, not request count. Full sections below: "Combo leg", "Confirmation rows",
 "Isolation leg". *2026-10-06:* the standard 50-prefix matrix re-run at three repeats under the
 shipping defaults improved every one of its twelve repeats: 8B 20u −26.7%, 13B 30u −14.1%,
-13B 20u −21.0%, 13B 10u −38.8% (medians); next section.
+13B 20u −21.0%, 13B 10u −38.8% (medians); the fitted suite at three repeats gave 13B 10u −28.6%,
+20u −56.6%, 30u −42.0% with zero timeouts and +15% throughput at 30 users; next two sections.
 
 ## Standard matrix under the shipping defaults (measured 2026-10-06, release 2.2.0) — the citable table
 
@@ -112,6 +113,44 @@ Archive: `docs/benchmarks/results/2026-10-06-rebaseline-2.2.0/` (compare files, 
 aggregates, manifests, prefix-arm Prometheus dumps); raw run directories to be attached to the
 next release.
 
+### Fitted suite under the shipping defaults (measured 2026-10-06/07, release 2.2.0)
+
+`bench-runner.sh --suite fitted` on the same instance and image, straight after the matrix above:
+16 prefixes × 2000–4000 tokens (~48k, ~6k per backend, fits beside in-flight requests), three rows
+× three repeats, alternating arm order, 9/9 runs passed. The 30-user row is new (added 2026-10-06
+so the high-load regime has a measurement without timeouts). **Zero incomplete requests in all
+eighteen arms**, so every P99 here is a true P99.
+
+| Config (fitted set) | P99 TTFT per repeat | Median (IQR) | P50 TTFT | Throughput | KV hit, RR → prefix | Diverts | Verdict |
+|---------------------|---------------------|--------------|----------|------------|---------------------|---------|---------|
+| **13B 10u/10m** | −28.6, −34.2, −23.6 | **−28.6%** (−31.4…−26.1) | −29.0 / −29.4 / −29.4% | +7…+9% | 16–19% → 76–82% | 17–23% | ✅ consistent improvement, 3/3 |
+| **13B 20u/10m** | −56.6, −61.5, −55.8 | **−56.6%** (−59.1…−56.2) | −28.5 / −28.5 / −27.8% | +10…+12% | 12–15% → 67–72% | 22–25% | ✅ consistent improvement, 3/3 |
+| **13B 30u/30m** | −43.1, −42.0, −34.1 | **−42.0%** (−42.6…−38.1) | −29.4 / −29.9 / −29.1% | **+14…+15%** | 10–11% → 46–50% | 16–17% | ✅ consistent improvement, 3/3 |
+
+**What the three rows say together.** P50 is −29% at every load: that is the prefill a cache hit
+saves, and it does not depend on queueing. P99 is what the divert policy adds on top, and it scales
+with the queue: −29% at 10 users (little queue to remove), −57% at 20 users (the queue is the tail),
+−42% at 30 users (the fleet is saturated and some eviction returns: KV hit 50% vs 70% at 20 users,
+residency downgrades 1.4–1.6%). Throughput follows saturation the other way: +8% at 10 users,
++11% at 20, +15% at 30, where the prefix arm served ~1,750 more requests per 30-minute arm because
+saved prefill becomes served requests rather than idle time. The 20u row reproduces the 2026-10-05
+combo leg (−60.4 / −57.5 / −55.2 on the Arizona instance) on a different box within one point of
+median: six repeats across two instances and both arm orders, all between −55 and −62%.
+
+**The 30-user row closes the timeout question.** On the 50-prefix set at 30 users the prefix arm
+left 0.1–0.4 points more requests incomplete than round-robin in every repeat. On the fitted set,
+same load, same 30-minute arms, both arms completed every one of ~25,000 requests per repeat, in
+both arm orders. The excess was the eviction regime (a hot backend running a deeper queue while it
+is also evicting), not the 2× cap; no ε sweep is needed and the default stands. Round-robin's P99
+sat at the 5 s validation gate (4.8–5.1 s; rep 3 reads FAILED → PASSED), the prefix arm's at 2.8–3.3 s.
+
+Arm order made no difference on any 13B fitted row (round-robin KV hit 9.7–18.7% whichever arm ran
+first), consistent with the reading above: round-robin never concentrates a prefix, so it inherits
+nothing from a warm cache. Routing-decision P99 is 8–10 ms on this set against 22 ms on the 50-prefix
+set: the boundary-detect tokenization tail scales with prefix length (4,000 vs 8,000 tokens max).
+
+Archive: `docs/benchmarks/results/2026-10-07-fitted-2.2.0/`.
+
 ### The campaign at a glance (CodeLlama-13B, 20 users, 8×A100, 3 Ranvier nodes)
 
 Every leg of the 2026-10-01..05 campaign on the one row that resisted, in the order it was run.
@@ -138,7 +177,9 @@ the three-repeat matrix of 2026-10-06 where the row is in it):
 
 | Row | Previous defaults, P99 per rep | Shipping defaults, confirmation (1 rep) | Shipping defaults, matrix (3 reps, 10-06) | KV hit, RR → prefix (shipping) |
 |-----|-------------------------------|------------------------------------------|--------------------------------------------|--------------------------------|
-| 13B 10u, fitted | −7.3 / −5.8 / −0.1 (default); −13.2 / −3.0 / +0.4 (v3) | **−34.5%** | — (50-prefix row: **−38.8%**) | 17% → 82% |
+| 13B 10u, fitted | −7.3 / −5.8 / −0.1 (default); −13.2 / −3.0 / +0.4 (v3) | **−34.5%** | **−28.6%** (fitted suite 10-06); −38.8% on the 50-prefix row | 16–19% → 76–82% |
+| 13B 20u, fitted | +10.1 / +8.2 / +21.4 | −57.5% (combo, 3 reps) | **−56.6%** (fitted suite 10-06) | 12–15% → 67–72% |
+| 13B 30u/30m, fitted | not measured | — | **−42.0%**, zero timeouts | 10–11% → 46–50% |
 | 8B 20u, 50 prefixes | **−17.0 / −6.5 / −17.4** | −22.6% | **−26.7%** | 72% → 96% |
 | 13B 20u, 50 prefixes | **+17.4 / +11.0 / +4.6** | — | **−21.0%** | 7% → 26% |
 | 13B 30u/30m, 50 prefixes (eviction regime) | −2.4 / −1.6 / +3.6 | −16.4%, timeouts in both arms | **−14.1%**, timeouts in both arms | 6% → 20% |
@@ -321,6 +362,7 @@ before termination after all): summaries in this tree, raw data as a release ass
 | Isolation (hash placement + live signal) | `results/2026-10-05-isolation/` |
 | Confirmation rows | `results/2026-10-05-confirm/` |
 | Standard matrix under 2.2.0 defaults (2026-10-06) | `results/2026-10-06-rebaseline-2.2.0/` |
+| Fitted suite under 2.2.0 defaults, incl. new 30u row (2026-10-06/07) | `results/2026-10-07-fitted-2.2.0/` |
 
 The raw run directories (Locust CSVs, per-request logs, vLLM logs, per-node Ranvier logs where
 captured; 4.6 GB, 610 MB compressed) are attached to the
@@ -660,13 +702,10 @@ nothing to do.
 
 1. ~~Rebaseline suite unflagged under the shipping defaults.~~ Done 2026-10-06 ("Standard matrix
    under the shipping defaults", above).
-2. The 13B 30u/30m row times out in both arms (eviction regime, 50 prefixes × 2000–8000 tokens
-   against 11.6k tokens of KV per backend). The `fitted` suite now carries a 13B 30u/30m row
-   (row 9, `--num-prefixes 16 --prefix-max-tokens 4000`, added 2026-10-06) so the high-load
-   regime has a valid measurement, and the 10u/20u fitted rows get their three repeats under the
-   shipping defaults: `bench-runner.sh --suite fitted` (~6.5 h, three configs × 3). The specific
-   question for row 9: does the prefix arm's 0.1–0.4-point timeout excess at 30 users disappear
-   when the cache fits? If not, sweep ε 0.1 on that row.
+2. ~~Fitted suite under the shipping defaults, with the new 13B 30u/30m row.~~ Done 2026-10-06/07
+   ("Fitted suite under the shipping defaults", above): 30u fitted −42.0% median with zero
+   incompletes in both arms, so the 50-prefix timeout excess was the eviction regime and no ε sweep
+   is needed. Nothing on this hardware remains unmeasured under the shipping defaults.
 3. Tooling, before the next campaign: reset vLLM's prefix cache between arms (the second arm
    inherits a warm cache; 8B prefix-first reps are ~9 points weaker) and record it in the compare
    header; trace the `Xlarge Hit P50 = N/A` on round-robin arms; find why rebaseline run 8 died

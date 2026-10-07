@@ -306,7 +306,8 @@ BUILT-IN SUITES:
       9. 13B 30 users 30m   same set. The rebaseline 30u row times out in both
          arms (eviction regime: 50 prefixes x 2000..8000 tokens against 11.6k
          KV tokens per backend); this row gives the high-load regime a
-         measurement without timeouts. Added 2026-10-06, not yet measured.
+         measurement without timeouts. Measured 2026-10-06/07 on 2.2.0:
+         -43.1 / -42.0 / -34.1% P99, zero incompletes both arms, +15% rps.
       Compare row 7 with rebaseline row 4, row 8 with rebaseline row 3 and
       row 9 with rebaseline row 2 (same load, default set). If the low-load
       regression persists on the fitted set, it is not a cache-capacity
@@ -486,8 +487,8 @@ define_runs() {
     # Same set at 30 users for 30 minutes. The rebaseline 30u/30m row times out
     # in both arms (eviction regime), so the high-load point of the matrix had
     # no valid measurement; on the fitted set the hot set fits and the row
-    # reports real TTFT percentiles. Pairs with rebaseline row 2. Added
-    # 2026-10-06 (resume checklist item 2); not yet measured.
+    # reports real TTFT percentiles. Pairs with rebaseline row 2. Measured
+    # 2026-10-06/07 on 2.2.0: -42.0% median P99, zero incompletes, +15% rps.
     add_run fitted "13B 30u/30m A/B, fitted prefix set (16 x 2000..4000)" \
         --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 30m --users 30 --max-model-len 8192 \

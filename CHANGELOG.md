@@ -18,6 +18,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (13B 20u, was +11.0%), −38.8% (13B 10u, was no reliable effect); every repeat improved.
   README and `docs/benchmarks/benchmark-results-current.md` cite it as the current table;
   the arm-order (warm-cache inheritance) and 30-user timeout caveats are recorded.
+- Fitted suite at three repeats on the 2.2.0 image (2026-10-06/07), including the new 13B
+  30 users / 30 min row: P99 TTFT −28.6% (10u), −56.6% (20u, reproducing the Oct 5 −57.5%
+  on another instance), −42.0% (30u) with zero incomplete requests in all eighteen arms and
+  +15% throughput at 30 users. The 50-prefix 30-user timeout excess is thereby attributed to
+  the eviction regime, not the ε 1.0 cap; no ε sweep is planned.
 
 ## [2.2.0] - 2026-10-06
 

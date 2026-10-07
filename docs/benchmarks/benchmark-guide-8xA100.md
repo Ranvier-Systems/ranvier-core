@@ -21,7 +21,8 @@ on the fitted 16-prefix set, **P99 TTFT −57.5% median vs round-robin** (−60.
 both arm orders), P50 −28%, KV prefix hits 69–73%. The standard 50-prefix matrix re-run at three
 repeats on the 2.2.0 image (2026-10-06): 8B/20u **−26.7%**, 13B/30u −14.1% (P99 of completed
 requests, timeouts in both arms), 13B/20u **−21.0%**, 13B/10u **−38.8%**; all twelve repeats
-improved. The 2026-10-01 re-baseline under the previous defaults (−17% at 8B/20u, **+11%** at
+improved. Fitted suite at three repeats on the same image: 13B/10u −28.6%, 13B/20u −56.6%,
+13B/30u **−42.0% with zero timeouts and +15% throughput**. The 2026-10-01 re-baseline under the previous defaults (−17% at 8B/20u, **+11%** at
 13B/20u) and the July 2026 matrix it superseded (−9 to −13% under load, +29% at light load,
 commit `817a1b5`) are both on record; the 13B regressions were the load-divert policy reading a
 stale signal at too tight a threshold, not the affinity. Cache-hit rate rises 4–5× in every
