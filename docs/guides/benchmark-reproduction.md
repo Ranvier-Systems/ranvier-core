@@ -75,8 +75,13 @@ workload the project has since deprecated and are not expected results.
 | Config | P99 TTFT vs round-robin | Verdict | KV hit rate, RR → prefix |
 |--------|-------------------------|---------|--------------------------|
 | CodeLlama-13B, 20 users, fitted 16-prefix set (2026-10-05 defaults) | **−57.5%** median (−60.4, −57.5, −55.2) | consistent improvement, 3/3 | 12–14% → 69–73% |
-| CodeLlama-13B, 10 users, fitted (2026-10-05 defaults, 1 repeat) | −34.5% | confirmation | 17% → 82% |
-| Llama-3.1-8B, 20 users (2026-10-05 defaults, 1 repeat) | −22.6% | confirmation | 72% → 96% |
+| CodeLlama-13B, 10 users, fitted (2.2.0 defaults, 2026-10-06) | **−28.6%** median (−28.6, −34.2, −23.6) | consistent improvement, 3/3 | 16–19% → 76–82% |
+| CodeLlama-13B, 20 users, fitted (2.2.0 defaults, 2026-10-06) | **−56.6%** median (−56.6, −61.5, −55.8) | consistent improvement, 3/3 | 12–15% → 67–72% |
+| CodeLlama-13B, 30 users, 30 min, fitted (2.2.0 defaults, 2026-10-07) | **−42.0%** median (−43.1, −42.0, −34.1), zero timeouts, +15% throughput | consistent improvement, 3/3 | 10–11% → 46–50% |
+| Llama-3.1-8B, 20 users (2.2.0 defaults, 2026-10-06) | **−26.7%** median (−26.7, −17.7, −27.1) | consistent improvement, 3/3 | 72–76% → 93–97% |
+| CodeLlama-13B, 20 users (2.2.0 defaults, 2026-10-06) | **−21.0%** median (−18.4, −27.9, −21.0) | consistent improvement, 3/3 | 6–8% → 23–29% |
+| CodeLlama-13B, 10 users (2.2.0 defaults, 2026-10-06) | **−38.8%** median (−38.8, −46.8, −36.8) | consistent improvement, 3/3 | 6–8% → 26–41% |
+| CodeLlama-13B, 30 users, 30 min (2.2.0 defaults, 2026-10-06) | −14.1% median (−14.1, −17.9, −13.1), P99 of completed requests; 1.3–1.8% timeouts in both arms | consistent improvement, 3/3; eviction regime | 5–6% → 17–21% |
 | Llama-3.1-8B, 20 users (2026-10-01 re-baseline, previous defaults) | **−17.0%** median | consistent improvement, 3/3 | 72% → 94% |
 | CodeLlama-13B, 20 users (2026-10-01 re-baseline, previous defaults) | +11.0% median | consistent regression, 3/3 | 4% → 19% |
 

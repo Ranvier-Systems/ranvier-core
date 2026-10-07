@@ -1477,7 +1477,16 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   two defaults or three; then 8B 20u / 13B 10u / 13B 30u under the new defaults.**
   **Confirmation rows (one rep each, same settings): 13B 10u −34.5% (KV 82%), 8B 20u −22.6%
   (was −17%), 13B 30u −16.4% excl. timeouts (both arms 1.4–1.6% incompletes, eviction regime).
-  Nothing regressed. Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
+  Nothing regressed. **Standard 50-prefix matrix at three repeats on the 2.2.0 image (2026-10-06,
+  fresh instance): 8B 20u −26.7 (−26.7/−17.7/−27.1), 13B 30u −14.1 (−14.1/−17.9/−13.1, timeouts
+  both arms), 13B 20u −21.0 (−18.4/−27.9/−21.0; was +11.0), 13B 10u −38.8 (−38.8/−46.8/−36.8; was
+  no reliable effect); 12/12 repeats improved; diverts 15–26% (were 30–49%). Open: prefix arm
+  times out 0.1–0.4 pt more at 30u only; arm order inherits a warm vLLM cache on 8B (prefix-first
+  rep ~9 pt weaker) — reset the cache between arms.** **Fitted suite ×3 on 2.2.0 (10-06/07): 10u
+  −28.6, 20u −56.6 (reproduces the combo), new 30u/30m row −43.1/−42.0/−34.1 with ZERO incompletes
+  both arms and +15% rps → the 30u timeout excess is the eviction regime, not the cap; ε sweep
+  closed.**
+  Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
   `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
   `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement
   contributes.** **Isolation leg: −48.4 / −51.8 / −53.5 (median −51.8) with hash placement:
