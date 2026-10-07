@@ -54,6 +54,7 @@ SUITE="rebaseline"
 REPEAT_SET=false   # true when --repeat was passed; rebaseline/epsilon default to 3
 CUSTOM_FILE=""
 STOP_ON_FAILURE=false
+STARTUP_RETRY_SECS=180   # --startup-retry N: re-run once a run that fails within N s (0 = off)
 BUILD_IMAGE=false
 SKIP_RUNS_RAW=""   # comma-separated list from --skip
 REPEAT=1           # --repeat N: run each config N times, then aggregate (median/IQR)
@@ -246,6 +247,12 @@ OPTIONS:
     --skip LIST         Skip specific runs by number (comma-separated, e.g., --skip 9,10)
     --pause SECONDS     Pause between runs for GPU cooldown (default: 60)
     --stop-on-failure   Stop the suite if any run fails (default: continue)
+    --startup-retry N   Re-run a failed run once, immediately, when it failed within
+                        N seconds, i.e. before any measurement (a vLLM engine-core
+                        init failure, a port still held by the previous run). 0
+                        disables. Default 180. The 2026-10-06 rebaseline lost its
+                        13B 20u rep 2 to a 47 s start-up failure and needed a
+                        manual rerun; measured runs that fail are never retried.
     --build-image       Build ranvier:latest from this checkout once, before the
                         first run. REQUIRED when the suite is the acceptance test
                         for a C++ change on a branch: bench.sh otherwise reuses
@@ -390,6 +397,7 @@ while [[ $# -gt 0 ]]; do
         --skip)             SKIP_RUNS_RAW="$2"; shift 2 ;;
         --pause)            PAUSE_BETWEEN_RUNS="$2"; shift 2 ;;
         --stop-on-failure)  STOP_ON_FAILURE=true; shift ;;
+        --startup-retry)    STARTUP_RETRY_SECS="$2"; shift 2 ;;
         --build-image)      BUILD_IMAGE=true; shift ;;
         --output-dir)       RUNNER_OUTPUT_DIR="$2"; shift 2 ;;
         --repeat)           REPEAT="$2"; REPEAT_SET=true; shift 2 ;;
@@ -841,6 +849,27 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
 
     RUN_END_TS=$(date +%s)
     RUN_ELAPSED=$((RUN_END_TS - RUN_START_TS))
+
+    # A run that dies within STARTUP_RETRY_SECS never measured anything (vLLM
+    # or Ranvier failed to come up), so one immediate retry costs nothing in
+    # comparability. A run that fails later is a real failure and stays one.
+    if [[ $EXIT_CODE -ne 0 && $STARTUP_RETRY_SECS -gt 0 && $RUN_ELAPSED -lt $STARTUP_RETRY_SECS ]]; then
+        log_warn "Run $RUN_NUM failed after ${RUN_ELAPSED}s (< ${STARTUP_RETRY_SECS}s: start-up failure, nothing measured); retrying once in ${PAUSE_BETWEEN_RUNS}s"
+        sleep "$PAUSE_BETWEEN_RUNS"
+        RETRY_START_TS=$(date +%s)
+        set +e
+        bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR"
+        EXIT_CODE=$?
+        set -e
+        RUN_END_TS=$(date +%s)
+        RUN_ELAPSED=$((RUN_END_TS - RETRY_START_TS))
+        if [[ $EXIT_CODE -eq 0 ]]; then
+            log_ok "Run $RUN_NUM retry succeeded"
+            LABELS[$i]="${LABELS[$i]} (retried after start-up failure)"
+        else
+            log_error "Run $RUN_NUM retry failed too (exit code $EXIT_CODE after ${RUN_ELAPSED}s)"
+        fi
+    fi
     DURATIONS+=($RUN_ELAPSED)
 
     # Update adaptive ETA data

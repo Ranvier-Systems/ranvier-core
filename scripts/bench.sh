@@ -1301,8 +1301,15 @@ if [[ "$SKIP_VLLM" = false ]]; then
         # Check if any vLLM process died
         for ((i=0; i<${#VLLM_PIDS[@]}; i++)); do
             if ! kill -0 "${VLLM_PIDS[$i]}" 2>/dev/null; then
-                log_error "vLLM instance $i died. Check /tmp/vllm_gpu${i}.log"
-                cat "/tmp/vllm_gpu${i}.log" | tail -20
+                # Keep the dead instance's log under the output dir: the next run
+                # overwrites /tmp/vllm_gpu${i}.log, which is how the cause of the
+                # 2026-10-06 rebaseline run 8 (engine-core init failure on GPU 5,
+                # 47 s in) was lost before anyone read it.
+                mkdir -p "$OUTPUT_DIR"
+                KEPT_LOG="${OUTPUT_DIR}/vllm_gpu${i}_startup_failure_$(date +%Y%m%d_%H%M%S).log"
+                cp "/tmp/vllm_gpu${i}.log" "$KEPT_LOG" 2>/dev/null || true
+                log_error "vLLM instance $i died during start-up. Log kept at $KEPT_LOG (tail below)"
+                tail -40 "/tmp/vllm_gpu${i}.log" 2>/dev/null | grep -v '^\s*$' | tail -25
                 exit 1
             fi
         done
