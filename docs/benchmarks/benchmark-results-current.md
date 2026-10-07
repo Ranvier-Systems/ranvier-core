@@ -713,9 +713,16 @@ nothing to do.
    carry-over) and the compare header says which it was, so the 8B order effect (second arm
    inherits a warm cache; prefix-first reps ~9 points weaker) cannot recur unnoticed; the
    aggregate prints rr-first and prefix-first medians beside the overall one and records them in
-   its JSON. Still open, both need the raw run data: trace the `Xlarge Hit P50 = N/A` on
-   round-robin arms (the value is `None` in that arm's per-bucket stats); find why rebaseline run 8
-   died 47 s into start-up (runner log). Not yet verified on GPUs: the reset's effect on the 8B row
+   its JSON. Run 8 of the rebaseline suite died because vLLM instance 5 failed engine-core
+   initialisation 40 s into start-up (same failure class as placement-v4 rep 3); its log was
+   overwritten by the next run, so bench.sh now keeps a dead instance's start-up log under the
+   output dir and bench-runner retries a run once when it fails within `--startup-retry` seconds
+   (default 180; nothing was measured). The `Xlarge Hit P50 = N/A` on round-robin arms does not
+   reproduce: the arm's stats JSON holds the value (887.3 ms, 576 samples for the 13B 30u rep 1
+   arm), and the same parser on the same `benchmark.log` prints it on another machine (Python
+   3.11+). It was printed as N/A by the compare run on the instance (Python 3.10) at the end of the
+   arm; the archived compare files carry that cell as printed, the headline rows are unaffected,
+   and the cause is not chased further. Not yet verified on GPUs: the reset's effect on the 8B row
    (expected: prefix-first and rr-first repeats converge; 13B rows unchanged).
 4. Archive every run directory's summaries with
    `./scripts/bench-archive.sh <run-dir> <date>-<leg>` (compare files, runner summary,
