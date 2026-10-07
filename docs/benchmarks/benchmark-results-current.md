@@ -706,10 +706,15 @@ nothing to do.
    ("Fitted suite under the shipping defaults", above): 30u fitted −42.0% median with zero
    incompletes in both arms, so the 50-prefix timeout excess was the eviction regime and no ε sweep
    is needed. Nothing on this hardware remains unmeasured under the shipping defaults.
-3. Tooling, before the next campaign: reset vLLM's prefix cache between arms (the second arm
-   inherits a warm cache; 8B prefix-first reps are ~9 points weaker) and record it in the compare
-   header; trace the `Xlarge Hit P50 = N/A` on round-robin arms; find why rebaseline run 8 died
-   47 s into start-up; print rr-first and prefix-first medians separately in the aggregate.
+3. Tooling, before the next campaign. Done 2026-10-07: `bench.sh --compare` now POSTs
+   `/reset_prefix_cache` to every vLLM backend before each arm (`--no-kv-reset` restores the
+   carry-over) and the compare header says which it was, so the 8B order effect (second arm
+   inherits a warm cache; prefix-first reps ~9 points weaker) cannot recur unnoticed; the
+   aggregate prints rr-first and prefix-first medians beside the overall one and records them in
+   its JSON. Still open, both need the raw run data: trace the `Xlarge Hit P50 = N/A` on
+   round-robin arms (the value is `None` in that arm's per-bucket stats); find why rebaseline run 8
+   died 47 s into start-up (runner log). Not yet verified on GPUs: the reset's effect on the 8B row
+   (expected: prefix-first and rr-first repeats converge; 13B rows unchanged).
 4. Archive every run directory's summaries with
    `./scripts/bench-archive.sh <run-dir> <date>-<leg>` (compare files, runner summary,
    aggregates, per-arm manifests, prefix-arm Prometheus dumps; `--with-logs` for the per-node

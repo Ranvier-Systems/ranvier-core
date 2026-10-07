@@ -319,7 +319,8 @@ BUILT-IN SUITES:
       10. 70B model test (16 users, TP auto)
       11. 8B high-concurrency stress (64 users, single arm)
 
-    all = rebaseline + epsilon + fitted + low.
+    all = rebaseline + epsilon + fitted + placement + low (every suite; the
+      historical epsilon and placement rows included — pass --skip to drop them).
 
     Retired (see .dev-context/benchmark-accuracy-audit-2026-09-30.md):
       - prefix-ratio 0.5/0.7 sweep: SHARED_PREFIX_RATIO only governs 20% of the

@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- `bench.sh --compare` resets every vLLM backend's prefix cache (`POST /reset_prefix_cache`)
+  before each arm, so the arm that runs second no longer inherits the first arm's warm KV
+  (on 8B/20u the prefix-first repeats read ~9 points weaker for that reason on both
+  2026-10-01 and 2026-10-06). `--no-kv-reset` keeps the old carry-over; the compare header
+  records which behaviour a run had and how many backends acknowledged the reset.
+- `results_parser.py aggregate` reads each repeat's arm order from its manifest and prints
+  rr-first and prefix-first medians beside the overall verdict (also in the JSON as
+  `by_arm_order`), so an order effect shows in the aggregate instead of needing the compare
+  files read by hand.
 - `bench-runner.sh`: the `fitted` suite gains a 13B 30 users / 30 min row (16 prefixes ×
   2000–4000 tokens) so the high-load regime has a measurement without timeouts; the `epsilon`
   and `placement` suites are labelled historical (ε 1.0 and least-loaded placement ship since
