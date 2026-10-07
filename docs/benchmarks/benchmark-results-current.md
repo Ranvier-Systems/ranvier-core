@@ -110,8 +110,8 @@ the value is `None` in that arm's per-bucket stats and the cause is not yet trac
 summary's per-arm "improv" column is the locust hit-vs-miss improvement, not the A/B result.
 
 Archive: `docs/benchmarks/results/2026-10-06-rebaseline-2.2.0/` (compare files, runner summary,
-aggregates, manifests, prefix-arm Prometheus dumps); raw run directories to be attached to the
-next release.
+aggregates, manifests, prefix-arm Prometheus dumps); raw run directories for this suite and the
+fitted suite below are on the v2.2.0 release as `ranvier-benchmark-runs-2026-10-06.tar.gz` (64 MB).
 
 ### Fitted suite under the shipping defaults (measured 2026-10-06/07, release 2.2.0)
 
@@ -367,7 +367,9 @@ before termination after all): summaries in this tree, raw data as a release ass
 The raw run directories (Locust CSVs, per-request logs, vLLM logs, per-node Ranvier logs where
 captured; 4.6 GB, 610 MB compressed) are attached to the
 [v2.2.0 release](https://github.com/Ranvier-Systems/ranvier-core/releases/tag/v2.2.0) as
-`ranvier-benchmark-runs-2026-10.tar.gz`. New runs are archived with
+`ranvier-benchmark-runs-2026-10.tar.gz` (the 2026-10-01..05 campaign) and
+`ranvier-benchmark-runs-2026-10-06.tar.gz` (the 2026-10-06/07 matrix and fitted suite, 64 MB).
+New runs are archived with
 `scripts/bench-archive.sh`. Manifests from 2026-10-02 on carry `server_image`, so the binary
 behind a run is identifiable.
 
