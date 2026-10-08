@@ -16,6 +16,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fitted 13B 20u and 30u rows against it, and the compare header names the arm. Not a
   recommended production mode.
 
+### Fixed
+- `bench.sh` launches vLLM with `VLLM_SERVER_DEV_MODE=1`: vLLM serves `POST /reset_prefix_cache`
+  only as a development endpoint behind that variable, so the between-arm KV reset added in
+  the previous entry returned 404 on vLLM 0.15.1 and the arms still carried KV over (first
+  seen on the 2026-10-08 baseline suite; its compare headers record `0/8` acknowledged). The
+  404 warning now says what to set on externally managed backends.
+
 ### Changed
 - `bench.sh --compare` resets every vLLM backend's prefix cache (`POST /reset_prefix_cache`)
   before each arm, so the arm that runs second no longer inherits the first arm's warm KV

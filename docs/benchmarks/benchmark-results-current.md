@@ -711,7 +711,12 @@ nothing to do.
 3. Tooling, before the next campaign. Done 2026-10-07: `bench.sh --compare` now POSTs
    `/reset_prefix_cache` to every vLLM backend before each arm (`--no-kv-reset` restores the
    carry-over) and the compare header says which it was, so the 8B order effect (second arm
-   inherits a warm cache; prefix-first reps ~9 points weaker) cannot recur unnoticed; the
+   inherits a warm cache; prefix-first reps ~9 points weaker) cannot recur unnoticed. *First
+   hardware contact 2026-10-08:* vLLM 0.15.1 answered 404, because the endpoint is served only
+   with `VLLM_SERVER_DEV_MODE=1`; bench.sh now sets that on the vLLM it launches, and the
+   baseline suite's compare headers honestly record `0/8` acknowledged (carry-over, as every
+   run before it; the 13B rows showed no order effect). Still unverified on hardware: a run
+   whose header says `8/8`; the
    aggregate prints rr-first and prefix-first medians beside the overall one and records them in
    its JSON. Run 8 of the rebaseline suite died because vLLM instance 5 failed engine-core
    initialisation 40 s into start-up (same failure class as placement-v4 rep 3); its log was
