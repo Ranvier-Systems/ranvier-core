@@ -225,9 +225,19 @@ rows, same set, same image lineage, one instance earlier.
 | | Prefix | 2.68–3.33 s | 0.76–0.77 s | 7.5–7.6 rps | 44–54% | 53–56% | 0.08–0.11 |
 | | *Prefix vs round-robin* | *−42.0%* | *−29%* | *+14…+15%* | | | |
 | | **Prefix vs least-loaded** | **−6.5 / +6.6 / +11.3%** (median +6.6; MIXED, no reliable effect) | **−28.9 / −27.8 / −28.5%** | **+9.1 / +7.9 / +8.8%** | | | |
+| **13B 20u/10m, 50-prefix set** (eviction regime, one repeat) | Round-robin (matrix, 10-06) | 5.07–5.38 s of completed; 1.5–1.8% timeouts | 0.97–1.00 s | 5.0–5.1 rps | 6–8% | 12% | 0.01–0.04 |
+| | **Least-loaded** | **3.66 s**; 1.7% timeouts | 0.92 s | 5.3 rps | 6% | 12% | **0.011** |
+| | Prefix (today / matrix) | 3.66 s / 3.66–4.39 s; 1.3% timeouts | 0.77 s | 5.4 rps | 28% / 23–29% | 46% | 0.107 |
+| | **Prefix vs least-loaded** | **+0.2%** (same) | **−16.6%** | **+2.5%** | | | |
 
-**Outcome against the pre-registered rule.** Cleared at 20 users (14.6 points, every repeat
-agreeing), not at 30 (mixed, median slightly against prefix). So:
+The one-repeat 50-prefix row (the set the campaign's regression was found on) says the same thing
+in the eviction regime: least-loaded matches prefix on P99 exactly (3.66 s both; round-robin 5.1–5.4 s),
+prefix keeps P50 (−16.6%, smaller than on the fitted set because only 28% of prefills hit), KV (6% →
+28%), throughput (+2.5%) and fewer timeouts (1.3% vs 1.7%).
+
+**Outcome against the pre-registered rule.** Cleared at 20 users on the fitted set (14.6 points,
+every repeat agreeing), not at 30 (mixed, median slightly against prefix), and not on the 50-prefix
+set (one repeat, parity). So:
 
 - **On P99, load balancing is most of the win over round-robin.** Least-loaded alone, with no
   affinity, takes the 20-user tail from ~3.5 s to ~1.75 s (about −50%) and the 30-user tail from
@@ -256,7 +266,7 @@ saturation. The product's case is prefill saved and capacity recovered, not the 
 **What it reopens.** The ε sweep closed on 2026-10-07 (both arms completed every request at 30
 users) is reopened on fairer grounds: least-loaded shows what a flat distribution buys at saturation.
 Next session: the fitted 30u row vs least-loaded at ε 0.5 and 0.25 (one config each, ×3, ~7 h), and
-the 50-prefix 20u row vs least-loaded (one run) to close the design's only gap. The reading to
+the 50-prefix 20u row vs least-loaded two more times (one repeat ran 2026-10-08: P99 parity, P50 −16.6%). The reading to
 pre-register: an ε that matches least-loaded's P99 at 30u while keeping P50 within 5 points of
 −28% and KV above 40% becomes the default; if no ε does both, the default stays 1.0 and the docs
 say the trade-off out loud.
@@ -810,7 +820,8 @@ nothing to do.
    and `0.25` (×3 each) to see whether a tighter cap recovers the saturation tail without giving
    back P50/KV; and one 50-prefix 20u run vs least-loaded (`bench.sh --compare --baseline-mode
    least_loaded --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20
-   --max-model-len 8192`). The first run on the box also verifies the KV reset (compare header must
+   --max-model-len 8192`; one repeat done 2026-10-08, two more make it citable). The first run on the
+   box also verifies the KV reset (compare header must
    say `8/8` acknowledged; the 8B 20u row is where it should matter).
 6. Archive every run directory's summaries with
    `./scripts/bench-archive.sh <run-dir> <date>-<leg>` (compare files, runner summary,
