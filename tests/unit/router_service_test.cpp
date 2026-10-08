@@ -892,6 +892,129 @@ TEST_F(RouterServiceTest, HashModeExcludesDecodePools) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LEAST_LOADED routing mode: the strongest no-affinity baseline arm. Lowest
+// capacity-adjusted composite load (in-flight count here: no GPU score cached,
+// headroom weight 0), ties uniformly at random, never consults the ART.
+// ---------------------------------------------------------------------------
+
+TEST_F(RouterServiceTest, LeastLoadedModePicksLowestInFlight) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    register_two_backends();  // ids 1, 2
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080));
+
+    BackendRequestGuard g1(1), g2(1), g3(1);  // backend 1: 3 in flight
+    BackendRequestGuard g4(2);                // backend 2: 1 in flight
+                                              // backend 3: idle
+
+    for (int i = 0; i < 20; ++i) {
+        auto result = router_->route_request({1, 2, 3});
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 3) << "draw " << i;
+        EXPECT_EQ(result.original_selected, 3);
+        EXPECT_EQ(result.routing_mode, "least_loaded");
+        EXPECT_FALSE(result.cache_hit);
+        EXPECT_EQ(result.matched_prefix_depth, 0u);
+        EXPECT_DOUBLE_EQ(result.backend_load_at_decision, 0.0);
+    }
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeTieBreaksAcrossIdleBackends) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    register_two_backends();
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080));
+
+    // An idle fleet must not herd onto one id: ties are broken at random.
+    std::map<BackendId, int> seen;
+    for (int i = 0; i < 300; ++i) {
+        auto result = router_->route_request({1, 2, 3});
+        ASSERT_TRUE(result.backend_id.has_value());
+        seen[result.backend_id.value()]++;
+    }
+    EXPECT_EQ(seen.size(), 3u);
+    for (const auto& [id, n] : seen) {
+        EXPECT_GT(n, 0) << "backend " << id << " never chosen";
+    }
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeIgnoresLearnedRoutes) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    register_two_backends();
+
+    // A learned route points this prefix at backend 1; backend 1 is also the
+    // busier one. PREFIX mode would honour the route; LEAST_LOADED must not.
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+    RouterService::insert_route_for_testing(tokens, 1);
+    BackendRequestGuard g1(1), g2(1);
+
+    for (int i = 0; i < 10; ++i) {
+        auto result = router_->route_request(tokens);
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 2) << "draw " << i;
+        EXPECT_FALSE(result.cache_hit);
+    }
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeExcludesDecodePools) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::UNIFIED);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+
+    // The decode pool is idle and the unified backend is busy: still unified.
+    BackendRequestGuard g1(1), g2(1);
+    for (int i = 0; i < 20; ++i) {
+        auto result = router_->route_request({1, 2, 3});
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 1) << "draw " << i;
+    }
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeAllDecodeValveStillRoutes) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+
+    auto result = router_->route_request({1, 2, 3});
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeStaysInHighestPriorityGroup) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080), 100, 0);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080), 100, 1);
+
+    // Priority groups come before load, as in RANDOM mode: the busy priority-0
+    // backend still wins over the idle priority-1 one.
+    BackendRequestGuard g1(1), g2(1);
+    for (int i = 0; i < 20; ++i) {
+        auto result = router_->route_request({1, 2, 3});
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 1) << "draw " << i;
+    }
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeNoBackendsIsAnError) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+
+    auto result = router_->route_request({1, 2, 3});
+    EXPECT_FALSE(result.backend_id.has_value());
+    EXPECT_EQ(result.routing_mode, "least_loaded");
+    EXPECT_FALSE(result.error_message.empty());
+}
+
 TEST_F(RouterServiceTest, ResidencyColdAndDecodeExclusionsCompose) {
     // The warm backend is cache-cold (residency downgrade) AND a decode pool
     // exists: the miss fallback must land on the remaining unified backend.
@@ -2369,6 +2492,15 @@ TEST(RoutingConfigTest, ModeHelpers) {
 
     cfg.routing_mode = RoutingConfig::RoutingMode::RANDOM;
     EXPECT_TRUE(cfg.is_random_mode());
+    EXPECT_FALSE(cfg.is_least_loaded_mode());
+    EXPECT_FALSE(cfg.uses_art());
+    EXPECT_FALSE(cfg.should_learn_routes());
+
+    cfg.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    EXPECT_TRUE(cfg.is_least_loaded_mode());
+    EXPECT_FALSE(cfg.is_prefix_mode());
+    EXPECT_FALSE(cfg.is_hash_mode());
+    EXPECT_FALSE(cfg.is_random_mode());
     EXPECT_FALSE(cfg.uses_art());
     EXPECT_FALSE(cfg.should_learn_routes());
 }

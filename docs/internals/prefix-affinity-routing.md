@@ -306,7 +306,7 @@ RANVIER_ENABLE_MULTI_DEPTH_ROUTING=false
 
 ```yaml
 routing:
-  routing_mode: prefix          # "prefix", "hash", or "random"
+  routing_mode: prefix          # "prefix", "hash", "random", or "least_loaded"
   prefix_token_length: 128
   block_alignment: 16           # Align to vLLM's PagedAttention block size
   hash_strategy: bounded_load   # bounded_load | p2c | jump | modular
@@ -328,7 +328,7 @@ routing:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `routing_mode` | `prefix` | `prefix` (ART + hash), `hash` (hash-only), or `random` |
+| `routing_mode` | `prefix` | `prefix` (ART + hash), `hash` (hash-only), `random` (uniform weighted random; `round_robin` is an alias), or `least_loaded` (lowest live in-flight count, no affinity; the benchmark's strongest no-affinity baseline, `bench.sh --baseline-mode least_loaded`) |
 | `prefix_token_length` | `128` | Number of tokens used as routing key when no boundary is available |
 | `block_alignment` | `16` | Align prefix to vLLM block boundaries before hashing |
 | `hash_strategy` | `bounded_load` | `bounded_load`, `p2c`, `jump`, or `modular` |

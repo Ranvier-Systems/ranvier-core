@@ -84,7 +84,7 @@ class TelemetryService;  // BACKLOG §21 P2: fed via ShardLocalState::telemetry_
 
 struct RouteResult {
     std::optional<BackendId> backend_id;  // Selected backend (nullopt if routing failed)
-    std::string routing_mode;             // "prefix", "hash", or "random"
+    std::string routing_mode;             // "prefix", "hash", "random", or "least_loaded"
     bool cache_hit = false;               // True if route was found via ART lookup (not hash fallback)
     std::string error_message;            // Non-empty if backend_id is nullopt
 
@@ -465,6 +465,16 @@ public:
 
     // Get a backend using weighted random selection within the highest available priority group
     std::optional<BackendId> get_random_backend();
+
+    // Get the least-loaded live backend (LEAST_LOADED routing mode): same
+    // candidate set as get_random_backend() (live, pool-role valve, highest
+    // priority group, weight > 0), minimum capacity-adjusted composite load,
+    // ties broken uniformly at random. No ART lookup, no route learning.
+    // estimated_cost scales the cache-headroom penalty exactly as the divert
+    // path does. Lock-free, shard-local (Hard Rule #1).
+    // (Distinct from the free get_least_loaded_backend(candidates) helper used by
+    // the bounded-load divert, which scans a caller-supplied candidate list.)
+    std::optional<BackendId> select_least_loaded_backend(double estimated_cost = 0.0);
 
     // Get a backend using prefix-affinity routing (ART + consistent hash fallback)
     // Routes requests with the same prefix to the same backend for KV cache reuse

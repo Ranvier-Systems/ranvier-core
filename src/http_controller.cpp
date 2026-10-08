@@ -1374,14 +1374,15 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // NOTE: tokenization_start collapsed into routing_start (phase-snapshot
     // optimization — only variable declarations between them, ~0 cycles).
 
-    // OPTIMIZATION: Skip tokenization entirely in RANDOM routing mode
-    // Random routing ignores tokens completely, so tokenization is wasted work.
-    // This saves ~5-6ms per request (Rust FFI + HuggingFace tokenizer overhead).
-    bool tokenization_skipped = _config.is_random_mode();
+    // OPTIMIZATION: Skip tokenization entirely in the no-affinity routing modes
+    // (RANDOM, LEAST_LOADED). They ignore tokens completely, so tokenization is
+    // wasted work; skipping it saves ~5-6ms per request (Rust FFI + HuggingFace
+    // tokenizer overhead) and keeps the two baseline arms comparable to each other.
+    bool tokenization_skipped = _config.is_random_mode() || _config.is_least_loaded_mode();
     if (tokenization_skipped) {
-        // Skip tokenization - tokens remain empty, router will use random backend selection
+        // Skip tokenization - tokens remain empty, router selects without them
         metrics().record_tokenization_skipped();
-        log_proxy.debug("[{}] Skipping tokenization (random routing mode)", request_id);
+        log_proxy.debug("[{}] Skipping tokenization (no-affinity routing mode)", request_id);
     }
 
     // Start tokenization span (only do actual work if not in random mode)

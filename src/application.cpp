@@ -804,6 +804,7 @@ RoutingStrategyParams Application::make_strategy_snapshot() const {
         case RoutingConfig::RoutingMode::PREFIX: p.routing_mode = "prefix"; break;
         case RoutingConfig::RoutingMode::HASH:   p.routing_mode = "hash";   break;
         case RoutingConfig::RoutingMode::RANDOM: p.routing_mode = "random"; break;
+        case RoutingConfig::RoutingMode::LEAST_LOADED: p.routing_mode = "least_loaded"; break;
     }
     switch (r.hash_strategy) {
         case RoutingConfig::HashStrategy::JUMP:         p.hash_strategy = "jump";         break;

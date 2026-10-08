@@ -55,8 +55,17 @@ struct RoutingConfig {
     // Routing mode: determines how requests are routed to backends
     // - "prefix": ART lookup + consistent hash fallback (best for KV cache, learns routes)
     // - "hash": Consistent hash only (no ART, no learning - measures hash baseline)
-    // - "random": Weighted random distribution (baseline, no affinity)
-    enum class RoutingMode { PREFIX, HASH, RANDOM };
+    // - "random": Weighted random distribution (baseline, no affinity).
+    //   "round_robin" is accepted as an alias: with equal weights the expected
+    //   distribution is the same, and the benchmark tooling labels this arm
+    //   "Round-Robin".
+    // - "least_loaded": the live backend with the lowest capacity-adjusted
+    //   composite load (under the shipping defaults: the node's in-flight count
+    //   summed across shards), ties broken uniformly at random. No ART, no
+    //   learning. This is the strongest no-affinity baseline: it sees the same
+    //   load signal the prefix mode's divert policy sees, so a prefix-vs-
+    //   least_loaded A/B isolates what affinity adds over load balancing alone.
+    enum class RoutingMode { PREFIX, HASH, RANDOM, LEAST_LOADED };
     RoutingMode routing_mode = RoutingMode::PREFIX;  // Default: prefix-affinity with ART
     size_t prefix_token_length = 128;  // Number of tokens to use as routing key (default: 128)
 
@@ -392,6 +401,7 @@ struct RoutingConfig {
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }
     bool is_random_mode() const { return routing_mode == RoutingMode::RANDOM; }
+    bool is_least_loaded_mode() const { return routing_mode == RoutingMode::LEAST_LOADED; }
     bool uses_art() const { return routing_mode == RoutingMode::PREFIX; }
     bool should_learn_routes() const { return routing_mode == RoutingMode::PREFIX; }
 };

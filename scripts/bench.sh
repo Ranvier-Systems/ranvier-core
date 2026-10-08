@@ -277,6 +277,13 @@ BENCHMARK OPTIONS:
                         A fixed order lets thermal drift / cache carry-over always
                         favor one side; bench-runner alternates this across --repeat
                         runs. Comparison always treats round-robin as the baseline.
+    --baseline-mode M   Routing mode of the --compare baseline arm: round_robin (default;
+                        an alias of the server's uniform random mode), random, hash, or
+                        least_loaded (lowest live in-flight count, no affinity: the
+                        strongest no-affinity baseline, so prefix-vs-least_loaded
+                        isolates what affinity adds over load balancing). The arm's
+                        report dir, manifest, Locust BENCHMARK_MODE and the compare
+                        header all follow the mode.
     --no-kv-reset       Do not POST /reset_prefix_cache to every vLLM backend before
                         each --compare arm. By default the cache is reset so the arm
                         that runs second does not inherit the first arm's warm KV
@@ -503,6 +510,7 @@ OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 COMPARE=false
 ORDER="rr-first"   # --order: arm order in --compare (rr-first | prefix-first)
 KV_RESET=true      # --no-kv-reset: keep vLLM's KV cache across the arm switch
+BASELINE_MODE="round_robin"  # --baseline-mode: routing mode of the --compare baseline arm
 SKIP_SETUP=false
 SKIP_VLLM=false
 VLLM_HOST="localhost"
@@ -550,6 +558,7 @@ while [[ $# -gt 0 ]]; do
         --compare)        COMPARE=true; shift ;;
         --order)          ORDER="$2"; shift 2 ;;
         --no-kv-reset)    KV_RESET=false; shift ;;
+        --baseline-mode)  BASELINE_MODE="$2"; shift 2 ;;
         --skip-setup)     SKIP_SETUP=true; shift ;;
         --skip-vllm)      SKIP_VLLM=true; shift ;;
         --vllm-host)      VLLM_HOST="$2"; shift 2 ;;
@@ -606,6 +615,20 @@ if [[ -n "$NUM_PREFIXES_FLAG" ]]; then
     fi
     export NUM_LARGE_PREFIXES="$NUM_PREFIXES_FLAG"
 fi
+
+# Validate --baseline-mode (only meaningful with --compare; harmless otherwise).
+case "$BASELINE_MODE" in
+    round_robin|random|hash|least_loaded) ;;
+    *)
+        log_error "--baseline-mode must be round_robin, random, hash or least_loaded (got: $BASELINE_MODE)"
+        exit 1 ;;
+esac
+# Human label for the baseline arm, used in logs and the compare header.
+case "$BASELINE_MODE" in
+    round_robin|random) BASELINE_LABEL="Round-Robin" ;;
+    hash)               BASELINE_LABEL="Consistent-Hash" ;;
+    least_loaded)       BASELINE_LABEL="Least-Loaded" ;;
+esac
 
 # Validate --order (only meaningful with --compare; harmless otherwise).
 if [[ "$ORDER" != "rr-first" && "$ORDER" != "prefix-first" ]]; then
@@ -1193,7 +1216,7 @@ if [[ "$DRY_RUN" = true ]]; then
         log_info "Would run warm-up ($DEFAULT_WARMUP_DURATION, $DEFAULT_WARMUP_USERS users)"
     fi
     if [[ "$COMPARE" = true ]]; then
-        log_info "Would run benchmark 1: Round-Robin ($DURATION, $USERS users)"
+        log_info "Would run benchmark 1: ${BASELINE_LABEL} baseline, mode ${BASELINE_MODE} ($DURATION, $USERS users)"
         log_info "Would pause 30s between benchmarks"
         log_info "Would run benchmark 2: Prefix-Aware ($DURATION, $USERS users)"
     else
@@ -2389,17 +2412,17 @@ if [[ "$COMPARE" = true ]]; then
     COMPARE_TOTAL_SECS=$((COMPARE_DURATION_SECS * 2 + 90))  # 2 benchmarks + restart + health
     COMPARE_TOTAL_MINS=$((COMPARE_TOTAL_SECS / 60))
     COMPARE_TOTAL_SECS_REM=$((COMPARE_TOTAL_SECS % 60))
-    log_info "Running two benchmarks: Round-Robin (baseline) vs Prefix-Aware (optimized)"
+    log_info "Running two benchmarks: ${BASELINE_LABEL} (baseline, mode ${BASELINE_MODE}) vs Prefix-Aware (optimized)"
     log_info "Each benchmark: $DURATION | Total estimated time: ${COMPARE_TOTAL_MINS}m ${COMPARE_TOTAL_SECS_REM}s"
 
     # Arm order (review F4): a fixed order lets thermal drift and cache carry-over
     # always land on the same side. --order picks it; bench-runner alternates it
     # across --repeat runs to cancel the bias. The comparison below always treats
-    # round_robin as the baseline regardless of which arm physically ran first.
+    # the --baseline-mode arm as the baseline regardless of which arm ran first.
     if [[ "$ORDER" == "prefix-first" ]]; then
-        ARMS=("prefix" "round_robin")
+        ARMS=("prefix" "$BASELINE_MODE")
     else
-        ARMS=("round_robin" "prefix")
+        ARMS=("$BASELINE_MODE" "prefix")
     fi
     log_info "Arm order: ${ARMS[0]} → ${ARMS[1]} (--order $ORDER)"
 
@@ -2425,19 +2448,19 @@ if [[ "$COMPARE" = true ]]; then
         # Warm THIS arm's freshly-restarted cluster in its own mode so both arms
         # are identically primed (was previously warmed once, before the restart).
         [[ "$WARMUP" = true ]] && run_warmup "$arm"
-        if [[ "$arm" == "round_robin" ]]; then
-            ARM_REPORT[round_robin]=$(run_benchmark "round_robin" "Round-Robin (Baseline)" "[${arm_i}/2]")
+        if [[ "$arm" == "$BASELINE_MODE" ]]; then
+            ARM_REPORT[baseline]=$(run_benchmark "$BASELINE_MODE" "${BASELINE_LABEL} (Baseline)" "[${arm_i}/2]")
         else
             ARM_REPORT[prefix]=$(run_benchmark "prefix" "Prefix-Aware (Optimized)" "[${arm_i}/2]")
         fi
     done
-    REPORT_RR="${ARM_REPORT[round_robin]}"
+    REPORT_RR="${ARM_REPORT[baseline]}"
     REPORT_PREFIX="${ARM_REPORT[prefix]}"
 
     log_header "A/B Comparison Complete"
     echo ""
     echo "Results:"
-    echo "  Round-Robin:  $REPORT_RR"
+    echo "  ${BASELINE_LABEL} (baseline, ${BASELINE_MODE}): $REPORT_RR"
     echo "  Prefix-Aware: $REPORT_PREFIX"
     echo ""
 
@@ -2449,6 +2472,7 @@ if [[ "$COMPARE" = true ]]; then
         echo "Git Commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
         echo "vLLM Version: $VLLM_VERSION"
         echo "Arm order: ${ARMS[0]} -> ${ARMS[1]} (--order $ORDER); warm-up per-arm: $WARMUP"
+        echo "Baseline arm routing mode: ${BASELINE_MODE} (--baseline-mode)"
         if [[ "$KV_RESET" = true ]]; then
             echo "vLLM KV cache reset before each arm via POST /reset_prefix_cache (backends acked: ${KV_RESET_LOG% })"
         else
