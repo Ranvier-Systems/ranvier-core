@@ -271,7 +271,8 @@ pre-register: an ε that matches least-loaded's P99 at 30u while keeping P50 wit
 −28% and KV above 40% becomes the default; if no ε does both, the default stays 1.0 and the docs
 say the trade-off out loud.
 
-Archive: `docs/benchmarks/results/2026-10-08-baseline-least-loaded/`.
+Archive: `docs/benchmarks/results/2026-10-08-baseline-least-loaded/`; raw run directories on the
+v2.2.0 release as `ranvier-benchmark-runs-2026-10-08.tar.gz`.
 
 ## Representative-workload re-baseline (measured 2026-10-01, fixed tooling, previous defaults)
 
@@ -451,7 +452,8 @@ The raw run directories (Locust CSVs, per-request logs, vLLM logs, per-node Ranv
 captured; 4.6 GB, 610 MB compressed) are attached to the
 [v2.2.0 release](https://github.com/Ranvier-Systems/ranvier-core/releases/tag/v2.2.0) as
 `ranvier-benchmark-runs-2026-10.tar.gz` (the 2026-10-01..05 campaign) and
-`ranvier-benchmark-runs-2026-10-06.tar.gz` (the 2026-10-06/07 matrix and fitted suite, 64 MB).
+`ranvier-benchmark-runs-2026-10-06.tar.gz` (the 2026-10-06/07 matrix and fitted suite, 64 MB) and
+`ranvier-benchmark-runs-2026-10-08.tar.gz` (the baseline suite vs least-loaded).
 New runs are archived with
 `scripts/bench-archive.sh`. Manifests from 2026-10-02 on carry `server_image`, so the binary
 behind a run is identifiable.
