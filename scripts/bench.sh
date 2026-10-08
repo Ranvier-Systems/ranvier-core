@@ -277,6 +277,12 @@ BENCHMARK OPTIONS:
                         A fixed order lets thermal drift / cache carry-over always
                         favor one side; bench-runner alternates this across --repeat
                         runs. Comparison always treats round-robin as the baseline.
+    --no-kv-reset       Do not POST /reset_prefix_cache to every vLLM backend before
+                        each --compare arm. By default the cache is reset so the arm
+                        that runs second does not inherit the first arm's warm KV
+                        (measured 2026-10-06: 8B prefix-first repeats ~9 points weaker
+                        because round-robin started warm). The compare header records
+                        which it was.
     --warmup            Run a short warm-up before the main benchmark (adds ~1m 10s).
                         With --compare, warm-up runs PER ARM after each mode restart so
                         both arms are identically primed.
@@ -496,6 +502,7 @@ NUM_PREFIXES_FLAG=""        # --num-prefixes: exported as NUM_LARGE_PREFIXES aft
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 COMPARE=false
 ORDER="rr-first"   # --order: arm order in --compare (rr-first | prefix-first)
+KV_RESET=true      # --no-kv-reset: keep vLLM's KV cache across the arm switch
 SKIP_SETUP=false
 SKIP_VLLM=false
 VLLM_HOST="localhost"
@@ -542,6 +549,7 @@ while [[ $# -gt 0 ]]; do
         --output-dir)     OUTPUT_DIR="$2"; shift 2 ;;
         --compare)        COMPARE=true; shift ;;
         --order)          ORDER="$2"; shift 2 ;;
+        --no-kv-reset)    KV_RESET=false; shift ;;
         --skip-setup)     SKIP_SETUP=true; shift ;;
         --skip-vllm)      SKIP_VLLM=true; shift ;;
         --vllm-host)      VLLM_HOST="$2"; shift 2 ;;
@@ -1293,8 +1301,15 @@ if [[ "$SKIP_VLLM" = false ]]; then
         # Check if any vLLM process died
         for ((i=0; i<${#VLLM_PIDS[@]}; i++)); do
             if ! kill -0 "${VLLM_PIDS[$i]}" 2>/dev/null; then
-                log_error "vLLM instance $i died. Check /tmp/vllm_gpu${i}.log"
-                cat "/tmp/vllm_gpu${i}.log" | tail -20
+                # Keep the dead instance's log under the output dir: the next run
+                # overwrites /tmp/vllm_gpu${i}.log, which is how the cause of the
+                # 2026-10-06 rebaseline run 8 (engine-core init failure on GPU 5,
+                # 47 s in) was lost before anyone read it.
+                mkdir -p "$OUTPUT_DIR"
+                KEPT_LOG="${OUTPUT_DIR}/vllm_gpu${i}_startup_failure_$(date +%Y%m%d_%H%M%S).log"
+                cp "/tmp/vllm_gpu${i}.log" "$KEPT_LOG" 2>/dev/null || true
+                log_error "vLLM instance $i died during start-up. Log kept at $KEPT_LOG (tail below)"
+                tail -40 "/tmp/vllm_gpu${i}.log" 2>/dev/null | grep -v '^\s*$' | tail -25
                 exit 1
             fi
         done
@@ -2328,6 +2343,45 @@ restart_ranvier_with_mode() {
 # Execute benchmarks
 # -----------------------------------------------------------------------------
 
+# vLLM keeps its KV cache across the Ranvier restart between --compare arms, so
+# the arm that runs second starts cache-warm (review F4). Measured 2026-10-06 on
+# 8B/20u: round-robin running second inherited the prefix arm's warm cache
+# (KV hit 76% vs 72%, P99 843 vs 882-890 ms) and the prefix-first repeat read
+# -17.7% against -26.7/-27.1% rr-first; same pattern on 2026-10-01. The 13B
+# rows showed no such effect (round-robin never concentrates a prefix, so it
+# has nothing to inherit). vLLM's OpenAI server exposes POST /reset_prefix_cache,
+# which frees every cached block; it refuses while requests are in flight, which
+# cannot happen here because Ranvier is stopped before each arm. Each backend is
+# hit the same way the health check addresses it. The result goes into the
+# compare header so a reader can tell a reset run from a carry-over run.
+KV_RESET_LOG=""
+reset_vllm_prefix_cache() {
+    local label="$1" acked=0 total=0 i host port code
+    for ((i=0; i<NUM_BACKENDS; i++)); do
+        if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
+            host="${VLLM_ENDPOINTS[$i]%:*}"
+            port="${VLLM_ENDPOINTS[$i]#*:}"
+        else
+            host="$VLLM_HOST"
+            port=$((DEFAULT_VLLM_PORT_START + i))
+        fi
+        total=$((total + 1))
+        code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 60 \
+                    -X POST "http://${host}:${port}/reset_prefix_cache" 2>/dev/null || echo 000)
+        if [[ "$code" == "200" ]]; then
+            acked=$((acked + 1))
+        else
+            log_warn "vLLM ${host}:${port}: POST /reset_prefix_cache returned HTTP $code (cache NOT reset on this backend)"
+        fi
+    done
+    if [[ $acked -eq $total ]]; then
+        log_ok "vLLM prefix cache reset on $acked/$total backends before the $label arm"
+    else
+        log_warn "vLLM prefix cache reset acked by only $acked/$total backends before the $label arm; the compare header records it"
+    fi
+    KV_RESET_LOG+="${label}=${acked}/${total} "
+}
+
 if [[ "$COMPARE" = true ]]; then
     log_header "A/B Comparison Mode"
     # Calculate total time for comparison mode (extra 60s for container restart + health check)
@@ -2351,14 +2405,21 @@ if [[ "$COMPARE" = true ]]; then
 
     # vLLM KV cache carry-over (review F4): only the Ranvier containers are
     # restarted between arms — the vLLM processes keep their KV cache, so the
-    # second arm can start vLLM-warm. Per-arm warm-up (below) gives both arms an
-    # equal warm dose; for stricter isolation, restart vLLM between arms.
-    log_warn "vLLM KV cache is NOT reset between arms (only Ranvier restarts). Per-arm warm-up equalizes the warm dose; restart vLLM between arms for strict isolation."
+    # second arm would start vLLM-warm. Since 2026-10-07 every backend's prefix
+    # cache is reset before each arm (reset_vllm_prefix_cache above) unless
+    # --no-kv-reset asks for the old carry-over behaviour.
+    if [[ "$KV_RESET" = true ]]; then
+        log_info "vLLM prefix cache is reset before each arm (POST /reset_prefix_cache; --no-kv-reset to keep the carry-over)."
+    else
+        log_warn "vLLM KV cache is NOT reset between arms (--no-kv-reset; only Ranvier restarts). The arm that runs second starts vLLM-warm."
+    fi
 
     declare -A ARM_REPORT
     arm_i=0
     for arm in "${ARMS[@]}"; do
         arm_i=$((arm_i + 1))
+        # Drop the previous arm's (or previous run's) KV blocks before this arm
+        [[ "$KV_RESET" = true ]] && reset_vllm_prefix_cache "$arm"
         # Restart Ranvier in this arm's mode (also resets its Prometheus histograms)
         restart_ranvier_with_mode "$arm"
         # Warm THIS arm's freshly-restarted cluster in its own mode so both arms
@@ -2388,7 +2449,11 @@ if [[ "$COMPARE" = true ]]; then
         echo "Git Commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
         echo "vLLM Version: $VLLM_VERSION"
         echo "Arm order: ${ARMS[0]} -> ${ARMS[1]} (--order $ORDER); warm-up per-arm: $WARMUP"
-        echo "vLLM KV cache NOT reset between arms (Ranvier-only restart)"
+        if [[ "$KV_RESET" = true ]]; then
+            echo "vLLM KV cache reset before each arm via POST /reset_prefix_cache (backends acked: ${KV_RESET_LOG% })"
+        else
+            echo "vLLM KV cache NOT reset between arms (--no-kv-reset; Ranvier-only restart)"
+        fi
         echo "Ranvier Env: $(env | grep '^RANVIER_' | sort | tr '\n' ' ')"
         echo ""
     } > "$COMPARE_OUTPUT"

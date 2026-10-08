@@ -1929,8 +1929,16 @@ def aggregate_runs(runs: List[BenchmarkResults],
 
 def aggregate_compare(baseline_runs: List[BenchmarkResults],
                       treatment_runs: List[BenchmarkResults],
-                      discriminating_metric: str = "p99_ttft_ms") -> Dict[str, Any]:
+                      discriminating_metric: str = "p99_ttft_ms",
+                      arm_orders: Optional[List[Optional[str]]] = None) -> Dict[str, Any]:
     """Paired A/B aggregation: baseline[i] vs treatment[i] over N repeats.
+
+    ``arm_orders[i]`` ("rr-first" / "prefix-first" / None) is the physical arm
+    order of pair i, read from its manifest by cmd_aggregate. The per-order
+    medians it enables matter because the arm that runs second inherits vLLM's
+    warm KV cache unless bench.sh reset it (2026-10-06: 8B prefix-first repeats
+    were ~9 points weaker than rr-first ones); with three alternating repeats the
+    overall median is always an rr-first value, so the split is reported beside it.
 
     Computes the per-pair percent change of the discriminating metric, then the
     median and IQR of that change across repeats, and a verdict:
@@ -1952,14 +1960,18 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
     deltas: List[float] = []
     per_pair = []
     hotspots = []
+    by_order_vals: Dict[str, List[float]] = {}
     for i, (base, treat) in enumerate(pairs):
         b = getattr(base, discriminating_metric, None)
         t = getattr(treat, discriminating_metric, None)
         d = _pct_change(b, t)
-        per_pair.append({"repeat": i + 1, "baseline": b, "treatment": t, "pct_change": d})
+        order = arm_orders[i] if arm_orders and i < len(arm_orders) else None
+        per_pair.append({"repeat": i + 1, "baseline": b, "treatment": t, "pct_change": d,
+                         "arm_order": order})
         if d is not None:
             deltas.append(d)
-
+            if order:
+                by_order_vals.setdefault(order, []).append(d)
         # Hot-spot: prefix (treatment) P99 much worse than RR (baseline) at high hit rate.
         bp99 = getattr(base, "p99_ttft_ms", None)
         tp99 = getattr(treat, "p99_ttft_ms", None)
@@ -1968,6 +1980,11 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
                 and tp99 > bp99 * _HOTSPOT_P99_FACTOR and thit >= _HOTSPOT_MIN_HIT_RATE):
             hotspots.append({"repeat": i + 1, "baseline_p99_ms": bp99,
                              "treatment_p99_ms": tp99, "cache_hit_rate_pct": thit})
+
+    by_order = {
+        order: {"n": len(vals), "median": statistics.median(vals), "values": vals}
+        for order, vals in by_order_vals.items()
+    }
 
     lower_better = discriminating_metric in _LOWER_IS_BETTER
     delta_summ = _summarize_metric(deltas)
@@ -2016,6 +2033,7 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
         "verdict": verdict,
         "reliable": reliable,
         "agreeing_pairs": agreeing,
+        "by_arm_order": by_order,
         "baseline": aggregate_runs(baseline_runs)["metrics"],
         "treatment": aggregate_runs(treatment_runs)["metrics"],
     }
@@ -2059,8 +2077,19 @@ def format_aggregate(agg: Dict[str, Any]) -> str:
         lines.append("Per-repeat %change (treatment vs baseline):")
         for p in agg["per_pair"]:
             d = "n/a" if p["pct_change"] is None else f"{p['pct_change']:+.1f}%"
+            order = f", {p['arm_order']}" if p.get("arm_order") else ""
             lines.append(f"  repeat {p['repeat']}: {d}  "
-                         f"(baseline={p['baseline']}, treatment={p['treatment']})")
+                         f"(baseline={p['baseline']}, treatment={p['treatment']}{order})")
+        by_order = agg.get("by_arm_order") or {}
+        if by_order:
+            parts = [f"{o} {s['median']:+.1f}% (n={s['n']})"
+                     for o, s in sorted(by_order.items())]
+            lines.append("Per arm-order median: " + " · ".join(parts))
+            if len(by_order) > 1:
+                meds = [s["median"] for s in by_order.values()]
+                spread = max(meds) - min(meds)
+                lines.append(f"  (order spread {spread:.1f} points; the arm that runs second "
+                             f"inherits vLLM's warm KV cache unless the compare header says it was reset)")
         if agg["hotspots"]:
             lines.append("")
             lines.append(f"⚠ HOT-SPOT (affinity-thrash) flagged in {len(agg['hotspots'])} repeat(s):")
@@ -2083,6 +2112,17 @@ def format_aggregate(agg: Dict[str, Any]) -> str:
                 lines.append(f"  repeat {o['repeat']}: P99 {o['p99_ttft_ms']:.0f}ms "
                              f"(> {o['threshold']:.0f}ms)")
     return "\n".join(lines)
+
+
+def _arm_order_for(path: str) -> Optional[str]:
+    """The --order a report dir's manifest records (bench.sh defaults to rr-first
+    under --compare); None when there is no manifest or the run was not an A/B."""
+    m = load_manifest(path)
+    cmd = (m or {}).get("command") or ""
+    if not cmd or "--compare" not in cmd:
+        return None
+    hit = re.search(r"--order\s+(rr-first|prefix-first)", cmd)
+    return hit.group(1) if hit else "rr-first"
 
 
 def _resolve_run_input(path: str) -> BenchmarkResults:
@@ -2284,7 +2324,8 @@ def cmd_aggregate(args):
                       f"inputs count ({len(treatment)}) for paired A/B aggregation",
                       file=sys.stderr)
                 return 1
-            agg = aggregate_compare(baseline, treatment, args.metric)
+            agg = aggregate_compare(baseline, treatment, args.metric,
+                                    arm_orders=[_arm_order_for(p) for p in args.inputs])
         else:
             agg = aggregate_runs(treatment)
 
