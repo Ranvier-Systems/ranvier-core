@@ -337,6 +337,9 @@ BUILT-IN SUITES:
       routing mode (2.3.0+); bench.sh aborts the arm on a mode mismatch.
       12. 13B 20 users 10m   --compare --baseline-mode least_loaded --num-prefixes 16 --prefix-max-tokens 4000
       13. 13B 30 users 30m   same
+      Measured 2026-10-08: 20u P99 -14.6/-13.8/-20.8% (3/3), 30u -6.5/+6.6/+11.3%
+      (mixed); P50 -27..-29% and rps +6..+9% at both loads. Least-loaded alone is
+      ~-50%/-41% P99 vs round-robin, so the tail win is mostly load balancing.
 
     all = rebaseline + epsilon + fitted + placement + baseline + low (every suite;
       the historical epsilon and placement rows included — pass --skip to drop them).

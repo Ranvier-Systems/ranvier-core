@@ -15,6 +15,17 @@ to `docs/benchmarks/results/2026-10-01-rebaseline/`.
 > −22.6%. The §4 recommendation to give the scorer a KV-occupancy term still stands for the
 > eviction regime (13B/30u, 50 prefixes, timeouts in both arms), but it was not what the 20-user
 > row needed. Record: `docs/benchmarks/benchmark-results-current.md`, 2026-10-03..05 sections.
+>
+> **Addendum, 2026-10-08.** The control this assessment asked for in §4 ("compared with a
+> least-loaded policy without affinity") has been run: a `least_loaded` routing mode (lowest live
+> in-flight count, no ART) as the baseline arm on the fitted 13B 20u and 30u rows, three repeats
+> each. Least-loaded alone removes most of the P99 tail against round-robin (−50% at 20u, −41% at
+> 30u). Prefix routing adds P50 −27…−29%, throughput +6…+9% and a 3–4× KV hit rate at both loads,
+> P99 a further −14.6% at 20u and nothing reliable at 30u (−6.5 / +6.6 / +11.3). The goal statement
+> holds on its own terms, "measurably reduces GPU KV-cache thrashing": the cache metric and the
+> prefill it saves are affinity's and nobody else's. The tail-latency framing the README carried
+> until today was mostly load balancing, and the README now says so. Record: "Baseline suite" in
+> `docs/benchmarks/benchmark-results-current.md`.
 
 ## Scorecard
 
