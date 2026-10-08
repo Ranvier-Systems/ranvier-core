@@ -239,7 +239,7 @@ USAGE:
     ./scripts/bench-runner.sh [OPTIONS]
 
 OPTIONS:
-    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, low, all, custom
+    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, low, all, custom
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
@@ -326,8 +326,20 @@ BUILT-IN SUITES:
       10. 70B model test (16 users, TP auto)
       11. 8B high-concurrency stress (64 users, single arm)
 
-    all = rebaseline + epsilon + fitted + placement + low (every suite; the
-      historical epsilon and placement rows included — pass --skip to drop them).
+    baseline (2 configs x 2 arms x 3 repeats, ~4.5h) — prefix vs LEAST-LOADED, the
+      strongest no-affinity baseline (--baseline-mode least_loaded: lowest live
+      in-flight count, no ART, no learning; the same load signal the prefix
+      divert policy reads). Fitted set, 13B 20u/10m and 30u/30m: the two rows
+      where the prefix-vs-round-robin win is largest (-57% / -42% P99). Reads:
+      the prefix arm's margin here is what affinity adds over load balancing;
+      least_loaded's own margin over round-robin is the fitted-suite number
+      minus this one on the same row. Requires an image with the least_loaded
+      routing mode (2.3.0+); bench.sh aborts the arm on a mode mismatch.
+      12. 13B 20 users 10m   --compare --baseline-mode least_loaded --num-prefixes 16 --prefix-max-tokens 4000
+      13. 13B 30 users 30m   same
+
+    all = rebaseline + epsilon + fitted + placement + baseline + low (every suite;
+      the historical epsilon and placement rows included — pass --skip to drop them).
 
     Retired (see .dev-context/benchmark-accuracy-audit-2026-09-30.md):
       - prefix-ratio 0.5/0.7 sweep: SHARED_PREFIX_RATIO only governs 20% of the
@@ -345,11 +357,11 @@ BUILT-IN SUITES:
       now identical to fitted on a 2.2.0 image; keep it for re-running the leg
       against an older image or with --miss-placement hash on the rr arm.
 
-    rebaseline, epsilon, fitted and placement default to --repeat 3; pass --repeat 1 for a smoke run.
+    rebaseline, epsilon, fitted, placement and baseline default to --repeat 3; pass --repeat 1 for a smoke run.
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
-      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | low
+      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | low
     Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
@@ -428,7 +440,7 @@ add_run() {
     local args="$*"
 
     case "$SUITE" in
-        rebaseline|epsilon|fitted|placement|low) [[ "$suite" != "$SUITE" ]] && return ;;
+        rebaseline|epsilon|fitted|placement|baseline|low) [[ "$suite" != "$SUITE" ]] && return ;;
         all)    ;;  # include everything
         *)      return ;;  # custom suite doesn't use add_run
     esac
@@ -524,6 +536,26 @@ define_runs() {
         --num-prefixes 16 --prefix-max-tokens 4000 \
         --miss-placement least_loaded
 
+    # --- baseline: prefix vs least-loaded (no affinity) ----------------------------
+    # Every headline number is prefix vs the round-robin arm, the weakest baseline
+    # there is. These rows run the same fitted 20u and 30u configs with the
+    # baseline arm in least_loaded mode: lowest live in-flight count, no ART, no
+    # learning, the same load signal the prefix mode's divert policy reads. The
+    # prefix arm's margin over this arm is what affinity adds beyond load
+    # balancing; least_loaded's margin over round-robin follows by subtraction
+    # from the fitted suite on the same rows.
+    add_run baseline "13B 20u/10m A/B vs least_loaded, fitted set" \
+        --compare --baseline-mode least_loaded \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    add_run baseline "13B 30u/30m A/B vs least_loaded, fitted set" \
+        --compare --baseline-mode least_loaded \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
     # --- low: exploratory, outside any headline --------------------------------
     # TP, max-model-len, and gpu-mem-util are auto-detected from GPU VRAM.
     # Explicit overrides: --tp 4 --max-model-len 4096 --gpu-mem-util 0.92 (for 40GB)
@@ -566,7 +598,7 @@ define_runs
 # so the post-suite aggregation can gather each config's repeats. See BACKLOG §25.
 # A single run is not a result (review F3): the headline suites default to
 # three repeats so the aggregate can issue a CONSISTENT / MIXED verdict.
-if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" || "$SUITE" == "placement" ) ]]; then
+if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" || "$SUITE" == "placement" || "$SUITE" == "baseline" ) ]]; then
     REPEAT=3
     log_info "Suite '$SUITE' defaults to --repeat 3 (pass --repeat 1 for a smoke run)"
 fi
@@ -1107,7 +1139,7 @@ if [[ "$REPEAT" -gt 1 ]]; then
                 # arm patterns below but hold warmup.log, not benchmark.log; passing one to the
                 # aggregator makes it exit before writing anything. They are not results.
                 [[ "$base" == warmup_* ]] && continue
-                if echo "$base" | grep -qE 'round_robin|random'; then
+                if echo "$base" | grep -qE 'round_robin|random|least_loaded|_hash'; then
                     RR_DIRS+=("$d")
                 elif echo "$base" | grep -qE 'prefix'; then
                     PREFIX_DIRS+=("$d")

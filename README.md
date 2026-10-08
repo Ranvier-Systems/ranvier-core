@@ -188,7 +188,7 @@ assets:
   tokenizer_path: ./assets/llama-3.json   # the served model's HuggingFace tokenizer.json
 
 routing:
-  routing_mode: prefix          # prefix | hash | random
+  routing_mode: prefix          # prefix | hash | random | least_loaded
   prefix_token_length: 128      # routing-key depth when no system-message boundary is found
   block_alignment: 16           # vLLM PagedAttention block size
   min_token_length: 32          # do not learn routes for very short prompts

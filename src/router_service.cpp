@@ -2708,6 +2708,7 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
 //   - PREFIX: ART lookup + consistent hash fallback (learns routes)
 //   - HASH: Consistent hash only (baseline comparison)
 //   - RANDOM: Weighted random (no affinity)
+//   - LEAST_LOADED: lowest live load, no affinity (strongest no-affinity baseline)
 //
 RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
                                          const std::string& request_id,
@@ -2787,6 +2788,24 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
             result.cache_hit = true;  // Hash always provides affinity
             result.original_selected = hash_backend.value();
             result.matched_prefix_depth = static_cast<uint32_t>(effective_prefix_len);
+        } else {
+            result.error_message = "No backends registered";
+        }
+    } else if (routing_mode == RoutingConfig::RoutingMode::LEAST_LOADED) {
+        // LEAST_LOADED mode: lowest capacity-adjusted composite load, no
+        // affinity. The benchmark's strongest no-affinity baseline: it reads
+        // the same live load signal the PREFIX divert policy reads, so
+        // prefix-vs-least_loaded isolates what affinity adds over balancing.
+        result.routing_mode = "least_loaded";
+        auto ll_id = select_least_loaded_backend(estimated_cost);
+
+        if (ll_id.has_value()) {
+            result.backend_id = ll_id.value();
+            result.cache_hit = false;  // Never consults the ART
+            result.original_selected = ll_id.value();
+            result.backend_load_at_decision =
+                static_cast<double>(get_composite_backend_load(ll_id.value()));
+            // matched_prefix_depth stays 0 — no affinity.
         } else {
             result.error_message = "No backends registered";
         }
@@ -2949,6 +2968,93 @@ std::optional<BackendId> RouterService::get_random_backend() {
 
     // Fallback (shouldn't reach here)
     return last_candidate;
+}
+
+// ============================================================================
+// select_least_loaded_backend() - LEAST_LOADED mode (HOT PATH)
+// ============================================================================
+//
+// HARD RULE #1 (No Blocking on Hot Path): shard-local reads only. The load
+// signal is get_capacity_adjusted_load(), the same function the PREFIX mode's
+// bounded-load divert and least-loaded placement consult: local in-flight
+// count + the cross-shard in-flight mirror (cross_shard_load_sync) + the
+// scraped GPU score and cache-headroom terms when their weights are non-zero.
+// Under the shipping defaults (weights 0) it is the node's live in-flight count.
+//
+// Candidate set and valves mirror get_random_backend(): live backends, DECODE
+// pools excluded unless nothing else is live, highest priority group, weight
+// > 0. Ties (an idle fleet, or equal queues) are broken uniformly at random
+// so the arm does not herd onto the lowest backend id and behave like a
+// single-backend fleet at low load.
+//
+std::optional<BackendId> RouterService::select_least_loaded_backend(double estimated_cost) {
+    if (!g_shard_state) return std::nullopt;
+    auto& state = shard_state();
+
+    if (state.backend_ids.empty()) {
+        return std::nullopt;
+    }
+
+    auto live_infos = state.get_live_backend_infos();
+
+    // Pool-role filter with the same availability valve as get_random_backend().
+    {
+        std::vector<std::pair<BackendId, const BackendInfo*>> eligible;
+        eligible.reserve(live_infos.size());
+        for (const auto& entry : live_infos) {
+            if (entry.second->pool_role != PoolRole::DECODE) {
+                eligible.push_back(entry);
+            }
+        }
+        if (eligible.empty() && !live_infos.empty()) {
+            state.stats.pool_role_fallbacks++;
+            log_router.debug("Pool-role valve: only decode-role backends live; "
+                             "least-loaded selection over the full live set");
+        } else {
+            live_infos = std::move(eligible);
+        }
+    }
+
+    // Highest priority group (lowest priority number) among weight > 0 backends.
+    uint32_t min_priority = std::numeric_limits<uint32_t>::max();
+    for (const auto& [id, info] : live_infos) {
+        if (info->weight > 0 && info->priority < min_priority) {
+            min_priority = info->priority;
+        }
+    }
+    if (min_priority == std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;  // No live backends with weight > 0
+    }
+
+    // Min scan. `ties` is bounded by the live backend count (Hard Rule #4:
+    // bounded by design, no growth beyond the fleet size).
+    uint64_t best_load = std::numeric_limits<uint64_t>::max();
+    std::vector<BackendId> ties;
+    ties.reserve(live_infos.size());
+    for (const auto& [id, info] : live_infos) {
+        if (info->priority != min_priority || info->weight == 0) continue;
+        const uint64_t load = get_capacity_adjusted_load(id, estimated_cost);
+        if (load < best_load) {
+            best_load = load;
+            ties.clear();
+            ties.push_back(id);
+        } else if (load == best_load) {
+            ties.push_back(id);
+        }
+    }
+    if (ties.empty()) {
+        return std::nullopt;  // Unreachable: min_priority came from this set
+    }
+
+    BackendId chosen = ties[0];
+    if (ties.size() > 1) {
+        std::uniform_int_distribution<size_t> dist(0, ties.size() - 1);
+        chosen = ties[dist(state.rng)];
+    }
+
+    log_router.debug("Least-loaded routing: backend {} (load={}, ties={})",
+                     chosen, best_load, ties.size());
+    return chosen;
 }
 
 // ============================================================================
@@ -5353,7 +5459,9 @@ seastar::future<> RouterService::update_routing_config(const RoutingConfig& conf
     _config = config;
 
     const char* mode_str = config.routing_mode == RoutingConfig::RoutingMode::PREFIX ? "prefix" :
-                           config.routing_mode == RoutingConfig::RoutingMode::HASH ? "hash" : "random";
+                           config.routing_mode == RoutingConfig::RoutingMode::HASH ? "hash" :
+                           config.routing_mode == RoutingConfig::RoutingMode::LEAST_LOADED ? "least_loaded" :
+                           "random";
     log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s, drain_timeout={}s, mode={}, prefix_len={})",
                   config.max_routes, config.ttl_seconds.count(), config.backend_drain_timeout.count(),
                   mode_str, config.prefix_token_length);

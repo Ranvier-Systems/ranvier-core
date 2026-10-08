@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `routing_mode: least_loaded` (`RANVIER_ROUTING_MODE=least_loaded`): route every request
+  to the live backend with the lowest capacity-adjusted composite load (under the shipping
+  defaults, the node's in-flight count summed across shards), ties broken uniformly at
+  random; no ART lookup, no route learning, tokenization skipped as in `random`. Exists as
+  the benchmark's strongest no-affinity baseline: `bench.sh --compare --baseline-mode
+  least_loaded` runs it as the baseline arm, `bench-runner.sh --suite baseline` runs the
+  fitted 13B 20u and 30u rows against it, and the compare header names the arm. Not a
+  recommended production mode.
+
 ### Changed
 - `bench.sh --compare` resets every vLLM backend's prefix cache (`POST /reset_prefix_cache`)
   before each arm, so the arm that runs second no longer inherits the first arm's warm KV

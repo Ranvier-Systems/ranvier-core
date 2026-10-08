@@ -1354,14 +1354,33 @@ def _max_incomplete_rate(*runs: BenchmarkResults) -> float:
     return max((r.incomplete_rate_pct or 0.0) for r in runs)
 
 
+_ARM_LABELS = {
+    # bench.sh's "round_robin" arm is the server's uniform random mode under an
+    # alias; the benchmark has always labelled it Round-Robin and keeps doing so.
+    "round_robin": "Round-Robin",
+    "random": "Round-Robin",
+    "hash": "Consistent-Hash",
+    "least_loaded": "Least-Loaded",
+    "prefix": "Prefix-Aware",
+}
+
+
+def _arm_label(run: BenchmarkResults, default: str) -> str:
+    """Human label for an arm from the Locust 'Benchmark Mode:' line, else default."""
+    mode = (run.benchmark_mode or "").strip().lower()
+    return _ARM_LABELS.get(mode, default)
+
+
 def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     """Compare two benchmark results and return formatted comparison."""
+    base_label = _arm_label(baseline, "Round-Robin")
+    new_label = _arm_label(new, "Prefix-Aware")
     lines = []
     lines.append("=" * 80)
-    lines.append("BENCHMARK COMPARISON: Round-Robin vs Prefix-Aware")
+    lines.append(f"BENCHMARK COMPARISON: {base_label} vs {new_label}")
     lines.append("=" * 80)
-    lines.append(f"Baseline (Round-Robin): {baseline.source_file}")
-    lines.append(f"New (Prefix-Aware):     {new.source_file}")
+    lines.append(f"Baseline ({base_label}): {baseline.source_file}")
+    lines.append(f"New ({new_label}):     {new.source_file}")
     lines.append("")
 
     # VALIDATION + INCOMPLETE-RATE BANNER (top of report).

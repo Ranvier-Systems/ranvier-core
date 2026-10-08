@@ -724,7 +724,19 @@ nothing to do.
    arm; the archived compare files carry that cell as printed, the headline rows are unaffected,
    and the cause is not chased further. Not yet verified on GPUs: the reset's effect on the 8B row
    (expected: prefix-first and rr-first repeats converge; 13B rows unchanged).
-4. Archive every run directory's summaries with
+4. Next GPU session: `bench-runner.sh --suite baseline` (~4.5 h). Every headline number so far is
+   prefix vs the round-robin arm, which is the weakest possible baseline (it is the server's
+   uniform random mode under the `round_robin` alias; with equal weights the expected distribution
+   is round-robin's, and the measured baseline Gini of 0.01–0.04 is what that gives). The suite
+   re-runs the fitted 13B 20u and 30u rows with the baseline arm in the new `least_loaded` routing
+   mode (lowest live in-flight count, no ART, no learning, the same load signal the prefix mode's
+   divert policy reads: `bench.sh --baseline-mode least_loaded`). The prefix arm's margin over that
+   arm is what affinity adds beyond load balancing; least_loaded's own margin over round-robin is
+   the fitted-suite number minus this one on the same row. Needs an image that carries the mode
+   (bench.sh aborts an arm whose server reports a different `X-Routing-Mode`). Pre-registered
+   reading: if prefix beats least_loaded by less than 10 points of P99 on the 20u row, the
+   campaign's win was mostly load balancing and the README must say so.
+5. Archive every run directory's summaries with
    `./scripts/bench-archive.sh <run-dir> <date>-<leg>` (compare files, runner summary,
    aggregates, per-arm manifests, prefix-arm Prometheus dumps; `--with-logs` for the per-node
    Ranvier logs, `--date-prefix YYYYMMDD` for a directory holding several campaigns) **before**
