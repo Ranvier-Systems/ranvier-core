@@ -16,6 +16,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fitted 13B 20u and 30u rows against it, and the compare header names the arm. Not a
   recommended production mode.
 
+### Added
+- `bench-runner.sh --suite saturation`: the fitted 13B 30u/30m row vs `least_loaded` at
+  `--bounded-load-epsilon 0.5` and `0.25`, plus the 50-prefix 20u row vs `least_loaded`, three
+  repeats each (~8 h). Asks whether a tighter divert cap recovers the saturation tail the
+  baseline suite found prefix routing does not have over least-loaded, without giving back P50
+  and KV; the pre-registered reading is in the suite's help text and the results doc.
+
 ### Documentation
 - Baseline suite measured (2026-10-08): prefix routing vs the new `least_loaded` mode on the
   fitted 13B 20u and 30u rows, three repeats each. Least-loaded alone removes most of the P99

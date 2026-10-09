@@ -239,7 +239,7 @@ USAGE:
     ./scripts/bench-runner.sh [OPTIONS]
 
 OPTIONS:
-    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, low, all, custom
+    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, saturation, low, all, custom
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
@@ -341,7 +341,24 @@ BUILT-IN SUITES:
       (mixed); P50 -27..-29% and rps +6..+9% at both loads. Least-loaded alone is
       ~-50%/-41% P99 vs round-robin, so the tail win is mostly load balancing.
 
-    all = rebaseline + epsilon + fitted + placement + baseline + low (every suite;
+    saturation (3 configs x 2 arms x 3 repeats, ~8h) — can a tighter divert cap recover
+      the saturation tail against LEAST-LOADED without giving back P50 / KV?
+      The baseline suite (2026-10-08) found prefix has no reliable P99 edge over
+      least_loaded at 30 users (-6.5 / +6.6 / +11.3) because the prefix arm's
+      concentration (Gini 0.08-0.11 vs 0.002-0.005) is itself the tail; the 2x
+      cap (epsilon 1.0) permits it. Same fitted 30u/30m row, baseline arm
+      least_loaded, prefix arm at epsilon 0.5 and 0.25; plus the 50-prefix 20u
+      row vs least_loaded, which has one repeat (P99 parity, P50 -16.6%).
+      Pre-registered reading: an epsilon that matches least_loaded's P99 at 30u
+      (MIXED or better, no CONSISTENT REGRESSION) while keeping P50 within 5
+      points of -28% and KV above 40% becomes the default; if none does both,
+      1.0 stays and the docs state the trade-off. Compare rows 14/15 with the
+      baseline suite's 30u row (epsilon 1.0) in results/2026-10-08-baseline-least-loaded/.
+      14. 13B 30 users 30m   --compare --baseline-mode least_loaded --bounded-load-epsilon 0.5  (fitted set)
+      15. 13B 30 users 30m   same at --bounded-load-epsilon 0.25
+      16. 13B 20 users 10m   --compare --baseline-mode least_loaded  (50-prefix set)
+
+    all = rebaseline + epsilon + fitted + placement + baseline + saturation + low (every suite;
       the historical epsilon and placement rows included — pass --skip to drop them).
 
     Retired (see .dev-context/benchmark-accuracy-audit-2026-09-30.md):
@@ -360,11 +377,11 @@ BUILT-IN SUITES:
       now identical to fitted on a 2.2.0 image; keep it for re-running the leg
       against an older image or with --miss-placement hash on the rr arm.
 
-    rebaseline, epsilon, fitted, placement and baseline default to --repeat 3; pass --repeat 1 for a smoke run.
+    rebaseline, epsilon, fitted, placement, baseline and saturation default to --repeat 3; pass --repeat 1 for a smoke run.
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
-      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | low
+      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | saturation | low
     Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
@@ -443,7 +460,7 @@ add_run() {
     local args="$*"
 
     case "$SUITE" in
-        rebaseline|epsilon|fitted|placement|baseline|low) [[ "$suite" != "$SUITE" ]] && return ;;
+        rebaseline|epsilon|fitted|placement|baseline|saturation|low) [[ "$suite" != "$SUITE" ]] && return ;;
         all)    ;;  # include everything
         *)      return ;;  # custom suite doesn't use add_run
     esac
@@ -559,6 +576,32 @@ define_runs() {
         --warmup --duration 30m --users 30 --max-model-len 8192 \
         --num-prefixes 16 --prefix-max-tokens 4000
 
+    # --- saturation: tighter divert cap vs least_loaded at 30 users -----------------
+    # The baseline suite showed prefix with no reliable P99 edge over least_loaded
+    # at 30 users: the prefix arm's concentration (two backends at ~2,100-2,460
+    # requests vs ~1,300) is the tail there, and the 2x cap (epsilon 1.0) permits
+    # it. These rows tighten the cap on the same row against the same baseline.
+    # The env var reaches both arms; the least_loaded arm has no divert path, so it
+    # is a no-op there and the baseline is identical across rows 14 and 15.
+    add_run saturation "13B 30u/30m A/B vs least_loaded, fitted set, epsilon 0.5" \
+        --compare --baseline-mode least_loaded --bounded-load-epsilon 0.5 \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    add_run saturation "13B 30u/30m A/B vs least_loaded, fitted set, epsilon 0.25" \
+        --compare --baseline-mode least_loaded --bounded-load-epsilon 0.25 \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    # The 50-prefix 20u row vs least_loaded has one repeat (2026-10-08: P99 parity,
+    # P50 -16.6%); three more make it citable on its own.
+    add_run saturation "13B 20u/10m A/B vs least_loaded, 50-prefix set" \
+        --compare --baseline-mode least_loaded \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192
+
     # --- low: exploratory, outside any headline --------------------------------
     # TP, max-model-len, and gpu-mem-util are auto-detected from GPU VRAM.
     # Explicit overrides: --tp 4 --max-model-len 4096 --gpu-mem-util 0.92 (for 40GB)
@@ -601,7 +644,7 @@ define_runs
 # so the post-suite aggregation can gather each config's repeats. See BACKLOG §25.
 # A single run is not a result (review F3): the headline suites default to
 # three repeats so the aggregate can issue a CONSISTENT / MIXED verdict.
-if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" || "$SUITE" == "placement" || "$SUITE" == "baseline" ) ]]; then
+if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" || "$SUITE" == "placement" || "$SUITE" == "baseline" || "$SUITE" == "saturation" ) ]]; then
     REPEAT=3
     log_info "Suite '$SUITE' defaults to --repeat 3 (pass --repeat 1 for a smoke run)"
 fi
