@@ -16,6 +16,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fitted 13B 20u and 30u rows against it, and the compare header names the arm. Not a
   recommended production mode.
 
+### Documentation
+- Baseline suite measured (2026-10-08): prefix routing vs the new `least_loaded` mode on the
+  fitted 13B 20u and 30u rows, three repeats each. Least-loaded alone removes most of the P99
+  tail against round-robin (−50% / −41%); prefix adds P50 −27…−29%, throughput +6…+9% and a
+  3–4× KV hit rate at both loads, a further −14.6% P99 at 20 users and no reliable P99 change at
+  30. README tagline, summary table and benchmark section, the results doc and the 2026-10-02
+  strategic assessment restate the headline accordingly: affinity's win is prefill saved and
+  capacity recovered; most of the tail win over round-robin is load balancing.
+
+### Fixed
+- `bench.sh` launches vLLM with `VLLM_SERVER_DEV_MODE=1`: vLLM serves `POST /reset_prefix_cache`
+  only as a development endpoint behind that variable, so the between-arm KV reset added in
+  the previous entry returned 404 on vLLM 0.15.1 and the arms still carried KV over (first
+  seen on the 2026-10-08 baseline suite; its compare headers record `0/8` acknowledged). The
+  404 warning now says what to set on externally managed backends.
+
 ### Changed
 - `bench.sh --compare` resets every vLLM backend's prefix cache (`POST /reset_prefix_cache`)
   before each arm, so the arm that runs second no longer inherits the first arm's warm KV

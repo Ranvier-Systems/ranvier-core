@@ -289,7 +289,10 @@ BENCHMARK OPTIONS:
                         that runs second does not inherit the first arm's warm KV
                         (measured 2026-10-06: 8B prefix-first repeats ~9 points weaker
                         because round-robin started warm). The compare header records
-                        which it was.
+                        which it was and how many backends acknowledged. vLLM serves
+                        the endpoint only with VLLM_SERVER_DEV_MODE=1, which bench.sh
+                        sets on the vLLM it launches; externally managed backends
+                        (--skip-vllm, --vllm-endpoints) need it set by the operator.
     --warmup            Run a short warm-up before the main benchmark (adds ~1m 10s).
                         With --compare, warm-up runs PER ARM after each mode restart so
                         both arms are identically primed.
@@ -1278,7 +1281,12 @@ if [[ "$SKIP_VLLM" = false ]]; then
             log_step "$((i+1))" "$NUM_BACKENDS" "GPU $i: Starting vLLM on :$PORT..."
         fi
 
+        # VLLM_SERVER_DEV_MODE=1: vLLM exposes POST /reset_prefix_cache (used
+        # between --compare arms, see reset_vllm_prefix_cache) only as a
+        # "development" endpoint behind this env var; without it the call is a
+        # 404 (observed on vLLM 0.15.1, 2026-10-08) and the arms carry over KV.
         CUDA_VISIBLE_DEVICES=$GPU_IDS HF_TOKEN="$HF_TOKEN" MASTER_PORT=$DIST_PORT \
+            VLLM_SERVER_DEV_MODE=1 \
             python3 -m vllm.entrypoints.openai.api_server \
             --model "$MODEL" \
             --host 0.0.0.0 \
@@ -2394,7 +2402,11 @@ reset_vllm_prefix_cache() {
         if [[ "$code" == "200" ]]; then
             acked=$((acked + 1))
         else
-            log_warn "vLLM ${host}:${port}: POST /reset_prefix_cache returned HTTP $code (cache NOT reset on this backend)"
+            if [[ "$code" == "404" ]]; then
+                log_warn "vLLM ${host}:${port}: POST /reset_prefix_cache returned HTTP 404: the endpoint exists only when vLLM runs with VLLM_SERVER_DEV_MODE=1 (bench.sh sets it for the vLLM it launches; set it yourself on --skip-vllm / --vllm-endpoints backends). Cache NOT reset on this backend."
+            else
+                log_warn "vLLM ${host}:${port}: POST /reset_prefix_cache returned HTTP $code (cache NOT reset on this backend)"
+            fi
         fi
     done
     if [[ $acked -eq $total ]]; then

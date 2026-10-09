@@ -191,6 +191,89 @@ route-unit leaves traffic 1.8× apart. Rows 10–11 change what the divert polic
 acts*, and the tail collapses while Gini stays where it was. Placement earns its place in row 11
 over row 10 by needing fewer diverts: 15–20 points more KV hits for 6 points more P99.
 
+## Baseline suite: prefix vs least-loaded, the no-affinity control (measured 2026-10-08)
+
+**Question.** Every number above is prefix routing against round-robin (the server's uniform random
+mode under the `round_robin` alias), the weakest baseline there is. How much of the win is affinity,
+and how much is load balancing that any least-loaded router provides? **Pre-registered reading
+(written before the run, resume checklist item 4):** if prefix beats least-loaded by less than 10
+points of P99 on the fitted 20u row, the campaign's P99 win was mostly load balancing and the README
+must say so.
+
+**Method.** `bench-runner.sh --suite baseline`: `bench.sh --compare --baseline-mode least_loaded` on
+the fitted 13B 20u/10m and 30u/30m rows, three repeats each, alternating arm order, fresh 8×A100
+instance, image built from `573fbf6` (2.3.0-dev, the commit that adds the mode). The baseline arm
+runs `RANVIER_ROUTING_MODE=least_loaded`: every request to the live backend with the lowest
+capacity-adjusted composite load (under the shipping defaults, the node's in-flight count summed
+across shards, the same signal the prefix mode's divert policy reads), ties uniformly at random, no
+ART, no learning, tokenization skipped as in `random`. Locust verified `X-Routing-Mode:
+least_loaded` on every arm. The between-arm KV reset returned 404 on every backend (vLLM serves
+`/reset_prefix_cache` only with `VLLM_SERVER_DEV_MODE=1`, fixed afterwards), so the arms carry KV
+over exactly as every run before them; the 13B rows have shown no order effect. Zero incomplete
+requests in all twelve arms. Round-robin figures below are the fitted suite's (2026-10-06/07), same
+rows, same set, same image lineage, one instance earlier.
+
+| Row (fitted set) | Arm | P99 TTFT | P50 TTFT | Throughput | KV hit | Route consistency | Gini |
+|---|---|---|---|---|---|---|---|
+| **13B 20u/10m** | Round-robin | 3.40–3.76 s | 1.02–1.03 s | 4.6–4.7 rps | 12–15% | 12–13% | 0.02–0.04 |
+| | **Least-loaded** | **1.68–1.85 s** | 1.00–1.01 s | 4.9 rps | 17–21% | 11–12% | **0.008–0.015** |
+| | Prefix | 1.45–1.50 s | 0.73–0.74 s | 5.2 rps | 64–72% | 50–53% | 0.07–0.11 |
+| | *Prefix vs round-robin* | *−56.6%* | *−28%* | *+10…+12%* | | | |
+| | **Prefix vs least-loaded** | **−14.6 / −13.8 / −20.8%** (median −14.6, IQR −17.7…−14.2; 3/3 agree) | **−26.5 / −26.4 / −27.1%** | **+6.3 / +5.7 / +7.1%** | | | |
+| **13B 30u/30m** | Round-robin | 4.79–5.06 s | 1.09 s | 6.5–6.6 rps | 10–11% | 13% | 0.01 |
+| | **Least-loaded** | **2.80–2.89 s** | 1.07 s | 6.9 rps | 13–15% | 11–12% | **0.002–0.005** |
+| | Prefix | 2.68–3.33 s | 0.76–0.77 s | 7.5–7.6 rps | 44–54% | 53–56% | 0.08–0.11 |
+| | *Prefix vs round-robin* | *−42.0%* | *−29%* | *+14…+15%* | | | |
+| | **Prefix vs least-loaded** | **−6.5 / +6.6 / +11.3%** (median +6.6; MIXED, no reliable effect) | **−28.9 / −27.8 / −28.5%** | **+9.1 / +7.9 / +8.8%** | | | |
+| **13B 20u/10m, 50-prefix set** (eviction regime, one repeat) | Round-robin (matrix, 10-06) | 5.07–5.38 s of completed; 1.5–1.8% timeouts | 0.97–1.00 s | 5.0–5.1 rps | 6–8% | 12% | 0.01–0.04 |
+| | **Least-loaded** | **3.66 s**; 1.7% timeouts | 0.92 s | 5.3 rps | 6% | 12% | **0.011** |
+| | Prefix (today / matrix) | 3.66 s / 3.66–4.39 s; 1.3% timeouts | 0.77 s | 5.4 rps | 28% / 23–29% | 46% | 0.107 |
+| | **Prefix vs least-loaded** | **+0.2%** (same) | **−16.6%** | **+2.5%** | | | |
+
+The one-repeat 50-prefix row (the set the campaign's regression was found on) says the same thing
+in the eviction regime: least-loaded matches prefix on P99 exactly (3.66 s both; round-robin 5.1–5.4 s),
+prefix keeps P50 (−16.6%, smaller than on the fitted set because only 28% of prefills hit), KV (6% →
+28%), throughput (+2.5%) and fewer timeouts (1.3% vs 1.7%).
+
+**Outcome against the pre-registered rule.** Cleared at 20 users on the fitted set (14.6 points,
+every repeat agreeing), not at 30 (mixed, median slightly against prefix), and not on the 50-prefix
+set (one repeat, parity). So:
+
+- **On P99, load balancing is most of the win over round-robin.** Least-loaded alone, with no
+  affinity, takes the 20-user tail from ~3.5 s to ~1.75 s (about −50%) and the 30-user tail from
+  ~4.9 s to ~2.85 s (−41%). Of prefix routing's 57 points against round-robin at 20 users, about 50
+  are load balancing and about 15 are affinity (the two overlap, so they do not add). At 30 users
+  prefix has no reliable P99 edge over least-loaded.
+- **On P50, KV hit rate and throughput, affinity is the whole effect.** Least-loaded's P50 equals
+  round-robin's (~1.0 s at 20 users, ~1.07 s at 30): it balances queues but every request still pays
+  full prefill. Prefix cuts P50 by 26–29% against *either* baseline at every load, lifts the KV hit
+  rate from 13–21% to 44–72%, and serves 6–9% more requests than least-loaded (10–15% more than
+  round-robin).
+- **Why prefix loses its tail edge at saturation.** Least-loaded's backend distribution is almost
+  perfectly flat (Gini 0.002–0.005). The prefix arm runs at 0.08–0.11, with two backends carrying
+  ~2,100–2,460 requests against ~1,300–1,360 at the low end; at 30 users that queue depth is the tail
+  (prefix route-consistent P99 2.1–2.65 s vs least-loaded's 2.0–2.1 s; prefix miss P99 worse in all
+  three reps). The 2× divert cap (ε 1.0) is what permits the concentration. It was cheap at 20 users
+  and is not at 30.
+
+**What this changes in the headline.** The round-robin numbers stay true and stay stated, with the
+caveat attached: a live least-loaded router already removes most of the tail. What prefix-aware
+routing adds on top of a competent balancer, at every load measured, is P50 −27…−29%, throughput
++6…+9% and a 3–4× KV hit rate; plus a further −15% P99 at moderate load and nothing reliable at
+saturation. The product's case is prefill saved and capacity recovered, not the tail. README and the
+2026-10-02 strategic assessment updated to say so.
+
+**What it reopens.** The ε sweep closed on 2026-10-07 (both arms completed every request at 30
+users) is reopened on fairer grounds: least-loaded shows what a flat distribution buys at saturation.
+Next session: the fitted 30u row vs least-loaded at ε 0.5 and 0.25 (one config each, ×3, ~7 h), and
+the 50-prefix 20u row vs least-loaded two more times (one repeat ran 2026-10-08: P99 parity, P50 −16.6%). The reading to
+pre-register: an ε that matches least-loaded's P99 at 30u while keeping P50 within 5 points of
+−28% and KV above 40% becomes the default; if no ε does both, the default stays 1.0 and the docs
+say the trade-off out loud.
+
+Archive: `docs/benchmarks/results/2026-10-08-baseline-least-loaded/`; raw run directories on the
+v2.2.0 release as `ranvier-benchmark-runs-2026-10-08.tar.gz`.
+
 ## Representative-workload re-baseline (measured 2026-10-01, fixed tooling, previous defaults)
 
 **Prefix-aware routing's P99 effect depends on whether the backends' KV cache can hold the hot
@@ -363,12 +446,14 @@ before termination after all): summaries in this tree, raw data as a release ass
 | Confirmation rows | `results/2026-10-05-confirm/` |
 | Standard matrix under 2.2.0 defaults (2026-10-06) | `results/2026-10-06-rebaseline-2.2.0/` |
 | Fitted suite under 2.2.0 defaults, incl. new 30u row (2026-10-06/07) | `results/2026-10-07-fitted-2.2.0/` |
+| Baseline suite: prefix vs least-loaded (2026-10-08) | `results/2026-10-08-baseline-least-loaded/` |
 
 The raw run directories (Locust CSVs, per-request logs, vLLM logs, per-node Ranvier logs where
 captured; 4.6 GB, 610 MB compressed) are attached to the
 [v2.2.0 release](https://github.com/Ranvier-Systems/ranvier-core/releases/tag/v2.2.0) as
 `ranvier-benchmark-runs-2026-10.tar.gz` (the 2026-10-01..05 campaign) and
-`ranvier-benchmark-runs-2026-10-06.tar.gz` (the 2026-10-06/07 matrix and fitted suite, 64 MB).
+`ranvier-benchmark-runs-2026-10-06.tar.gz` (the 2026-10-06/07 matrix and fitted suite, 64 MB) and
+`ranvier-benchmark-runs-2026-10-08.tar.gz` (the baseline suite vs least-loaded).
 New runs are archived with
 `scripts/bench-archive.sh`. Manifests from 2026-10-02 on carry `server_image`, so the binary
 behind a run is identifiable.
@@ -711,7 +796,12 @@ nothing to do.
 3. Tooling, before the next campaign. Done 2026-10-07: `bench.sh --compare` now POSTs
    `/reset_prefix_cache` to every vLLM backend before each arm (`--no-kv-reset` restores the
    carry-over) and the compare header says which it was, so the 8B order effect (second arm
-   inherits a warm cache; prefix-first reps ~9 points weaker) cannot recur unnoticed; the
+   inherits a warm cache; prefix-first reps ~9 points weaker) cannot recur unnoticed. *First
+   hardware contact 2026-10-08:* vLLM 0.15.1 answered 404, because the endpoint is served only
+   with `VLLM_SERVER_DEV_MODE=1`; bench.sh now sets that on the vLLM it launches, and the
+   baseline suite's compare headers honestly record `0/8` acknowledged (carry-over, as every
+   run before it; the 13B rows showed no order effect). Still unverified on hardware: a run
+   whose header says `8/8`; the
    aggregate prints rr-first and prefix-first medians beside the overall one and records them in
    its JSON. Run 8 of the rebaseline suite died because vLLM instance 5 failed engine-core
    initialisation 40 s into start-up (same failure class as placement-v4 rep 3); its log was
@@ -724,19 +814,18 @@ nothing to do.
    arm; the archived compare files carry that cell as printed, the headline rows are unaffected,
    and the cause is not chased further. Not yet verified on GPUs: the reset's effect on the 8B row
    (expected: prefix-first and rr-first repeats converge; 13B rows unchanged).
-4. Next GPU session: `bench-runner.sh --suite baseline` (~4.5 h). Every headline number so far is
-   prefix vs the round-robin arm, which is the weakest possible baseline (it is the server's
-   uniform random mode under the `round_robin` alias; with equal weights the expected distribution
-   is round-robin's, and the measured baseline Gini of 0.01–0.04 is what that gives). The suite
-   re-runs the fitted 13B 20u and 30u rows with the baseline arm in the new `least_loaded` routing
-   mode (lowest live in-flight count, no ART, no learning, the same load signal the prefix mode's
-   divert policy reads: `bench.sh --baseline-mode least_loaded`). The prefix arm's margin over that
-   arm is what affinity adds beyond load balancing; least_loaded's own margin over round-robin is
-   the fitted-suite number minus this one on the same row. Needs an image that carries the mode
-   (bench.sh aborts an arm whose server reports a different `X-Routing-Mode`). Pre-registered
-   reading: if prefix beats least_loaded by less than 10 points of P99 on the 20u row, the
-   campaign's win was mostly load balancing and the README must say so.
-5. Archive every run directory's summaries with
+4. ~~`bench-runner.sh --suite baseline`: prefix vs least-loaded.~~ Done 2026-10-08 ("Baseline suite",
+   above). Pre-registered rule: cleared at 20u (−14.6% P99, 3/3), not at 30u (mixed). Load
+   balancing is most of the P99 win over round-robin; affinity owns P50 (−27…−29%), KV (3–4×) and
+   throughput (+6…+9% over least-loaded). README and strategic assessment updated.
+5. Next GPU session (~7.5 h): the fitted 30u row vs least-loaded at `--bounded-load-epsilon 0.5`
+   and `0.25` (×3 each) to see whether a tighter cap recovers the saturation tail without giving
+   back P50/KV; and one 50-prefix 20u run vs least-loaded (`bench.sh --compare --baseline-mode
+   least_loaded --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20
+   --max-model-len 8192`; one repeat done 2026-10-08, two more make it citable). The first run on the
+   box also verifies the KV reset (compare header must
+   say `8/8` acknowledged; the 8B 20u row is where it should matter).
+6. Archive every run directory's summaries with
    `./scripts/bench-archive.sh <run-dir> <date>-<leg>` (compare files, runner summary,
    aggregates, per-arm manifests, prefix-arm Prometheus dumps; `--with-logs` for the per-node
    Ranvier logs, `--date-prefix YYYYMMDD` for a directory holding several campaigns) **before**

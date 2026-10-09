@@ -1485,7 +1485,12 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   rep ~9 pt weaker) — reset the cache between arms.** **Fitted suite ×3 on 2.2.0 (10-06/07): 10u
   −28.6, 20u −56.6 (reproduces the combo), new 30u/30m row −43.1/−42.0/−34.1 with ZERO incompletes
   both arms and +15% rps → the 30u timeout excess is the eviction regime, not the cap; ε sweep
-  closed.**
+  closed.** **Baseline suite vs `least_loaded` mode (10-08, fitted set ×3): 20u P99 −14.6/−13.8/−20.8
+  (3/3), 30u P99 −6.5/+6.6/+11.3 (MIXED); P50 −27…−29% and rps +6…+9% at both loads, KV 3–4×.
+  Least-loaded alone is −50%/−41% P99 vs round-robin with Gini < 0.01: most of the tail win over
+  round-robin is load balancing; affinity owns P50, KV and throughput. Prefix's Gini 0.08–0.11 is
+  its own tail at 30u → ε sweep REOPENED on fair grounds: 30u fitted vs least_loaded at ε 0.5 / 0.25
+  next session.**
   Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
   `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
   `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement
