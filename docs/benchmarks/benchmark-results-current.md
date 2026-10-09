@@ -818,11 +818,13 @@ nothing to do.
    above). Pre-registered rule: cleared at 20u (−14.6% P99, 3/3), not at 30u (mixed). Load
    balancing is most of the P99 win over round-robin; affinity owns P50 (−27…−29%), KV (3–4×) and
    throughput (+6…+9% over least-loaded). README and strategic assessment updated.
-5. Next GPU session (~7.5 h): the fitted 30u row vs least-loaded at `--bounded-load-epsilon 0.5`
-   and `0.25` (×3 each) to see whether a tighter cap recovers the saturation tail without giving
-   back P50/KV; and one 50-prefix 20u run vs least-loaded (`bench.sh --compare --baseline-mode
-   least_loaded --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20
-   --max-model-len 8192`; one repeat done 2026-10-08, two more make it citable). The first run on the
+5. Next GPU session: `bench-runner.sh --suite saturation --output-dir benchmark-reports-saturation`
+   (~8 h): the fitted 30u row vs least-loaded at `--bounded-load-epsilon 0.5` and `0.25` (×3
+   each) to see whether a tighter cap recovers the saturation tail without giving back P50/KV,
+   plus the 50-prefix 20u row vs least-loaded ×3 (one repeat done 2026-10-08: P99 parity, P50
+   −16.6%). Pre-registered reading: an ε that matches least-loaded's P99 at 30u (MIXED or better,
+   no CONSISTENT REGRESSION) while keeping P50 within 5 points of −28% and KV above 40% becomes
+   the default; if none does both, 1.0 stays and the docs state the trade-off. The first run on the
    box also verifies the KV reset (compare header must
    say `8/8` acknowledged; the 8B 20u row is where it should matter).
 6. Archive every run directory's summaries with
