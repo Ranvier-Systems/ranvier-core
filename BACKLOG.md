@@ -1490,7 +1490,13 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   Least-loaded alone is −50%/−41% P99 vs round-robin with Gini < 0.01: most of the tail win over
   round-robin is load balancing; affinity owns P50, KV and throughput. Prefix's Gini 0.08–0.11 is
   its own tail at 30u → ε sweep REOPENED on fair grounds: 30u fitted vs least_loaded at ε 0.5 / 0.25
-  next session.**
+  next session.** **Saturation suite (10-09, KV reset 8/8 every arm): 30u fitted vs least_loaded at
+  ε 0.5 → −7.3/+6.0/+1.3 (MIXED, KV 42–44%, diverts 24%); ε 0.25 → +11.1/+4.8/+25.4 (CONSISTENT
+  REGRESSION, KV 32–37%, diverts 30%). Tightening the cap diverts more, flattens, gives back KV and
+  moves the tail the wrong way; ε CLOSED, 1.0 stays. 50-prefix 20u vs least_loaded ×3 clean:
+  +22.9/+24.9/+21.7 P99 (the 10-08 carry-over rep's parity was the cache), P50 −9…−16%, KV 3–5×,
+  fewer timeouts, rps flat → in the eviction regime prefix loses the tail to a load balancer. Next
+  routing change is a divert that keeps the hit (holder-aware divert, below), not a knob.**
   Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
   `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
   `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement
@@ -1511,6 +1517,22 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   terminating the instance — the 2026-10-02/03 raw runs were lost that way; numbers live in
   `docs/benchmarks/benchmark-results-current.md`. Known limit: balances prefix tokens, not
   popularity — hot-prefix replication is the follow-on.
+- [ ] **[STRATEGIC] Holder-aware divert (saturation-suite finding, 2026-10-09).** `bounded_load_select`
+  diverts an over-cap hit to the least-loaded live candidate, where it arrives as a miss. At
+  saturation that is the whole problem: on the fitted 30u row vs `least_loaded`, every tightening
+  of the cap (ε 1.0 → 0.5 → 0.25) diverted more (→ 24% → 30%), gave back KV (44–54% → 42–44% →
+  32–37%) and made P99 worse (MIXED → MIXED → +11.1/+4.8/+25.4), with the prefix arm's
+  route-consistent P99 above least-loaded's at every ε; on the 50-prefix 20u row prefix is
+  +22.9/+24.9/+21.7% P99 against least-loaded (Gini 0.09–0.17, large-bucket hit P99 3.7–4.4 s
+  above least-loaded's miss P99 3.1–3.6 s) while keeping P50 −9…−16% and KV 3–5×. The hits queue
+  behind each other on the few backends that hold the prefix. Fix: when the anchor is over cap,
+  offer the request to another backend that *holds the same prefix* (the residency gossip already
+  carries verified holders per hot prefix, §20.1 P3 `verified_holders`) and only then to the
+  least-loaded stranger; and replicate a hot prefix that has a single holder instead of diverting
+  its overflow (placement balances prefix count, not popularity). Acceptance: `--suite saturation`
+  row 16 (50-prefix 20u vs least_loaded, now +23%) and `--suite baseline` row 13 (fitted 30u, now
+  MIXED) turn to improvements without KV or route consistency falling below today's. Record:
+  "Saturation suite" in `docs/benchmarks/benchmark-results-current.md`.
 - [ ] **[STRATEGIC] KV-aware dispatch.** Extend the backend load signal with the already-scraped
   `gpu_cache_usage_percent` (`health_service.cpp:425`, `vllm_metrics.hpp:21`) and add a
   `kv_pressure` candidate field + weight to `route_scorer.hpp`, so dispatch diverts off an anchor

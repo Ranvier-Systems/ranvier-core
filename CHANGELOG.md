@@ -31,6 +31,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   30. README tagline, summary table and benchmark section, the results doc and the 2026-10-02
   strategic assessment restate the headline accordingly: affinity's win is prefill saved and
   capacity recovered; most of the tail win over round-robin is load balancing.
+- Saturation suite measured (2026-10-09, first suite with the KV reset acknowledged `8/8` on every
+  arm): the fitted 13B 30u row vs `least_loaded` with the prefix arm at `bounded_load_epsilon`
+  0.5 (P99 −7.3/+6.0/+1.3%, mixed, KV 42–44%) and 0.25 (+11.1/+4.8/+25.4%, consistent
+  regression, KV 32–37%): a tighter cap diverts more, gives back KV and moves the tail the wrong
+  way, so the default stays 1.0 and the docs state the trade-off. The 50-prefix 13B 20u row vs
+  `least_loaded`, three clean repeats: P99 +22.9/+24.9/+21.7% of completed requests with P50
+  −9…−16%, KV 3–5×, fewer timeouts and flat throughput; the carry-over repeat's parity of
+  2026-10-08 was the inherited cache. README, results doc, strategic assessment and BACKLOG §27
+  (new item: holder-aware divert) updated.
 
 ### Fixed
 - `bench.sh` launches vLLM with `VLLM_SERVER_DEV_MODE=1`: vLLM serves `POST /reset_prefix_cache`

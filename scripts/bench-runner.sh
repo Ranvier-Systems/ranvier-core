@@ -357,6 +357,11 @@ BUILT-IN SUITES:
       14. 13B 30 users 30m   --compare --baseline-mode least_loaded --bounded-load-epsilon 0.5  (fitted set)
       15. 13B 30 users 30m   same at --bounded-load-epsilon 0.25
       16. 13B 20 users 10m   --compare --baseline-mode least_loaded  (50-prefix set)
+      Measured 2026-10-09 (KV reset 8/8 every arm): epsilon 0.5 P99 -7.3/+6.0/+1.3 (MIXED,
+      KV 42-44%, diverts 24%); epsilon 0.25 +11.1/+4.8/+25.4 (CONSISTENT REGRESSION, KV
+      32-37%, diverts 30%); no epsilon recovers the tail, 1.0 stays. 50-prefix 20u vs
+      least_loaded: +22.9/+24.9/+21.7 P99 (the 10-08 carry-over rep's parity was the
+      cache), P50 -9..-16%, KV 3-5x, fewer timeouts. Record: results/2026-10-09-saturation/.
 
     all = rebaseline + epsilon + fitted + placement + baseline + saturation + low (every suite;
       the historical epsilon and placement rows included — pass --skip to drop them).
@@ -595,8 +600,8 @@ define_runs() {
         --warmup --duration 30m --users 30 --max-model-len 8192 \
         --num-prefixes 16 --prefix-max-tokens 4000
 
-    # The 50-prefix 20u row vs least_loaded has one repeat (2026-10-08: P99 parity,
-    # P50 -16.6%); three more make it citable on its own.
+    # The 50-prefix 20u row vs least_loaded: one carry-over repeat 2026-10-08 (P99 parity),
+    # three clean repeats 2026-10-09 (+22.9/+24.9/+21.7 P99, P50 -9..-16%; see --help).
     add_run saturation "13B 20u/10m A/B vs least_loaded, 50-prefix set" \
         --compare --baseline-mode least_loaded \
         --model meta-llama/CodeLlama-13b-Instruct-hf \
