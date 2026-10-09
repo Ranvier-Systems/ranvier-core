@@ -25,7 +25,11 @@ to `docs/benchmarks/results/2026-10-01-rebaseline/`.
 > holds on its own terms, "measurably reduces GPU KV-cache thrashing": the cache metric and the
 > prefill it saves are affinity's and nobody else's. The tail-latency framing the README carried
 > until today was mostly load balancing, and the README now says so. Record: "Baseline suite" in
-> `docs/benchmarks/benchmark-results-current.md`.
+> `docs/benchmarks/benchmark-results-current.md`. *2026-10-09:* the saturation suite found no divert
+> cap (ε 0.5, 0.25) that recovers the 30u tail against least-loaded, and in the eviction regime
+> (50-prefix set, 20u, cache reset per arm) prefix routing is +23% P99 against least-loaded while
+> keeping P50 −9…−16% and KV 3–5×. The goal holds where it was always claimed, the cache; the tail
+> in the eviction regime belongs to the load balancer, and the README says that too.
 
 ## Scorecard
 

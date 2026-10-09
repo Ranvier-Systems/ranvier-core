@@ -1,0 +1,118 @@
+Command: /home/ubuntu/ranvier-core/scripts/bench.sh --compare --baseline-mode least_loaded --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192 --order rr-first --output-dir benchmark-reports-saturation
+Git Commit: 5f8be8b
+vLLM Version: 0.15.1
+Arm order: least_loaded -> prefix (--order rr-first); warm-up per-arm: true
+Baseline arm routing mode: least_loaded (--baseline-mode)
+vLLM KV cache reset before each arm via POST /reset_prefix_cache (backends acked: least_loaded=8/8 prefix=8/8)
+Ranvier Env: RANVIER_LOAD_AWARE_ROUTING=true RANVIER_ROUTING_MODE=prefix 
+
+================================================================================
+BENCHMARK COMPARISON: Least-Loaded vs Prefix-Aware
+================================================================================
+Baseline (Least-Loaded): benchmark-reports-saturation/20261009_215649_8gpu_least_loaded/benchmark.log
+New (Prefix-Aware):     benchmark-reports-saturation/20261009_220819_8gpu_prefix/benchmark.log
+
+--------------------------------------------------------------------------------
+RUN STATUS (read this first)
+--------------------------------------------------------------------------------
+  Validation:   PASSED -> PASSED
+  Incompletes:  baseline 59 (1.8%)  new 54 (1.7%)   *** TIMEOUTS PRESENT — P99 figures below EXCLUDE incompletes ***
+TTFT source: baseline=raw, new=raw
+
+--------------------------------------------------------------------------------
+KEY METRICS (Routing Affinity / KV Cache)
+--------------------------------------------------------------------------------
+Metric                        Baseline          New                         Change
+Route Consistency (%)             12.6         44.9        +32.36 (+257.3%) BETTER
+KV Prefix-Cache Hit (%)            7.6         23.7        +16.11 (+212.6%) BETTER
+Route-consistent Reqs            398.0       1431.0      +1033.00 (+259.5%) BETTER
+Route-changed Reqs              2766.0       1753.0       -1013.00 (-36.6%) BETTER
+Unique Prefixes                  128.0        121.0                               
+
+--------------------------------------------------------------------------------
+PER-BUCKET TTFT IMPROVEMENT (Large Prefixes)
+--------------------------------------------------------------------------------
+  (Prefix-aware routing benefits large prefixes most)
+  Guards: floor=100ms, min-samples=10, min-denominator=50ms, cap=±1000%
+
+Metric                                       Baseline          New                         Change
+Large bucket  (baseline n=950, new n=959)
+  Large Hit P50 (ms) [n=125/465]                758.2        755.0             -3.15 (-0.4%) SAME
+  Large Hit P99 (ms) [n=125/465]               2914.0       4447.1        +1533.11 (+52.6%) WORSE
+  Large Miss P50 (ms) [n=825/494]              1096.5       1083.2          -13.25 (-1.2%) BETTER
+  Large Miss P99 (ms) [n=825/494]              3647.0       4331.2         +684.19 (+18.8%) WORSE
+  Large Improvement (%)                          30.9         30.3                 -0.55pp (SAME)
+
+Xlarge bucket  (baseline n=1211, new n=1245)
+  Xlarge Hit P50 (ms) [n=146/610]               819.4        754.7          -64.63 (-7.9%) BETTER
+  Xlarge Hit P99 (ms) [n=146/610]              2780.7       4480.8        +1700.15 (+61.1%) WORSE
+  Xlarge Miss P50 (ms) [n=1065/635]            1254.8       1185.2          -69.55 (-5.5%) BETTER
+  Xlarge Miss P99 (ms) [n=1065/635]            3892.7       4403.3         +510.61 (+13.1%) WORSE
+  Xlarge Improvement (%)                         34.7         36.3               +1.62pp (BETTER)
+
+
+--------------------------------------------------------------------------------
+OVERALL TTFT (All Request Sizes)
+--------------------------------------------------------------------------------
+  (Aggregate may be misleading - see per-bucket for real impact)
+  *** P99 TTFT (excl. timeouts: baseline 1.83%, new 1.67%) ***
+
+Metric                        Baseline          New                         Change
+P50 TTFT (ms)                    914.4        769.9        -144.56 (-15.8%) BETTER
+P99 TTFT (ms)                   3354.4       4081.4         +727.06 (+21.7%) WORSE
+Route-consistent P50 (ms)        734.4        741.0             +6.60 (+0.9%) SAME
+Route-consistent P99 (ms)       2528.4       4125.1        +1596.69 (+63.1%) WORSE
+Route-changed P50 (ms)           980.1        820.1        -160.02 (-16.3%) BETTER
+Route-changed P99 (ms)          3454.1       3995.8         +541.65 (+15.7%) WORSE
+
+--------------------------------------------------------------------------------
+REQUEST STATISTICS
+--------------------------------------------------------------------------------
+Metric                        Baseline          New                         Change
+Total Requests                  3223.0       3238.0            +15.00 (+0.5%) SAME
+Failed (errors)                    0.0          0.0                         0 (--)
+Incomplete (timeout)              59.0         54.0           -5.00 (-8.5%) BETTER
+Incomplete Rate (%)                1.8          1.7           -0.16 (-8.9%) BETTER
+Failure Rate (%)                   0.0          0.0                         0 (--)
+Requests/sec                       5.3          5.4             +0.02 (+0.4%) SAME
+Sync Errors                        0.0          0.0                         0 (--)
+
+--------------------------------------------------------------------------------
+RANVIER OVERHEAD (from Prometheus metrics)
+--------------------------------------------------------------------------------
+Metric                             Baseline          New                         Change
+Routing Decision P50 (ms)              0.05         0.27          +0.22 (+447.5%) WORSE
+Routing Decision P99 (ms)              0.10        23.76      +23.66 (>+1000%) ARTIFACT
+  - Tokenization P50 (ms)              0.05         0.23          +0.18 (+369.3%) WORSE
+  - Tokenization P99 (ms)              0.10        23.74      +23.64 (>+1000%) ARTIFACT
+    - Primary P50 (ms)                 0.05         0.23          +0.18 (+356.5%) WORSE
+    - Primary P99 (ms)                 0.10         2.44       +2.34 (>+1000%) ARTIFACT
+    - Boundary Detect P50 (ms)         0.05         0.07           +0.02 (+38.2%) WORSE
+    - Boundary Detect P99 (ms)         0.10        22.96      +22.86 (>+1000%) ARTIFACT
+  - ART Lookup P50 (ms)                0.00         0.04       +0.04 (>+1000%) ARTIFACT
+  - ART Lookup P99 (ms)                0.00         0.02       +0.02 (>+1000%) ARTIFACT
+Backend Connect P50 (ms)               0.50         0.50               0.00 (0.0%) SAME
+Backend Connect P99 (ms)               0.99         0.99               0.00 (0.0%) SAME
+
+--------------------------------------------------------------------------------
+ROUTING COUNTERS (from Prometheus /metrics dump)
+--------------------------------------------------------------------------------
+  nodes scraped: baseline=3 new=3 (counters summed across nodes)
+  load_aware_fallbacks_total:        baseline=0  new=753 (23.3%)
+  (percent = fallbacks / total_requests; high % suggests load-aware affinity thrashing)
+  residency_route_downgrades_total: baseline=0  new=36 (1.1%)
+  (percent = downgrades / total_requests; high % means residency routing is diverting ART hits)
+  residency signal (new): cache_states sent=2904 received=5808, residency_cache_size=8
+  baseline backend dist: min=308 max=342 gini=0.020
+    [b1=308.0, b2=310.0, b3=342.0, b4=317.0, b5=334.0, b6=330.0, b7=333.0, b8=317.0]
+  new      backend dist: min=199 max=500 gini=0.165
+    [b1=199.0, b2=345.0, b3=314.0, b4=303.0, b5=229.0, b6=423.0, b7=247.0, b8=500.0]
+
+--------------------------------------------------------------------------------
+
+SUMMARY:
+  Route Consistency: 12.6% -> 44.9% (+32.4 pp)
+  KV Prefix-Cache Hit: 7.6% -> 23.7% (+16.1 pp)
+  Large Prefix TTFT Improvement: 30.3%
+  XLarge Prefix TTFT Improvement: 36.3%
+================================================================================

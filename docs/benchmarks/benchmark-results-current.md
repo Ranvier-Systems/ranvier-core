@@ -269,10 +269,102 @@ Next session: the fitted 30u row vs least-loaded at ε 0.5 and 0.25 (one config 
 the 50-prefix 20u row vs least-loaded two more times (one repeat ran 2026-10-08: P99 parity, P50 −16.6%). The reading to
 pre-register: an ε that matches least-loaded's P99 at 30u while keeping P50 within 5 points of
 −28% and KV above 40% becomes the default; if no ε does both, the default stays 1.0 and the docs
-say the trade-off out loud.
+say the trade-off out loud. *Measured 2026-10-09 ("Saturation suite", next): no ε recovers the
+tail, 1.0 stays; and with the KV reset working the 50-prefix row is a consistent +23% P99 against
+least-loaded, so the parity above was the carry-over cache, not the regime.*
 
 Archive: `docs/benchmarks/results/2026-10-08-baseline-least-loaded/`; raw run directories on the
 v2.2.0 release as `ranvier-benchmark-runs-2026-10-08.tar.gz`.
+
+## Saturation suite: a tighter divert cap vs least-loaded, and the eviction regime (measured 2026-10-09)
+
+**Question.** The baseline suite left prefix routing with no reliable P99 edge over least-loaded at
+30 users, and read the prefix arm's concentration (Gini 0.08–0.11 under the 2× cap) as the tail.
+Does a tighter cap (ε 0.5: divert at 1.5× the mean; ε 0.25: at 1.25×) recover that tail without
+giving back P50 and KV? And on the 50-prefix set at 20 users, where the fleet's cache cannot hold
+the prefix set, is the one carry-over repeat's P99 parity real? **Pre-registered reading (resume
+checklist item 5, written 2026-10-08):** an ε that matches least-loaded's P99 at 30u (MIXED or
+better, no CONSISTENT REGRESSION) while keeping P50 within 5 points of −28% and KV above 40%
+becomes the default; if none does both, 1.0 stays and the docs state the trade-off.
+
+**Method.** `bench-runner.sh --suite saturation`: `bench.sh --compare --baseline-mode least_loaded`
+on the fitted 13B 30u/30m row with the prefix arm at `--bounded-load-epsilon 0.5` and `0.25`, and
+on the 50-prefix 13B 20u/10m row at the shipping ε 1.0; three repeats each, alternating arm order,
+fresh 8×A100 instance, image built from `5f8be8b` (2.3.0-dev). First suite with the between-arm KV
+reset working: every compare header records `8/8` backends acknowledging `/reset_prefix_cache`
+before each arm, so no arm inherits the other's cache. Zero incomplete requests in all eighteen
+30-user arms. The ε 1.0 row quoted for comparison is the baseline suite's (2026-10-08, same row,
+same set, carry-over KV; the 13B rows have shown no order effect).
+
+| 13B 30u/30m, fitted set | P99 TTFT, least-loaded → prefix | P99 vs least-loaded | P50 | Throughput | KV hit, LL → prefix | Route consistency | Diverts | Gini (prefix) | Route-consistent P99 |
+|---|---|---|---|---|---|---|---|---|---|
+| ε 1.0 (shipping; 10-08, carry-over KV) | 2.80–2.89 s → 2.68–3.33 s | −6.5 / +6.6 / +11.3% (MIXED) | −28.9 / −27.8 / −28.5% | +9.1 / +7.9 / +8.8% | 13–15% → 44–54% | 53–56% | | 0.08–0.11 | +5…+26% worse |
+| **ε 0.5** | 2.97 / 2.91 / 3.09 s → 2.75 / 3.09 / 3.13 s | **−7.3 / +6.0 / +1.3%** (median +1.3; MIXED) | −27.7 / −27.3 / −27.3% | +7.1 / +7.8 / +6.8% | 13% → 44 / 43 / 42% | 46 / 48 / 45% | 24.2 / 24.6 / 23.7% | 0.067 / 0.070 / 0.079 | +14.9 / +40.2 / +22.6% worse |
+| **ε 0.25** | 2.98 / 2.93 / 2.75 s → 3.31 / 3.08 / 3.45 s | **+11.1 / +4.8 / +25.4%** (median +11.1; CONSISTENT REGRESSION) | −24.1 / −25.4 / −24.8% | +4.5 / +5.5 / +4.8% | 13–15% → 32 / 37 / 33% | 37 / 40 / 38% | 30.8 / 29.8 / 29.9% | 0.059 / 0.056 / 0.044 | +60.6 / +26.2 / +71.5% worse |
+
+Least-loaded's own P99 sat at 2.75–3.09 s in all six runs (2.80–2.89 s the day before), its Gini
+at 0.003–0.006. Read down the table: each halving of the cap diverts more (24% → 30%), spreads
+the prefix arm flatter (Gini 0.07 → 0.05), and gives back KV (43% → 33%), route consistency (47%
+→ 38%), P50 (−27% → −25%) and throughput (+7% → +5%), and the tail gets *worse*, not better. The
+loss is in the hits, not only the misses: the prefix arm's route-consistent P99 is above
+least-loaded's at every ε (the "hit" P99 of a prefix router at saturation is a request queued
+behind other hits on a warm backend), and at ε 0.25 the large-bucket hit P99 is +9 … +53% above
+least-loaded's in all three repeats. The divert policy can only move a request to the momentarily
+lowest backend, where it arrives as a miss; at 30 users every backend is within a request or two of
+the mean already (least-loaded's per-backend counts 1,474–1,534), so the move buys no queue position
+and costs the prefill the hit would have saved. The 2026-10-08 reading, that the prefix arm's
+concentration *is* the tail, was wrong in its remedy: flattening the distribution by diverting
+more is what least-loaded does with 13% KV, and prefix routing cannot reach least-loaded's tail by
+imitating it while keeping any affinity.
+
+**Outcome against the pre-registered rule.** ε 0.5 satisfies the rule as written (MIXED, P50
+−27.3…−27.7%, KV 42–44%), but so does the shipping ε 1.0 the rule was meant to improve on (MIXED,
+P50 −28%, KV 44–54%), and the rule did not say "better than 1.0". Between the two, ε 0.5 has a P99
+median 5 points nearer parity (+1.3 vs +6.6) inside overlapping ranges (−7.3…+6.0 vs −6.5…+11.3),
+and measurably less affinity: 2–10 points of KV, 6–9 points of route consistency, 1–2 points of
+throughput. Changing a default for a tail gain inside the noise at a measured affinity cost is not
+justified by this suite, and the rule's premise, that some ε recovers the saturation tail, is not
+met by any ε: **the default stays 1.0, and the trade-off is now stated out loud: at saturation
+the 2× cap gives prefix routing least-loaded's tail within about ±10% while keeping P50 −28%, KV
+3–4× and throughput +8%; tightening it moves the tail the wrong way.** ε 0.25, the pre-2.2.0
+default, is a consistent regression against least-loaded at this load, which is the mechanism
+behind the 13B rows that regressed under the previous defaults.
+
+| 13B 20u/10m, 50-prefix set (eviction regime) | Arm | P99 TTFT (of completed) | Incomplete | P50 TTFT | Throughput | KV hit | Route consistency | Diverts | Gini |
+|---|---|---|---|---|---|---|---|---|---|
+| rep 1 (rr-first) | Least-loaded | 3.31 s | 66 (2.1%) | 0.86 s | 5.3 rps | 7.2% | 11% | | 0.014 |
+| | Prefix | 4.06 s (**+22.9%**) | 47 (1.5%) | 0.78 s (−9.3%) | 5.3 rps (−0.2%) | 22.9% | 46% | 21.6% | 0.087 |
+| rep 2 (prefix-first) | Least-loaded | 3.40 s | 68 (2.1%) | 0.93 s | 5.3 rps | 6.4% | 11% | | 0.013 |
+| | Prefix | 4.24 s (**+24.9%**) | 50 (1.6%) | 0.79 s (−15.2%) | 5.3 rps (−1.5%) | 32.4% | 48% | 22.1% | 0.148 |
+| rep 3 (rr-first) | Least-loaded | 3.35 s | 59 (1.8%) | 0.91 s | 5.3 rps | 7.6% | 13% | | 0.020 |
+| | Prefix | 4.08 s (**+21.7%**) | 54 (1.7%) | 0.77 s (−15.8%) | 5.4 rps (+0.4%) | 23.7% | 45% | 23.3% | 0.165 |
+| **Prefix vs least-loaded** | | **+22.9 / +24.9 / +21.7%** (median +22.9; CONSISTENT REGRESSION) | fewer in 3/3 | **−9.3 / −15.2 / −15.8%** | −0.2 / −1.5 / +0.4% | 3–5× | | | |
+
+The one carry-over repeat of 2026-10-08 (KV reset 404 on every backend, P99 3.66 s in both arms)
+does not survive three clean repeats: with the cache reset before each arm, least-loaded's tail is
+3.3–3.4 s and prefix's 4.1–4.2 s, both arm orders, every repeat agreeing. The clean reps supersede
+it. Where the fleet's cache cannot hold the shared prefixes (50 prefixes of 2,000–8,000 tokens
+against ~11,600 KV tokens per 13B backend), prefix routing keeps the hit rate 3–5× (7% → 23–32%),
+P50 −9…−16% and fewer timeouts (1.5–1.7% vs 1.8–2.1%), serves the same number of requests, and
+loses the tail to least-loaded by 22–25%. The counters say why: the prefix arm's large-bucket
+*hit* P99 (3.7–4.4 s) is above least-loaded's *miss* P99 (3.1–3.6 s) in every repeat, and its
+Gini (0.09–0.17, the highest of any prefix arm in the campaign) shows the hits piling onto the
+few backends that happen to hold a prefix at the moment. Against round-robin on the same row
+(standard matrix, 2026-10-06) prefix is −21.0% P99; against a least-loaded router it is +23%. This
+is the eviction regime's honest number and the README now carries it.
+
+**What it closes and what it opens.** The ε question is closed on measured grounds: the cap
+trades affinity for distribution monotonically and never buys the saturation tail; ε 1.0 stays.
+Nothing further on this hardware distinguishes the shipping defaults from least-loaded at
+saturation, so the next routing change is not a knob. What the counters point at is a divert that
+keeps the hit: a hit that would queue past the cap on its home backend should be offered to
+*another backend that also holds the prefix* (the residency gossip already carries holders per hot
+prefix, BACKLOG §20.1 P3) before being sent to the least-loaded stranger as a miss, and a hot
+prefix that no second backend holds should be replicated rather than diverted (placement balances
+prefix count, not popularity). Backlog §27 carries the item with these numbers attached.
+
+Archive: `docs/benchmarks/results/2026-10-09-saturation/`; raw run directories on the v2.2.0
+release as `ranvier-benchmark-runs-2026-10-09.tar.gz`.
 
 ## Representative-workload re-baseline (measured 2026-10-01, fixed tooling, previous defaults)
 
@@ -447,6 +539,7 @@ before termination after all): summaries in this tree, raw data as a release ass
 | Standard matrix under 2.2.0 defaults (2026-10-06) | `results/2026-10-06-rebaseline-2.2.0/` |
 | Fitted suite under 2.2.0 defaults, incl. new 30u row (2026-10-06/07) | `results/2026-10-07-fitted-2.2.0/` |
 | Baseline suite: prefix vs least-loaded (2026-10-08) | `results/2026-10-08-baseline-least-loaded/` |
+| Saturation suite: ε 0.5 / 0.25 vs least-loaded at 30u, 50-prefix 20u vs least-loaded (2026-10-09) | `results/2026-10-09-saturation/` |
 
 The raw run directories (Locust CSVs, per-request logs, vLLM logs, per-node Ranvier logs where
 captured; 4.6 GB, 610 MB compressed) are attached to the
@@ -818,15 +911,15 @@ nothing to do.
    above). Pre-registered rule: cleared at 20u (−14.6% P99, 3/3), not at 30u (mixed). Load
    balancing is most of the P99 win over round-robin; affinity owns P50 (−27…−29%), KV (3–4×) and
    throughput (+6…+9% over least-loaded). README and strategic assessment updated.
-5. Next GPU session: `bench-runner.sh --suite saturation --output-dir benchmark-reports-saturation`
-   (~8 h): the fitted 30u row vs least-loaded at `--bounded-load-epsilon 0.5` and `0.25` (×3
-   each) to see whether a tighter cap recovers the saturation tail without giving back P50/KV,
-   plus the 50-prefix 20u row vs least-loaded ×3 (one repeat done 2026-10-08: P99 parity, P50
-   −16.6%). Pre-registered reading: an ε that matches least-loaded's P99 at 30u (MIXED or better,
-   no CONSISTENT REGRESSION) while keeping P50 within 5 points of −28% and KV above 40% becomes
-   the default; if none does both, 1.0 stays and the docs state the trade-off. The first run on the
-   box also verifies the KV reset (compare header must
-   say `8/8` acknowledged; the 8B 20u row is where it should matter).
+5. ~~`bench-runner.sh --suite saturation`: the fitted 30u row vs least-loaded at ε 0.5 and 0.25,
+   plus the 50-prefix 20u row vs least-loaded, ×3 each.~~ Done 2026-10-09 ("Saturation suite",
+   above). Pre-registered rule: ε 0.5 passes it (−7.3/+6.0/+1.3, P50 −27%, KV 42–44%) but so does
+   the shipping 1.0, and no ε recovers the tail (ε 0.25 is +11.1/+4.8/+25.4, a consistent
+   regression); 1.0 stays and the trade-off is stated. The 50-prefix row is +22.9/+24.9/+21.7%
+   P99 against least-loaded with the KV reset working (the carry-over repeat's parity was the
+   cache), P50 −9…−16%, KV 3–5×, fewer timeouts. The KV reset verified on hardware: every header
+   `8/8`. Still unverified: the reset's effect on the 8B row's order effect (no 8B row in this
+   suite).
 6. Archive every run directory's summaries with
    `./scripts/bench-archive.sh <run-dir> <date>-<leg>` (compare files, runner summary,
    aggregates, per-arm manifests, prefix-arm Prometheus dumps; `--with-logs` for the per-node
@@ -862,13 +955,18 @@ now shows were measured in an eviction regime.
   least-loaded placement. Open: the isolation leg (same without placement) decides whether the
   shipping change is two defaults or three; then one rep each of 8B 20u, 13B 10u and 13B 30u
   under the new defaults (resume checklist above).
-- **Leg V1, epsilon** (`bench-runner.sh --suite epsilon`): the shipped file sweeps ε 0.5
-  (looser). The fitted result says looser strands more capacity; sweep *tighter* (0.1) instead,
-  on the fitted set, after the diversion fix. The factor/floor "threshold leg" (BACKLOG §25
-  item 5) remains inert under `bounded_load`; `bench.sh` refuses it without `--hash-strategy jump`.
-- **Four-arm design** (direct-to-vLLM, random, least-loaded without affinity, prefix): still
-  the only way to separate affinity from load balancing and to measure Ranvier's own cost.
-  Needs a least-loaded mode and a no-proxy arm in `bench.sh`.
+- **Epsilon: closed 2026-10-09** ("Saturation suite" above). Against least-loaded at 30 users,
+  ε 0.5 and 0.25 both move the tail the wrong way while giving back KV; 1.0 stays. The
+  factor/floor "threshold leg" (BACKLOG §25 item 5) remains inert under `bounded_load`;
+  `bench.sh` refuses it without `--hash-strategy jump`.
+- **Four-arm design** (direct-to-vLLM, random, least-loaded without affinity, prefix): the
+  least-loaded arm exists since 2.3.0-dev (`--baseline-mode least_loaded`, measured 2026-10-08/09);
+  the no-proxy arm, which measures Ranvier's own cost, still needs a direct-to-vLLM mode in
+  `bench.sh`.
+- **Holder-aware divert** (BACKLOG §27): the eviction-regime and saturation rows say the next
+  routing change is a divert that keeps the hit, not a knob. Acceptance: the 50-prefix 20u row
+  vs least-loaded (now +23% P99) and the fitted 30u row (now MIXED) turn to improvements without
+  giving back KV.
 
 ## Adding an entry here
 
