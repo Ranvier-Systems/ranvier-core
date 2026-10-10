@@ -239,7 +239,7 @@ USAGE:
     ./scripts/bench-runner.sh [OPTIONS]
 
 OPTIONS:
-    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, saturation, kvevents, kvreset, low, all, custom
+    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, saturation, kvevents, kvablate, kvreset, low, all, custom
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
@@ -384,6 +384,25 @@ BUILT-IN SUITES:
       17. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --num-prefixes 16 --prefix-max-tokens 4000
       18. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events  (50-prefix set)
 
+    kvablate (3 configs x 2 arms x 1 repeat, ~1h25m) — separates the two things the native
+      stream does to routing, after kvevents run 1 (2026-10-10, stream live: kv_ops 2.0M)
+      turned the fitted 20u row from -12.5% P99 vs least_loaded (control, stream off) into
+      +84.8%, with KV hits 68% -> 27%, route consistency 53% -> 37%, Gini 0.08 -> 0.14,
+      87,015 routes materialized and 98 verified-eviction downgrades (3.4%).
+      Suspect A, route materialization: PUSH routes at every block boundary up to 128
+      tokens of every prefill, so a short header shared by prompts becomes an affinity
+      anchor that funnels unrelated prefixes onto one backend. Suspect B, the verified
+      lookup at a routing depth beyond the 2,048-token index: the fitted prefixes are
+      2,000-4,000 tokens, so a deep hit is "absent" by construction and downgraded with
+      certainty (fixed on the branch by skipping verification beyond the indexed depth;
+      --kv-events-depth 4096 masks it on an image without the fix).
+      20. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off   (fitted set)
+      21. 13B 20 users 10m   same, --kv-events-depth 4096 (materialize on)
+      22. 13B 20 users 10m   same, --kv-events-materialize off --kv-events-depth 4096
+      Reading: row 20 back near -12% with KV ~65% => materialization is the damage; row 21
+      alone recovering => the depth defect dominates; row 22 is the configuration the
+      kvevents suite should rerun with. One repeat each; promote the winner to x3.
+
     kvreset (1 config x 2 arms x 3 repeats, ~1h15m) — the 8B 20u row with the between-arm
       KV reset acknowledged. The reset exists for this row (2026-10-06: prefix-first
       repeats ~9 points weaker because round-robin inherited the prefix arm's warm cache)
@@ -393,8 +412,8 @@ BUILT-IN SUITES:
       19. 8B 20 users 10m    --compare  (50-prefix set; matrix row 1 with the reset working)
 
     all = rebaseline + epsilon + fitted + placement + baseline + saturation + kvevents +
-      kvreset + low (every suite; the historical epsilon and placement rows included —
-      pass --skip to drop them).
+      kvablate + kvreset + low (every suite; the historical epsilon and placement rows
+      included — pass --skip to drop them).
 
     Retired (see .dev-context/benchmark-accuracy-audit-2026-09-30.md):
       - prefix-ratio 0.5/0.7 sweep: SHARED_PREFIX_RATIO only governs 20% of the
@@ -416,7 +435,7 @@ BUILT-IN SUITES:
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
-      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | saturation | kvevents | kvreset | low
+      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | saturation | kvevents | kvablate | kvreset | low
     Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
@@ -484,6 +503,7 @@ done
 #   fitted     = 13B with a KV-fitting prefix set         (--suite fitted, all)
 #   placement  = fitted set, --miss-placement least_loaded (--suite placement; historical, default since 2.2.0)
 #   kvevents   = fitted 20u + 50-prefix 20u vs least_loaded with --kv-events (--suite kvevents)
+#   kvablate   = fitted 20u vs least_loaded, --kv-events with materialize off / depth 4096 / both, x1 (--suite kvablate)
 #   kvreset    = 8B 20u vs round-robin with the between-arm KV reset working (--suite kvreset)
 #   low        = exploratory runs outside any headline  (--suite low, all)
 #
@@ -497,7 +517,7 @@ add_run() {
     local args="$*"
 
     case "$SUITE" in
-        rebaseline|epsilon|fitted|placement|baseline|saturation|kvevents|kvreset|low) [[ "$suite" != "$SUITE" ]] && return ;;
+        rebaseline|epsilon|fitted|placement|baseline|saturation|kvevents|kvablate|kvreset|low) [[ "$suite" != "$SUITE" ]] && return ;;
         all)    ;;  # include everything
         *)      return ;;  # custom suite doesn't use add_run
     esac
@@ -657,6 +677,28 @@ define_runs() {
         --compare --baseline-mode least_loaded --kv-events \
         --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 10m --users 20 --max-model-len 8192
+
+    # --- kvablate: which half of the native stream broke affinity? ------------------
+    # One repeat each (not in the --repeat 3 default list): these are diagnostic
+    # arms to pick the configuration the kvevents suite reruns with, not headline
+    # rows. See --help for the first-contact numbers behind them.
+    add_run kvablate "13B 20u/10m A/B vs least_loaded, fitted set, kv-events, materialize off" \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    add_run kvablate "13B 20u/10m A/B vs least_loaded, fitted set, kv-events, depth 4096" \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-depth 4096 \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    add_run kvablate "13B 20u/10m A/B vs least_loaded, fitted set, kv-events, materialize off + depth 4096" \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --kv-events-depth 4096 \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
 
     # --- kvreset: the 8B order effect with the between-arm KV reset working -------
     # Same args as rebaseline row 1. The reset was built for this row and has not

@@ -957,6 +957,22 @@ nothing to do.
    arrived. All three fixed the same day (CHANGELOG, Fixed); bench.sh now verifies each
    publisher port is listening after vLLM start. The suite restarts from run 1 on a rebuilt
    image.
+   *Second contact, same day, published image 818f6e3:* the stream is live (kv_ops 1.2 M on the
+   least-loaded arm, 2.0 M on the prefix arm, zero stream resets, 394 verified hits, 98 verified
+   evictions, 87,015 routes materialized) and run 1 (fitted 20u, rr-first) is a regression
+   caused by the stream: **P99 +84.8% vs least-loaded** where the three stream-off control reps
+   of the same day read −13.2 / −12.5 / −7.1%; P50 −16.5% (control −27%); KV hits 27% (control
+   61–68%); route consistency 37% (53%); Gini 0.141 (0.08–0.10); residency downgrades 3.4%
+   (0.4–0.6%); route-changed P99 3.6 s vs 1.8 s. Two mechanisms, one confirmed in code: the
+   verified lookup is made at the routing depth (the system-prompt boundary, 2,000–4,000 tokens
+   here) against an index that tracks chains only to 2,048 tokens, so a deep hit is absent by
+   construction and downgraded with certainty (fixed: verification is skipped beyond the indexed
+   depth, counted in `verified_depth_skips`). The second is route materialization: 87,015 PUSH
+   routes in ten minutes, one per block boundary up to 128 tokens of every prefill, so any
+   header shared by prompts becomes an ART anchor that captures requests whose longer prefix is
+   not yet learned and funnels unrelated prefixes onto one backend (b4 = 480 requests vs b8 =
+   230). The `kvablate` suite (materialize off / depth 4096 / both, one repeat each) separates
+   them before the kvevents suite reruns with the winning configuration.
 8. Same session, after 7: `bench-runner.sh --suite kvreset --output-dir benchmark-reports-kvreset`
    (~1h15m): the 8B 20u row with the between-arm KV reset acknowledged, which the reset was
    built for and has never had (404 on 10-08; 13B rows only on 10-09). Expected: the rr-first

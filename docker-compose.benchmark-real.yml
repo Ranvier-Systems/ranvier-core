@@ -202,6 +202,8 @@ services:
       # by default. The per-backend publisher port reaches the node through
       # Locust's POST /admin/backends?kv_events_port=... at registration.
       - RANVIER_KV_EVENTS_ENABLED=${RANVIER_KV_EVENTS_ENABLED:-false}
+      - RANVIER_KV_EVENTS_MATERIALIZE=${RANVIER_KV_EVENTS_MATERIALIZE:-true}
+      - RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}
       # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
       # vLLM's Python endpoint exactly when the engine is busy, censoring the
       # cache-usage signal at peak pressure (the instants residency routing
@@ -303,6 +305,8 @@ services:
       # leg). Must be listed here or the host env var never reaches the server.
       - RANVIER_CACHE_RESIDENCY_THRESHOLD=${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}
       - RANVIER_KV_EVENTS_ENABLED=${RANVIER_KV_EVENTS_ENABLED:-false}
+      - RANVIER_KV_EVENTS_MATERIALIZE=${RANVIER_KV_EVENTS_MATERIALIZE:-true}
+      - RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}
       # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
       # vLLM's Python endpoint exactly when the engine is busy, censoring the
       # cache-usage signal at peak pressure (the instants residency routing
@@ -404,6 +408,8 @@ services:
       # leg). Must be listed here or the host env var never reaches the server.
       - RANVIER_CACHE_RESIDENCY_THRESHOLD=${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}
       - RANVIER_KV_EVENTS_ENABLED=${RANVIER_KV_EVENTS_ENABLED:-false}
+      - RANVIER_KV_EVENTS_MATERIALIZE=${RANVIER_KV_EVENTS_MATERIALIZE:-true}
+      - RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}
       # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
       # vLLM's Python endpoint exactly when the engine is busy, censoring the
       # cache-usage signal at peak pressure (the instants residency routing

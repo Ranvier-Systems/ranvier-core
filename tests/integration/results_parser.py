@@ -186,6 +186,7 @@ class BenchmarkResults:
     native_kv_ops_total: Optional[int] = None
     native_verified_hits_total: Optional[int] = None
     native_verified_evictions_total: Optional[int] = None
+    native_verified_depth_skips_total: Optional[int] = None
     native_routes_materialized_total: Optional[int] = None
     native_stream_resets_total: Optional[int] = None
     # Per-backend request distribution — printed as a sorted list so prefix-
@@ -653,6 +654,7 @@ _NATIVE_KEYS = (
     "native_kv_ops_total",
     "native_verified_hits_total",
     "native_verified_evictions_total",
+    "native_verified_depth_skips_total",
     "native_routes_materialized_total",
     "native_stream_resets_total",
 )
