@@ -293,6 +293,20 @@ BENCHMARK OPTIONS:
                         the endpoint only with VLLM_SERVER_DEV_MODE=1, which bench.sh
                         sets on the vLLM it launches; externally managed backends
                         (--skip-vllm, --vllm-endpoints) need it set by the operator.
+    --kv-events         Native KV-event mode. Each vLLM instance is launched with
+                        --kv-events-config (ZMQ publisher on port 5557+i, replay socket
+                        +100) and the Ranvier nodes with RANVIER_KV_EVENTS_ENABLED=true;
+                        Locust registers each backend with kv_events_port so the
+                        subscriber mirrors every backend's KV cache block-exactly
+                        (BlockStored/BlockRemoved) instead of estimating residency from
+                        the /metrics scrape. Both --compare arms get it. The compare
+                        header prints router_native_kv_ops_total per arm: 0 means the
+                        stream never connected and the arm ran on probabilistic
+                        residency after all. With --skip-vllm / --vllm-endpoints the
+                        operator must have launched backend i publishing on
+                        --kv-events-port-start + i - 1 on its own host.
+    --kv-events-port-start N
+                        Publisher port of the first backend (default 5557).
     --warmup            Run a short warm-up before the main benchmark (adds ~1m 10s).
                         With --compare, warm-up runs PER ARM after each mode restart so
                         both arms are identically primed.
@@ -514,6 +528,9 @@ COMPARE=false
 ORDER="rr-first"   # --order: arm order in --compare (rr-first | prefix-first)
 KV_RESET=true      # --no-kv-reset: keep vLLM's KV cache across the arm switch
 BASELINE_MODE="round_robin"  # --baseline-mode: routing mode of the --compare baseline arm
+KV_EVENTS=false              # --kv-events: vLLM publishes KV-cache events over ZMQ; Ranvier subscribes (native residency)
+KV_EVENTS_PORT_START=5557    # --kv-events-port-start: publisher port of vLLM instance 0 (instance i: +i)
+KV_EVENTS_REPLAY_OFFSET=100  # replay ROUTER socket of each instance = its publisher port + 100
 SKIP_SETUP=false
 SKIP_VLLM=false
 VLLM_HOST="localhost"
@@ -562,6 +579,8 @@ while [[ $# -gt 0 ]]; do
         --order)          ORDER="$2"; shift 2 ;;
         --no-kv-reset)    KV_RESET=false; shift ;;
         --baseline-mode)  BASELINE_MODE="$2"; shift 2 ;;
+        --kv-events)      KV_EVENTS=true; shift ;;
+        --kv-events-port-start) KV_EVENTS_PORT_START="$2"; shift 2 ;;
         --skip-setup)     SKIP_SETUP=true; shift ;;
         --skip-vllm)      SKIP_VLLM=true; shift ;;
         --vllm-host)      VLLM_HOST="$2"; shift 2 ;;
@@ -1214,6 +1233,9 @@ if [[ "$DRY_RUN" = true ]]; then
             log_info "Would use $NUM_BACKENDS external vLLM endpoints at $VLLM_HOST:$DEFAULT_VLLM_PORT_START-$((DEFAULT_VLLM_PORT_START + NUM_BACKENDS - 1))"
         fi
     fi
+    if [[ "$KV_EVENTS" = true ]]; then
+        log_info "Would enable native KV events: vLLM --kv-events-config (zmq on ports ${KV_EVENTS_PORT_START}-$((KV_EVENTS_PORT_START + NUM_BACKENDS - 1)), replay +${KV_EVENTS_REPLAY_OFFSET}), RANVIER_KV_EVENTS_ENABLED=true, backends registered with kv_events_port"
+    fi
     log_info "Would start Ranvier cluster (3 nodes)"
     if [[ "$WARMUP" = true ]]; then
         log_info "Would run warm-up ($DEFAULT_WARMUP_DURATION, $DEFAULT_WARMUP_USERS users)"
@@ -1281,6 +1303,21 @@ if [[ "$SKIP_VLLM" = false ]]; then
             log_step "$((i+1))" "$NUM_BACKENDS" "GPU $i: Starting vLLM on :$PORT..."
         fi
 
+        # --kv-events: vLLM publishes block-granular KV-cache events
+        # (BlockStored / BlockRemoved / AllBlocksCleared) over ZMQ PUB; Ranvier's
+        # native subscriber (kv_events.enabled, WITH_KV_EVENTS) mirrors each
+        # backend's cache block-exactly instead of estimating residency from the
+        # /metrics scrape. One publisher per instance, bound on 0.0.0.0 so the
+        # Ranvier containers reach it over the docker bridge; the replay ROUTER
+        # socket (sequence-gap recovery) sits +100. The between-arm
+        # /reset_prefix_cache shows up on the stream as AllBlocksCleared.
+        KV_EVENTS_VLLM_ARGS=()
+        if [[ "$KV_EVENTS" = true ]]; then
+            KV_PUB_PORT=$((KV_EVENTS_PORT_START + i))
+            KV_REPLAY_PORT=$((KV_PUB_PORT + KV_EVENTS_REPLAY_OFFSET))
+            KV_EVENTS_VLLM_ARGS=(--kv-events-config "{\"enable_kv_cache_events\": true, \"publisher\": \"zmq\", \"endpoint\": \"tcp://0.0.0.0:${KV_PUB_PORT}\", \"replay_endpoint\": \"tcp://0.0.0.0:${KV_REPLAY_PORT}\"}")
+        fi
+
         # VLLM_SERVER_DEV_MODE=1: vLLM exposes POST /reset_prefix_cache (used
         # between --compare arms, see reset_vllm_prefix_cache) only as a
         # "development" endpoint behind this env var; without it the call is a
@@ -1296,6 +1333,7 @@ if [[ "$SKIP_VLLM" = false ]]; then
             --disable-frontend-multiprocessing \
             ${MAX_MODEL_LEN:+--max-model-len "$MAX_MODEL_LEN"} \
             $( [[ "$TP_SIZE" -gt 1 ]] && echo "--tensor-parallel-size $TP_SIZE" ) \
+            "${KV_EVENTS_VLLM_ARGS[@]}" \
             > "$LOG_FILE" 2>&1 &
 
         VLLM_PIDS+=($!)
@@ -1576,6 +1614,19 @@ if [[ -n "$BOUNDED_LOAD_EPSILON" ]]; then
     export RANVIER_BOUNDED_LOAD_EPSILON="$BOUNDED_LOAD_EPSILON"
     log_info "Bounded-load epsilon: $BOUNDED_LOAD_EPSILON"
 fi
+# --kv-events, server side. The compose file forwards RANVIER_KV_EVENTS_ENABLED
+# to all three nodes; each backend's publisher port reaches every node through
+# Locust's POST /admin/backends?kv_events_port=... (KV_EVENTS_ARGS below), the
+# admin-API form of the static-YAML / K8s-annotation opt-in.
+KV_EVENTS_ARGS=""
+if [[ "$KV_EVENTS" = true ]]; then
+    export RANVIER_KV_EVENTS_ENABLED=true
+    KV_EVENTS_ARGS="-e KV_EVENTS_PORT_START=$KV_EVENTS_PORT_START -e KV_EVENTS_REPLAY_PORT_START=$((KV_EVENTS_PORT_START + KV_EVENTS_REPLAY_OFFSET))"
+    log_info "Native KV events: vLLM --kv-events-config zmq on ports ${KV_EVENTS_PORT_START}-$((KV_EVENTS_PORT_START + NUM_BACKENDS - 1)) (replay +${KV_EVENTS_REPLAY_OFFSET}); RANVIER_KV_EVENTS_ENABLED=true"
+    if [[ "$SKIP_VLLM" = true || ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
+        log_warn "--kv-events with externally managed vLLM: backend i must already publish on port $((KV_EVENTS_PORT_START))+i-1 of its own host (--kv-events-config), or the subscriber connects to nothing and the compare header shows router_native_kv_ops_total=0."
+    fi
+fi
 # Residency routing toggle (#527). The flag takes precedence over a bare
 # RANVIER_CACHE_RESIDENCY_THRESHOLD=... env prefix; both reach the servers now
 # that docker-compose.benchmark-real.yml passes the variable through.
@@ -1853,7 +1904,12 @@ write_manifest() {
         printf '    "backpressure_tier_capacity": "%s",\n' "$(_json_escape "${RANVIER_BACKPRESSURE_TIER_CAPACITY:-64,128,256,512}")"
         printf '    "chat_template_format": "%s",\n' "$(_json_escape "${RANVIER_CHAT_TEMPLATE_FORMAT:-none}")"
         printf '    "tokenizer_thread_pool_enabled": "%s",\n' "$(_json_escape "${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}")"
-        printf '    "health_vllm_metrics_timeout_ms": "%s"\n' "$(_json_escape "${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}")"
+        printf '    "health_vllm_metrics_timeout_ms": "%s",\n' "$(_json_escape "${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}")"
+        # Native KV-event mode (--kv-events). results_parser prints the native
+        # counters whenever this says true, so a stream that never connected
+        # shows up as kv_ops=0 in the compare instead of passing silently.
+        printf '    "kv_events_enabled": "%s",\n' "$(_json_escape "${RANVIER_KV_EVENTS_ENABLED:-false}")"
+        printf '    "kv_events_port_start": "%s"\n' "$(_json_escape "$([[ "$KV_EVENTS" = true ]] && echo "$KV_EVENTS_PORT_START")")"
         printf '  },\n'
         # workload knobs — the block results_parser.py compares for comparability.
         printf '  "workload": {\n'
@@ -2088,6 +2144,7 @@ run_benchmark() {
         $PREFIX_MAX_ARGS \
         $NUM_PREFIXES_ARGS \
         $CHURN_ARGS \
+        $KV_EVENTS_ARGS \
         locust \
         --headless \
         --users "$USERS" \
@@ -2285,6 +2342,7 @@ run_warmup() {
         $PREFIX_MAX_ARGS \
         $NUM_PREFIXES_ARGS \
         $CHURN_ARGS \
+        $KV_EVENTS_ARGS \
         locust \
         --headless \
         --users "$USERS" \
@@ -2386,6 +2444,14 @@ restart_ranvier_with_mode() {
 # hit the same way the health check addresses it. The result goes into the
 # compare header so a reader can tell a reset run from a carry-over run.
 KV_RESET_LOG=""
+# Sum of router_native_kv_ops_total over an arm's per-node end-of-run dumps
+# (prometheus_metrics_node*.txt; Seastar emits one series per shard, all
+# summed). Prints 0 when the counter is absent, as on an image without it.
+native_kv_ops_total() {
+    local dir="$1"
+    cat "$dir"/prometheus_metrics_node*.txt 2>/dev/null \
+        | awk '/^(seastar_)?ranvier_router_native_kv_ops_total/ { s += $NF } END { printf "%d", s }'
+}
 reset_vllm_prefix_cache() {
     local label="$1" acked=0 total=0 i host port code
     for ((i=0; i<NUM_BACKENDS; i++)); do
@@ -2476,6 +2542,24 @@ if [[ "$COMPARE" = true ]]; then
     echo "  Prefix-Aware: $REPORT_PREFIX"
     echo ""
 
+    # --kv-events liveness: the one number that says whether the stream was
+    # connected, summed across the three nodes' end-of-arm dumps. 0 on the
+    # prefix arm means that arm ran on probabilistic residency after all; the
+    # compare header says so instead of letting the run pass as a KV-event
+    # measurement. The baseline arm subscribes too (the ledger and route
+    # materialization run in every routing mode), so both should be nonzero.
+    NATIVE_OPS_BASELINE="n/a"
+    NATIVE_OPS_PREFIX="n/a"
+    if [[ "$KV_EVENTS" = true ]]; then
+        NATIVE_OPS_BASELINE=$(native_kv_ops_total "$REPORT_RR")
+        NATIVE_OPS_PREFIX=$(native_kv_ops_total "$REPORT_PREFIX")
+        if [[ "$NATIVE_OPS_PREFIX" == "0" ]]; then
+            log_error "--kv-events requested but router_native_kv_ops_total is 0 at the end of the prefix arm: the ZMQ stream never delivered. Check /tmp/vllm_gpu*.log for the --kv-events-config publisher and the Ranvier logs for 'KV-event subscriber'. The compare header records it; read this run as probabilistic residency."
+        else
+            log_ok "Native KV events live: router_native_kv_ops_total ${BASELINE_MODE}=${NATIVE_OPS_BASELINE} prefix=${NATIVE_OPS_PREFIX}"
+        fi
+    fi
+
     # Run automatic comparison analysis
     COMPARE_OUTPUT="${OUTPUT_DIR}/compare_$(date +%Y%m%d_%H%M%S).txt"
     # Log run configuration at the top of the compare file for reproducibility
@@ -2489,6 +2573,11 @@ if [[ "$COMPARE" = true ]]; then
             echo "vLLM KV cache reset before each arm via POST /reset_prefix_cache (backends acked: ${KV_RESET_LOG% })"
         else
             echo "vLLM KV cache NOT reset between arms (--no-kv-reset; Ranvier-only restart)"
+        fi
+        if [[ "$KV_EVENTS" = true ]]; then
+            echo "Native KV events: ON (--kv-events; vLLM --kv-events-config zmq on ports ${KV_EVENTS_PORT_START}+, RANVIER_KV_EVENTS_ENABLED=true); router_native_kv_ops_total at end of arm: ${BASELINE_MODE}=${NATIVE_OPS_BASELINE} prefix=${NATIVE_OPS_PREFIX}"
+        else
+            echo "Native KV events: off (residency estimated from the vLLM /metrics scrape)"
         fi
         echo "Ranvier Env: $(env | grep '^RANVIER_' | sort | tr '\n' ' ')"
         echo ""

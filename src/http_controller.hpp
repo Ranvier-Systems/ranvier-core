@@ -419,6 +419,23 @@ public:
     // See src/telemetry_sink.hpp for the sink contract.
     void set_telemetry_service(TelemetryService* ts) { _telemetry_service = ts; }
 
+    // Native KV-event subscription seam (BACKLOG §20.1 P0.1). Installed by
+    // Application on every shard when kv_events.enabled and the build has
+    // WITH_KV_EVENTS; left empty otherwise, and POST /admin/backends then
+    // reports "kv_events": "unavailable" for a request that asked for it.
+    // The handler calls it with tcp://<resolved-ip>:<kv_events_port> and the
+    // replay endpoint (or ""), the admin-API equivalent of static YAML
+    // `kv_events_port` and the ranvier.io/kv-events-port annotation; an empty
+    // endpoint means "drop this backend's stream" (kv_events_port=0). The
+    // callee is KvEventSubscriberService::add/remove_subscription, a lock-free
+    // MPSC enqueue that is legal from any shard (Rule #1). Returns false when
+    // the subscriber's command queue is full; the handler reports that too.
+    using KvEventsSubscribeCallback =
+        std::function<bool(BackendId id, std::string endpoint, std::string replay_endpoint)>;
+    void set_kv_events_subscribe_callback(KvEventsSubscribeCallback cb) {
+        _kv_events_subscribe = std::move(cb);
+    }
+
     // Install this shard's usage-ledger sink (owned). When set, the proxy
     // completion path hands one UsageEvent per request to record(). When unset
     // (the default, and whenever usage_ledger.enabled is false), the completion
@@ -514,6 +531,10 @@ private:
 
     // HealthService pointer for admin metrics endpoint (nullable, not owned)
     HealthService* _health_service = nullptr;
+
+    // Native KV-event subscription seam for POST /admin/backends (empty when
+    // kv_events is disabled or compiled out); see set_kv_events_subscribe_callback.
+    KvEventsSubscribeCallback _kv_events_subscribe;
 
     // TelemetryService pointer for aggregate metrics export (nullable, not
     // owned). Each shard's HttpController is wired to its LOCAL shard's

@@ -1497,6 +1497,14 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   +22.9/+24.9/+21.7 P99 (the 10-08 carry-over rep's parity was the cache), P50 −9…−16%, KV 3–5×,
   fewer timeouts, rps flat → in the eviction regime prefix loses the tail to a load balancer. Next
   routing change is a divert that keeps the hit (holder-aware divert, below), not a knob.**
+  **10-10: that divert has no signal to read yet. `holders_of` counts Ranvier nodes (telemetry
+  sink, off), the route table holds one home per prefix, and the native KV-event subscriber has
+  never run on GPUs (`router_native_*` = 0 in every archived dump) because the benchmark
+  registers backends via `POST /admin/backends`, which could not opt them in. Added:
+  `kv_events_port` on that endpoint, `bench.sh --kv-events`, `bench-runner.sh --suite kvevents`
+  (fitted 20u + 50-prefix 20u vs least_loaded, ×3) and `--suite kvreset` (8B 20u with the reset
+  acked). Next session runs those; the pre-registered reading is in the runner's --help and the
+  results doc's resume checklist item 7.**
   Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
   `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
   `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement

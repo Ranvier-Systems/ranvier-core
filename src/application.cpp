@@ -1322,6 +1322,33 @@ seastar::future<> Application::startup() {
 #endif
             return seastar::make_ready_future<>();
         }).then([this] {
+            // 14a-quater. Hand the KV-event subscriber to every shard's
+            // HttpController so POST /admin/backends?kv_events_port=... can
+            // opt a backend in at runtime, as static YAML (14b) and the K8s
+            // annotation (15) do at registration. The callback is a lock-free
+            // MPSC enqueue, so any shard may call it (Rule #1); it captures
+            // the Application, which outlives every controller shard.
+#ifdef RANVIER_WITH_KV_EVENTS
+            if (!_kv_subscriber) {
+                return seastar::make_ready_future<>();
+            }
+            return _controller.invoke_on_all([this](HttpController& c) {
+                c.set_kv_events_subscribe_callback(
+                    [this](BackendId id, std::string endpoint, std::string replay_endpoint) {
+                        if (!_kv_subscriber) {
+                            return false;
+                        }
+                        if (endpoint.empty()) {
+                            return _kv_subscriber->remove_subscription(id);
+                        }
+                        return _kv_subscriber->add_subscription(
+                            id, std::move(endpoint), std::move(replay_endpoint));
+                    });
+            });
+#else
+            return seastar::make_ready_future<>();
+#endif
+        }).then([this] {
             // 14b. Register static-config backends from YAML.
             // Runs after persistence replay so YAML wins on ID collision,
             // and before discovery services start so static entries are

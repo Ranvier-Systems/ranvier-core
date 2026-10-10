@@ -176,6 +176,18 @@ class BenchmarkResults:
     cache_states_sent_total: Optional[int] = None
     cache_states_received_total: Optional[int] = None
     residency_cache_size: Optional[int] = None
+    # Native KV-event subscriber counters (BACKLOG §20.1 P0.1; "router_native_*"
+    # in router_service.cpp). kv_ops is the liveness signal: 0 on a run whose
+    # manifest says kv_events_enabled=true means the ZMQ stream never connected
+    # and the arm measured probabilistic residency after all. verified_hits /
+    # verified_evictions are ART hits the stream confirmed resident / absent;
+    # routes_materialized are PUSH routes learned from BlockStored; stream_resets
+    # are sequence gaps that wiped a backend's ledger (replay off or failed).
+    native_kv_ops_total: Optional[int] = None
+    native_verified_hits_total: Optional[int] = None
+    native_verified_evictions_total: Optional[int] = None
+    native_routes_materialized_total: Optional[int] = None
+    native_stream_resets_total: Optional[int] = None
     # Per-backend request distribution — printed as a sorted list so prefix-
     # concentration hot-spotting shows up directly in the comparison output.
     # Aggregated across ALL ranvier nodes (see parse_prometheus_report).
@@ -635,6 +647,19 @@ _PROM_CACHE_STATES_RECV_RE = re.compile(
 _PROM_RESIDENCY_CACHE_SIZE_RE = re.compile(
     r"^(?:seastar_)?ranvier_router_residency_cache_size(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
 )
+# Native KV-event subscriber counters (router_service.cpp make_counter
+# "router_native_*", "ranvier" group; per-shard series summed like the others).
+_NATIVE_KEYS = (
+    "native_kv_ops_total",
+    "native_verified_hits_total",
+    "native_verified_evictions_total",
+    "native_routes_materialized_total",
+    "native_stream_resets_total",
+)
+_PROM_NATIVE_RES = {
+    k: re.compile(r"^(?:seastar_)?ranvier_router_" + k + r"(?:\{[^}]*\})?\s+([0-9.eE+-]+)")
+    for k in _NATIVE_KEYS
+}
 # NOTE: backend_active_requests is an instantaneous gauge — it reads ~0 when
 # scraped after traffic has drained at end-of-run, so it is a poor distribution
 # signal. The cumulative histogram count below is preferred (see caller).
@@ -669,10 +694,21 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
     cs_sent: Optional[float] = None    # summed across shards
     cs_recv: Optional[float] = None    # summed across shards
     res_cache_size: Optional[float] = None  # max across shards (per-shard gauge)
+    native: Dict[str, float] = {}      # native KV-event counters, summed across shards
     active: Dict[str, float] = {}      # summed per backend_id across shards
     routed_total: Dict[str, float] = {}
     for line in content.splitlines():
         if not line or line.startswith("#"):
+            continue
+        if "_native_" in line:
+            for key, rx in _PROM_NATIVE_RES.items():
+                m = rx.match(line)
+                if m:
+                    try:
+                        native[key] = native.get(key, 0.0) + float(m.group(1))
+                    except ValueError:
+                        pass
+                    break
             continue
         m = _PROM_FALLBACK_RE.match(line)
         if m:
@@ -737,6 +773,8 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
         out["cache_states_received_total"] = int(cs_recv)
     if res_cache_size is not None:
         out["residency_cache_size"] = int(res_cache_size)
+    for key, val in native.items():
+        out[key] = int(val)
     if active:
         out["backend_active_requests"] = active
     if routed_total:
@@ -799,7 +837,7 @@ def parse_prometheus_report(report_dir: str) -> Dict[str, Any]:
         return {}
 
     sum_keys = ("load_aware_fallbacks_total", "residency_route_downgrades_total",
-                "cache_states_sent_total", "cache_states_received_total")
+                "cache_states_sent_total", "cache_states_received_total") + _NATIVE_KEYS
     sums: Dict[str, int] = {}
     active: Dict[str, float] = {}
     routed: Dict[str, float] = {}
@@ -1042,6 +1080,9 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.cache_states_received_total = prom["cache_states_received_total"]
     if "residency_cache_size" in prom:
         results.residency_cache_size = prom["residency_cache_size"]
+    for key in _NATIVE_KEYS:
+        if key in prom:
+            setattr(results, key, prom[key])
     if "nodes_scraped" in prom:
         results.prometheus_nodes_scraped = prom["nodes_scraped"]
     # Prefer per-backend histogram counts (cumulative dispatched requests) if
@@ -1771,6 +1812,36 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
                     "before trusting a residency A/B."
                 )
 
+        # Native KV-event subscriber — the block-exact residency signal. Printed
+        # when either arm saw any native op, or when a manifest says the run
+        # asked for it (bench.sh --kv-events): then a zero IS the finding, the
+        # stream never connected and the arm ran on probabilistic residency.
+        def _native_any(r) -> bool:
+            return any((getattr(r, k, None) or 0) > 0 for k in _NATIVE_KEYS)
+
+        kv_requested = (_manifest_kv_events_enabled(new.source_file)
+                        or _manifest_kv_events_enabled(baseline.source_file))
+        if _native_any(baseline) or _native_any(new) or kv_requested:
+            def _native_row(r) -> str:
+                return ", ".join(
+                    f"{k[len('native_'):-len('_total')]}={_fmt_count(getattr(r, k, None))}"
+                    for k in _NATIVE_KEYS
+                )
+            lines.append(f"  native KV events (baseline): {_native_row(baseline)}")
+            lines.append(f"  native KV events (new):      {_native_row(new)}")
+            if kv_requested and not _native_any(new):
+                lines.append(
+                    "  -> native KV events REQUESTED (--kv-events) but kv_ops=0 on the new arm: the ZMQ "
+                    "stream never delivered; this arm ran on probabilistic residency. Check the vLLM "
+                    "--kv-events-config publisher and RANVIER_KV_EVENTS_ENABLED before reading the result."
+                )
+            elif _native_any(new):
+                lines.append(
+                    "  (verified_hits / verified_evictions = ART hits the stream confirmed resident / "
+                    "absent; routes_materialized = PUSH routes learned from BlockStored; stream_resets "
+                    "> 0 means sequence gaps wiped a backend's ledger)"
+                )
+
         # Per-backend request distribution. Print as sorted list with min/max
         # and a Gini coefficient — hot-spotting from prefix concentration
         # shows up as a high Gini (>0.3 is suspicious on a uniform workload).
@@ -2177,6 +2248,19 @@ def _manifest_path_for(path: str) -> Optional[Path]:
     p = Path(path)
     m = (p / "manifest.json") if p.is_dir() else (p.parent / "manifest.json")
     return m if m.exists() else None
+
+
+def _manifest_kv_events_enabled(path: Optional[str]) -> bool:
+    """True when the manifest beside `path` records routing.kv_events_enabled=true
+    (bench.sh --kv-events). False for no manifest, older manifests, or any path
+    that is not a report dir / log file."""
+    if not path:
+        return False
+    m = load_manifest(path)
+    if not m:
+        return False
+    routing = m.get("routing") or {}
+    return str(routing.get("kv_events_enabled", "")).lower() == "true"
 
 
 def load_manifest(path: str) -> Optional[Dict[str, Any]]:

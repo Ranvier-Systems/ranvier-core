@@ -7,6 +7,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `POST /admin/backends?...&kv_events_port=P[&kv_events_replay_port=R]`: opt an
+  admin-registered backend into the native KV-event stream (vLLM `--kv-events-config`
+  ZMQ publisher at `tcp://<ip>:P`), the admin-API form of the static-YAML `kv_events_port`
+  and the `ranvier.io/kv-events-port` annotation; `kv_events_port=0` drops the stream. The
+  response carries `"kv_events": subscribed | unsubscribed | unavailable | queue_full`
+  (`unavailable` when `kv_events.enabled` is false or the build lacks `WITH_KV_EVENTS`; the
+  backend still registers). Not persisted with the backend row. Exists because the
+  benchmark fleet registers backends through this endpoint and so had no way to turn the
+  subscriber on: every GPU campaign to date ran with `router_native_*` at zero.
+- `bench.sh --kv-events` (and `--kv-events-port-start N`, default 5557): launches each vLLM
+  with `--kv-events-config` (ZMQ publisher on 5557+i, replay socket +100), the Ranvier nodes
+  with `RANVIER_KV_EVENTS_ENABLED=true`, and has Locust register every backend with
+  `kv_events_port`, for both `--compare` arms. The compare header states whether the stream
+  was on and prints `router_native_kv_ops_total` per arm (bench.sh logs an error when the
+  prefix arm's is 0: the stream never connected and the arm ran on probabilistic residency);
+  the manifest records `kv_events_enabled`; `results_parser.py compare` prints the native
+  counters (kv_ops, verified_hits, verified_evictions, routes_materialized, stream_resets)
+  for both arms whenever any is non-zero or a manifest says the run asked for the stream.
+- `bench-runner.sh --suite kvevents` (fitted 13B 20u and 50-prefix 13B 20u vs `least_loaded`
+  with `--kv-events`, ×3, ~2h40m; the pre-registered reading is in `--help`) and
+  `--suite kvreset` (the 8B 20u row vs round-robin ×3 with the between-arm KV reset working,
+  which that row has never had).
 - `routing_mode: least_loaded` (`RANVIER_ROUTING_MODE=least_loaded`): route every request
   to the live backend with the lowest capacity-adjusted composite load (under the shipping
   defaults, the node's in-flight count summed across shards), ties broken uniformly at

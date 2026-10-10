@@ -239,7 +239,7 @@ USAGE:
     ./scripts/bench-runner.sh [OPTIONS]
 
 OPTIONS:
-    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, saturation, low, all, custom
+    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, saturation, kvevents, kvreset, low, all, custom
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
@@ -363,8 +363,38 @@ BUILT-IN SUITES:
       least_loaded: +22.9/+24.9/+21.7 P99 (the 10-08 carry-over rep's parity was the
       cache), P50 -9..-16%, KV 3-5x, fewer timeouts. Record: results/2026-10-09-saturation/.
 
-    all = rebaseline + epsilon + fitted + placement + baseline + saturation + low (every suite;
-      the historical epsilon and placement rows included — pass --skip to drop them).
+    kvevents (2 configs x 2 arms x 3 repeats, ~2h50m) — the native KV-event subscriber
+      on GPUs for the first time: bench.sh --kv-events launches every vLLM with
+      --kv-events-config (ZMQ publisher), the nodes with RANVIER_KV_EVENTS_ENABLED=true,
+      and Locust registers each backend with kv_events_port. Both arms get the stream.
+      Read the FIRST compare's "Native KV events" header line and "native KV events"
+      counter rows before anything else: router_native_kv_ops_total must be > 0 on
+      the prefix arm and stream_resets ~0, or the stream never connected and the suite
+      measured probabilistic residency again (bench.sh also logs an error). Then the
+      question: does block-exact residency (verified evictions downgrade hits to a
+      backend that no longer holds the prefix; PUSH routes learned from BlockStored)
+      move the rows prefix ties or loses against least_loaded?
+      Pre-registered reading: row 17 (fitted 20u; baseline suite -14.6/-13.8/-20.8%
+      P99 without the stream) must not regress. Row 18 (50-prefix 20u; saturation
+      suite +22.9/+24.9/+21.7% P99 vs least_loaded) is the eviction-regime acceptance
+      row: a consistent improvement is the finding; MIXED with KV above today's 23-32%
+      is progress; an unchanged consistent regression means verified residency alone
+      does not fix the eviction regime and the holder-aware divert (BACKLOG section 27)
+      is the next change.
+      17. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --num-prefixes 16 --prefix-max-tokens 4000
+      18. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events  (50-prefix set)
+
+    kvreset (1 config x 2 arms x 3 repeats, ~1h15m) — the 8B 20u row with the between-arm
+      KV reset acknowledged. The reset exists for this row (2026-10-06: prefix-first
+      repeats ~9 points weaker because round-robin inherited the prefix arm's warm cache)
+      and has never run on it: it 404'd on 2026-10-08 and worked on 13B rows only on
+      2026-10-09. Expected: rr-first and prefix-first repeats converge on the -27% median
+      and the compare header reads "backends acked: 8/8" for both arms.
+      19. 8B 20 users 10m    --compare  (50-prefix set; matrix row 1 with the reset working)
+
+    all = rebaseline + epsilon + fitted + placement + baseline + saturation + kvevents +
+      kvreset + low (every suite; the historical epsilon and placement rows included —
+      pass --skip to drop them).
 
     Retired (see .dev-context/benchmark-accuracy-audit-2026-09-30.md):
       - prefix-ratio 0.5/0.7 sweep: SHARED_PREFIX_RATIO only governs 20% of the
@@ -382,11 +412,11 @@ BUILT-IN SUITES:
       now identical to fitted on a 2.2.0 image; keep it for re-running the leg
       against an older image or with --miss-placement hash on the rr arm.
 
-    rebaseline, epsilon, fitted, placement, baseline and saturation default to --repeat 3; pass --repeat 1 for a smoke run.
+    rebaseline, epsilon, fitted, placement, baseline, saturation, kvevents and kvreset default to --repeat 3; pass --repeat 1 for a smoke run.
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
-      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | saturation | low
+      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | saturation | kvevents | kvreset | low
     Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
@@ -453,6 +483,8 @@ done
 #   epsilon    = Leg V1 bounded-load epsilon 0.5 leg    (--suite epsilon, all)
 #   fitted     = 13B with a KV-fitting prefix set         (--suite fitted, all)
 #   placement  = fitted set, --miss-placement least_loaded (--suite placement; historical, default since 2.2.0)
+#   kvevents   = fitted 20u + 50-prefix 20u vs least_loaded with --kv-events (--suite kvevents)
+#   kvreset    = 8B 20u vs round-robin with the between-arm KV reset working (--suite kvreset)
 #   low        = exploratory runs outside any headline  (--suite low, all)
 #
 # Run numbers are assigned in definition order within the selected suite.
@@ -465,7 +497,7 @@ add_run() {
     local args="$*"
 
     case "$SUITE" in
-        rebaseline|epsilon|fitted|placement|baseline|saturation|low) [[ "$suite" != "$SUITE" ]] && return ;;
+        rebaseline|epsilon|fitted|placement|baseline|saturation|kvevents|kvreset|low) [[ "$suite" != "$SUITE" ]] && return ;;
         all)    ;;  # include everything
         *)      return ;;  # custom suite doesn't use add_run
     esac
@@ -607,6 +639,32 @@ define_runs() {
         --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 10m --users 20 --max-model-len 8192
 
+    # --- kvevents: native KV-event subscriber, first hardware contact ------------
+    # Every campaign so far ran with the subscriber off (router_native_* all 0 in
+    # the saturation dumps), so residency was the /metrics scrape estimate and no
+    # per-backend holder signal existed. --kv-events turns the block-exact stream
+    # on for both arms. Row 17 is the control (fitted 20u, -14.6% P99 vs
+    # least_loaded without the stream: must not regress); row 18 is the
+    # eviction-regime acceptance row (+22.9/+24.9/+21.7% P99 vs least_loaded on
+    # 2026-10-09). Read the first compare's kv_ops counter before trusting any of it.
+    add_run kvevents "13B 20u/10m A/B vs least_loaded, fitted set, native KV events" \
+        --compare --baseline-mode least_loaded --kv-events \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    add_run kvevents "13B 20u/10m A/B vs least_loaded, 50-prefix set, native KV events" \
+        --compare --baseline-mode least_loaded --kv-events \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192
+
+    # --- kvreset: the 8B order effect with the between-arm KV reset working -------
+    # Same args as rebaseline row 1. The reset was built for this row and has not
+    # yet run on it with vLLM acknowledging (2026-10-08: 404; 2026-10-09: 13B only).
+    add_run kvreset "8B 20u/10m A/B, KV reset verified" \
+        --compare --model meta-llama/Llama-3.1-8B-Instruct \
+        --warmup --duration 10m --users 20
+
     # --- low: exploratory, outside any headline --------------------------------
     # TP, max-model-len, and gpu-mem-util are auto-detected from GPU VRAM.
     # Explicit overrides: --tp 4 --max-model-len 4096 --gpu-mem-util 0.92 (for 40GB)
@@ -649,7 +707,7 @@ define_runs
 # so the post-suite aggregation can gather each config's repeats. See BACKLOG §25.
 # A single run is not a result (review F3): the headline suites default to
 # three repeats so the aggregate can issue a CONSISTENT / MIXED verdict.
-if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" || "$SUITE" == "placement" || "$SUITE" == "baseline" || "$SUITE" == "saturation" ) ]]; then
+if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" || "$SUITE" == "placement" || "$SUITE" == "baseline" || "$SUITE" == "saturation" || "$SUITE" == "kvevents" || "$SUITE" == "kvreset" ) ]]; then
     REPEAT=3
     log_info "Suite '$SUITE' defaults to --repeat 3 (pass --repeat 1 for a smoke run)"
 fi

@@ -197,6 +197,11 @@ services:
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
       - RANVIER_CACHE_RESIDENCY_THRESHOLD=${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}
+      # Native KV-event subscriber (bench.sh --kv-events): block-exact residency
+      # from vLLM's ZMQ event stream instead of the /metrics scrape estimate. Off
+      # by default. The per-backend publisher port reaches the node through
+      # Locust's POST /admin/backends?kv_events_port=... at registration.
+      - RANVIER_KV_EVENTS_ENABLED=${RANVIER_KV_EVENTS_ENABLED:-false}
       # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
       # vLLM's Python endpoint exactly when the engine is busy, censoring the
       # cache-usage signal at peak pressure (the instants residency routing
@@ -297,6 +302,7 @@ services:
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
       - RANVIER_CACHE_RESIDENCY_THRESHOLD=${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}
+      - RANVIER_KV_EVENTS_ENABLED=${RANVIER_KV_EVENTS_ENABLED:-false}
       # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
       # vLLM's Python endpoint exactly when the engine is busy, censoring the
       # cache-usage signal at peak pressure (the instants residency routing
@@ -397,6 +403,7 @@ services:
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
       - RANVIER_CACHE_RESIDENCY_THRESHOLD=${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}
+      - RANVIER_KV_EVENTS_ENABLED=${RANVIER_KV_EVENTS_ENABLED:-false}
       # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
       # vLLM's Python endpoint exactly when the engine is busy, censoring the
       # cache-usage signal at peak pressure (the instants residency routing
@@ -481,6 +488,11 @@ services:
       - BACKEND7_PORT=${BACKEND7_PORT:-8000}
       - BACKEND8_IP=${BACKEND8_IP:-}
       - BACKEND8_PORT=${BACKEND8_PORT:-8000}
+      # Native KV events (bench.sh --kv-events): backend i registers with
+      # kv_events_port = KV_EVENTS_PORT_START + i - 1 (replay port likewise).
+      # Empty = backends register without a stream (probabilistic residency).
+      - KV_EVENTS_PORT_START=${KV_EVENTS_PORT_START:-}
+      - KV_EVENTS_REPLAY_PORT_START=${KV_EVENTS_REPLAY_PORT_START:-}
       # Model name must match vLLM's loaded model
       - VLLM_MODEL=${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
       # Chat template format — must match RANVIER_CHAT_TEMPLATE_FORMAT on server

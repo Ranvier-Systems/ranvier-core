@@ -397,6 +397,12 @@ def _build_backends_list(num_backends: int) -> List[dict]:
     3. Defaults: Different IPs (172.29.1.10, .11, ...), same port (8000)
        Example: NUM_BACKENDS=4
          -> 172.29.1.10:8000, 172.29.1.11:8000, 172.29.1.12:8000, 172.29.1.13:8000
+
+    Native KV events (bench.sh --kv-events): BACKEND{N}_KV_EVENTS_PORT, or
+    KV_EVENTS_PORT_START + N - 1, is registered as the backend's kv_events_port
+    (vLLM --kv-events-config ZMQ publisher on the backend's own host); the
+    replay port follows the same pattern with BACKEND{N}_KV_EVENTS_REPLAY_PORT /
+    KV_EVENTS_REPLAY_PORT_START. Unset = no stream (probabilistic residency).
     """
     backends = []
 
@@ -418,9 +424,33 @@ def _build_backends_list(num_backends: int) -> List[dict]:
             ip = DEFAULT_BACKEND_IP_PATTERN.format(9 + i)  # 172.29.1.10, .11, .12, etc.
             port = DEFAULT_BACKEND_PORT
 
-        backends.append({"id": i, "ip": ip, "port": port})
+        backend = {"id": i, "ip": ip, "port": port}
+        kv_port = _kv_events_port_for(i, "BACKEND{i}_KV_EVENTS_PORT", "KV_EVENTS_PORT_START")
+        if kv_port:
+            backend["kv_events_port"] = kv_port
+            replay = _kv_events_port_for(
+                i, "BACKEND{i}_KV_EVENTS_REPLAY_PORT", "KV_EVENTS_REPLAY_PORT_START")
+            if replay:
+                backend["kv_events_replay_port"] = replay
+        backends.append(backend)
 
     return backends
+
+
+def _kv_events_port_for(i: int, per_backend_env: str, start_env: str) -> int:
+    """Native KV-event port for backend i, or 0 when not requested.
+
+    The per-backend variable wins; otherwise the sequential pattern
+    <start_env> + i - 1 (bench.sh --kv-events launches vLLM instance i-1
+    publishing on exactly that port). Empty strings count as unset.
+    """
+    explicit = os.environ.get(per_backend_env.format(i=i))
+    if explicit:
+        return int(explicit)
+    start = os.environ.get(start_env)
+    if start:
+        return int(start) + i - 1
+    return 0
 
 
 BACKENDS = _build_backends_list(NUM_BACKENDS)
@@ -3163,10 +3193,35 @@ def register_backends_on_all_nodes():
                 f"&ip={backend['ip']}"
                 f"&port={backend['port']}"
             )
+            kv_port = backend.get("kv_events_port")
+            if kv_port:
+                url += f"&kv_events_port={kv_port}"
+                if backend.get("kv_events_replay_port"):
+                    url += f"&kv_events_replay_port={backend['kv_events_replay_port']}"
             try:
                 resp = requests.post(url, timeout=10)
                 if resp.status_code == 200:
                     logger.info(f"Registered backend {backend['id']} on {node_url}")
+                    if kv_port:
+                        # The server answers "subscribed", "unavailable" (kv_events
+                        # disabled or compiled out) or "queue_full". Anything but
+                        # the first means this arm runs on probabilistic residency
+                        # despite --kv-events; say so where the run log is read.
+                        try:
+                            kv_status = resp.json().get("kv_events", "unknown")
+                        except ValueError:
+                            kv_status = "unknown"
+                        if kv_status == "subscribed":
+                            logger.info(
+                                f"Backend {backend['id']}: native KV events subscribed "
+                                f"(port {kv_port}) on {node_url}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Backend {backend['id']}: native KV events requested "
+                                f"(port {kv_port}) but {node_url} answered kv_events="
+                                f"{kv_status}; this node routes on probabilistic residency"
+                            )
                 else:
                     logger.warning(
                         f"Failed to register backend {backend['id']} on {node_url}: "

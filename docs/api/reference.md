@@ -160,6 +160,12 @@ Register a new GPU backend.
 | port | int | Yes | - | Backend port |
 | weight | int | No | 100 | Load balancing weight (higher = more traffic) |
 | priority | int | No | 0 | Priority for fallback routing (lower = preferred) |
+| supports_token_ids | bool | No | true | Whether the backend accepts vLLM's `prompt_token_ids` (false for Ollama-class backends) |
+| compression_ratio | float | No | config default | KV-cache compression ratio (>= 1.0) for compression-aware load scoring |
+| type | string | No | vllm | Engine class: vllm, sglang, trt_llm, ollama, lm_studio, cerebras, openai_compatible |
+| pool_role | string | No | unified | Disaggregated pool role: unified, prefill, decode |
+| kv_events_port | int | No | (none) | Native KV-event stream: subscribe to the backend's vLLM `--kv-events-config` ZMQ publisher at `tcp://<ip>:<port>`. `0` drops an existing stream; omitted leaves it alone. Needs `kv_events.enabled` and a `WITH_KV_EVENTS` build |
+| kv_events_replay_port | int | No | (none) | The publisher's replay ROUTER socket for sequence-gap recovery; requires `kv_events_port` |
 
 **Example**:
 ```bash
@@ -168,16 +174,27 @@ curl -X POST "http://localhost:8080/admin/backends?id=1&ip=192.168.1.100&port=11
 
 # With weight and priority
 curl -X POST "http://localhost:8080/admin/backends?id=2&ip=192.168.1.101&port=11434&weight=200&priority=1"
+
+# vLLM publishing KV-cache events on 5557 (replay on 5657): block-exact residency
+curl -X POST "http://localhost:8080/admin/backends?id=3&ip=192.168.1.102&port=8000&kv_events_port=5557&kv_events_replay_port=5657"
 ```
 
 **Response**:
 ```json
-{"status": "ok"}
+{"status": "ok", "weight": 100, "priority": 0, "supports_token_ids": true, "compression_ratio": 1.0,
+ "type": "vllm", "pool_role": "unified", "kv_events": "subscribed", "kv_events_port": 5557}
 ```
+
+`kv_events` is `not_requested`, `subscribed`, `unsubscribed` (port 0), `unavailable`
+(`kv_events.enabled` false or the build lacks `WITH_KV_EVENTS`; the backend is registered
+and routes on probabilistic residency) or `queue_full` (retry).
 
 **Notes**:
 - `weight` affects consistent hashing distribution for cache-miss routing
 - `priority` is used when circuit breaker triggers fallback to alternate backends
+- `kv_events_port` is the admin-API form of the static-YAML `kv_events_port` and the
+  `ranvier.io/kv-events-port` EndpointSlice annotation. It is not persisted with the
+  backend row: a restarted node needs it posted again
 
 ---
 
