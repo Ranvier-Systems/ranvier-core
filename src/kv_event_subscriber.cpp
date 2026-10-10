@@ -88,10 +88,14 @@ bool split_seq_payload(const Message& msg, uint64_t& seq,
 }
 
 // Recover missed batches from vLLM's replay ROUTER socket. Sends the start
-// sequence as 8 bytes big-endian; the publisher streams (seq, payload)
-// messages from its bounded buffer, ending with a sentinel (seq = -1, empty
-// payload). A DEALER socket is used deliberately: REQ's strict send/recv
-// alternation cannot consume a multi-message stream.
+// sequence as 8 bytes big-endian behind an empty delimiter frame — the ROUTER
+// handler unpacks exactly [identity, delimiter, seq] and logs anything else
+// as "Invalid replay request" without answering (seen on vLLM 0.15.1,
+// 2026-10-10, when the request was the bare 8 bytes). The publisher streams
+// [delimiter, seq, payload] messages from its bounded buffer, ending with a
+// sentinel (seq = -1, empty payload). A DEALER socket is used deliberately:
+// REQ's strict send/recv alternation cannot consume a multi-message stream,
+// and REQ would add the delimiter itself, which is why DEALER must add it.
 //
 // Gap repair (upto_exclusive != UINT64_MAX): succeeds only when the stream
 // covers [from_seq, upto_exclusive) contiguously starting exactly at
@@ -131,7 +135,8 @@ bool attempt_replay(void* ctx, Subscription& sub, BackendId backend,
     }
     uint8_t request[8];
     encode_replay_request(from_seq, request);
-    if (zmq_send(sock, request, sizeof(request), 0) != static_cast<int>(sizeof(request))) {
+    if (zmq_send(sock, "", 0, ZMQ_SNDMORE) != 0 ||
+        zmq_send(sock, request, sizeof(request), 0) != static_cast<int>(sizeof(request))) {
         zmq_close(sock);
         return false;
     }

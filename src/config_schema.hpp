@@ -631,7 +631,13 @@ struct CacheEventsConfig {
 // port (static YAML `kv_events_port`, K8s annotation
 // `ranvier.io/kv-events-port`); the subscriber connects to
 // tcp://<backend-ip>:<port>. The matching vLLM flag is --kv-events-config
-// with a zmq publisher bound on that port.
+// with a zmq publisher bound on that port: the endpoint MUST be written
+// "tcp://*:<port>" — vLLM binds only when the endpoint contains "*" (or "::",
+// ipc, inproc) and otherwise connect()s to it, so "tcp://0.0.0.0:<port>"
+// silently publishes to nothing (observed on 0.15.1, 2026-10-10). Block
+// hashes arrive as 32-byte sha256 BIN by default or as 64-bit ints with
+// VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1 on the engine; the decoder accepts
+// both (kv_event_decoder.hpp).
 //
 // Requires a WITH_KV_EVENTS build (the default; libzmq). With the feature
 // compiled out (-DWITH_KV_EVENTS=OFF) this section parses but is inert
