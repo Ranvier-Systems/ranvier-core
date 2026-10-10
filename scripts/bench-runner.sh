@@ -56,6 +56,7 @@ CUSTOM_FILE=""
 STOP_ON_FAILURE=false
 STARTUP_RETRY_SECS=180   # --startup-retry N: re-run once a run that fails within N s (0 = off)
 BUILD_IMAGE=false
+ALLOW_STALE_IMAGE=false  # --allow-stale-image: forward to every bench.sh run (image older than this checkout's src/)
 SKIP_RUNS_RAW=""   # comma-separated list from --skip
 REPEAT=1           # --repeat N: run each config N times, then aggregate (median/IQR)
 
@@ -258,6 +259,11 @@ OPTIONS:
                         for a C++ change on a branch: bench.sh otherwise reuses
                         whatever ranvier:latest exists (and refuses if it predates
                         the newest src/ commit).
+    --allow-stale-image Forward bench.sh's --allow-stale-image to every run: benchmark
+                        the existing ranvier:latest although this checkout has newer
+                        src/ commits. For suites that deliberately run on the current
+                        image (kvablate: the knobs are env, the depth defect is masked
+                        by --kv-events-depth 4096); every manifest records the override.
     --output-dir DIR    Output directory (default: benchmark-reports)
     --repeat N          Run each config N times, then aggregate median/IQR per
                         config and print a verdict (default: 1). Variance is the
@@ -485,6 +491,7 @@ while [[ $# -gt 0 ]]; do
         --stop-on-failure)  STOP_ON_FAILURE=true; shift ;;
         --startup-retry)    STARTUP_RETRY_SECS="$2"; shift 2 ;;
         --build-image)      BUILD_IMAGE=true; shift ;;
+        --allow-stale-image) ALLOW_STALE_IMAGE=true; shift ;;
         --output-dir)       RUNNER_OUTPUT_DIR="$2"; shift 2 ;;
         --repeat)           REPEAT="$2"; REPEAT_SET=true; shift 2 ;;
         -h|--help)          print_help; exit 0 ;;
