@@ -439,7 +439,7 @@ inline std::string format_hot_prefix_topology_json(const std::vector<HotPrefixEn
 // window at the emitter, not per bucket.
 struct RoutingStrategyParams {
     // RoutingConfig::RoutingMode as a stable string label.
-    std::string routing_mode;          // "prefix" | "hash" | "random"
+    std::string routing_mode;          // "prefix" | "hash" | "random" | "least_loaded"
     // RoutingConfig::HashStrategy as a stable string label.
     std::string hash_strategy;         // "jump" | "bounded_load" | "p2c" | "modular"
     double      bounded_load_epsilon  = 0.0;

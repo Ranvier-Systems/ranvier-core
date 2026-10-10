@@ -65,15 +65,32 @@ locust -f locustfile_real.py \
   --run-time 30m --headless
 ```
 
-### Expected Results (8x A100, 30-Minute Runs)
+### Expected Results (8x A100, 50-prefix workload, July 2026)
 
-| Model | Cache Hits | P99 TTFT Improvement | Throughput Gain |
-|-------|-----------|---------------------|-----------------|
-| Llama-3.1-70B (TP=2) | 25% → 98% | **44% faster** | ~same |
-| CodeLlama-13B | 12% → 58–98% | **-60% to -85%** | **+4% to +22%** |
-| Llama-3.1-8B | 12% → 68–98% | **40% faster** | ~same |
+These are the citable figures (median of three `--compare` repeats; see
+[benchmark-results-current.md](../benchmarks/benchmark-results-current.md)). The
+February 2026 numbers quoted in older copies of this guide came from a five-prefix
+workload the project has since deprecated and are not expected results.
 
-13B is the sweet spot: queue-bound under load, so routing has the largest impact.
+| Config | P99 TTFT vs round-robin | Verdict | KV hit rate, RR → prefix |
+|--------|-------------------------|---------|--------------------------|
+| CodeLlama-13B, 20 users, fitted 16-prefix set (2026-10-05 defaults) | **−57.5%** median (−60.4, −57.5, −55.2) | consistent improvement, 3/3 | 12–14% → 69–73% |
+| CodeLlama-13B, 10 users, fitted (2.2.0 defaults, 2026-10-06) | **−28.6%** median (−28.6, −34.2, −23.6) | consistent improvement, 3/3 | 16–19% → 76–82% |
+| CodeLlama-13B, 20 users, fitted (2.2.0 defaults, 2026-10-06) | **−56.6%** median (−56.6, −61.5, −55.8) | consistent improvement, 3/3 | 12–15% → 67–72% |
+| CodeLlama-13B, 30 users, 30 min, fitted (2.2.0 defaults, 2026-10-07) | **−42.0%** median (−43.1, −42.0, −34.1), zero timeouts, +15% throughput | consistent improvement, 3/3 | 10–11% → 46–50% |
+| Llama-3.1-8B, 20 users (2.2.0 defaults, 2026-10-06) | **−26.7%** median (−26.7, −17.7, −27.1) | consistent improvement, 3/3 | 72–76% → 93–97% |
+| CodeLlama-13B, 20 users (2.2.0 defaults, 2026-10-06) | **−21.0%** median (−18.4, −27.9, −21.0) | consistent improvement, 3/3 | 6–8% → 23–29% |
+| CodeLlama-13B, 10 users (2.2.0 defaults, 2026-10-06) | **−38.8%** median (−38.8, −46.8, −36.8) | consistent improvement, 3/3 | 6–8% → 26–41% |
+| CodeLlama-13B, 30 users, 30 min (2.2.0 defaults, 2026-10-06) | −14.1% median (−14.1, −17.9, −13.1), P99 of completed requests; 1.3–1.8% timeouts in both arms | consistent improvement, 3/3; eviction regime | 5–6% → 17–21% |
+| Llama-3.1-8B, 20 users (2026-10-01 re-baseline, previous defaults) | **−17.0%** median | consistent improvement, 3/3 | 72% → 94% |
+| CodeLlama-13B, 20 users (2026-10-01 re-baseline, previous defaults) | +11.0% median | consistent regression, 3/3 | 4% → 19% |
+
+The 2026-10-01 13B regression was the load-divert policy reading a stale signal at too tight a
+threshold, not the affinity; the 2026-10-05 defaults (node-local in-flight signal, ε 1.0,
+least-loaded placement) resolved it. Expect route consistency to rise about fourfold and the
+per-backend request distribution to stay uneven (Gini 0.09–0.12) in every prefix arm; the tail
+is set by queue depth, which the divert policy now sees live. The 13B 30-user row (50 prefixes,
+eviction regime) times out in both arms and is directional only.
 
 ## Interpreting Results
 
@@ -81,18 +98,20 @@ locust -f locustfile_real.py \
 
 | Metric | What It Tells You |
 |--------|------------------|
-| **Cache hit rate** | % of requests that found a warm KV cache. Target: >80% |
-| **TTFT (Time-To-First-Token)** | Latency until first token streams back. Lower = better |
-| **P99 latency** | Tail latency. Ranvier targets -60% to -85% vs baseline |
-| **Throughput (rps)** | Requests/sec. Expect +4–22% on queue-bound models |
-| **Incomplete rate** | Should be 0%. Ranvier retries stale connections |
+| **Route consistency** | % of requests that landed on the same backend as the previous request with that prefix. A client-side affinity proxy, ~1/N under round-robin; roughly 3× higher with prefix routing. Logs before 2026-09-30 label this "cache hit rate". |
+| **KV prefix-cache hit rate** | vLLM's own `prefix_cache_hits/queries` counters differenced over the run (token-level). The real cache signal; reported since 2026-09-30 when backends expose it. |
+| **TTFT (Time-To-First-Token)** | Latency until the first SSE chunk. Lower = better. Quote the "raw samples" line, not Locust's approximated table (±50 ms above 1 s). |
+| **P99 TTFT** | Tail latency. −22% (8B) to −58% (13B, fitted set) vs round-robin under the 2026-10-05 defaults; the July 2026 light-load regression and the October 1 13B regression were the previous divert policy. |
+| **Throughput (req/s)** | HTTP requests/sec from the Aggregated row. Before 2026-09-30 this row also counted derived samples and read ~6× high. |
+| **Incomplete rate** | Requests that got HTTP 200 but no first token. Compare across arms; a difference here changes how to read P99. |
 
 ### What "Good" Looks Like
 
-- **8B models:** High cache hits (>90%), modest TTFT improvement. Compute-light, so less headroom.
-- **13B models:** Best overall improvement. P99 drops 60–85%, throughput up 4–22%.
-- **70B models:** Highest per-request TTFT savings (44%), but compute-bound — throughput stays flat.
+- **Saturated fleet (queue-bound):** P99 TTFT 9–13% lower than round-robin, every repeat agreeing; route consistency ~3× higher.
+- **Moderately loaded fleet:** no reliable P99 effect; route consistency still ~3× higher.
+- **Idle fleet:** P99 TTFT worse than round-robin and more incompletes; prefix affinity concentrates load the GPUs did not need relieved.
+- **Any load:** the aggregate's verdict line says "CONSISTENT" only when every repeat moved the same way with at least three repeats; treat "MIXED" or "NO RELIABLE EFFECT" as exactly that.
 
 ### Detailed Results
 
-See [CHANGELOG.md](../../CHANGELOG.md) and the full [Benchmark Guide](../benchmarks/benchmark-guide-8xA100.md) for run-by-run data, methodology notes, and hardware-specific tuning.
+See [benchmark-results-current.md](../benchmarks/benchmark-results-current.md) for the citable numbers with manifests, [benchmark-methodology.md](../benchmarks/benchmark-methodology.md) for how to run, and the [history notebook](../benchmarks/history/benchmark-history-8xA100.md) for the dated run-by-run tables.

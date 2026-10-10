@@ -33,6 +33,9 @@ uint64_t get_backend_load(BackendId id);
 // Forward declaration for the per-backend resident-route gauge (BACKLOG §21 P1).
 // Defined in router_service.cpp - reads the shard-local ART's per-backend tally.
 uint64_t get_resident_routes(BackendId id);
+// Sum of live route key lengths (tokens) pinned to this backend in this shard's
+// ART — the least-loaded placement weight (RadixTree::route_tokens_by_backend).
+uint64_t get_resident_route_tokens(BackendId id);
 
 // Forward declaration for the per-backend GPU-count gauge (observe-only).
 // Defined in router_service.cpp - reads operator-declared shard-local BackendInfo.
@@ -1044,6 +1047,15 @@ private:
                 seastar::metrics::description("Routes resident in this node's ART pinned to this backend. Lower = colder = safer to drain."),
                 {{"backend_id", backend_id_str}},
                 [backend_id] { return static_cast<double>(get_resident_routes(backend_id)); }),
+
+            // Per-backend resident route TOKENS: the weight least-loaded cache-miss
+            // placement balances on. Sums across shards like backend_resident_routes.
+            // Uneven tokens with uneven traffic = uneven placement; even tokens with
+            // uneven traffic = a popular prefix (needs replication, not placement).
+            seastar::metrics::make_gauge("backend_resident_route_tokens",
+                seastar::metrics::description("Sum of route key lengths (tokens) resident in this node's ART pinned to this backend: the least-loaded placement weight. Sum across shards."),
+                {{"backend_id", backend_id_str}},
+                [backend_id] { return static_cast<double>(get_resident_route_tokens(backend_id)); }),
 
             // Per-backend operator-declared GPU count (observe-only). Unlike the
             // sum-aggregated counters above, this is a per-backend constant

@@ -1374,14 +1374,15 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // NOTE: tokenization_start collapsed into routing_start (phase-snapshot
     // optimization — only variable declarations between them, ~0 cycles).
 
-    // OPTIMIZATION: Skip tokenization entirely in RANDOM routing mode
-    // Random routing ignores tokens completely, so tokenization is wasted work.
-    // This saves ~5-6ms per request (Rust FFI + HuggingFace tokenizer overhead).
-    bool tokenization_skipped = _config.is_random_mode();
+    // OPTIMIZATION: Skip tokenization entirely in the no-affinity routing modes
+    // (RANDOM, LEAST_LOADED). They ignore tokens completely, so tokenization is
+    // wasted work; skipping it saves ~5-6ms per request (Rust FFI + HuggingFace
+    // tokenizer overhead) and keeps the two baseline arms comparable to each other.
+    bool tokenization_skipped = _config.is_random_mode() || _config.is_least_loaded_mode();
     if (tokenization_skipped) {
-        // Skip tokenization - tokens remain empty, router will use random backend selection
+        // Skip tokenization - tokens remain empty, router selects without them
         metrics().record_tokenization_skipped();
-        log_proxy.debug("[{}] Skipping tokenization (random routing mode)", request_id);
+        log_proxy.debug("[{}] Skipping tokenization (no-affinity routing mode)", request_id);
     }
 
     // Start tokenization span (only do actual work if not in random mode)
@@ -1960,6 +1961,28 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
         target_id = route_result.backend_id.value();
         learn_target = route_result.was_fast_lane ? 0 : route_result.original_selected;
+
+        // Eager route learning for a least-loaded-placed miss. The first-byte
+        // learn below still runs (and dedups) and still owns multi-depth
+        // learning; this only closes the window in which other shards/nodes
+        // would place the same new prefix somewhere else (see
+        // RouterService::eager_learn_on_miss). Same gates as the first-byte
+        // learn. Fire-and-forget with a gate holder so `this` outlives the tail.
+        if (!route_result.cache_hit && learn_target != 0 &&
+            RouterService::eager_learn_on_miss() &&
+            _config.should_learn_routes() && tokens.size() >= _config.min_token_length &&
+            _router.should_cache_routes_for(learn_target)) {
+            (void)_router.learn_route_global(tokens, learn_target, request_id, prefix_boundary)
+                .then([this, tokens, backend = learn_target,
+                       holder = _request_gate.hold()](bool is_new_route) {
+                    if (is_new_route && _persistence) {
+                        _persistence->queue_save_route(tokens, backend);
+                    }
+                })
+                .handle_exception([request_id](auto) {
+                    log_proxy.debug("[{}] Eager route learning failed (non-fatal)", request_id);
+                });
+        }
         if (route_result.was_load_redirect) {
             log_proxy.debug("[{}] Load redirect: original backend overloaded (gpu_load={:.2f}), "
                             "redirected to backend {}",

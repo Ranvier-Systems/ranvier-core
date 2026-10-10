@@ -1,44 +1,25 @@
 {
-  "version": "2.1.0-partial-tokenization",
-  "description": "Benchmark baseline for Ranvier Core CI regression testing (§15 intelligence layer + partial tokenization)",
-  "updated_at": "2026-04-11T00:00:00Z",
+  "version": "1.0.0",
+  "description": "Benchmark baseline for Ranvier Core CI regression testing",
+  "updated_at": "2026-10-06T00:34:38Z",
   "updated_by": "run-benchmark.sh",
-  "features_enabled": [
-    "cost_estimation",
-    "priority_tiers",
-    "intent_classification",
-    "priority_queue",
-    "agent_registry",
-    "vllm_metrics",
-    "load_aware_routing",
-    "cost_based_routing",
-    "partial_tokenization"
-  ],
   "test_config": {
     "users": 100,
     "duration_seconds": 60,
     "spawn_rate": 10,
-    "environment": "docker-compose.test.yml (mock backends, §15 features enabled, CI mode)"
+    "environment": "docker-compose.test.yml (mock backends)"
   },
   "metrics": {
-    "p50_latency_ms": 46.00,
-    "p90_latency_ms": 52.00,
-    "p99_latency_ms": 59.00,
-    "avg_latency_ms": 48.00,
-    "min_latency_ms": 28.00,
-    "max_latency_ms": 110.00,
-    "throughput_rps": 513.58,
-    "total_requests": 30336,
+    "p50_latency_ms": 6.00,
+    "p90_latency_ms": 13.00,
+    "p99_latency_ms": 24.00,
+    "avg_latency_ms": 6.97,
+    "min_latency_ms": 2.13,
+    "max_latency_ms": 44.09,
+    "throughput_rps": 289.03,
+    "total_requests": 17073,
     "failure_rate_percent": 0.00,
     "success_rate_percent": 100.00
-  },
-  "intelligence_layer_metrics": {
-    "priority_distribution": {"critical": 0, "high": 0, "normal": 0, "low": 0},
-    "intent_distribution": {"autocomplete": 0, "chat": 0, "edit": 0},
-    "cost_redirects": 0,
-    "load_redirects": 0,
-    "agents_detected": 0,
-    "avg_scheduler_wait_ms": 1.88
   },
   "thresholds": {
     "p99_regression_percent": 10,
@@ -46,11 +27,9 @@
     "max_failure_rate_percent": 1.0
   },
   "notes": [
-    "Baseline captured from CI environment (100 users, 0.1-0.5s wait, ubuntu-latest runner)",
-    "All §15 intelligence layer features enabled + partial tokenization for routing",
-    "Partial tokenization delta vs 2.0.0: P99 85ms -> 59ms (-30%), throughput 502->513 rps (+2%)",
-    "Intelligence layer Prometheus counters read zero on mock backends (expected)",
-    "P99 latency target: <65ms for CI (10% regression budget over 59ms)",
-    "Update baseline via: gh workflow run benchmark.yml -f update_baseline=true"
+    "Baseline established with mock vLLM backends (docker-compose.test.yml)",
+    "Mock backends have minimal latency compared to real vLLM inference",
+    "P99 latency target: <100ms for mock backend tests",
+    "Update baseline via: gh workflow run benchmark.yml -f update_baseline=true (opens a PR; main rejects direct pushes)"
   ]
 }

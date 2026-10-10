@@ -139,6 +139,12 @@ services:
         hard: -1
     volumes:
       - /tmp:/tmp  # For core dumps
+    # Routing DB on a container-local tmpfs so no ART/backend state carries
+    # across arms, legs or runs. /tmp above is a HOST bind mount shared by all
+    # three nodes: a DB there survives `rm`/`down -v` and is replayed by
+    # load_persisted_state() at every start.
+    tmpfs:
+      - /var/lib/ranvier:size=256M
     environment:
       # Cluster configuration
       - RANVIER_CLUSTER_ENABLED=true
@@ -149,7 +155,7 @@ services:
       - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
       # Routing config - use more tokens for real workloads
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
-      - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_DB_PATH=/var/lib/ranvier/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       # Accept client-provided prompt_token_ids for routing (bypasses local tokenization)
       - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
@@ -170,7 +176,7 @@ services:
       # Route batch flush interval (ms) - lower values improve cache affinity at cost of SMP overhead
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
-      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
+      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-true}
       # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
@@ -181,8 +187,12 @@ services:
       # jump/modular allowance; under the shipped BOUNDED_LOAD strategy the allowance comes
       # from bounded_load_epsilon — the epsilon sweep is what actually moves diversion.
       # hash_strategy lets the factor/floor variant run under jump.
-      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
+      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-1.0}
       - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
+      # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
+      # then fewest routes, then lowest load). Must be listed here or the host env never
+      # reaches the server.
+      - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-least_loaded}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
@@ -192,6 +202,16 @@ services:
       # cache-usage signal at peak pressure (the instants residency routing
       # needs). 1000ms keeps the scrape honest under benchmark load.
       - RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}
+      # What "load" means to bounded-load/P2C in this stack. With cross-shard sync
+      # off, each of the 24 shards (3 nodes x 8) sees ~1/24 of the in-flight
+      # requests, so the composite load is dominated by the scraped vLLM score
+      # (gpu_load_weight x [0.7 queue + 0.3 KV usage]) plus the KV-headroom term
+      # (capacity_headroom_weight x KV usage), refreshed every health scrape and
+      # identical on every shard of a node. Set both weights to 0 (and sync on)
+      # to make load mean in-flight requests. Defaults match the shipped values.
+      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-0}
+      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-0}
+      - RANVIER_HEALTH_CHECK_INTERVAL=${RANVIER_HEALTH_CHECK_INTERVAL:-5}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
       # Priority queue scheduler
@@ -231,6 +251,12 @@ services:
         hard: -1
     volumes:
       - /tmp:/tmp  # For core dumps
+    # Routing DB on a container-local tmpfs so no ART/backend state carries
+    # across arms, legs or runs. /tmp above is a HOST bind mount shared by all
+    # three nodes: a DB there survives `rm`/`down -v` and is replayed by
+    # load_persisted_state() at every start.
+    tmpfs:
+      - /var/lib/ranvier:size=256M
     environment:
       - RANVIER_CLUSTER_ENABLED=true
       - RANVIER_CLUSTER_GOSSIP_PORT=9190
@@ -239,7 +265,7 @@ services:
       - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
       - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
-      - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_DB_PATH=/var/lib/ranvier/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
       - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
@@ -250,7 +276,7 @@ services:
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
-      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
+      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-true}
       # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
@@ -261,8 +287,12 @@ services:
       # jump/modular allowance; under the shipped BOUNDED_LOAD strategy the allowance comes
       # from bounded_load_epsilon — the epsilon sweep is what actually moves diversion.
       # hash_strategy lets the factor/floor variant run under jump.
-      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
+      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-1.0}
       - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
+      # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
+      # then fewest routes, then lowest load). Must be listed here or the host env never
+      # reaches the server.
+      - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-least_loaded}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
@@ -272,6 +302,16 @@ services:
       # cache-usage signal at peak pressure (the instants residency routing
       # needs). 1000ms keeps the scrape honest under benchmark load.
       - RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}
+      # What "load" means to bounded-load/P2C in this stack. With cross-shard sync
+      # off, each of the 24 shards (3 nodes x 8) sees ~1/24 of the in-flight
+      # requests, so the composite load is dominated by the scraped vLLM score
+      # (gpu_load_weight x [0.7 queue + 0.3 KV usage]) plus the KV-headroom term
+      # (capacity_headroom_weight x KV usage), refreshed every health scrape and
+      # identical on every shard of a node. Set both weights to 0 (and sync on)
+      # to make load mean in-flight requests. Defaults match the shipped values.
+      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-0}
+      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-0}
+      - RANVIER_HEALTH_CHECK_INTERVAL=${RANVIER_HEALTH_CHECK_INTERVAL:-5}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
       # Priority queue scheduler
@@ -311,6 +351,12 @@ services:
         hard: -1
     volumes:
       - /tmp:/tmp  # For core dumps
+    # Routing DB on a container-local tmpfs so no ART/backend state carries
+    # across arms, legs or runs. /tmp above is a HOST bind mount shared by all
+    # three nodes: a DB there survives `rm`/`down -v` and is replayed by
+    # load_persisted_state() at every start.
+    tmpfs:
+      - /var/lib/ranvier:size=256M
     environment:
       - RANVIER_CLUSTER_ENABLED=true
       - RANVIER_CLUSTER_GOSSIP_PORT=9190
@@ -319,7 +365,7 @@ services:
       - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
       - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
-      - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_DB_PATH=/var/lib/ranvier/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
       - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
@@ -330,7 +376,7 @@ services:
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
-      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
+      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-true}
       # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
@@ -341,8 +387,12 @@ services:
       # jump/modular allowance; under the shipped BOUNDED_LOAD strategy the allowance comes
       # from bounded_load_epsilon — the epsilon sweep is what actually moves diversion.
       # hash_strategy lets the factor/floor variant run under jump.
-      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-0.25}
+      - RANVIER_BOUNDED_LOAD_EPSILON=${RANVIER_BOUNDED_LOAD_EPSILON:-1.0}
       - RANVIER_HASH_STRATEGY=${RANVIER_HASH_STRATEGY:-bounded_load}
+      # Cache-miss placement: hash (bucket) or least_loaded (fewest learned-route tokens,
+      # then fewest routes, then lowest load). Must be listed here or the host env never
+      # reaches the server.
+      - RANVIER_MISS_PLACEMENT=${RANVIER_MISS_PLACEMENT:-least_loaded}
       # Cache-residency-aware routing (#527): downgrade ART hits whose backend's
       # gossiped residency is below this. 0.0 disables (the residency-A/B "off"
       # leg). Must be listed here or the host env var never reaches the server.
@@ -352,6 +402,16 @@ services:
       # cache-usage signal at peak pressure (the instants residency routing
       # needs). 1000ms keeps the scrape honest under benchmark load.
       - RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}
+      # What "load" means to bounded-load/P2C in this stack. With cross-shard sync
+      # off, each of the 24 shards (3 nodes x 8) sees ~1/24 of the in-flight
+      # requests, so the composite load is dominated by the scraped vLLM score
+      # (gpu_load_weight x [0.7 queue + 0.3 KV usage]) plus the KV-headroom term
+      # (capacity_headroom_weight x KV usage), refreshed every health scrape and
+      # identical on every shard of a node. Set both weights to 0 (and sync on)
+      # to make load mean in-flight requests. Defaults match the shipped values.
+      - RANVIER_ROUTING_GPU_LOAD_WEIGHT=${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-0}
+      - RANVIER_CAPACITY_HEADROOM_WEIGHT=${RANVIER_CAPACITY_HEADROOM_WEIGHT:-0}
+      - RANVIER_HEALTH_CHECK_INTERVAL=${RANVIER_HEALTH_CHECK_INTERVAL:-5}
       # Compression-aware load scoring
       - RANVIER_DEFAULT_COMPRESSION_RATIO=${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}
       # Priority queue scheduler

@@ -253,6 +253,17 @@ BENCHMARK OPTIONS:
                         See tests/integration/data/prompts/ for examples
     --prefix-ratio R    Shared prefix ratio 0.0-1.0 (default: 0.9)
     --prefix-max-tokens N  Maximum prefix size in tokens (default: 8000)
+    --num-prefixes N    Number of distinct large prefixes in the stress pool (default: 50,
+                        the locustfile's). Sets NUM_LARGE_PREFIXES for warm-up and both
+                        arms; with --prefix-max-tokens it sizes the hot working set, so a
+                        13B fleet (~11.6k KV tokens/backend) can be given a set that fits.
+    --pacing S          Open-loop load: every user starts a request every S seconds
+                        regardless of latency, so both arms carry the same offered load
+                        (users / S req/s). Default is the locustfile's closed-loop think
+                        time (0.5-2 s), under which the faster arm carries 5-7% more
+                        traffic — a tail confound once the fleet is queue-bound. Pick S
+                        above the slowest request (e.g. 20 users, --pacing 4.3 ≈ the
+                        4.65 req/s round-robin reached closed-loop at 13B/20u).
     --cache-residency-threshold F
                         Cache-residency downgrade threshold (#527). ART hits whose
                         backend reports residency < F are diverted. 0.0 disables
@@ -266,6 +277,22 @@ BENCHMARK OPTIONS:
                         A fixed order lets thermal drift / cache carry-over always
                         favor one side; bench-runner alternates this across --repeat
                         runs. Comparison always treats round-robin as the baseline.
+    --baseline-mode M   Routing mode of the --compare baseline arm: round_robin (default;
+                        an alias of the server's uniform random mode), random, hash, or
+                        least_loaded (lowest live in-flight count, no affinity: the
+                        strongest no-affinity baseline, so prefix-vs-least_loaded
+                        isolates what affinity adds over load balancing). The arm's
+                        report dir, manifest, Locust BENCHMARK_MODE and the compare
+                        header all follow the mode.
+    --no-kv-reset       Do not POST /reset_prefix_cache to every vLLM backend before
+                        each --compare arm. By default the cache is reset so the arm
+                        that runs second does not inherit the first arm's warm KV
+                        (measured 2026-10-06: 8B prefix-first repeats ~9 points weaker
+                        because round-robin started warm). The compare header records
+                        which it was and how many backends acknowledged. vLLM serves
+                        the endpoint only with VLLM_SERVER_DEV_MODE=1, which bench.sh
+                        sets on the vLLM it launches; externally managed backends
+                        (--skip-vllm, --vllm-endpoints) need it set by the operator.
     --warmup            Run a short warm-up before the main benchmark (adds ~1m 10s).
                         With --compare, warm-up runs PER ARM after each mode restart so
                         both arms are identically primed.
@@ -291,6 +318,20 @@ BENCHMARK OPTIONS:
     --load-imbalance-floor N
                         Additive floor to prevent flapping at low load (default: 2).
                         Threshold = median * factor + floor.
+                        NOTE: factor/floor govern the divert allowance ONLY under
+                        --hash-strategy jump|modular. The shipped default is
+                        bounded_load, where --bounded-load-epsilon is the knob;
+                        bench.sh refuses to run a mislabelled combination.
+    --hash-strategy S   Ranvier hash strategy: bounded_load (default), p2c, jump, modular.
+                        Sets RANVIER_HASH_STRATEGY for the cluster.
+    --miss-placement M  Where a cache miss (new prefix) is placed: hash (default,
+                        the strategy's bucket) or least_loaded (fewest learned-route
+                        tokens, then fewest routes, lowest load, probe order). Sets
+                        RANVIER_MISS_PLACEMENT. The fitted-suite leg A finding:
+                        hash placement alone costs +8..12% P99 at 13B/20u.
+    --bounded-load-epsilon E
+                        Divert allowance under bounded_load: cap = avg * (1 + E)
+                        (default: 0.25). Sets RANVIER_BOUNDED_LOAD_EPSILON.
     --vllm-version VER  Pin vLLM to a specific version (default: ${DEFAULT_VLLM_VERSION}).
                         Ensures reproducible benchmarks across instances.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models).
@@ -322,6 +363,10 @@ OTHER OPTIONS:
                         which tracks main). REQUIRED when benchmarking C++
                         changes from a branch — otherwise the run silently
                         uses a stale server build.
+    --allow-stale-image Run even when the existing ranvier:latest predates the
+                        newest server-source commit in this checkout. Without
+                        it bench.sh refuses, because the run would benchmark a
+                        server build that does not contain the change under test.
     --skip-setup        Skip system configuration (for repeated runs)
     --dry-run           Show what would be done without executing
     --no-log            Disable full output logging (logging is ON by default)
@@ -462,9 +507,13 @@ SPAWN_RATE="$DEFAULT_SPAWN_RATE"
 PROMPT_DIST="$DEFAULT_PROMPT_DIST"
 PREFIX_RATIO="$DEFAULT_PREFIX_RATIO"
 PREFIX_MAX_TOKENS=""
+PACING_S=""                 # --pacing: open-loop seconds between a user's request starts
+NUM_PREFIXES_FLAG=""        # --num-prefixes: exported as NUM_LARGE_PREFIXES after parsing
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 COMPARE=false
 ORDER="rr-first"   # --order: arm order in --compare (rr-first | prefix-first)
+KV_RESET=true      # --no-kv-reset: keep vLLM's KV cache across the arm switch
+BASELINE_MODE="round_robin"  # --baseline-mode: routing mode of the --compare baseline arm
 SKIP_SETUP=false
 SKIP_VLLM=false
 VLLM_HOST="localhost"
@@ -479,6 +528,9 @@ MULTI_DEPTH=false
 LOAD_AWARE=true
 LOAD_IMBALANCE_FACTOR=""
 LOAD_IMBALANCE_FLOOR=""
+HASH_STRATEGY=""            # --hash-strategy: bounded_load | p2c | jump | modular
+MISS_PLACEMENT=""           # --miss-placement: hash | least_loaded
+BOUNDED_LOAD_EPSILON=""     # --bounded-load-epsilon: divert allowance under bounded_load
 CACHE_RESIDENCY_THRESHOLD=""
 COMPRESSION_RATIO=""
 PRIORITY_QUEUE=false
@@ -490,6 +542,7 @@ TP_SIZE=1
 GPU_MEM_UTIL="0.85"
 CPUSET_OVERRIDE=""
 BUILD_IMAGE=false
+ALLOW_STALE_IMAGE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -502,9 +555,13 @@ while [[ $# -gt 0 ]]; do
         --prompt-file)    PROMPT_FILE="$2"; shift 2 ;;
         --prefix-ratio)   PREFIX_RATIO="$2"; shift 2 ;;
         --prefix-max-tokens) PREFIX_MAX_TOKENS="$2"; shift 2 ;;
+        --pacing)         PACING_S="$2"; shift 2 ;;
+        --num-prefixes)   NUM_PREFIXES_FLAG="$2"; shift 2 ;;
         --output-dir)     OUTPUT_DIR="$2"; shift 2 ;;
         --compare)        COMPARE=true; shift ;;
         --order)          ORDER="$2"; shift 2 ;;
+        --no-kv-reset)    KV_RESET=false; shift ;;
+        --baseline-mode)  BASELINE_MODE="$2"; shift 2 ;;
         --skip-setup)     SKIP_SETUP=true; shift ;;
         --skip-vllm)      SKIP_VLLM=true; shift ;;
         --vllm-host)      VLLM_HOST="$2"; shift 2 ;;
@@ -521,6 +578,9 @@ while [[ $# -gt 0 ]]; do
         --compression-ratio) COMPRESSION_RATIO="$2"; shift 2 ;;
         --load-imbalance-factor) LOAD_IMBALANCE_FACTOR="$2"; shift 2 ;;
         --load-imbalance-floor)  LOAD_IMBALANCE_FLOOR="$2"; shift 2 ;;
+        --hash-strategy)  HASH_STRATEGY="$2"; shift 2 ;;
+        --miss-placement) MISS_PLACEMENT="$2"; shift 2 ;;
+        --bounded-load-epsilon) BOUNDED_LOAD_EPSILON="$2"; shift 2 ;;
         --cache-residency-threshold) CACHE_RESIDENCY_THRESHOLD="$2"; shift 2 ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --tp)             TP_SIZE="$2"; shift 2 ;;
@@ -531,6 +591,7 @@ while [[ $# -gt 0 ]]; do
         --cpuset)          CPUSET_OVERRIDE="$2"; shift 2 ;;
         --priority-queue) PRIORITY_QUEUE=true; shift ;;
         --build-image)    BUILD_IMAGE=true; shift ;;
+        --allow-stale-image) ALLOW_STALE_IMAGE=true; shift ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -547,6 +608,30 @@ fi
 if [[ -n "$PROMPT_FILE" ]]; then
     PROMPT_DIST="file"
 fi
+
+# --num-prefixes rides the existing NUM_LARGE_PREFIXES env path (forwarded to
+# warm-up and both arms only when set; banner; manifest; regime estimate).
+if [[ -n "$NUM_PREFIXES_FLAG" ]]; then
+    if ! [[ "$NUM_PREFIXES_FLAG" =~ ^[0-9]+$ ]] || [[ "$NUM_PREFIXES_FLAG" -lt 1 ]]; then
+        log_error "--num-prefixes must be a positive integer (got: $NUM_PREFIXES_FLAG)"
+        exit 1
+    fi
+    export NUM_LARGE_PREFIXES="$NUM_PREFIXES_FLAG"
+fi
+
+# Validate --baseline-mode (only meaningful with --compare; harmless otherwise).
+case "$BASELINE_MODE" in
+    round_robin|random|hash|least_loaded) ;;
+    *)
+        log_error "--baseline-mode must be round_robin, random, hash or least_loaded (got: $BASELINE_MODE)"
+        exit 1 ;;
+esac
+# Human label for the baseline arm, used in logs and the compare header.
+case "$BASELINE_MODE" in
+    round_robin|random) BASELINE_LABEL="Round-Robin" ;;
+    hash)               BASELINE_LABEL="Consistent-Hash" ;;
+    least_loaded)       BASELINE_LABEL="Least-Loaded" ;;
+esac
 
 # Validate --order (only meaningful with --compare; harmless otherwise).
 if [[ "$ORDER" != "rr-first" && "$ORDER" != "prefix-first" ]]; then
@@ -1075,6 +1160,7 @@ if [[ "$DRY_RUN" = true ]]; then
     fi
     echo "  Prefix Ratio:    $PREFIX_RATIO"
     [[ -n "$PREFIX_MAX_TOKENS" ]] && echo "  Prefix Max Tok:  $PREFIX_MAX_TOKENS"
+    [[ -n "$NUM_PREFIXES_FLAG" ]] && echo "  Num Prefixes:    $NUM_PREFIXES_FLAG"
     echo "  Output Dir:      $OUTPUT_DIR"
     echo "  Compare Mode:    $COMPARE"
     echo "  Warmup:          $WARMUP"
@@ -1084,6 +1170,8 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Load-Aware:      $LOAD_AWARE"
     [[ -n "$LOAD_IMBALANCE_FACTOR" ]] && echo "  Imbalance Factor: $LOAD_IMBALANCE_FACTOR"
     [[ -n "$LOAD_IMBALANCE_FLOOR" ]] && echo "  Imbalance Floor:  $LOAD_IMBALANCE_FLOOR"
+    [[ -n "$HASH_STRATEGY" ]] && echo "  Hash Strategy:   $HASH_STRATEGY"
+    [[ -n "$BOUNDED_LOAD_EPSILON" ]] && echo "  Bounded Epsilon: $BOUNDED_LOAD_EPSILON"
     [[ -n "$CACHE_RESIDENCY_THRESHOLD" ]] && echo "  Residency Thresh: $CACHE_RESIDENCY_THRESHOLD"
     echo "  Max Tokens:      $MAX_TOKENS"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
@@ -1131,7 +1219,7 @@ if [[ "$DRY_RUN" = true ]]; then
         log_info "Would run warm-up ($DEFAULT_WARMUP_DURATION, $DEFAULT_WARMUP_USERS users)"
     fi
     if [[ "$COMPARE" = true ]]; then
-        log_info "Would run benchmark 1: Round-Robin ($DURATION, $USERS users)"
+        log_info "Would run benchmark 1: ${BASELINE_LABEL} baseline, mode ${BASELINE_MODE} ($DURATION, $USERS users)"
         log_info "Would pause 30s between benchmarks"
         log_info "Would run benchmark 2: Prefix-Aware ($DURATION, $USERS users)"
     else
@@ -1193,7 +1281,12 @@ if [[ "$SKIP_VLLM" = false ]]; then
             log_step "$((i+1))" "$NUM_BACKENDS" "GPU $i: Starting vLLM on :$PORT..."
         fi
 
+        # VLLM_SERVER_DEV_MODE=1: vLLM exposes POST /reset_prefix_cache (used
+        # between --compare arms, see reset_vllm_prefix_cache) only as a
+        # "development" endpoint behind this env var; without it the call is a
+        # 404 (observed on vLLM 0.15.1, 2026-10-08) and the arms carry over KV.
         CUDA_VISIBLE_DEVICES=$GPU_IDS HF_TOKEN="$HF_TOKEN" MASTER_PORT=$DIST_PORT \
+            VLLM_SERVER_DEV_MODE=1 \
             python3 -m vllm.entrypoints.openai.api_server \
             --model "$MODEL" \
             --host 0.0.0.0 \
@@ -1239,8 +1332,15 @@ if [[ "$SKIP_VLLM" = false ]]; then
         # Check if any vLLM process died
         for ((i=0; i<${#VLLM_PIDS[@]}; i++)); do
             if ! kill -0 "${VLLM_PIDS[$i]}" 2>/dev/null; then
-                log_error "vLLM instance $i died. Check /tmp/vllm_gpu${i}.log"
-                cat "/tmp/vllm_gpu${i}.log" | tail -20
+                # Keep the dead instance's log under the output dir: the next run
+                # overwrites /tmp/vllm_gpu${i}.log, which is how the cause of the
+                # 2026-10-06 rebaseline run 8 (engine-core init failure on GPU 5,
+                # 47 s in) was lost before anyone read it.
+                mkdir -p "$OUTPUT_DIR"
+                KEPT_LOG="${OUTPUT_DIR}/vllm_gpu${i}_startup_failure_$(date +%Y%m%d_%H%M%S).log"
+                cp "/tmp/vllm_gpu${i}.log" "$KEPT_LOG" 2>/dev/null || true
+                log_error "vLLM instance $i died during start-up. Log kept at $KEPT_LOG (tail below)"
+                tail -40 "/tmp/vllm_gpu${i}.log" 2>/dev/null | grep -v '^\s*$' | tail -25
                 exit 1
             fi
         done
@@ -1381,16 +1481,50 @@ elif ! docker image inspect ranvier:latest &> /dev/null; then
     log_info "Pulling Ranvier image from GHCR..."
     if docker pull "$GHCR_IMAGE" > /dev/null 2>&1; then
         docker tag "$GHCR_IMAGE" ranvier:latest
-        log_ok "Ranvier image pulled from GHCR"
+        PULLED_FROM_GHCR=true
+        log_ok "Ranvier image pulled from GHCR (tracks main — not this branch's C++ changes)"
     else
         log_warn "GHCR pull failed, building locally..."
         docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
+        BUILT_FALLBACK=true
         log_ok "Ranvier image built"
     fi
 else
-    IMAGE_CREATED=$(docker image inspect -f '{{.Created}}' ranvier:latest 2>/dev/null | cut -dT -f1)
-    log_info "Using existing ranvier:latest (created ${IMAGE_CREATED:-unknown}) — pass --build-image to rebuild from this checkout"
+    # Reusing an existing image is the classic way to benchmark the wrong
+    # server: the checkout moves (branch with C++ changes) but ranvier:latest
+    # does not, and the manifest still records the checkout's commit. Refuse
+    # when the image predates the newest commit that touched the server
+    # sources, unless --allow-stale-image says the operator knows.
+    IMAGE_CREATED_RAW=$(docker image inspect -f '{{.Created}}' ranvier:latest 2>/dev/null)
+    IMAGE_CREATED=$(echo "$IMAGE_CREATED_RAW" | cut -dT -f1)
+    IMAGE_TS=$(date -d "$IMAGE_CREATED_RAW" +%s 2>/dev/null || echo 0)
+    SRC_TS=$(git log -1 --format=%ct -- src CMakeLists.txt Dockerfile.production 2>/dev/null || echo 0)
+    SRC_DESC=$(git log -1 --format='%h %s' -- src CMakeLists.txt Dockerfile.production 2>/dev/null || echo unknown)
+    if [[ "$IMAGE_TS" -gt 0 && "$SRC_TS" -gt 0 && "$IMAGE_TS" -lt "$SRC_TS" ]]; then
+        if [[ "$ALLOW_STALE_IMAGE" = true ]]; then
+            log_warn "ranvier:latest (built $(date -d "@$IMAGE_TS" '+%Y-%m-%d %H:%M' 2>/dev/null)) predates the newest server-source commit ($SRC_DESC); running anyway (--allow-stale-image). The manifest records this."
+        else
+            log_error "ranvier:latest was built $(date -d "@$IMAGE_TS" '+%Y-%m-%d %H:%M' 2>/dev/null), BEFORE the newest commit touching src/ in this checkout:"
+            log_error "  $SRC_DESC ($(date -d "@$SRC_TS" '+%Y-%m-%d %H:%M' 2>/dev/null))"
+            log_error "The run would benchmark a server that does not contain that change, while the manifest records this commit."
+            log_error "Fix: ./scripts/bench.sh --build-image ...   (or: docker build -t ranvier:latest -f Dockerfile.production .)"
+            log_error "Override only if you know the image is right: --allow-stale-image"
+            exit 1
+        fi
+    else
+        log_info "Using existing ranvier:latest (created ${IMAGE_CREATED:-unknown}; newest server-source commit: $SRC_DESC) — pass --build-image to rebuild from this checkout"
+    fi
+    if [[ -n "$(git status --porcelain -- src CMakeLists.txt 2>/dev/null)" ]]; then
+        log_warn "Uncommitted changes under src/ — the existing image cannot contain them; pass --build-image if they are the change under test."
+    fi
 fi
+
+# Record what server actually ran, independent of the checkout's commit.
+SERVER_IMAGE_ID=$(docker image inspect -f '{{.Id}}' ranvier:latest 2>/dev/null | sed 's/^sha256://' | cut -c1-12)
+SERVER_IMAGE_CREATED=$(docker image inspect -f '{{.Created}}' ranvier:latest 2>/dev/null)
+SERVER_IMAGE_SOURCE="existing"
+[[ "$BUILD_IMAGE" = true || "${DEBUG_BUILD:-}" == "true" || "${BUILT_FALLBACK:-false}" = true ]] && SERVER_IMAGE_SOURCE="built_from_checkout"
+[[ "${PULLED_FROM_GHCR:-false}" = true ]] && SERVER_IMAGE_SOURCE="ghcr_main"
 
 # Build locust image unconditionally: the locustfiles are baked into the image
 # (Dockerfile.locust COPY), so reusing a stale image silently runs an outdated
@@ -1405,10 +1539,16 @@ if [[ "$MULTI_DEPTH" = true ]]; then
     log_info "Multi-depth routing enabled (Option C)"
 fi
 
-# Export load-aware routing settings for docker-compose
+# Export load-aware routing settings for docker-compose. --no-load-aware wins;
+# otherwise an explicit host env RANVIER_LOAD_AWARE_ROUTING=false is honored
+# (it used to be silently overwritten to true, which turned a "pure affinity"
+# leg into another default-config run; the manifest records the effective value).
 if [[ "$LOAD_AWARE" = false ]]; then
     export RANVIER_LOAD_AWARE_ROUTING=false
-    log_info "Load-aware routing disabled (pure affinity mode)"
+    log_info "Load-aware routing disabled (pure affinity mode, --no-load-aware)"
+elif [[ "${RANVIER_LOAD_AWARE_ROUTING:-true}" == "false" ]]; then
+    export RANVIER_LOAD_AWARE_ROUTING=false
+    log_info "Load-aware routing disabled (pure affinity mode, RANVIER_LOAD_AWARE_ROUTING=false in env)"
 else
     export RANVIER_LOAD_AWARE_ROUTING=true
 fi
@@ -1420,6 +1560,22 @@ if [[ -n "$LOAD_IMBALANCE_FLOOR" ]]; then
     export RANVIER_LOAD_IMBALANCE_FLOOR="$LOAD_IMBALANCE_FLOOR"
     log_info "Load imbalance floor: $LOAD_IMBALANCE_FLOOR"
 fi
+if [[ -n "$HASH_STRATEGY" ]]; then
+    export RANVIER_HASH_STRATEGY="$HASH_STRATEGY"
+    log_info "Hash strategy: $HASH_STRATEGY"
+fi
+if [[ -n "$MISS_PLACEMENT" ]]; then
+    case "$MISS_PLACEMENT" in
+        hash|least_loaded) ;;
+        *) log_error "--miss-placement must be hash or least_loaded (got: $MISS_PLACEMENT)"; exit 1 ;;
+    esac
+    export RANVIER_MISS_PLACEMENT="$MISS_PLACEMENT"
+    log_info "Cache-miss placement: $MISS_PLACEMENT"
+fi
+if [[ -n "$BOUNDED_LOAD_EPSILON" ]]; then
+    export RANVIER_BOUNDED_LOAD_EPSILON="$BOUNDED_LOAD_EPSILON"
+    log_info "Bounded-load epsilon: $BOUNDED_LOAD_EPSILON"
+fi
 # Residency routing toggle (#527). The flag takes precedence over a bare
 # RANVIER_CACHE_RESIDENCY_THRESHOLD=... env prefix; both reach the servers now
 # that docker-compose.benchmark-real.yml passes the variable through.
@@ -1430,15 +1586,67 @@ fi
 
 # Effective routing config the server is about to launch with. Printed at
 # second 0 so a misconfigured load-aware experiment is caught immediately
-# rather than after a 30-minute run. NOTE: these flags (--no-load-aware,
-# --load-imbalance-factor/floor) are the ONLY supported way to override
-# load-aware behavior — a bare `RANVIER_LOAD_AWARE_ROUTING=... ./bench.sh`
-# env prefix is overwritten by the export above and has no effect.
+# rather than after a 30-minute run. --no-load-aware and
+# --load-imbalance-factor/floor are the preferred way to override load-aware
+# behavior; a `RANVIER_LOAD_AWARE_ROUTING=false ./bench.sh` env prefix is
+# honored too (see the export above).
+# KV-cache regime. Prefix routing can only pay off when the hot prefix set does
+# not fit in one backend's KV cache but does fit when split across backends;
+# below that, round-robin already hits, and above it every backend thrashes
+# whatever the router does. Record both sides so each run states its regime.
+# vLLM prints its capacity at startup: V1 "GPU KV cache size: N tokens",
+# V0 "# GPU blocks: N" (16-token blocks). External/--skip-vllm backends: unknown.
+KV_CACHE_TOKENS_JSON="{}"
+KV_CACHE_TOKENS_MIN=""
+capture_kv_capacity() {
+    local json="" sep="" i tokens blocks
+    for ((i=0; i<NUM_BACKENDS; i++)); do
+        local log="/tmp/vllm_gpu${i}.log"
+        [[ -f "$log" ]] || continue
+        tokens=$(grep -oE 'GPU KV cache size: *[0-9,]+ tokens' "$log" | tail -1 | grep -oE '[0-9,]+ tokens' | tr -d ', tokens' || true)
+        if [[ -z "$tokens" ]]; then
+            blocks=$(grep -oE '# GPU blocks: *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+            [[ -n "$blocks" ]] && tokens=$((blocks * 16))
+        fi
+        [[ -n "$tokens" ]] || continue
+        json+="${sep}\"$((i+1))\": $tokens"; sep=", "
+        if [[ -z "$KV_CACHE_TOKENS_MIN" || "$tokens" -lt "$KV_CACHE_TOKENS_MIN" ]]; then
+            KV_CACHE_TOKENS_MIN="$tokens"
+        fi
+    done
+    KV_CACHE_TOKENS_JSON="{${json}}"
+}
+capture_kv_capacity
+# Prefix working set the stress workload keeps hot: NUM_LARGE_PREFIXES prefixes
+# of LARGE_PREFIX_MIN..MAX tokens (locustfile defaults 50, 2000..8000; the
+# --prefix-max-tokens flag raises MAX). Mean size x count, as an estimate.
+_WS_MIN="${LARGE_PREFIX_MIN_TOKENS:-2000}"
+_WS_MAX="${PREFIX_MAX_TOKENS:-${LARGE_PREFIX_MAX_TOKENS:-8000}}"
+PREFIX_WORKING_SET_TOKENS=$(( ${NUM_LARGE_PREFIXES:-50} * (_WS_MIN + _WS_MAX) / 2 ))
+
 log_header "Effective Routing Config"
 log_info "RANVIER_ROUTING_MODE          = ${RANVIER_ROUTING_MODE:-prefix} (default prefix)"
 log_info "RANVIER_LOAD_AWARE_ROUTING    = ${RANVIER_LOAD_AWARE_ROUTING}"
 log_info "RANVIER_LOAD_IMBALANCE_FACTOR = ${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0 (compose default)}"
 log_info "RANVIER_LOAD_IMBALANCE_FLOOR  = ${RANVIER_LOAD_IMBALANCE_FLOOR:-2 (compose default)}"
+# The divert allowance depends on the hash strategy (router_service.cpp
+# compute_load_allowance): factor/floor apply only under jump/modular; the
+# shipped default bounded_load uses epsilon, p2c uses its load bias. A run
+# labelled "factor 3.0 / floor 4" under bounded_load measured the defaults —
+# so refuse that combination instead of recording a mislabelled experiment.
+EFFECTIVE_HASH_STRATEGY="${RANVIER_HASH_STRATEGY:-bounded_load}"
+log_info "RANVIER_HASH_STRATEGY         = ${RANVIER_HASH_STRATEGY:-bounded_load (compose default)}"
+log_info "RANVIER_BOUNDED_LOAD_EPSILON  = ${RANVIER_BOUNDED_LOAD_EPSILON:-0.25 (compose default)}"
+case "$EFFECTIVE_HASH_STRATEGY" in
+    jump|modular) ;;
+    *)
+        if [[ -n "${RANVIER_LOAD_IMBALANCE_FACTOR:-}" || -n "${RANVIER_LOAD_IMBALANCE_FLOOR:-}" ]]; then
+            log_error "--load-imbalance-factor/--load-imbalance-floor have NO effect under hash strategy '$EFFECTIVE_HASH_STRATEGY'."
+            log_error "Use --bounded-load-epsilon (bounded_load), or add --hash-strategy jump so factor/floor apply."
+            exit 1
+        fi
+        ;;
+esac
 # Residency routing (#527) is a SECOND diversion mechanism, on by default
 # (threshold 0.2). It is NOT controlled by --no-load-aware — only by
 # --cache-residency-threshold (or the env var; 0.0 disables). Surfaced here
@@ -1457,6 +1665,20 @@ fi
 # Fallback literal must match locustfile_real.py's NUM_LARGE_PREFIXES default: it
 # is only a display/pigeonhole-check value here; bench.sh no longer injects it.
 log_info "NUM_LARGE_PREFIXES            = ${NUM_LARGE_PREFIXES:-50 (locust default)}  [workload, not routing]"
+log_info "PREFIX_WORKING_SET            ~ ${PREFIX_WORKING_SET_TOKENS} tokens (${NUM_LARGE_PREFIXES:-50} prefixes x ${_WS_MIN}..${_WS_MAX})  [estimate]"
+if [[ -n "$KV_CACHE_TOKENS_MIN" ]]; then
+    log_info "KV_CACHE_PER_BACKEND          = min ${KV_CACHE_TOKENS_MIN} tokens  ${KV_CACHE_TOKENS_JSON}"
+    _WS_PER_BACKEND=$(( PREFIX_WORKING_SET_TOKENS / (NUM_BACKENDS > 0 ? NUM_BACKENDS : 1) ))
+    if [[ "$_WS_PER_BACKEND" -gt "$KV_CACHE_TOKENS_MIN" ]]; then
+        log_warn "KV regime: even split ${NUM_BACKENDS} ways (~${_WS_PER_BACKEND} tokens/backend) the hot set exceeds a backend's KV cache (${KV_CACHE_TOKENS_MIN}). Every backend evicts regardless of routing; P99 here measures eviction, not affinity."
+    elif [[ "$PREFIX_WORKING_SET_TOKENS" -le "$KV_CACHE_TOKENS_MIN" ]]; then
+        log_warn "KV regime: the whole hot set (~${PREFIX_WORKING_SET_TOKENS}) fits in ONE backend's KV cache (${KV_CACHE_TOKENS_MIN}). Round-robin will also hit once warm; affinity has little to gain."
+    else
+        log_ok "KV regime: hot set fits when split across backends but not in one — the regime where affinity can pay."
+    fi
+else
+    log_info "KV_CACHE_PER_BACKEND          = unknown (no vLLM startup log; external backends?)"
+fi
 if [[ "${NUM_LARGE_PREFIXES:-50}" -le "${NUM_BACKENDS:-0}" ]] 2>/dev/null; then
     log_warn "NUM_LARGE_PREFIXES (${NUM_LARGE_PREFIXES:-50}) <= backends (${NUM_BACKENDS:-?}): pure affinity cannot use all backends (pigeonhole concentration; intentional only for a stress test)."
 fi
@@ -1533,6 +1755,7 @@ fi
 
 # Start Ranvier nodes
 log_info "Starting Ranvier nodes..."
+log_info "Routing DB is a container-local tmpfs (RANVIER_DB_PATH in the compose file): no routes or backends carry over from earlier runs or arms."
 $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real up -d ranvier1 ranvier2 ranvier3 2>/dev/null
 
 # Wait for Ranvier to be healthy
@@ -1591,17 +1814,46 @@ write_manifest() {
         printf '  "schema_version": 1,\n'
         printf '  "timestamp": "%s",\n' "$(_json_escape "$ts")"
         printf '  "commit": "%s",\n' "$(_json_escape "$commit")"
+        # The server that actually ran. "commit" above is the CHECKOUT; the
+        # image may be older (reused) or built from main (GHCR). Readers must
+        # not infer the server's code from "commit" when source != built_from_checkout.
+        printf '  "server_image": { "id": "%s", "created": "%s", "source": "%s", "stale_override": %s },\n' \
+            "$(_json_escape "${SERVER_IMAGE_ID:-unknown}")" "$(_json_escape "${SERVER_IMAGE_CREATED:-unknown}")" \
+            "$(_json_escape "${SERVER_IMAGE_SOURCE:-unknown}")" "$([[ "${ALLOW_STALE_IMAGE:-false}" = true ]] && echo true || echo false)"
         printf '  "host": "%s",\n' "$(_json_escape "$host")"
         printf '  "command": "%s",\n' "$(_json_escape "$ORIGINAL_CMD")"
         printf '  "vllm_version": "%s",\n' "$(_json_escape "$VLLM_VERSION")"
         printf '  "hardware": { "gpu_name": "%s", "gpu_count": "%s" },\n' \
             "$(_json_escape "${GPU_NAME:-unknown}")" "${TOTAL_GPUS:-0}"
+        # KV-cache regime: per-backend capacity from vLLM's startup log beside the
+        # prefix working set the workload keeps hot (see capture_kv_capacity).
+        printf '  "regime": { "kv_cache_tokens_per_backend": %s, "kv_cache_tokens_min": %s, "prefix_working_set_tokens_est": %s },\n' \
+            "${KV_CACHE_TOKENS_JSON:-{\}}" "${KV_CACHE_TOKENS_MIN:-null}" "${PREFIX_WORKING_SET_TOKENS:-null}"
         printf '  "routing": {\n'
         printf '    "mode": "%s",\n' "$(_json_escape "$mode")"
         printf '    "load_aware_routing": "%s",\n' "$(_json_escape "${RANVIER_LOAD_AWARE_ROUTING:-}")"
         printf '    "load_imbalance_factor": "%s",\n' "$(_json_escape "${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}")"
         printf '    "load_imbalance_floor": "%s",\n' "$(_json_escape "${RANVIER_LOAD_IMBALANCE_FLOOR:-2}")"
-        printf '    "cache_residency_threshold": "%s"\n' "$(_json_escape "${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}")"
+        printf '    "cache_residency_threshold": "%s",\n' "$(_json_escape "${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}")"
+        # Every other RANVIER_* knob the compose file forwards from the host env.
+        # Defaults mirror docker-compose.benchmark-real.yml so an unset knob is
+        # recorded as the value the server actually ran with.
+        printf '    "hash_strategy": "%s",\n' "$(_json_escape "${RANVIER_HASH_STRATEGY:-bounded_load}")"
+        printf '    "miss_placement": "%s",\n' "$(_json_escape "${RANVIER_MISS_PLACEMENT:-least_loaded}")"
+        printf '    "bounded_load_epsilon": "%s",\n' "$(_json_escape "${RANVIER_BOUNDED_LOAD_EPSILON:-1.0}")"
+        printf '    "cross_shard_load_sync": "%s",\n' "$(_json_escape "${RANVIER_CROSS_SHARD_LOAD_SYNC:-true}")"
+        printf '    "gpu_load_weight": "%s",\n' "$(_json_escape "${RANVIER_ROUTING_GPU_LOAD_WEIGHT:-0}")"
+        printf '    "capacity_headroom_weight": "%s",\n' "$(_json_escape "${RANVIER_CAPACITY_HEADROOM_WEIGHT:-0}")"
+        printf '    "health_check_interval_s": "%s",\n' "$(_json_escape "${RANVIER_HEALTH_CHECK_INTERVAL:-5}")"
+        printf '    "min_token_length": "%s",\n' "$(_json_escape "${RANVIER_MIN_TOKEN_LENGTH:-10}")"
+        printf '    "route_batch_flush_interval_ms": "%s",\n' "$(_json_escape "${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}")"
+        printf '    "enable_multi_depth_routing": "%s",\n' "$(_json_escape "${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}")"
+        printf '    "default_compression_ratio": "%s",\n' "$(_json_escape "${RANVIER_DEFAULT_COMPRESSION_RATIO:-1.0}")"
+        printf '    "backpressure_enable_priority_queue": "%s",\n' "$(_json_escape "${RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE:-false}")"
+        printf '    "backpressure_tier_capacity": "%s",\n' "$(_json_escape "${RANVIER_BACKPRESSURE_TIER_CAPACITY:-64,128,256,512}")"
+        printf '    "chat_template_format": "%s",\n' "$(_json_escape "${RANVIER_CHAT_TEMPLATE_FORMAT:-none}")"
+        printf '    "tokenizer_thread_pool_enabled": "%s",\n' "$(_json_escape "${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}")"
+        printf '    "health_vllm_metrics_timeout_ms": "%s"\n' "$(_json_escape "${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}")"
         printf '  },\n'
         # workload knobs — the block results_parser.py compares for comparability.
         printf '  "workload": {\n'
@@ -1613,7 +1865,9 @@ write_manifest() {
         printf '    "prompt_distribution": "%s",\n' "$(_json_escape "$PROMPT_DIST")"
         printf '    "shared_prefix_ratio": "%s",\n' "$(_json_escape "$PREFIX_RATIO")"
         printf '    "num_large_prefixes": "%s",\n' "$(_json_escape "${NUM_LARGE_PREFIXES:-50}")"
+        printf '    "prefix_seed": "%s",\n' "$(_json_escape "${PREFIX_SEED:-42}")"
         printf '    "max_output_tokens": "%s",\n' "$(_json_escape "${MAX_TOKENS:-}")"
+        printf '    "pacing_s": "%s",\n' "$(_json_escape "${PACING_S:-0}")"
         printf '    "client_tokenize": "%s"' "$client_tok"
         if [[ "$PROMPT_DIST" == "churn" ]]; then
             printf ',\n    "churn": { "universe": "%s", "active": "%s", "rotation_step": "%s", "rotation_seconds": "%s", "seed": "%s" }\n' \
@@ -1758,6 +2012,7 @@ run_benchmark() {
     # Set NUM_LARGE_PREFIXES=5 in the environment only to stress prefix concentration.
     NUM_PREFIXES_ARGS=""
     [[ -n "$NUM_LARGE_PREFIXES" ]] && NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=$NUM_LARGE_PREFIXES"
+    [[ -n "$PREFIX_SEED" ]] && NUM_PREFIXES_ARGS+=" -e PREFIX_SEED=$PREFIX_SEED"
 
     # Forward churn-workload knobs (read by locustfile_real.py; only meaningful with
     # --prompt-dist churn) ONLY when explicitly set — the locustfile owns the defaults.
@@ -1773,6 +2028,20 @@ run_benchmark() {
     LOCUST_RUN_TIME_SECS=$(parse_duration "$DURATION")
     log_info "Locust --run-time: ${LOCUST_RUN_TIME_SECS}s (from DURATION=$DURATION)" >&2
     BENCHMARK_START_TS=$(date +%s)
+
+    # Start-of-run /metrics snapshot per node. Counters are cumulative since the
+    # arm's Ranvier start, which includes the warm-up; results_parser subtracts
+    # these from the end-of-run dumps so diversion/routed counters cover the
+    # main run only. Filename deliberately does not match prometheus_metrics_node*.
+    if command -v docker &> /dev/null; then
+        node_idx=0
+        for node in ranvier-bench1 ranvier-bench2 ranvier-bench3; do
+            node_idx=$((node_idx + 1))
+            start_file="$REPORT_DIR/prometheus_metrics_start_node${node_idx}.txt"
+            docker exec "$node" curl -sf http://localhost:9180/metrics > "$start_file" 2>/dev/null \
+                || rm -f "$start_file"
+        done
+    fi
 
     # Capture GPU clocks/throttle state at start of run for environmental-drift
     # auditing between runs. See .dev-context/investigation-289-routing-regression.md.
@@ -1810,6 +2079,7 @@ run_benchmark() {
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         -e MAX_OUTPUT_TOKENS="$MAX_TOKENS" \
+        -e BENCH_PACING_S="${PACING_S:-0}" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE="$PRIORITY_QUEUE" \
         -e SIMULATE_AGENTS="$( [[ "$PRIORITY_QUEUE" = true ]] && echo true || echo false )" \
@@ -1827,6 +2097,8 @@ run_benchmark() {
         --csv "/mnt/locust/output/results" \
         --html "/mnt/locust/output/report.html" \
         2>&1 | tee "$REPORT_DIR/benchmark.log" /dev/stderr > /dev/null
+    # tee masks locust's status (no pipefail); keep it for the arm check below.
+    LOCUST_RC=${PIPESTATUS[0]}
 
     BENCHMARK_END_TS=$(date +%s)
     ACTUAL_DURATION=$((BENCHMARK_END_TS - BENCHMARK_START_TS))
@@ -1875,9 +2147,41 @@ run_benchmark() {
                 # node count reflects only nodes actually scraped.
                 rm -f "$node_file"
             fi
+            # Keep this arm's Ranvier log next to its metrics. The containers
+            # are recreated per arm and removed at the end of the suite, so
+            # the log is gone unless captured here; it holds the info-level
+            # route-learning lines ("Buffering route: N tokens -> backend B")
+            # that give the per-node route map the counters cannot (placement
+            # v3, 2026-10-03: the logs were wanted after the run and were gone).
+            if ! docker logs "$node" > "$REPORT_DIR/ranvier_node${node_idx}.log" 2>&1; then
+                rm -f "$REPORT_DIR/ranvier_node${node_idx}.log"
+            fi
         done
         # If nothing scraped at all, remove the empty combined file too.
         [[ -s "$REPORT_DIR/prometheus_metrics.txt" ]] || rm -f "$REPORT_DIR/prometheus_metrics.txt"
+    fi
+
+    # Arm validity. A crashed locust (no stats block), or a server running a
+    # different routing mode than the arm's label, must not reach compare or
+    # aggregate as a "pass". Locust's own exit code is NOT by itself a failure:
+    # it exits 1 whenever any request errored or its P99 check tripped, both of
+    # which are measurements, not crashes. It is recorded for the log.
+    local ARM_FAILURE=""
+    if ! grep -q "BENCHMARK_STATS_JSON:" "$REPORT_DIR/benchmark.log" 2>/dev/null; then
+        ARM_FAILURE="no BENCHMARK_STATS_JSON in benchmark.log (locust exit ${LOCUST_RC:-?})"
+    fi
+    if grep -q "ROUTING MODE MISMATCH" "$REPORT_DIR/benchmark.log" 2>/dev/null; then
+        ARM_FAILURE="${ARM_FAILURE:+$ARM_FAILURE; }server routing mode != arm label '$ROUTING_MODE' (ROUTING MODE MISMATCH in log)"
+    fi
+    if [[ -n "$ARM_FAILURE" ]]; then
+        echo "$ARM_FAILURE" > "$REPORT_DIR/FAILED"
+        log_error "Arm '$ROUTING_MODE' FAILED: $ARM_FAILURE" >&2
+        log_error "Marker written: $REPORT_DIR/FAILED — this dir must not be compared or aggregated." >&2
+        echo "$REPORT_DIR"
+        return 1
+    fi
+    if [[ "${LOCUST_RC:-0}" -ne 0 ]]; then
+        log_warn "locust exited ${LOCUST_RC} (request errors or its own P99 check); stats block present, arm kept." >&2
     fi
 
     log_ok "Results saved to: $REPORT_DIR/" >&2
@@ -1950,6 +2254,7 @@ run_warmup() {
     # locustfile default (50), so the two stay identically primed either way.
     NUM_PREFIXES_ARGS=""
     [[ -n "$NUM_LARGE_PREFIXES" ]] && NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=$NUM_LARGE_PREFIXES"
+    [[ -n "$PREFIX_SEED" ]] && NUM_PREFIXES_ARGS+=" -e PREFIX_SEED=$PREFIX_SEED"
 
     # Match the main run's churn knobs so warm-up exercises the same universe
     # (CHURN_SEED makes the prefix content identical). Forward only when set.
@@ -1971,6 +2276,7 @@ run_warmup() {
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         -e MAX_OUTPUT_TOKENS="$MAX_TOKENS" \
+        -e BENCH_PACING_S="${PACING_S:-0}" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE="$PRIORITY_QUEUE" \
         -e SIMULATE_AGENTS="$( [[ "$PRIORITY_QUEUE" = true ]] && echo true || echo false )" \
@@ -2004,16 +2310,39 @@ restart_ranvier_with_mode() {
     local MODE="$1"
     log_info "Restarting Ranvier cluster with RANVIER_ROUTING_MODE=$MODE..."
 
-    # Stop existing containers
-    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
-        stop ranvier1 ranvier2 ranvier3 2>/dev/null
-    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
-        rm -f ranvier1 ranvier2 ranvier3 2>/dev/null
+    # Stop and remove existing containers. Removal also discards the routing DB
+    # (container-local tmpfs), so the new arm starts with an empty ART.
+    # These three compose calls used to run with stderr discarded under set -e,
+    # so a transient failure (a name still held by a container being removed, a
+    # network with a lingering endpoint) killed the whole run with no message
+    # (leg B rep 2, 2026-10-03: exit 1 two minutes in, nothing logged). stop/rm
+    # are best effort; up is retried and its error shown.
+    local out
+    if ! out=$($DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+                 stop ranvier1 ranvier2 ranvier3 2>&1); then
+        log_warn "compose stop (ignored): $(echo "$out" | tail -2 | tr '\n' ' ')"
+    fi
+    if ! out=$($DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+                 rm -f ranvier1 ranvier2 ranvier3 2>&1); then
+        log_warn "compose rm (ignored): $(echo "$out" | tail -2 | tr '\n' ' ')"
+    fi
 
     # Restart with the desired routing mode
     export RANVIER_ROUTING_MODE="$MODE"
-    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
-        up -d ranvier1 ranvier2 ranvier3 2>/dev/null
+    local UP_OK=false attempt
+    for attempt in 1 2 3; do
+        if out=$($DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+                   up -d ranvier1 ranvier2 ranvier3 2>&1); then
+            UP_OK=true
+            break
+        fi
+        log_warn "compose up (attempt $attempt/3) failed: $(echo "$out" | tail -3 | tr '\n' ' ')"
+        [[ $attempt -lt 3 ]] && sleep 5
+    done
+    if [[ "$UP_OK" != true ]]; then
+        log_error "Ranvier containers did not start after 3 attempts (mode=$MODE); last error above"
+        exit 1
+    fi
 
     # Wait for all 3 nodes to be healthy
     local MAX_WAIT=60
@@ -2045,6 +2374,49 @@ restart_ranvier_with_mode() {
 # Execute benchmarks
 # -----------------------------------------------------------------------------
 
+# vLLM keeps its KV cache across the Ranvier restart between --compare arms, so
+# the arm that runs second starts cache-warm (review F4). Measured 2026-10-06 on
+# 8B/20u: round-robin running second inherited the prefix arm's warm cache
+# (KV hit 76% vs 72%, P99 843 vs 882-890 ms) and the prefix-first repeat read
+# -17.7% against -26.7/-27.1% rr-first; same pattern on 2026-10-01. The 13B
+# rows showed no such effect (round-robin never concentrates a prefix, so it
+# has nothing to inherit). vLLM's OpenAI server exposes POST /reset_prefix_cache,
+# which frees every cached block; it refuses while requests are in flight, which
+# cannot happen here because Ranvier is stopped before each arm. Each backend is
+# hit the same way the health check addresses it. The result goes into the
+# compare header so a reader can tell a reset run from a carry-over run.
+KV_RESET_LOG=""
+reset_vllm_prefix_cache() {
+    local label="$1" acked=0 total=0 i host port code
+    for ((i=0; i<NUM_BACKENDS; i++)); do
+        if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
+            host="${VLLM_ENDPOINTS[$i]%:*}"
+            port="${VLLM_ENDPOINTS[$i]#*:}"
+        else
+            host="$VLLM_HOST"
+            port=$((DEFAULT_VLLM_PORT_START + i))
+        fi
+        total=$((total + 1))
+        code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 60 \
+                    -X POST "http://${host}:${port}/reset_prefix_cache" 2>/dev/null || echo 000)
+        if [[ "$code" == "200" ]]; then
+            acked=$((acked + 1))
+        else
+            if [[ "$code" == "404" ]]; then
+                log_warn "vLLM ${host}:${port}: POST /reset_prefix_cache returned HTTP 404: the endpoint exists only when vLLM runs with VLLM_SERVER_DEV_MODE=1 (bench.sh sets it for the vLLM it launches; set it yourself on --skip-vllm / --vllm-endpoints backends). Cache NOT reset on this backend."
+            else
+                log_warn "vLLM ${host}:${port}: POST /reset_prefix_cache returned HTTP $code (cache NOT reset on this backend)"
+            fi
+        fi
+    done
+    if [[ $acked -eq $total ]]; then
+        log_ok "vLLM prefix cache reset on $acked/$total backends before the $label arm"
+    else
+        log_warn "vLLM prefix cache reset acked by only $acked/$total backends before the $label arm; the compare header records it"
+    fi
+    KV_RESET_LOG+="${label}=${acked}/${total} "
+}
+
 if [[ "$COMPARE" = true ]]; then
     log_header "A/B Comparison Mode"
     # Calculate total time for comparison mode (extra 60s for container restart + health check)
@@ -2052,48 +2424,55 @@ if [[ "$COMPARE" = true ]]; then
     COMPARE_TOTAL_SECS=$((COMPARE_DURATION_SECS * 2 + 90))  # 2 benchmarks + restart + health
     COMPARE_TOTAL_MINS=$((COMPARE_TOTAL_SECS / 60))
     COMPARE_TOTAL_SECS_REM=$((COMPARE_TOTAL_SECS % 60))
-    log_info "Running two benchmarks: Round-Robin (baseline) vs Prefix-Aware (optimized)"
+    log_info "Running two benchmarks: ${BASELINE_LABEL} (baseline, mode ${BASELINE_MODE}) vs Prefix-Aware (optimized)"
     log_info "Each benchmark: $DURATION | Total estimated time: ${COMPARE_TOTAL_MINS}m ${COMPARE_TOTAL_SECS_REM}s"
 
     # Arm order (review F4): a fixed order lets thermal drift and cache carry-over
     # always land on the same side. --order picks it; bench-runner alternates it
     # across --repeat runs to cancel the bias. The comparison below always treats
-    # round_robin as the baseline regardless of which arm physically ran first.
+    # the --baseline-mode arm as the baseline regardless of which arm ran first.
     if [[ "$ORDER" == "prefix-first" ]]; then
-        ARMS=("prefix" "round_robin")
+        ARMS=("prefix" "$BASELINE_MODE")
     else
-        ARMS=("round_robin" "prefix")
+        ARMS=("$BASELINE_MODE" "prefix")
     fi
     log_info "Arm order: ${ARMS[0]} → ${ARMS[1]} (--order $ORDER)"
 
     # vLLM KV cache carry-over (review F4): only the Ranvier containers are
     # restarted between arms — the vLLM processes keep their KV cache, so the
-    # second arm can start vLLM-warm. Per-arm warm-up (below) gives both arms an
-    # equal warm dose; for stricter isolation, restart vLLM between arms.
-    log_warn "vLLM KV cache is NOT reset between arms (only Ranvier restarts). Per-arm warm-up equalizes the warm dose; restart vLLM between arms for strict isolation."
+    # second arm would start vLLM-warm. Since 2026-10-07 every backend's prefix
+    # cache is reset before each arm (reset_vllm_prefix_cache above) unless
+    # --no-kv-reset asks for the old carry-over behaviour.
+    if [[ "$KV_RESET" = true ]]; then
+        log_info "vLLM prefix cache is reset before each arm (POST /reset_prefix_cache; --no-kv-reset to keep the carry-over)."
+    else
+        log_warn "vLLM KV cache is NOT reset between arms (--no-kv-reset; only Ranvier restarts). The arm that runs second starts vLLM-warm."
+    fi
 
     declare -A ARM_REPORT
     arm_i=0
     for arm in "${ARMS[@]}"; do
         arm_i=$((arm_i + 1))
+        # Drop the previous arm's (or previous run's) KV blocks before this arm
+        [[ "$KV_RESET" = true ]] && reset_vllm_prefix_cache "$arm"
         # Restart Ranvier in this arm's mode (also resets its Prometheus histograms)
         restart_ranvier_with_mode "$arm"
         # Warm THIS arm's freshly-restarted cluster in its own mode so both arms
         # are identically primed (was previously warmed once, before the restart).
         [[ "$WARMUP" = true ]] && run_warmup "$arm"
-        if [[ "$arm" == "round_robin" ]]; then
-            ARM_REPORT[round_robin]=$(run_benchmark "round_robin" "Round-Robin (Baseline)" "[${arm_i}/2]")
+        if [[ "$arm" == "$BASELINE_MODE" ]]; then
+            ARM_REPORT[baseline]=$(run_benchmark "$BASELINE_MODE" "${BASELINE_LABEL} (Baseline)" "[${arm_i}/2]")
         else
             ARM_REPORT[prefix]=$(run_benchmark "prefix" "Prefix-Aware (Optimized)" "[${arm_i}/2]")
         fi
     done
-    REPORT_RR="${ARM_REPORT[round_robin]}"
+    REPORT_RR="${ARM_REPORT[baseline]}"
     REPORT_PREFIX="${ARM_REPORT[prefix]}"
 
     log_header "A/B Comparison Complete"
     echo ""
     echo "Results:"
-    echo "  Round-Robin:  $REPORT_RR"
+    echo "  ${BASELINE_LABEL} (baseline, ${BASELINE_MODE}): $REPORT_RR"
     echo "  Prefix-Aware: $REPORT_PREFIX"
     echo ""
 
@@ -2105,7 +2484,12 @@ if [[ "$COMPARE" = true ]]; then
         echo "Git Commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
         echo "vLLM Version: $VLLM_VERSION"
         echo "Arm order: ${ARMS[0]} -> ${ARMS[1]} (--order $ORDER); warm-up per-arm: $WARMUP"
-        echo "vLLM KV cache NOT reset between arms (Ranvier-only restart)"
+        echo "Baseline arm routing mode: ${BASELINE_MODE} (--baseline-mode)"
+        if [[ "$KV_RESET" = true ]]; then
+            echo "vLLM KV cache reset before each arm via POST /reset_prefix_cache (backends acked: ${KV_RESET_LOG% })"
+        else
+            echo "vLLM KV cache NOT reset between arms (--no-kv-reset; Ranvier-only restart)"
+        fi
         echo "Ranvier Env: $(env | grep '^RANVIER_' | sort | tr '\n' ' ')"
         echo ""
     } > "$COMPARE_OUTPUT"
@@ -2129,7 +2513,10 @@ if [[ "$COMPARE" = true ]]; then
 else
     # Single-arm run: warm the (already-running, prefix-mode) cluster if requested.
     [[ "$WARMUP" = true ]] && run_warmup "prefix"
-    run_benchmark "prefix" "Prefix-Aware Routing"
+    # The cluster was started from the host env (compose default: prefix), so the
+    # arm label, manifest and BENCHMARK_MODE must follow that, not a literal.
+    SINGLE_ARM_MODE="${RANVIER_ROUTING_MODE:-prefix}"
+    run_benchmark "$SINGLE_ARM_MODE" "Single arm (${SINGLE_ARM_MODE})"
 fi
 
 log_header "Benchmark Complete"

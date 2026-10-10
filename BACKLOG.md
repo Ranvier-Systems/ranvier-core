@@ -36,6 +36,8 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 23. [Holistic Audit Findings (2026-07-04)](#23-holistic-audit-findings-2026-07-04)
 24. [Adversarial Audit Findings — Pass A (2026-07-04)](#24-adversarial-audit-findings-pass-a-2026-07-04)
 25. [Benchmark Tooling P0 — Re-anchor the Truth (2026-07-06)](#25-benchmark-tooling-p0--re-anchor-the-truth-2026-07-06)
+26. [Kimi (Moonshot) Model Support (2026-07-18)](#26-kimi-moonshot-model-support-2026-07-18)
+27. [Strategic Assessment (2026-10-02)](#27-strategic-assessment-2026-10-02)
 
 ---
 
@@ -1286,9 +1288,24 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
   13B/30u −9.1% (both reliable wins), 13B/20u no reliable effect, 13B/10u **+29% (reliable
   regression)** — monotonic in cluster throughput. Cache hit +3× everywhere, decoupled from P99.
   Written up in `docs/benchmarks/benchmark-results-current.md`.
+- [x] **Re-baseline on fixed tooling (2026-10-01, 8×A100-40GB, `bench-runner.sh --suite rebaseline`,
+  12/12 runs, 7h11m):** 8B/20u **−17.0% P99, 3/3 repeats agree** (KV hit 72%→94%): the one July
+  row that reproduces, stronger. All three 13B rows measured an eviction regime (11,648 KV
+  tokens/backend vs a ~250k-token hot set; KV hits 4–6% RR, 14–26% prefix; 216–277 preemptions/
+  backend/45 min): 30u no reliable effect (was −9.1%), **20u +11.0% consistent regression** (was
+  +3.8%), 10u no reliable effect (was +29%). July's "monotonic in throughput" reading does not
+  survive. Written up in `benchmark-results-current.md`; July moved to its superseded section.
+  **Next:** `--suite fitted` (13B with a KV-fitting set, 10u + 20u ×3) decides whether the 20u
+  regression is a memory-pressure artefact; then `--suite epsilon` on a fitting set.
 - [ ] **Item 5 — threshold leg** (shipped `2.0/2` vs raised `3.0/4`) NOT yet run; the 30–47%
   load-aware fallback rates seen across the matrix make it the highest-value remaining GPU run.
   Runbook `benchmark-rebaseline-campaign.md` §2; run files under `docs/benchmarks/rebaseline/`.
+  **2026-09-30 audit:** factor/floor are inert under the shipped `bounded_load` strategy, so the
+  leg as written (and D2) measured nothing; `bench.sh` now refuses it without `--hash-strategy
+  jump`. The live replacement is **Leg V1, `bench-runner.sh --suite epsilon`** (bounded-load
+  epsilon 0.5 vs 0.25, ×3). Prerequisite: re-run the July matrix with `--suite rebaseline`
+  (default, ×3) — the July runs carried the routing DB across arms and used unseeded,
+  per-arm-different prefixes, so the −13%/−9%/+29% headline is unconfirmed until then.
 - [ ] **Load-gating Leg V0 — `cross_shard_load_sync` A/B at 13B/10u** (ran 2026-09-28, 8×A100):
   **inconclusive.** Sync off reproduced a reliable +9.7% P99 regression; sync on shrank it to
   +3.4% with no reliable effect, short of the pre-registered "≤ 0" bar. Sync stays off by
@@ -1377,6 +1394,176 @@ Kimi K2 (and, once public, K3) with correct prefix-cache alignment.
 - Multimodal `content` arrays (K3 vision) are dropped from routing/tokenization
   (`request_rewriter.hpp`) — image requests route on their text turns only.
 - Tool-result `## Return of {id}` framing is not reproduced.
+
+---
+
+## 27. Strategic Assessment (2026-10-02)
+
+Full write-up: [`docs/audits/strategic-assessment-2026-10-02.md`](docs/audits/strategic-assessment-2026-10-02.md).
+Scorecard: Architecture **B**, Reliability **B−**, Progress-to-goal **C+**. Trigger: the 2026-10-01
+re-baseline (§25) — one configuration demonstrates the goal with a real cache metric (8B/20u:
+KV hit 72→94%, P99 −17% ×3); every 13B row sat in an eviction regime (11,648 KV tokens/backend
+vs a ~250k-token hot set) where both arms were cache-cold and routing could not help.
+
+- [ ] **[STRATEGIC] Least-loaded diversion (fitted-suite finding, 2026-10-02).** `bounded_load_select`
+  (`router_service.cpp`) diverts an over-cap anchor to the FIRST under-cap consistent-hash probe;
+  it never pulls toward the coldest backend and only falls back to least-loaded when every backend
+  is over cap. All six fitted-suite prefix arms left one backend 35–45% below the mean (Gini
+  0.06–0.15 vs ≤0.055 under round-robin) with 30% of requests already diverted; at 20 users that
+  stranded eighth of the fleet is a consistent +10% P99 regression despite 3× the KV hit rate and
+  ~9% more completions. Fix: choose the least-loaded under-cap candidate when diverting (or P2C
+  among under-cap probes), and consider a pull rule for backends far below average. Acceptance
+  test: `--suite fitted` 13B 20u turns to a consistent improvement. Cheaper and better supported
+  than the KV-aware item below; do it first.
+  **Implemented and acceptance-tested 2026-10-02: FAILED.** Branch `claude/sleepy-lamport-wxly0b`
+  (`f47c998`) diverts an over-cap primary to the least-loaded live candidate and ranks load ahead of
+  `probe_rank` in the scorer. Same-box fitted suite, 13B 20u, three repeats each: old rule +11.7,
+  +11.0, +3.9; new rule +10.5, +24.1, +17.5 (P99 TTFT vs round-robin). The new rule tightened the
+  prefix-arm spread (Gini 0.049–0.075 vs 0.075–0.105) without moving the tail, so stranded
+  capacity is a symptom, not the mechanism. Root finding: with 24 shards and cross-shard sync off,
+  "load" is ~entirely the 5 s-stale scraped vLLM score (×10) plus KV headroom (×5), identical on
+  every shard of a node; ~88% of shard-0 load diverts carried a GPU score. Diverts fire at ~30% on
+  scraped KV pressure, and least-loaded herds them onto one backend per node per scrape. Details:
+  `docs/benchmarks/benchmark-results-current.md` (acceptance section). The code change is held on
+  the branch; the tooling beside it (stale-image refusal, `--build-image`, manifest `server_image`,
+  compose load-signal knobs) should merge regardless.
+  **Leg A (no-divert control, 2026-10-02/03): +8.2, +12.3, +11.3.** Pure affinity
+  (`--no-load-aware --cache-residency-threshold 0.0`, 0 diverts, 97% route consistency) regresses
+  P99 by the same amount as either divert policy. The cause is hash placement itself: 16 uniform
+  prefixes over 8 backends by hash left b7 with 4 prefixes (23% of requests) and b5 with 0 (0.6%),
+  Gini 0.30 in all three repeats; the busiest backend's queue sets P99 while P50 keeps −28%.
+  **Implemented (2026-10-03, same branch): `routing.miss_placement: least_loaded`** — a new prefix
+  is placed on the live candidate holding the fewest learned-route tokens
+  (`RadixTree::route_tokens_by_backend`, new), then fewest routes, then lowest capacity-adjusted
+  load, then probe order; default `hash` unchanged. First acceptance rep (count-weighted build,
+  20u): +6.6% P99, Gini 0.076 — the stress mix's ~70 short one-off routes outvoted the 16 long
+  prefixes in a count tally, hence the token weighting. Rep 2 (count-weighted): +25.1%, Gini 0.104,
+  route consistency 36.7% (default ~48%) and KV hits 28.7% (default 36–44%): because placement is
+  a local decision and routes were learned only at first byte (~1 TTFT later), shards/nodes placed
+  the same new prefix on different backends and each kept its LOCAL route. Fix: learn a placed miss
+  at dispatch too (window → one 20 ms batch flush + gossip). **v2 run (token-weighted + eager
+  learn, 2026-10-03): +11.4, +12.5, +3.9; consistency 37.9/40.8/41.5%, KV 29.8/31.0/37.6%, Gini
+  0.048/0.074/0.050 — split persists, and `router_remote_routes_trust_refused_total` = 860/781/800 per arm on shard 0
+  (≈0 under hash placement) confirms it is cross-node: each node keeps its own LOCAL placement
+  under T7 and refuses the others' forever. Third fix (branch): under `least_loaded`, a conflicting
+  gossiped route is settled by lowest backend id on every node (`insert_if_trusted(...,
+  converge_local_conflicts)`, counter `router_remote_routes_converged_total`); PUSH and the hash
+  default untouched. Tell on the next run: refusals ≈ 0, converged in the tens, consistency ≥ ~48%,
+  KV ≈ 40%. **v3 run (+ convergence, main `48471f4`, 2026-10-03): +8.1, +10.1, +3.4; consistency
+  56.5/59.1/58.2%, KV 47.7/42.4/46.7% (best of the campaign, above the hash default) but Gini
+  0.113/0.106/0.090 (worst), busiest backend 16–18.5% of requests vs quietest 8.4–8.9%, hot
+  backend moving between reps. Counters: converged 0/0/0, refused 219/222/247 — the rule never
+  fired. Cause: `apply_local_batch_to_tree` used plain latest-wins `insert`, so a placed miss landing
+  at the 20 ms flush moved the prefix back off a peer's lower-id route and the peer refused the
+  announcement forever. Fourth fix (branch): LOCAL learns go through the same lowest-id rule at
+  flush, losers dropped before fan-out/gossip (`router_local_routes_converged_total`); new gauge
+  `backend_resident_route_tokens` to separate uneven placement from a popular prefix. Tell for v4:
+  refusals ≈ 0, local-converged in the tens, token gauge even within one prefix, consistency ≥ 57%.
+  10u on v3: −13.2% P99 / −29.1% P50 / KV 66% (rep 1) — the regime where the queue is short.
+  **v4 (+ local-flush convergence, 2026-10-05): +20.9, +13.1 (rep 3 lost to a vLLM start
+  failure); refusals 0/0/0, local-converged ~25 per node — split gone; consistency 57% (ceiling,
+  the rest is 25–28% diverts + first-seen). Token gauge: routes are 128-token keys (partial
+  tokenization never reaches the system-message boundary), so the token tally equals the count
+  tally, was balanced within one route-unit, and traffic still ran 1.5–1.8× busiest/quietest.
+  A placement weight derived from the route table cannot balance this workload. Placement line
+  closed; convergence fixes stay. Remaining levers: route weight carried over gossip (estimated
+  prompt tokens or hits), replication, or the live-queue divert policy (combo leg).**
+  **Combo leg (2026-10-05, split-free placement + `RANVIER_CROSS_SHARD_LOAD_SYNC=true`, GPU-score
+  and headroom weights 0, ε 1.0): −60.4 / −57.5 / −55.2% P99, P50 −28..−29%, KV 69–73%, diverts
+  23–27%, +10% req/s, 3/3 across arm orders — the 13B 20u row's acceptance. Request Gini stayed
+  0.09–0.12: the tail was queue depth, not request count, and a divert policy that sees the queue
+  live and acts only at 2× the mean removes it without giving back affinity (consistency 50–53%).
+  Next: isolation leg (hash placement, same signal and ε) to decide whether the shipping change is
+  two defaults or three; then 8B 20u / 13B 10u / 13B 30u under the new defaults.**
+  **Confirmation rows (one rep each, same settings): 13B 10u −34.5% (KV 82%), 8B 20u −22.6%
+  (was −17%), 13B 30u −16.4% excl. timeouts (both arms 1.4–1.6% incompletes, eviction regime).
+  Nothing regressed. **Standard 50-prefix matrix at three repeats on the 2.2.0 image (2026-10-06,
+  fresh instance): 8B 20u −26.7 (−26.7/−17.7/−27.1), 13B 30u −14.1 (−14.1/−17.9/−13.1, timeouts
+  both arms), 13B 20u −21.0 (−18.4/−27.9/−21.0; was +11.0), 13B 10u −38.8 (−38.8/−46.8/−36.8; was
+  no reliable effect); 12/12 repeats improved; diverts 15–26% (were 30–49%). Open: prefix arm
+  times out 0.1–0.4 pt more at 30u only; arm order inherits a warm vLLM cache on 8B (prefix-first
+  rep ~9 pt weaker) — reset the cache between arms.** **Fitted suite ×3 on 2.2.0 (10-06/07): 10u
+  −28.6, 20u −56.6 (reproduces the combo), new 30u/30m row −43.1/−42.0/−34.1 with ZERO incompletes
+  both arms and +15% rps → the 30u timeout excess is the eviction regime, not the cap; ε sweep
+  closed.** **Baseline suite vs `least_loaded` mode (10-08, fitted set ×3): 20u P99 −14.6/−13.8/−20.8
+  (3/3), 30u P99 −6.5/+6.6/+11.3 (MIXED); P50 −27…−29% and rps +6…+9% at both loads, KV 3–4×.
+  Least-loaded alone is −50%/−41% P99 vs round-robin with Gini < 0.01: most of the tail win over
+  round-robin is load balancing; affinity owns P50, KV and throughput. Prefix's Gini 0.08–0.11 is
+  its own tail at 30u → ε sweep REOPENED on fair grounds: 30u fitted vs least_loaded at ε 0.5 / 0.25
+  next session.** **Saturation suite (10-09, KV reset 8/8 every arm): 30u fitted vs least_loaded at
+  ε 0.5 → −7.3/+6.0/+1.3 (MIXED, KV 42–44%, diverts 24%); ε 0.25 → +11.1/+4.8/+25.4 (CONSISTENT
+  REGRESSION, KV 32–37%, diverts 30%). Tightening the cap diverts more, flattens, gives back KV and
+  moves the tail the wrong way; ε CLOSED, 1.0 stays. 50-prefix 20u vs least_loaded ×3 clean:
+  +22.9/+24.9/+21.7 P99 (the 10-08 carry-over rep's parity was the cache), P50 −9…−16%, KV 3–5×,
+  fewer timeouts, rps flat → in the eviction regime prefix loses the tail to a load balancer. Next
+  routing change is a divert that keeps the hit (holder-aware divert, below), not a knob.**
+  Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
+  `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
+  `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement
+  contributes.** **Isolation leg: −48.4 / −51.8 / −53.5 (median −51.8) with hash placement:
+  the divert policy is ~50 of the 57 points; placement adds the rest via fewer diverts (KV 69–73%
+  vs 49–55%, consistency 50–53% vs 39–45%, diverts 23–27% vs 30–33%, ranges non-overlapping).
+  `miss_placement: least_loaded` ships as the fifth default. 13B 20u row: closed. Next: the
+  rebaseline suite unflagged ×3 under the shipping defaults, and a fitted 30u row.** Rep 3 (count-weighted): +13.3%, consistency 37.1%, KV 30.1%, Gini
+  0.080 — the count-weighted build is a consistent regression (+6.6, +25.1, +13.3) with worse
+  affinity than the default in all three. Leg B (in-flight signal, default placement): +14.2, −1.0
+  (rep 2 lost to a silent compose failure, since fixed) — a real-time signal helps diversion at
+  the cost of affinity; ε 0.25 is uncalibrated at ~1 in-flight per backend per node.
+  **Resume (next GPU session):** rebuild from the branch tip (`d8bdde4` token weighting +
+  `5769f4e` eager learn), re-run `--suite placement`; read route consistency (≥ ~48%) and KV hits
+  (≈ 40%) first, then Gini (≈ 0.03), then P99 (acceptance: negative ×3 at 20u, P50 ≈ −25%). If
+  balance/affinity recover but P99 does not: combo (placement + in-flight knobs +
+  `--bounded-load-epsilon 1.0`) and paced control (`--pacing 4.3`). Archive run dirs before
+  terminating the instance — the 2026-10-02/03 raw runs were lost that way; numbers live in
+  `docs/benchmarks/benchmark-results-current.md`. Known limit: balances prefix tokens, not
+  popularity — hot-prefix replication is the follow-on.
+- [ ] **[STRATEGIC] Holder-aware divert (saturation-suite finding, 2026-10-09).** `bounded_load_select`
+  diverts an over-cap hit to the least-loaded live candidate, where it arrives as a miss. At
+  saturation that is the whole problem: on the fitted 30u row vs `least_loaded`, every tightening
+  of the cap (ε 1.0 → 0.5 → 0.25) diverted more (→ 24% → 30%), gave back KV (44–54% → 42–44% →
+  32–37%) and made P99 worse (MIXED → MIXED → +11.1/+4.8/+25.4), with the prefix arm's
+  route-consistent P99 above least-loaded's at every ε; on the 50-prefix 20u row prefix is
+  +22.9/+24.9/+21.7% P99 against least-loaded (Gini 0.09–0.17, large-bucket hit P99 3.7–4.4 s
+  above least-loaded's miss P99 3.1–3.6 s) while keeping P50 −9…−16% and KV 3–5×. The hits queue
+  behind each other on the few backends that hold the prefix. Fix: when the anchor is over cap,
+  offer the request to another backend that *holds the same prefix* (the residency gossip already
+  carries verified holders per hot prefix, §20.1 P3 `verified_holders`) and only then to the
+  least-loaded stranger; and replicate a hot prefix that has a single holder instead of diverting
+  its overflow (placement balances prefix count, not popularity). Acceptance: `--suite saturation`
+  row 16 (50-prefix 20u vs least_loaded, now +23%) and `--suite baseline` row 13 (fitted 30u, now
+  MIXED) turn to improvements without KV or route consistency falling below today's. Record:
+  "Saturation suite" in `docs/benchmarks/benchmark-results-current.md`.
+- [ ] **[STRATEGIC] KV-aware dispatch.** Extend the backend load signal with the already-scraped
+  `gpu_cache_usage_percent` (`health_service.cpp:425`, `vllm_metrics.hpp:21`) and add a
+  `kv_pressure` candidate field + weight to `route_scorer.hpp`, so dispatch diverts off an anchor
+  whose KV is near full as it does off one over its in-flight allowance. The fitted suite showed
+  the 13B/20u regression is stranded capacity, not preemption, so this is the second step: it
+  protects the eviction regime (default-set 13B rows) rather than fixing the 20u regression.
+- [ ] **[STRATEGIC] Runtime regime detection.** Compute hot-set tokens (ART working set) against
+  per-backend KV capacity (vLLM reports it) and expose an operator-facing advisory: "fleet in
+  eviction regime — affinity degraded". The bench banner already computes the ratio offline.
+- [ ] **[STRATEGIC] Delete `JUMP`/`MODULAR` hash strategies and `load_imbalance_factor/floor`.**
+  Unreachable under the shipped `bounded_load` default; produced the inert threshold leg (§25
+  item 5, D2); `bench.sh` now refuses them. Remove config, compose, docs and the refusal check.
+- [ ] **[STRATEGIC] Fuzz target on the dispatch path** (`router_service.cpp` request → route).
+  The two load-bearing files (`router_service.cpp` 5,985 lines, `http_controller.cpp` 4,346)
+  are the only unfuzzed hot-path code and the place the KV term lands.
+- [ ] **[STRATEGIC] Four-arm benchmark design**: direct-to-vLLM, random, least-loaded without
+  affinity, prefix. Needs a least-loaded mode and a no-proxy arm in `bench.sh`. Then a capacity
+  sweep (working set ÷ KV at fixed load) and a multi-turn workload. Supersedes the throughput
+  "crossover" framing.
+- [ ] **[STRATEGIC] Re-scope GPU legs.** The "powered V0 rerun" (~9 GPU-h) and the epsilon leg
+  as written run 13B on the default 50-prefix set and would measure eviction noise; run them, if
+  at all, on the fitted set. The epsilon leg also sweeps the wrong direction: the fitted result
+  says looser ε strands more capacity, so sweep tighter (0.1), after the diversion fix.
+- [ ] **[STRATEGIC] Freeze sideways growth** until the core claim is settled: no new Intelligence
+  Layer (§15), telemetry-export (§21) or model-template work; GIE EPP maintained, not expanded.
+- [ ] **[STRATEGIC] Benchmark code to data-plane standard.** Add `tests/integration/test_prom_scrape.py`,
+  `test_results_*.py` to CI; keep `bench-preflight.sh` in the runbook; a headline without a
+  manifest and a KV hit rate is not a result.
+- [ ] **[STRATEGIC] Reframe the public claim** in README/docs once `fitted` lands: "prefix routing
+  cuts P99 when the fleet's KV cache can hold its share of the hot set, and Ranvier tells you
+  which regime you are in."
 
 ---
 

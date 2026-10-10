@@ -23,7 +23,9 @@
 // cache_residency_threshold, cost_routing.*, cost_per_hour) keep their
 // authority via the allowances/hinges the router computes. The weights shift
 // authority from those per-step constants to a blended trade-off only when
-// tuned away from defaults.
+// tuned away from defaults. One deliberate departure from the pre-scorer
+// rules: a BOUNDED_LOAD divert lands on the least-loaded candidate, not the
+// first under-cap jump probe (see probe_rank below).
 //
 // This header is PURE: no Seastar includes, no shard state — directly
 // unit-testable without a reactor (same pattern as rate_limiter_core.hpp and
@@ -124,11 +126,15 @@ struct ScoreCandidate {
     // preference broke equal-price ties toward lower composite load).
     double price_tiebreak_load = 0.0;
 
-    // BOUNDED_LOAD divert spillover order: rank of this candidate's first
+    // BOUNDED_LOAD divert spillover tie-break: rank of this candidate's first
     // appearance in the jump-hash probe sequence, filled by the router ONLY
     // for under-allowance candidates when the anchor forfeits under
-    // BOUNDED_LOAD. UINT32_MAX = not probed / not applicable. Preserves the
-    // strategy's deterministic, cluster-consistent spillover target.
+    // BOUNDED_LOAD. UINT32_MAX = not probed / not applicable. Ranks below
+    // load in the dispatch tie order: a divert goes to the LEAST-LOADED
+    // under-allowance candidate, and probe order only separates equal loads
+    // (deterministic, cluster-consistent). The former first-under-cap rule
+    // stranded the coldest backend (BACKLOG section 27, fitted suite
+    // 2026-10-02).
     uint32_t probe_rank = std::numeric_limits<uint32_t>::max();
 };
 
@@ -176,11 +182,13 @@ inline double dispatch_score(const ScoreCandidate& c, const ScoringWeights& w,
 // Dispatch tie order:   score desc, "clean placement winner" first (the
 //                       placement winner keeps its seat whenever it forfeited
 //                       nothing — zero load hinge and zero cost hinge), lower
-//                       probe_rank, lower cost_pressure, lower load, lower id.
+//                       cost_pressure, lower load, lower probe_rank, lower id.
 //
-// The dispatch tie keys encode the pre-scorer divert targets: probe order for
-// BOUNDED_LOAD spillover, least-loaded for P2C/JUMP/MODULAR, least-cost for
-// the small-request fast lane. Deterministic by construction (id last).
+// The dispatch tie keys encode the divert targets: least-cost for the
+// small-request fast lane, least-loaded for every strategy (BOUNDED_LOAD
+// included — probe order breaks equal loads only, so the spillover target is
+// the coldest under-allowance candidate, not the first one the probe sequence
+// reaches). Deterministic by construction (id last).
 inline ScoreDecision score_and_select(const ScoreCandidate* candidates, size_t count,
                                       const ScoringWeights& weights,
                                       bool load_term_enabled) {
@@ -241,12 +249,12 @@ inline ScoreDecision score_and_select(const ScoreCandidate* candidates, size_t c
             const bool b_pref = placement_clean && (best == decision.placement);
             if (c_pref != b_pref) {
                 wins = c_pref;
-            } else if (c.probe_rank != b.probe_rank) {
-                wins = c.probe_rank < b.probe_rank;
             } else if (c.cost_pressure != b.cost_pressure) {
                 wins = c.cost_pressure < b.cost_pressure;
             } else if (c.load != b.load) {
                 wins = c.load < b.load;
+            } else if (c.probe_rank != b.probe_rank) {
+                wins = c.probe_rank < b.probe_rank;
             } else {
                 wins = c.id < b.id;
             }

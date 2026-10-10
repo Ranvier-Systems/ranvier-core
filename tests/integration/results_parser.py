@@ -83,11 +83,26 @@ class BenchmarkResults:
     p90_ttft_ms: Optional[float] = None
     p95_ttft_ms: Optional[float] = None
     p99_ttft_ms: Optional[float] = None
+    # "raw": exact percentiles over every TTFT sample (BENCHMARK_STATS_JSON).
+    # "locust_table": Locust's approximated table, which rounds 1-10 s values
+    # to 100 ms buckets — a ±50 ms floor on any P99 quoted from it.
+    ttft_source: Optional[str] = None
 
-    # Cache-specific metrics (real benchmarks only)
+    # Route-consistency metrics (real benchmarks only). cache_hits/misses and
+    # cache_hit_rate_pct are the client-side SAME-BACKEND affinity proxy: a
+    # "hit" is a request that landed on the same backend as the previous
+    # request with that prefix. Random routing scores ~1/N here by
+    # construction. The field names predate that understanding; every label
+    # printed from them says "route consistency".
     cache_hits: Optional[int] = None
     cache_misses: Optional[int] = None
     cache_hit_rate_pct: Optional[float] = None
+    # Real KV-cache signal: vLLM prefix_cache_hits/queries (token-level),
+    # differenced over the run across the backends that expose them.
+    kv_prefix_cache_hit_rate_pct: Optional[float] = None
+    kv_prefix_cache_hits: Optional[float] = None
+    kv_prefix_cache_queries: Optional[float] = None
+    kv_prefix_cache_backends_scraped: Optional[int] = None
     ttft_cache_hit_p50_ms: Optional[float] = None
     ttft_cache_hit_p99_ms: Optional[float] = None
     ttft_cache_miss_p50_ms: Optional[float] = None
@@ -210,6 +225,8 @@ def detect_benchmark_type(content: str) -> str:
     # Real benchmarks have cache hit/miss tracking from locustfile_real.py
     if "Cache HIT" in content or "Cache MISS" in content:
         return "real"
+    if "Route-consistent" in content or "route_consistency_pct" in content:
+        return "real"
     if "cache_hit_rate" in content.lower():
         return "real"
     # Note: BENCHMARK_STATS_JSON is emitted by both mock and real locustfiles,
@@ -252,14 +269,14 @@ def parse_cache_ttft(content: str) -> Dict[str, Optional[float]]:
     }
 
     # Cache hit pattern
-    cache_hit_pattern = r"GET\s+TTFT \(Cache HIT\)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
+    cache_hit_pattern = r"GET\s+TTFT \((?:Cache HIT|Route-consistent)\)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
     hit_match = re.search(cache_hit_pattern, content)
     if hit_match:
         results["ttft_cache_hit_p50_ms"] = float(hit_match.group(1))
         results["ttft_cache_hit_p99_ms"] = float(hit_match.group(8))
 
     # Cache miss pattern
-    cache_miss_pattern = r"GET\s+TTFT \(Cache MISS\)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
+    cache_miss_pattern = r"GET\s+TTFT \((?:Cache MISS|Route-changed)\)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
     miss_match = re.search(cache_miss_pattern, content)
     if miss_match:
         results["ttft_cache_miss_p50_ms"] = float(miss_match.group(1))
@@ -300,8 +317,14 @@ def parse_json_stats(content: str) -> Dict[str, Any]:
         # Core metrics
         results["cache_hits"] = stats.get("cache_hits")
         results["cache_misses"] = stats.get("cache_misses")
-        results["cache_hit_rate_pct"] = stats.get("cache_hit_rate_pct")
+        # route_consistency_pct is the honest name; cache_hit_rate_pct is what
+        # logs written before 2026-09-30 carry for the same number.
+        results["cache_hit_rate_pct"] = stats.get("route_consistency_pct", stats.get("cache_hit_rate_pct"))
         results["ttft_improvement_pct"] = stats.get("ttft_improvement_pct")
+        for key in ("ttft_p50_ms", "ttft_p90_ms", "ttft_p95_ms", "ttft_p99_ms",
+                    "kv_prefix_cache_hit_rate_pct", "kv_prefix_cache_hits",
+                    "kv_prefix_cache_queries", "kv_prefix_cache_backends_scraped"):
+            results[key] = stats.get(key)
         results["total_prompt_tokens"] = stats.get("total_prompt_tokens")
         results["total_completion_tokens"] = stats.get("total_completion_tokens")
         results["tokens_per_second"] = stats.get("tokens_per_second")
@@ -372,17 +395,18 @@ def parse_cache_stats_text(content: str) -> Dict[str, Any]:
     results = {}
 
     # Cache Hits: 5393
-    hits_match = re.search(r"Cache Hits:\s*(\d+)", content)
+    hits_match = re.search(r"(?:Cache Hits|Route-consistent):\s*(\d+)", content)
     if hits_match:
         results["cache_hits"] = int(hits_match.group(1))
 
     # Cache Misses: 117
-    misses_match = re.search(r"Cache Misses:\s*(\d+)", content)
+    misses_match = re.search(r"(?:Cache Misses|Route changed / first seen):\s*(\d+)", content)
     if misses_match:
         results["cache_misses"] = int(misses_match.group(1))
 
     # Cache Hit Rate: 97.9%
-    rate_match = re.search(r"Cache Hit Rate:\s*([0-9.]+)%", content)
+    # Lookbehind keeps "KV Prefix-Cache Hit Rate:" from matching as the affinity rate.
+    rate_match = re.search(r"(?<![-\w])(?:Cache Hit Rate|Route Consistency):\s*([0-9.]+)%", content)
     if rate_match:
         results["cache_hit_rate_pct"] = float(rate_match.group(1))
 
@@ -397,22 +421,22 @@ def parse_cache_stats_text(content: str) -> Dict[str, Any]:
         results["ttft_improvement_pct"] = float(improvement_match.group(1))
 
     # Cache Hit P50: 459.9ms
-    hit_p50_match = re.search(r"Cache Hit P50:\s*([0-9.]+)ms", content)
+    hit_p50_match = re.search(r"(?:Cache Hit|Route-consistent) P50:\s*([0-9.]+)ms", content)
     if hit_p50_match:
         results["ttft_cache_hit_p50_ms"] = float(hit_p50_match.group(1))
 
     # Cache Hit P99: 607.4ms
-    hit_p99_match = re.search(r"Cache Hit P99:\s*([0-9.]+)ms", content)
+    hit_p99_match = re.search(r"(?:Cache Hit|Route-consistent) P99:\s*([0-9.]+)ms", content)
     if hit_p99_match:
         results["ttft_cache_hit_p99_ms"] = float(hit_p99_match.group(1))
 
     # Cache Miss P50: 406.3ms
-    miss_p50_match = re.search(r"Cache Miss P50:\s*([0-9.]+)ms", content)
+    miss_p50_match = re.search(r"(?:Cache Miss|Route-changed) P50:\s*([0-9.]+)ms", content)
     if miss_p50_match:
         results["ttft_cache_miss_p50_ms"] = float(miss_p50_match.group(1))
 
     # Cache Miss P99: 1040.7ms
-    miss_p99_match = re.search(r"Cache Miss P99:\s*([0-9.]+)ms", content)
+    miss_p99_match = re.search(r"(?:Cache Miss|Route-changed) P99:\s*([0-9.]+)ms", content)
     if miss_p99_match:
         results["ttft_cache_miss_p99_ms"] = float(miss_p99_match.group(1))
 
@@ -485,6 +509,12 @@ def parse_bucket_ttft(content: str) -> Dict[str, Any]:
 
 def parse_aggregated_stats(content: str) -> Dict[str, Any]:
     """Parse Locust aggregated statistics.
+
+    The "Aggregated" row counts HTTP requests only: the locustfiles log their
+    derived rows (TTFT, per-bucket TTFT, Tokens/Second) straight to those rows
+    via record_derived_sample, never through events.request. Logs written
+    before 2026-09-30 have a row inflated by those samples (~6x real workload,
+    2x mock).
 
     Example formats:
       Standard:   Aggregated    1263  282(22.33%) |     38       0      72     53 |    3.09        0.69
@@ -733,6 +763,17 @@ def _gini_coefficient(values: List[float]) -> Optional[float]:
     return (2.0 * cum) / (n * total) - (n + 1.0) / n
 
 
+def _start_snapshot_for(end_file: Path) -> Dict[str, Any]:
+    """Parsed start-of-run dump matching an end dump's node index, or {} if none."""
+    m = re.search(r"prometheus_metrics_node(\d+)\.txt$", end_file.name)
+    if not m:
+        return {}
+    start_file = end_file.with_name(f"prometheus_metrics_start_node{m.group(1)}.txt")
+    if not start_file.exists():
+        return {}
+    return parse_prometheus_dump(str(start_file)) or {}
+
+
 def parse_prometheus_report(report_dir: str) -> Dict[str, Any]:
     """Aggregate /metrics across ALL ranvier nodes in a report dir.
 
@@ -741,6 +782,13 @@ def parse_prometheus_report(report_dir: str) -> Dict[str, Any]:
     for older or one-node runs. Scalar counters are summed across nodes, per-backend
     dicts merged per backend_id, `residency_cache_size` taken as the max, and the
     number of nodes actually scraped is recorded so a partial capture is visible.
+
+    When bench.sh also left start-of-run snapshots (`prometheus_metrics_start_node{N}.txt`,
+    taken after warm-up, before the main locust run), counters are DIFFERENCED
+    against them per node, so fallbacks/downgrades/routed counts cover the main
+    run only instead of everything since the arm's Ranvier start. Gauges are
+    taken from the end dump as before. `counters_differenced` records which case
+    applied so a report mixing the two is visible.
     """
     d = Path(report_dir)
     node_files = sorted(d.glob("prometheus_metrics_node*.txt"))
@@ -757,23 +805,31 @@ def parse_prometheus_report(report_dir: str) -> Dict[str, Any]:
     routed: Dict[str, float] = {}
     res_size: Optional[int] = None
     nodes = 0
+    differenced = 0
     for nf in node_files:
         part = parse_prometheus_dump(str(nf))
         if not part:
             continue
         nodes += 1
+        start = _start_snapshot_for(nf)
+        if start:
+            differenced += 1
         for k in sum_keys:
             if k in part:
-                sums[k] = sums.get(k, 0) + int(part[k])
+                delta = int(part[k]) - int(start.get(k, 0))
+                sums[k] = sums.get(k, 0) + max(delta, 0)  # a restart mid-run resets to 0
         if "residency_cache_size" in part:
             v = int(part["residency_cache_size"])
             res_size = v if res_size is None else max(res_size, v)
         for bid, val in (part.get("backend_active_requests") or {}).items():
             active[bid] = active.get(bid, 0.0) + val
+        start_routed = start.get("backend_routed_total") or {}
         for bid, val in (part.get("backend_routed_total") or {}).items():
-            routed[bid] = routed.get(bid, 0.0) + val
+            routed[bid] = routed.get(bid, 0.0) + max(val - start_routed.get(bid, 0.0), 0.0)
 
     merged: Dict[str, Any] = dict(sums)
+    if nodes:
+        merged["counters_differenced"] = (differenced == nodes)
     if res_size is not None:
         merged["residency_cache_size"] = res_size
     if active:
@@ -807,6 +863,8 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
     results.p90_ttft_ms = ttft["p90_ttft_ms"]
     results.p95_ttft_ms = ttft["p95_ttft_ms"]
     results.p99_ttft_ms = ttft["p99_ttft_ms"]
+    if results.p99_ttft_ms is not None:
+        results.ttft_source = "locust_table"
 
     # Parse aggregated stats (common to both types)
     agg = parse_aggregated_stats(content)
@@ -851,6 +909,18 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.total_completion_tokens = json_stats.get("total_completion_tokens")
         results.tokens_per_second = json_stats.get("tokens_per_second")
         results.unique_prefixes = json_stats.get("unique_prefixes")
+        results.kv_prefix_cache_hit_rate_pct = json_stats.get("kv_prefix_cache_hit_rate_pct")
+        results.kv_prefix_cache_hits = json_stats.get("kv_prefix_cache_hits")
+        results.kv_prefix_cache_queries = json_stats.get("kv_prefix_cache_queries")
+        results.kv_prefix_cache_backends_scraped = json_stats.get("kv_prefix_cache_backends_scraped")
+
+        # Exact raw-sample TTFT percentiles beat Locust's approximated table.
+        if json_stats.get("ttft_p99_ms") is not None:
+            results.p50_ttft_ms = json_stats.get("ttft_p50_ms")
+            results.p90_ttft_ms = json_stats.get("ttft_p90_ms")
+            results.p95_ttft_ms = json_stats.get("ttft_p95_ms")
+            results.p99_ttft_ms = json_stats.get("ttft_p99_ms")
+            results.ttft_source = "raw"
 
         # Override cache TTFT from JSON if available
         if json_stats.get("ttft_cache_hit_p50_ms"):
@@ -1082,13 +1152,15 @@ def format_markdown_table(results: BenchmarkResults) -> str:
         ("P90 TTFT (ms)", results.p90_ttft_ms),
         ("P95 TTFT (ms)", results.p95_ttft_ms),
         ("P99 TTFT (ms)", results.p99_ttft_ms),
-        ("Cache Hit Rate (%)", results.cache_hit_rate_pct),
-        ("Cache Hits", results.cache_hits),
-        ("Cache Misses", results.cache_misses),
-        ("TTFT Cache Hit P50 (ms)", results.ttft_cache_hit_p50_ms),
-        ("TTFT Cache Hit P99 (ms)", results.ttft_cache_hit_p99_ms),
-        ("TTFT Cache Miss P50 (ms)", results.ttft_cache_miss_p50_ms),
-        ("TTFT Cache Miss P99 (ms)", results.ttft_cache_miss_p99_ms),
+        ("TTFT Source", results.ttft_source),
+        ("Route Consistency (%)", results.cache_hit_rate_pct),
+        ("Route-consistent Requests", results.cache_hits),
+        ("Route-changed Requests", results.cache_misses),
+        ("KV Prefix-Cache Hit Rate (%)", results.kv_prefix_cache_hit_rate_pct),
+        ("TTFT Route-consistent P50 (ms)", results.ttft_cache_hit_p50_ms),
+        ("TTFT Route-consistent P99 (ms)", results.ttft_cache_hit_p99_ms),
+        ("TTFT Route-changed P50 (ms)", results.ttft_cache_miss_p50_ms),
+        ("TTFT Route-changed P99 (ms)", results.ttft_cache_miss_p99_ms),
         ("TTFT Improvement (%)", results.ttft_improvement_pct),
         ("Tokens/Second", results.tokens_per_second),
         ("Total Requests", results.total_requests),
@@ -1121,25 +1193,32 @@ def print_summary(results: BenchmarkResults):
         print(f"Mode: {results.benchmark_mode}")
 
     if results.benchmark_type == "real" and results.cache_hit_rate_pct is not None:
-        print("\nCache Performance:")
-        print(f"  Cache Hit Rate: {results.cache_hit_rate_pct:.1f}%")
+        print("\nRoute Consistency (client-side same-backend affinity; not a KV-cache hit rate):")
+        print(f"  Route Consistency: {results.cache_hit_rate_pct:.1f}%")
         if results.cache_hits is not None:
-            print(f"  Cache Hits: {results.cache_hits}")
+            print(f"  Route-consistent: {results.cache_hits}")
         if results.cache_misses is not None:
-            print(f"  Cache Misses: {results.cache_misses}")
+            print(f"  Route changed / first seen: {results.cache_misses}")
+        if results.kv_prefix_cache_hit_rate_pct is not None:
+            print(f"  KV Prefix-Cache Hit Rate (vLLM counters): {results.kv_prefix_cache_hit_rate_pct:.1f}%")
+        else:
+            print("  KV Prefix-Cache Hit Rate (vLLM counters): unavailable")
 
     print("\nTTFT Latency:")
+    if results.ttft_source:
+        note = "exact, raw samples" if results.ttft_source == "raw" else "Locust approximated table, ±50 ms above 1 s"
+        print(f"  Source: {results.ttft_source} ({note})")
     if results.p50_ttft_ms is not None:
         print(f"  P50: {results.p50_ttft_ms:.1f}ms")
     if results.p99_ttft_ms is not None:
         print(f"  P99: {results.p99_ttft_ms:.1f}ms")
 
     if results.ttft_cache_hit_p50_ms is not None:
-        print(f"  Cache Hit P50: {results.ttft_cache_hit_p50_ms:.1f}ms")
+        print(f"  Route-consistent P50: {results.ttft_cache_hit_p50_ms:.1f}ms")
     if results.ttft_cache_miss_p50_ms is not None:
-        print(f"  Cache Miss P50: {results.ttft_cache_miss_p50_ms:.1f}ms")
+        print(f"  Route-changed P50: {results.ttft_cache_miss_p50_ms:.1f}ms")
     if results.ttft_improvement_pct is not None:
-        print(f"  Improvement (Hit vs Miss): {results.ttft_improvement_pct:.1f}%")
+        print(f"  Improvement (consistent vs changed): {results.ttft_improvement_pct:.1f}%")
 
     print("\nThroughput:")
     if results.tokens_per_second is not None:
@@ -1275,14 +1354,33 @@ def _max_incomplete_rate(*runs: BenchmarkResults) -> float:
     return max((r.incomplete_rate_pct or 0.0) for r in runs)
 
 
+_ARM_LABELS = {
+    # bench.sh's "round_robin" arm is the server's uniform random mode under an
+    # alias; the benchmark has always labelled it Round-Robin and keeps doing so.
+    "round_robin": "Round-Robin",
+    "random": "Round-Robin",
+    "hash": "Consistent-Hash",
+    "least_loaded": "Least-Loaded",
+    "prefix": "Prefix-Aware",
+}
+
+
+def _arm_label(run: BenchmarkResults, default: str) -> str:
+    """Human label for an arm from the Locust 'Benchmark Mode:' line, else default."""
+    mode = (run.benchmark_mode or "").strip().lower()
+    return _ARM_LABELS.get(mode, default)
+
+
 def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     """Compare two benchmark results and return formatted comparison."""
+    base_label = _arm_label(baseline, "Round-Robin")
+    new_label = _arm_label(new, "Prefix-Aware")
     lines = []
     lines.append("=" * 80)
-    lines.append("BENCHMARK COMPARISON: Round-Robin vs Prefix-Aware")
+    lines.append(f"BENCHMARK COMPARISON: {base_label} vs {new_label}")
     lines.append("=" * 80)
-    lines.append(f"Baseline (Round-Robin): {baseline.source_file}")
-    lines.append(f"New (Prefix-Aware):     {new.source_file}")
+    lines.append(f"Baseline ({base_label}): {baseline.source_file}")
+    lines.append(f"New ({new_label}):     {new.source_file}")
     lines.append("")
 
     # VALIDATION + INCOMPLETE-RATE BANNER (top of report).
@@ -1305,17 +1403,23 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
         f"  Incompletes:  baseline {baseline.incomplete_requests} ({inc_b:.1f}%)  "
         f"new {new.incomplete_requests} ({inc_n:.1f}%){inc_warn}"
     )
+    lines.append(f"TTFT source: baseline={baseline.ttft_source or 'unknown'}, "
+                 f"new={new.ttft_source or 'unknown'}"
+                 + ("  *** locust_table is approximated (±50 ms above 1 s) ***"
+                    if "locust_table" in (baseline.ttft_source, new.ttft_source) else ""))
     lines.append("")
 
-    # KEY METRICS - Cache hit rate is the most important comparison
+    # KEY METRICS — route consistency is the affinity signal; the KV row is the
+    # backends' own cache counters and the only real cache-hit measurement.
     lines.append("-" * 80)
-    lines.append("KEY METRICS (Cache Efficiency)")
+    lines.append("KEY METRICS (Routing Affinity / KV Cache)")
     lines.append("-" * 80)
 
     cache_metrics = [
-        ("cache_hit_rate_pct", "Cache Hit Rate (%)", False),
-        ("cache_hits", "Cache Hits", False),
-        ("cache_misses", "Cache Misses", True),
+        ("cache_hit_rate_pct", "Route Consistency (%)", False),
+        ("kv_prefix_cache_hit_rate_pct", "KV Prefix-Cache Hit (%)", False),
+        ("cache_hits", "Route-consistent Reqs", False),
+        ("cache_misses", "Route-changed Reqs", True),
         ("unique_prefixes", "Unique Prefixes", None),
     ]
 
@@ -1506,10 +1610,10 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     ttft_metrics = [
         ("p50_ttft_ms", "P50 TTFT (ms)", True),
         ("p99_ttft_ms", "P99 TTFT (ms)", True),
-        ("ttft_cache_hit_p50_ms", "Cache Hit P50 (ms)", True),
-        ("ttft_cache_hit_p99_ms", "Cache Hit P99 (ms)", True),
-        ("ttft_cache_miss_p50_ms", "Cache Miss P50 (ms)", True),
-        ("ttft_cache_miss_p99_ms", "Cache Miss P99 (ms)", True),
+        ("ttft_cache_hit_p50_ms", "Route-consistent P50 (ms)", True),
+        ("ttft_cache_hit_p99_ms", "Route-consistent P99 (ms)", True),
+        ("ttft_cache_miss_p50_ms", "Route-changed P50 (ms)", True),
+        ("ttft_cache_miss_p99_ms", "Route-changed P99 (ms)", True),
     ]
 
     lines.append(f"{'Metric':<25} {'Baseline':>12} {'New':>12} {'Change':>30}")
@@ -1700,7 +1804,10 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     lines.append("SUMMARY:")
     if new.cache_hit_rate_pct and baseline.cache_hit_rate_pct:
         improvement = new.cache_hit_rate_pct - baseline.cache_hit_rate_pct
-        lines.append(f"  Cache Hit Rate: {baseline.cache_hit_rate_pct:.1f}% -> {new.cache_hit_rate_pct:.1f}% (+{improvement:.1f}%)")
+        lines.append(f"  Route Consistency: {baseline.cache_hit_rate_pct:.1f}% -> {new.cache_hit_rate_pct:.1f}% ({improvement:+.1f} pp)")
+    if new.kv_prefix_cache_hit_rate_pct is not None and baseline.kv_prefix_cache_hit_rate_pct is not None:
+        kv_delta = new.kv_prefix_cache_hit_rate_pct - baseline.kv_prefix_cache_hit_rate_pct
+        lines.append(f"  KV Prefix-Cache Hit: {baseline.kv_prefix_cache_hit_rate_pct:.1f}% -> {new.kv_prefix_cache_hit_rate_pct:.1f}% ({kv_delta:+.1f} pp)")
     for bucket_key, bucket_label in (("large", "Large"), ("xlarge", "XLarge")):
         improv = getattr(new, f"ttft_{bucket_key}_improvement_pct", None)
         miss_p50 = getattr(new, f"ttft_{bucket_key}_miss_p50_ms", None)
@@ -1756,7 +1863,8 @@ _LOWER_IS_BETTER = {
 # so the table stays readable and stable across schema growth.
 _AGG_METRICS = [
     "p50_ttft_ms", "p90_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
-    "cache_hit_rate_pct", "ttft_cache_miss_p99_ms", "tokens_per_second",
+    "cache_hit_rate_pct", "kv_prefix_cache_hit_rate_pct",
+    "ttft_cache_miss_p99_ms", "tokens_per_second",
     "requests_per_sec", "incomplete_rate_pct", "failure_rate_pct",
     "total_requests",
 ]
@@ -1832,6 +1940,7 @@ def aggregate_runs(runs: List[BenchmarkResults],
     return {
         "mode": "single-arm",
         "n_repeats": len(runs),
+        "ttft_sources": sorted({(r.ttft_source or "unknown") for r in runs}),
         "metrics": per_metric,
         "p99_outliers": outliers,
     }
@@ -1839,14 +1948,28 @@ def aggregate_runs(runs: List[BenchmarkResults],
 
 def aggregate_compare(baseline_runs: List[BenchmarkResults],
                       treatment_runs: List[BenchmarkResults],
-                      discriminating_metric: str = "p99_ttft_ms") -> Dict[str, Any]:
+                      discriminating_metric: str = "p99_ttft_ms",
+                      arm_orders: Optional[List[Optional[str]]] = None) -> Dict[str, Any]:
     """Paired A/B aggregation: baseline[i] vs treatment[i] over N repeats.
+
+    ``arm_orders[i]`` ("rr-first" / "prefix-first" / None) is the physical arm
+    order of pair i, read from its manifest by cmd_aggregate. The per-order
+    medians it enables matter because the arm that runs second inherits vLLM's
+    warm KV cache unless bench.sh reset it (2026-10-06: 8B prefix-first repeats
+    were ~9 points weaker than rr-first ones); with three alternating repeats the
+    overall median is always an rr-first value, so the split is reported beside it.
 
     Computes the per-pair percent change of the discriminating metric, then the
     median and IQR of that change across repeats, and a verdict:
-      - < 2 pairs                -> INSUFFICIENT DATA
-      - IQR straddles zero       -> NO RELIABLE EFFECT (report, do not cherry-pick)
-      - otherwise                -> improvement / regression by the median change
+      - < 2 pairs                    -> INSUFFICIENT DATA
+      - IQR straddles zero           -> NO RELIABLE EFFECT (report, do not cherry-pick)
+      - every repeat same direction  -> CONSISTENT improvement / regression
+                                        (reliable only with >= 3 repeats)
+      - otherwise                    -> MIXED: not reliable, even if the IQR clears zero
+    "reliable" means every repeat moved the same way, nothing more: with n=3 the
+    inclusive-method Q3 is the mean of the two worst repeats, so an IQR that
+    clears zero can still hide one repeat that went the other way. No
+    significance test is performed; this tool has no claim to one at n=3.
     Also flags per-pair affinity-thrash hot-spots (treatment P99 >> baseline P99
     at high hit rate).
     """
@@ -1856,14 +1979,18 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
     deltas: List[float] = []
     per_pair = []
     hotspots = []
+    by_order_vals: Dict[str, List[float]] = {}
     for i, (base, treat) in enumerate(pairs):
         b = getattr(base, discriminating_metric, None)
         t = getattr(treat, discriminating_metric, None)
         d = _pct_change(b, t)
-        per_pair.append({"repeat": i + 1, "baseline": b, "treatment": t, "pct_change": d})
+        order = arm_orders[i] if arm_orders and i < len(arm_orders) else None
+        per_pair.append({"repeat": i + 1, "baseline": b, "treatment": t, "pct_change": d,
+                         "arm_order": order})
         if d is not None:
             deltas.append(d)
-
+            if order:
+                by_order_vals.setdefault(order, []).append(d)
         # Hot-spot: prefix (treatment) P99 much worse than RR (baseline) at high hit rate.
         bp99 = getattr(base, "p99_ttft_ms", None)
         tp99 = getattr(treat, "p99_ttft_ms", None)
@@ -1873,26 +2000,49 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
             hotspots.append({"repeat": i + 1, "baseline_p99_ms": bp99,
                              "treatment_p99_ms": tp99, "cache_hit_rate_pct": thit})
 
+    by_order = {
+        order: {"n": len(vals), "median": statistics.median(vals), "values": vals}
+        for order, vals in by_order_vals.items()
+    }
+
     lower_better = discriminating_metric in _LOWER_IS_BETTER
     delta_summ = _summarize_metric(deltas)
 
+    def _better(d: float) -> bool:
+        return (d < 0) if lower_better else (d > 0)
+
+    agreeing = 0
     if delta_summ is None or delta_summ["n"] < 2:
         verdict = "INSUFFICIENT DATA (need >= 2 valid repeats)"
         reliable = False
     else:
-        q1, q3 = delta_summ["q1"], delta_summ["q3"]
+        q1, q3, med = delta_summ["q1"], delta_summ["q3"], delta_summ["median"]
+        n_valid = delta_summ["n"]
+        improved = _better(med)
+        agreeing = sum(1 for d in deltas if d != 0 and _better(d) == improved)
+        direction = "IMPROVEMENT" if improved else "REGRESSION"
+        iqr_txt = f"IQR {q1:+.1f}…{q3:+.1f}"
         if q1 <= 0 <= q3:
-            verdict = "NO RELIABLE EFFECT (IQR spans zero)"
+            verdict = f"NO RELIABLE EFFECT ({iqr_txt} spans zero) on {discriminating_metric}"
+            reliable = False
+        elif agreeing == n_valid and n_valid >= 3:
+            verdict = (f"CONSISTENT {direction}: median {med:+.1f}% on {discriminating_metric} "
+                       f"({agreeing}/{n_valid} repeats agree; {iqr_txt})")
+            reliable = True
+        elif agreeing == n_valid:
+            verdict = (f"CONSISTENT {direction}: median {med:+.1f}% on {discriminating_metric} "
+                       f"({agreeing}/{n_valid} repeats agree; {iqr_txt}) — "
+                       f"too few repeats to call reliable (need >= 3)")
             reliable = False
         else:
-            med = delta_summ["median"]
-            improved = (med < 0) if lower_better else (med > 0)
-            verdict = (f"{'IMPROVEMENT' if improved else 'REGRESSION'}: "
-                       f"median {med:+.1f}% on {discriminating_metric}")
-            reliable = True
+            verdict = (f"MIXED: median {med:+.1f}% on {discriminating_metric} "
+                       f"({agreeing}/{n_valid} repeats agree; {iqr_txt}) — not reliable: "
+                       f"{n_valid - agreeing} repeat(s) moved the other way")
+            reliable = False
 
     return {
         "mode": "paired-ab",
+        "ttft_sources": sorted({(r.ttft_source or "unknown") for r in baseline_runs + treatment_runs}),
         "discriminating_metric": discriminating_metric,
         "lower_is_better": lower_better,
         "n_pairs": n,
@@ -1901,6 +2051,8 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
         "hotspots": hotspots,
         "verdict": verdict,
         "reliable": reliable,
+        "agreeing_pairs": agreeing,
+        "by_arm_order": by_order,
         "baseline": aggregate_runs(baseline_runs)["metrics"],
         "treatment": aggregate_runs(treatment_runs)["metrics"],
     }
@@ -1909,8 +2061,20 @@ def aggregate_compare(baseline_runs: List[BenchmarkResults],
 def _fmt_stat(s: Optional[Dict[str, Any]]) -> str:
     if not s:
         return "n/a"
-    iqr = "" if s["iqr"] is None else f", IQR {s['iqr']:.1f}"
-    return f"median {s['median']:.1f} [{s['min']:.1f}..{s['max']:.1f}]{iqr} (n={s['n']})"
+    # Print the Q1…Q3 RANGE, not just its width: the results doc quotes ranges
+    # ("IQR −15.6…−8.5") and nothing used to print one.
+    iqr = ""
+    if s["iqr"] is not None:
+        iqr = f", IQR {s['q1']:.1f}…{s['q3']:.1f} (width {s['iqr']:.1f})"
+    return f"median {s['median']:.1f} [min {s['min']:.1f} .. max {s['max']:.1f}]{iqr} (n={s['n']})"
+
+
+def _ttft_sources_line(agg: Dict[str, Any]) -> str:
+    sources = agg.get("ttft_sources") or ["unknown"]
+    line = f"TTFT source(s): {', '.join(sources)}"
+    if any(src != "raw" for src in sources):
+        line += "  *** not all runs carry raw-sample percentiles; Locust's table is approximated (±50 ms above 1 s) ***"
+    return line
 
 
 def format_aggregate(agg: Dict[str, Any]) -> str:
@@ -1922,6 +2086,9 @@ def format_aggregate(agg: Dict[str, Any]) -> str:
                      f"discriminating metric: {agg['discriminating_metric']}")
         lines.append("=" * 72)
         lines.append(f"VERDICT: {agg['verdict']}")
+        lines.append("  ('reliable' = every repeat moved the same direction, n >= 3; "
+                     "no significance test is performed)")
+        lines.append(_ttft_sources_line(agg))
         ds = agg["delta_pct"]
         if ds:
             lines.append(f"  {agg['discriminating_metric']} %change: {_fmt_stat(ds)}")
@@ -1929,19 +2096,31 @@ def format_aggregate(agg: Dict[str, Any]) -> str:
         lines.append("Per-repeat %change (treatment vs baseline):")
         for p in agg["per_pair"]:
             d = "n/a" if p["pct_change"] is None else f"{p['pct_change']:+.1f}%"
+            order = f", {p['arm_order']}" if p.get("arm_order") else ""
             lines.append(f"  repeat {p['repeat']}: {d}  "
-                         f"(baseline={p['baseline']}, treatment={p['treatment']})")
+                         f"(baseline={p['baseline']}, treatment={p['treatment']}{order})")
+        by_order = agg.get("by_arm_order") or {}
+        if by_order:
+            parts = [f"{o} {s['median']:+.1f}% (n={s['n']})"
+                     for o, s in sorted(by_order.items())]
+            lines.append("Per arm-order median: " + " · ".join(parts))
+            if len(by_order) > 1:
+                meds = [s["median"] for s in by_order.values()]
+                spread = max(meds) - min(meds)
+                lines.append(f"  (order spread {spread:.1f} points; the arm that runs second "
+                             f"inherits vLLM's warm KV cache unless the compare header says it was reset)")
         if agg["hotspots"]:
             lines.append("")
             lines.append(f"⚠ HOT-SPOT (affinity-thrash) flagged in {len(agg['hotspots'])} repeat(s):")
             for h in agg["hotspots"]:
                 lines.append(f"  repeat {h['repeat']}: treatment P99 {h['treatment_p99_ms']:.0f}ms "
                              f"≫ baseline {h['baseline_p99_ms']:.0f}ms at "
-                             f"{h['cache_hit_rate_pct']:.0f}% hit rate")
+                             f"{h['cache_hit_rate_pct']:.0f}% route consistency")
     else:
         lines.append("=" * 72)
         lines.append(f"AGGREGATE over {agg['n_repeats']} repeat(s)")
         lines.append("=" * 72)
+        lines.append(_ttft_sources_line(agg))
         for m, s in agg["metrics"].items():
             lines.append(f"  {m:24s} {_fmt_stat(s)}")
         if agg["p99_outliers"]:
@@ -1954,10 +2133,28 @@ def format_aggregate(agg: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _arm_order_for(path: str) -> Optional[str]:
+    """The --order a report dir's manifest records (bench.sh defaults to rr-first
+    under --compare); None when there is no manifest or the run was not an A/B."""
+    m = load_manifest(path)
+    cmd = (m or {}).get("command") or ""
+    if not cmd or "--compare" not in cmd:
+        return None
+    hit = re.search(r"--order\s+(rr-first|prefix-first)", cmd)
+    return hit.group(1) if hit else "rr-first"
+
+
 def _resolve_run_input(path: str) -> BenchmarkResults:
     """Accept a report DIR (uses <dir>/benchmark.log), a .csv, or a log file."""
     p = Path(path)
     if p.is_dir():
+        # bench.sh writes <dir>/FAILED when an arm crashed (no stats block) or the
+        # server ran a different routing mode than the arm's label. Such a dir is
+        # not a measurement and must never enter a comparison or an aggregate.
+        marker = p / "FAILED"
+        if marker.exists():
+            reason = marker.read_text().strip() or "no reason recorded"
+            raise SystemExit(f"refusing {path}: arm marked FAILED by bench.sh ({reason})")
         log = p / "benchmark.log"
         if not log.exists():
             raise FileNotFoundError(f"no benchmark.log in report dir: {path}")
@@ -2146,7 +2343,8 @@ def cmd_aggregate(args):
                       f"inputs count ({len(treatment)}) for paired A/B aggregation",
                       file=sys.stderr)
                 return 1
-            agg = aggregate_compare(baseline, treatment, args.metric)
+            agg = aggregate_compare(baseline, treatment, args.metric,
+                                    arm_orders=[_arm_order_for(p) for p in args.inputs])
         else:
             agg = aggregate_runs(treatment)
 

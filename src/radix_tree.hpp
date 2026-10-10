@@ -206,6 +206,10 @@ struct Node {
     absl::InlinedVector<uint8_t, 32> prefix;
     std::optional<BackendId> leaf_value;
     RouteOrigin origin = RouteOrigin::LOCAL;
+    // Key length in TokenIds of the route this leaf holds (0 for inner nodes).
+    // Feeds the per-backend token tally so a 3000-token prefix outweighs a
+    // one-off short prompt in cache-miss placement.
+    uint32_t key_tokens = 0;
     std::chrono::steady_clock::time_point last_accessed;
 
     // Intrusive LRU list pointers (only meaningful for leaf nodes).
@@ -368,7 +372,7 @@ public:
         auto [new_root, is_new_route] = insert_recursive(
             std::move(root_),
             std::span<const uint8_t>(key_bytes.data(), key_bytes.size()),
-            backend, origin);
+            backend, origin, static_cast<uint32_t>(aligned_len));
         root_ = std::move(new_root);
         if (is_new_route) {
             route_count_++;
@@ -380,8 +384,28 @@ public:
     // update applies the conflict-resolution trust order instead of
     // overwriting unconditionally. Returns what happened (see
     // TrustInsertResult); REFUSED/TOUCHED_SAME leave the route untouched.
+    //
+    // converge_local_conflicts: resolve a REMOTE announcement that names a
+    // different backend than this node's own LOCAL route (or an earlier
+    // REMOTE one) by a total order, lowest backend id wins, instead of
+    // refusing it. Needed by least-loaded cache-miss placement: placement is
+    // a local decision, so nodes that see a new prefix before its route
+    // arrives place it independently, each learns a LOCAL route, and under
+    // the plain trust ladder every node keeps its own forever (2026-10-03
+    // placement run: ~800 refusals per 10-minute arm on shard 0, the prefix
+    // warm on two or three backends, route consistency 38% vs 48%). Both
+    // sides apply the same rule, so the cluster converges on one backend and
+    // nothing flaps. PUSH routes are never touched. The same order applies to
+    // a LOCAL insert (the local batch flush under least-loaded placement): a
+    // LOCAL learn that meets a lower-id LOCAL or REMOTE route is REFUSED
+    // instead of overwriting it, otherwise the 20 ms between placement and
+    // flush re-splits every prefix a peer placed first (placement v3,
+    // 2026-10-03: converged = 0 while ~220 announcements per node were
+    // refused). Without the flag LOCAL keeps its plain ladder: it overwrites
+    // REMOTE and same-origin routes, latest wins.
     TrustInsertResult insert_if_trusted(std::span<const TokenId> tokens, BackendId backend,
-                                        RouteOrigin origin) {
+                                        RouteOrigin origin,
+                                        bool converge_local_conflicts = false) {
         size_t aligned_len = (tokens.size() / block_alignment_) * block_alignment_;
         if (aligned_len == 0) return TrustInsertResult::REFUSED;
 
@@ -393,7 +417,8 @@ public:
         auto [new_root, is_new_route] = insert_recursive(
             std::move(root_),
             std::span<const uint8_t>(key_bytes.data(), key_bytes.size()),
-            backend, origin, &result);
+            backend, origin, static_cast<uint32_t>(aligned_len), &result,
+            converge_local_conflicts);
         root_ = std::move(new_root);
         if (is_new_route) {
             route_count_++;
@@ -450,6 +475,15 @@ public:
     // backend. Backend a scaler would drain coldest = the one with the fewest here.
     const std::unordered_map<BackendId, size_t>& routes_by_backend() const {
         return routes_by_backend_;
+    }
+
+    // Live route key length (TokenIds) summed per backend, maintained in
+    // lockstep with routes_by_backend(). The weight cache-miss placement
+    // balances on: a backend holding one 3000-token prefix is "fuller" than
+    // one holding eight 40-token one-off prompts, which route counts alone
+    // would rank the other way (fitted-suite placement run, 2026-10-03).
+    const std::unordered_map<BackendId, uint64_t>& route_tokens_by_backend() const {
+        return route_tokens_by_backend_;
     }
 
     // Calculate tree statistics for monitoring path compression effectiveness
@@ -799,6 +833,8 @@ private:
     // the ASan/UBSan fuzz build against a non-sanitizer system libabsl. Mirrors
     // metrics_service's std::unordered_map<BackendId, ...> per-backend map.
     std::unordered_map<BackendId, size_t> routes_by_backend_;
+    // Same keys as routes_by_backend_, value = sum of leaf key_tokens.
+    std::unordered_map<BackendId, uint64_t> route_tokens_by_backend_;
 
     // Intrusive LRU doubly-linked lists of leaf nodes, one per RouteOrigin
     // (invariant T8: a leaf is linked in exactly the list matching its
@@ -902,7 +938,7 @@ private:
     // Shared eviction tail: unlink, tombstone, and account for one leaf.
     void evict_leaf(Node* victim) {
         lru_remove(victim);
-        note_route_removed(victim->leaf_value);  // BACKLOG §21 P1
+        note_route_removed(victim->leaf_value, victim->key_tokens);  // BACKLOG §21 P1
         victim->leaf_value = std::nullopt;
         if (route_count_ > 0) route_count_--;
     }
@@ -1136,6 +1172,7 @@ private:
         dest->prefix = std::move(src->prefix);
         dest->leaf_value = src->leaf_value;
         dest->origin = src->origin;
+        dest->key_tokens = src->key_tokens;
         dest->last_accessed = src->last_accessed;
 
         // Splice dest into src's position in src's origin's LRU list
@@ -1286,6 +1323,7 @@ private:
             // Transfer leaf data to child
             new_child->leaf_value = node->leaf_value;
             new_child->origin = node->origin;
+            new_child->key_tokens = node->key_tokens;
             new_child->last_accessed = node->last_accessed;
 
             // Transfer LRU position to child (same origin — copied above —
@@ -1335,6 +1373,7 @@ private:
         // Transfer leaf data to child (including LRU position)
         new_child->leaf_value = node->leaf_value;
         new_child->origin = node->origin;
+        new_child->key_tokens = node->key_tokens;
         new_child->last_accessed = node->last_accessed;
         if (node->leaf_value.has_value()) {
             // Replace node's position in its origin's LRU list with
@@ -1643,7 +1682,9 @@ private:
                              std::span<const uint8_t> key_bytes,
                              BackendId backend,
                              RouteOrigin origin,
-                             TrustInsertResult* trust_result = nullptr) {
+                             uint32_t key_tokens,
+                             TrustInsertResult* trust_result = nullptr,
+                             bool converge = false) {
         // Calculate prefix match length
         size_t match_len = 0;
         while (match_len < node->prefix.size() && match_len < key_bytes.size()) {
@@ -1665,24 +1706,47 @@ private:
             // route (numerically lower origin) is never overwritten. Same
             // backend gets an LRU refresh — the route is being re-confirmed,
             // its provenance stays the more-trusted one.
-            if (trust_result != nullptr && !is_new && origin > node->origin) {
-                if (node->leaf_value == backend) {
-                    node->last_accessed = std::chrono::steady_clock::now();
-                    lru_touch(node.get());
-                    *trust_result = TrustInsertResult::TOUCHED_SAME;
-                } else {
-                    *trust_result = TrustInsertResult::REFUSED;
+            if (trust_result != nullptr && !is_new) {
+                const bool different_backend = node->leaf_value != backend;
+                // Convergence (see insert_if_trusted): a REMOTE announcement
+                // or a LOCAL learn meeting a LOCAL or REMOTE route to a
+                // different backend is settled by lowest backend id. PUSH is
+                // outside the rule on both sides. LOCAL is included because the
+                // local batch flush lands a placed miss ~20 ms after the
+                // decision, by which time a peer's lower-id route may already
+                // hold the key: latest-wins there re-splits the prefix and the
+                // lower side never re-announces (placement v3, 2026-10-03:
+                // converged = 0, refusals ~220 per node).
+                const bool converge_case =
+                    converge && origin != RouteOrigin::PUSH && different_backend &&
+                    node->origin != RouteOrigin::PUSH;
+                if (converge_case) {
+                    if (backend < *node->leaf_value) {
+                        // fall through: overwrite, reported as OVERWROTE
+                    } else {
+                        *trust_result = TrustInsertResult::REFUSED;
+                        return {std::move(node), false};
+                    }
+                } else if (origin > node->origin) {
+                    if (!different_backend) {
+                        node->last_accessed = std::chrono::steady_clock::now();
+                        lru_touch(node.get());
+                        *trust_result = TrustInsertResult::TOUCHED_SAME;
+                    } else {
+                        *trust_result = TrustInsertResult::REFUSED;
+                    }
+                    return {std::move(node), false};
                 }
-                return {std::move(node), false};
             }
             // BACKLOG §21 P1 tally, before leaf_value is reassigned: a new leaf,
             // or an overwrite that moves this route to a different backend.
             if (is_new) {
-                note_route_added(backend);
+                note_route_added(backend, key_tokens);
             } else if (node->leaf_value != backend) {
-                note_route_removed(node->leaf_value);
-                note_route_added(backend);
+                note_route_removed(node->leaf_value, node->key_tokens);
+                note_route_added(backend, key_tokens);
             }
+            node->key_tokens = key_tokens;
             // Unlink BEFORE origin is reassigned: lru_remove derives the list
             // from node->origin, and an overwrite may change the origin.
             if (!is_new) {
@@ -1703,7 +1767,7 @@ private:
         uint8_t next_key = remaining[0];
         if (find_child(node.get(), next_key)) {
             auto child_ptr = extract_child(node.get(), next_key);
-            auto [new_child, is_new] = insert_recursive(std::move(child_ptr), remaining.subspan(1), backend, origin, trust_result);
+            auto [new_child, is_new] = insert_recursive(std::move(child_ptr), remaining.subspan(1), backend, origin, key_tokens, trust_result, converge);
             set_child(node.get(), next_key, std::move(new_child));
             return {std::move(node), is_new};
         } else {
@@ -1716,7 +1780,8 @@ private:
             }
             new_child->leaf_value = backend;
             new_child->origin = origin;
-            note_route_added(backend);  // BACKLOG §21 P1: new leaf
+            new_child->key_tokens = key_tokens;
+            note_route_added(backend, key_tokens);  // BACKLOG §21 P1: new leaf
             lru_push_front(new_child.get());
             // Rule #4: bound prefix length to prevent pathological memory usage
             if (new_child->prefix.size() > MAX_PREFIX_LENGTH) {
@@ -1843,22 +1908,29 @@ private:
 
     // Per-backend live-route tally maintenance (BACKLOG §21 P1). Called at every
     // leaf add/remove so routes_by_backend_ tracks route_count_ exactly.
-    void note_route_added(BackendId backend) {
+    void note_route_added(BackendId backend, uint32_t key_tokens) {
         auto it = routes_by_backend_.find(backend);
         if (it != routes_by_backend_.end()) {
             ++it->second;
+            route_tokens_by_backend_[backend] += key_tokens;
         } else if (routes_by_backend_.size() < kMaxTrackedBackends) {
             routes_by_backend_.emplace(backend, 1);
+            route_tokens_by_backend_[backend] = key_tokens;
         }
         // At cap (unreachable for registry-bound ids): leave untracked. Balance
         // holds because the matching note_route_removed() also finds no entry.
     }
-    void note_route_removed(const std::optional<BackendId>& backend) {
+    void note_route_removed(const std::optional<BackendId>& backend, uint32_t key_tokens) {
         if (!backend.has_value()) return;
         auto it = routes_by_backend_.find(*backend);
         if (it == routes_by_backend_.end()) return;
+        auto tok = route_tokens_by_backend_.find(*backend);
+        if (tok != route_tokens_by_backend_.end()) {
+            tok->second = tok->second > key_tokens ? tok->second - key_tokens : 0;
+        }
         if (--it->second == 0) {
             routes_by_backend_.erase(it);  // self-cleaning -> bounded by live backends
+            route_tokens_by_backend_.erase(*backend);
         }
     }
 
@@ -1867,7 +1939,7 @@ private:
 
         if (node->leaf_value.has_value() && node->last_accessed < cutoff) {
             lru_remove(node);
-            note_route_removed(node->leaf_value);  // BACKLOG §21 P1
+            note_route_removed(node->leaf_value, node->key_tokens);  // BACKLOG §21 P1
             node->leaf_value = std::nullopt;
             removed++;
         }
@@ -1886,7 +1958,7 @@ private:
             auto cutoff = cutoff_fn(node->leaf_value.value());
             if (node->last_accessed < cutoff) {
                 lru_remove(node);
-                note_route_removed(node->leaf_value);  // BACKLOG §21 P1
+                note_route_removed(node->leaf_value, node->key_tokens);  // BACKLOG §21 P1
                 node->leaf_value = std::nullopt;
                 removed++;
             }
@@ -1904,7 +1976,7 @@ private:
             node->leaf_value.value() == backend &&
             node->origin == origin) {
             lru_remove(node);
-            note_route_removed(node->leaf_value);  // BACKLOG §21 P1
+            note_route_removed(node->leaf_value, node->key_tokens);  // BACKLOG §21 P1
             node->leaf_value = std::nullopt;
             removed++;
         }

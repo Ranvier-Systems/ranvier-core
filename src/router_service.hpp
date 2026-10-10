@@ -84,7 +84,7 @@ class TelemetryService;  // BACKLOG §21 P2: fed via ShardLocalState::telemetry_
 
 struct RouteResult {
     std::optional<BackendId> backend_id;  // Selected backend (nullopt if routing failed)
-    std::string routing_mode;             // "prefix", "hash", or "random"
+    std::string routing_mode;             // "prefix", "hash", "random", or "least_loaded"
     bool cache_hit = false;               // True if route was found via ART lookup (not hash fallback)
     std::string error_message;            // Non-empty if backend_id is nullopt
 
@@ -465,6 +465,16 @@ public:
 
     // Get a backend using weighted random selection within the highest available priority group
     std::optional<BackendId> get_random_backend();
+
+    // Get the least-loaded live backend (LEAST_LOADED routing mode): same
+    // candidate set as get_random_backend() (live, pool-role valve, highest
+    // priority group, weight > 0), minimum capacity-adjusted composite load,
+    // ties broken uniformly at random. No ART lookup, no route learning.
+    // estimated_cost scales the cache-headroom penalty exactly as the divert
+    // path does. Lock-free, shard-local (Hard Rule #1).
+    // (Distinct from the free get_least_loaded_backend(candidates) helper used by
+    // the bounded-load divert, which scans a caller-supplied candidate list.)
+    std::optional<BackendId> select_least_loaded_backend(double estimated_cost = 0.0);
 
     // Get a backend using prefix-affinity routing (ART + consistent hash fallback)
     // Routes requests with the same prefix to the same backend for KV cache reuse
@@ -915,9 +925,34 @@ public:
     // Shard-local headroom-divert counter observer (invariant R9).
     static uint64_t headroom_redirects_for_testing();
 
+    // Shard-local load-divert counter observer: every load-driven departure
+    // from the anchor (bounded-load, P2C, scorer load term).
+    static uint64_t load_aware_fallbacks_for_testing();
+
+    // True when cache misses are placed least-loaded (routing.miss_placement =
+    // least_loaded). The HttpController then learns a placed miss at DISPATCH
+    // rather than at first byte: hash placement needs no coordination (every
+    // shard computes the same bucket), but least-loaded placement is a local
+    // decision, and until the route propagates every shard and node that sees
+    // the same new prefix places it independently. Learning at first byte left
+    // that window at ~1 TTFT (~1 s at 13B); the first placement run (2026-10-03)
+    // split prefixes across backends and route consistency fell from ~48% to
+    // 37-42%. Learning at dispatch shrinks the window to one route-batch flush
+    // (route_batch_flush_interval, 20 ms) plus gossip.
+    static bool eager_learn_on_miss();
+
     // Shard-local trust-ladder refusal counter observer (invariant T7): gossip
     // REMOTE announcements refused by a higher-trust LOCAL/PUSH route.
     static uint64_t remote_routes_trust_refused_for_testing();
+
+    // Shard-local convergence counter observer: gossip REMOTE routes that moved
+    // a conflicting route to the lower backend id (miss_placement=least_loaded).
+    static uint64_t remote_routes_converged_for_testing();
+
+    // Shard-local counter observer: this node's own learns dropped at batch
+    // flush because a lower backend id already held the prefix
+    // (miss_placement=least_loaded; see apply_local_batch_to_tree).
+    static uint64_t local_routes_converged_for_testing();
 
     // Resolve a key against the shard-local RadixTree (backend the tree would
     // route it to, or nullopt). Confirms which origin's route won a conflict.

@@ -6,12 +6,135 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-> **Note (2026-09-05).** The entries below have merged to `main` but have not been
-> exercised on GPU hardware since the 2026-07-13 re-baseline (BACKLOG §25). They will
-> be cut as 2.2.0 once each has a recorded run or is explicitly marked
-> hardware-independent. Release notes further down quote a 33–44% TTFT improvement
-> measured on a 5-prefix workload that the 2026-07-05 methodology review deprecated;
-> the citable figures are in README → Benchmark Results.
+### Added
+- `routing_mode: least_loaded` (`RANVIER_ROUTING_MODE=least_loaded`): route every request
+  to the live backend with the lowest capacity-adjusted composite load (under the shipping
+  defaults, the node's in-flight count summed across shards), ties broken uniformly at
+  random; no ART lookup, no route learning, tokenization skipped as in `random`. Exists as
+  the benchmark's strongest no-affinity baseline: `bench.sh --compare --baseline-mode
+  least_loaded` runs it as the baseline arm, `bench-runner.sh --suite baseline` runs the
+  fitted 13B 20u and 30u rows against it, and the compare header names the arm. Not a
+  recommended production mode.
+
+### Added
+- `bench-runner.sh --suite saturation`: the fitted 13B 30u/30m row vs `least_loaded` at
+  `--bounded-load-epsilon 0.5` and `0.25`, plus the 50-prefix 20u row vs `least_loaded`, three
+  repeats each (~8 h). Asks whether a tighter divert cap recovers the saturation tail the
+  baseline suite found prefix routing does not have over least-loaded, without giving back P50
+  and KV; the pre-registered reading is in the suite's help text and the results doc.
+
+### Documentation
+- Baseline suite measured (2026-10-08): prefix routing vs the new `least_loaded` mode on the
+  fitted 13B 20u and 30u rows, three repeats each. Least-loaded alone removes most of the P99
+  tail against round-robin (−50% / −41%); prefix adds P50 −27…−29%, throughput +6…+9% and a
+  3–4× KV hit rate at both loads, a further −14.6% P99 at 20 users and no reliable P99 change at
+  30. README tagline, summary table and benchmark section, the results doc and the 2026-10-02
+  strategic assessment restate the headline accordingly: affinity's win is prefill saved and
+  capacity recovered; most of the tail win over round-robin is load balancing.
+- Saturation suite measured (2026-10-09, first suite with the KV reset acknowledged `8/8` on every
+  arm): the fitted 13B 30u row vs `least_loaded` with the prefix arm at `bounded_load_epsilon`
+  0.5 (P99 −7.3/+6.0/+1.3%, mixed, KV 42–44%) and 0.25 (+11.1/+4.8/+25.4%, consistent
+  regression, KV 32–37%): a tighter cap diverts more, gives back KV and moves the tail the wrong
+  way, so the default stays 1.0 and the docs state the trade-off. The 50-prefix 13B 20u row vs
+  `least_loaded`, three clean repeats: P99 +22.9/+24.9/+21.7% of completed requests with P50
+  −9…−16%, KV 3–5×, fewer timeouts and flat throughput; the carry-over repeat's parity of
+  2026-10-08 was the inherited cache. README, results doc, strategic assessment and BACKLOG §27
+  (new item: holder-aware divert) updated.
+
+### Fixed
+- `bench.sh` launches vLLM with `VLLM_SERVER_DEV_MODE=1`: vLLM serves `POST /reset_prefix_cache`
+  only as a development endpoint behind that variable, so the between-arm KV reset added in
+  the previous entry returned 404 on vLLM 0.15.1 and the arms still carried KV over (first
+  seen on the 2026-10-08 baseline suite; its compare headers record `0/8` acknowledged). The
+  404 warning now says what to set on externally managed backends.
+
+### Changed
+- `bench.sh --compare` resets every vLLM backend's prefix cache (`POST /reset_prefix_cache`)
+  before each arm, so the arm that runs second no longer inherits the first arm's warm KV
+  (on 8B/20u the prefix-first repeats read ~9 points weaker for that reason on both
+  2026-10-01 and 2026-10-06). `--no-kv-reset` keeps the old carry-over; the compare header
+  records which behaviour a run had and how many backends acknowledged the reset.
+- `results_parser.py aggregate` reads each repeat's arm order from its manifest and prints
+  rr-first and prefix-first medians beside the overall verdict (also in the JSON as
+  `by_arm_order`), so an order effect shows in the aggregate instead of needing the compare
+  files read by hand.
+- `bench-runner.sh`: the `fitted` suite gains a 13B 30 users / 30 min row (16 prefixes ×
+  2000–4000 tokens) so the high-load regime has a measurement without timeouts; the `epsilon`
+  and `placement` suites are labelled historical (ε 1.0 and least-loaded placement ship since
+  2.2.0).
+
+### Documentation
+- Standard 50-prefix matrix re-measured at three repeats on the 2.2.0 image (2026-10-06):
+  P99 TTFT vs round-robin −26.7% (8B 20u), −14.1% (13B 30u, timeouts both arms), −21.0%
+  (13B 20u, was +11.0%), −38.8% (13B 10u, was no reliable effect); every repeat improved.
+  README and `docs/benchmarks/benchmark-results-current.md` cite it as the current table;
+  the arm-order (warm-cache inheritance) and 30-user timeout caveats are recorded.
+- Fitted suite at three repeats on the 2.2.0 image (2026-10-06/07), including the new 13B
+  30 users / 30 min row: P99 TTFT −28.6% (10u), −56.6% (20u, reproducing the Oct 5 −57.5%
+  on another instance), −42.0% (30u) with zero incomplete requests in all eighteen arms and
+  +15% throughput at 30 users. The 50-prefix 30-user timeout excess is thereby attributed to
+  the eviction regime, not the ε 1.0 cap; no ε sweep is planned.
+
+## [2.2.0] - 2026-10-06
+
+Routing release. The load-divert policy now reads the node's live in-flight count
+instead of a 5-second-stale scraped GPU score, diverts only at twice the mean
+instead of on nearly any load, and places new prefixes least-loaded with
+cluster-wide convergence. On the configuration that had regressed in every earlier
+campaign (CodeLlama-13B, 20 users, 8×A100, 3 Ranvier nodes) P99 time-to-first-token
+went from +11% against round-robin to **−57.5% median across three repeats and both
+arm orders**, with P50 −28% and vLLM's KV prefix-cache hit rate 12% → 70%. Nothing
+measured regressed: 13B 10 users −34.5%, Llama-8B 20 users −22.6% (was −17%), 13B
+30 users −16.4% in the eviction regime. Record and every intermediate leg:
+`docs/benchmarks/benchmark-results-current.md`. Also in this release: the Gateway API
+Inference Extension Endpoint-Picker mode, the native vLLM KV-event subscriber,
+prefill/decode pool roles, the unified route scorer, and the embeddability seams
+(admission policy, usage ledger, response-side usage, OpenTelemetry GenAI).
+
+### Upgrade notes
+
+Five routing defaults changed. Every multi-shard deployment gets the new divert
+behaviour on upgrade; no config key was renamed or removed.
+
+| Key | 2.1.0 | 2.2.0 | Env to restore 2.1.0 |
+|-----|-------|-------|----------------------|
+| `routing.cross_shard_load_sync` | `false` | `true` | `RANVIER_CROSS_SHARD_LOAD_SYNC=false` |
+| `routing.gpu_load_weight` | `10` | `0` | `RANVIER_ROUTING_GPU_LOAD_WEIGHT=10` |
+| `routing.capacity_headroom_weight` | `5` | `0` | `RANVIER_CAPACITY_HEADROOM_WEIGHT=5` |
+| `routing.bounded_load_epsilon` | `0.25` | `1.0` | `RANVIER_BOUNDED_LOAD_EPSILON=0.25` |
+| `routing.miss_placement` | `hash` | `least_loaded` | `RANVIER_MISS_PLACEMENT=hash` |
+
+- Cross-shard load sync broadcasts each shard's in-flight counts every 100 ms:
+  about 1,100 SMP messages per second on 8 shards. A single-shard process skips
+  the timer. Lower `cross_shard_load_sync_interval` only with a reason.
+- The vLLM metrics scrape still runs; the GPU score and KV usage now feed
+  observability and residency routing only, not the divert decision. Set the two
+  weights above zero to blend them back in.
+- `miss_placement: hash` remains the right choice on a single node without gossip,
+  where the convergence rules have nothing to do.
+- Gossip peers on 2.1.0 and 2.2.0 interoperate: the route-announcement wire format
+  is unchanged. A mixed cluster converges only once every node runs 2.2.0, since
+  2.1.0 nodes keep the plain trust ladder.
+
+### Measurement status
+
+The 2026-09-05 release gate asked that each entry have a recorded GPU run or be
+marked hardware-independent. As of this release:
+
+- **Measured on 8×A100, October 2026:** the five routing defaults, least-loaded
+  cache-miss placement with eager learn and both convergence rules, the
+  bounded-load divert target, the unified route scorer (every run went through it).
+  Three repeats for 13B/20 users; one confirmation repeat each for 13B/10u, 8B/20u
+  and 13B/30u. The full matrix at three repeats under these defaults is the next
+  benchmark session.
+- **Hardware-independent:** request-admission policy seam, response-side usage
+  accounting, usage-ledger sink, OpenTelemetry GenAI conventions, GIE EPP bridge,
+  server, integration test and overhead microbenchmark, inline-vs-sidecar scope and
+  Phase 1 harness.
+- **Not yet exercised on GPU hardware, ship as experimental:** Kimi (Moonshot)
+  templates; native KV-event mode parts 1 and 2 (the October campaigns ran with the
+  subscriber off and the residency signal never crossed its threshold);
+  disaggregated prefill/decode pool roles. Each is opt-in and off by default.
 
 ### Added
 
@@ -245,6 +368,81 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   surfaced in `GET /admin/backends`.
 
 ### Changed
+
+- **Routing defaults: node-local in-flight load signal, scraped GPU/KV terms out of the
+  divert signal, bounded-load ε 1.0** (`cross_shard_load_sync` false → **true**,
+  `gpu_load_weight` 10 → **0**, `capacity_headroom_weight` 5 → **0**,
+  `bounded_load_epsilon` 0.25 → **1.0**). Bounded-load diversion was reading a 5 s-stale
+  scraped score that moved every backend together plus one shard's share of the node's
+  in-flight count, and at ε 0.25 the cap at ~1 in-flight per backend was 1–2, so it diverted
+  25–30% of requests without reaching the tail. With the node's live queue as the signal and
+  a divert only at twice the mean, the 13B 20-user fitted row went from +3…+21% P99 TTFT
+  against round-robin (twelve runs of placement and divert variants) to **−60.4 / −57.5 /
+  −55.2%** across three repeats and both arm orders, P50 −28%, KV prefix hits 69–73%; 13B 10
+  users −34.5% (was mixed), 8B 20 users −22.6% (was −17%), 13B 30 users −16.4% (was no effect).
+  The scrape still runs for observability and residency routing; the old behaviour is four env
+  vars away (`RANVIER_CROSS_SHARD_LOAD_SYNC=false RANVIER_ROUTING_GPU_LOAD_WEIGHT=10
+  RANVIER_CAPACITY_HEADROOM_WEIGHT=5 RANVIER_BOUNDED_LOAD_EPSILON=0.25`). The benchmark
+  compose and `bench.sh` manifest defaults follow.
+- **`miss_placement` defaults to `least_loaded`** (was `hash`). On its own, least-loaded
+  placement never moved the 13B 20-user tail (four variants, +3…+21%): the route table cannot
+  see which routes carry traffic. Under the live divert policy above it earns its place by
+  needing fewer diverts, one home per prefix: against `hash` with the same signal, three
+  repeats each on the same box and day, P99 −57.5% vs −51.8% median, KV prefix hits 69–73% vs
+  49–55%, route consistency 50–53% vs 39–45%, diverts 23–27% vs 30–33%. The eager learn and
+  both convergence rules (gossip and local flush) are what make it split-free; a learn that
+  yields at the flush is one that meets a lower-id route for a different backend, and learns
+  shorter than `block_alignment` (which store nothing under either placement) still ride the
+  batch to other shards and over gossip exactly as before. `hash` is one
+  env var away (`RANVIER_MISS_PLACEMENT=hash`) and is the right choice on a single node without
+  gossip. Details: docs/benchmarks/benchmark-results-current.md (combo, isolation and
+  confirmation legs, 2026-10-05).
+
+- **Least-loaded cache-miss placement** (`routing.miss_placement: least_loaded`, env
+  `RANVIER_MISS_PLACEMENT`; introduced with default `hash`, made the default in this
+  release, see above) — a prefix with no
+  learned route is placed on the live backend holding the fewest learned-route tokens
+  (`RadixTree::route_tokens_by_backend`, new: the sum of live route key lengths per
+  backend), then the fewest routes, then the lowest capacity-adjusted load, then
+  jump-probe order, instead of its consistent-hash bucket. Token-weighted so a long
+  shared prefix outweighs the short one-off prompts a real mix also learns as routes.
+  A placed miss is learned at dispatch as well as at first byte, so other shards and
+  nodes stop placing the same new prefix elsewhere within one route-batch flush
+  instead of one TTFT, and a gossiped route that still conflicts with a node's own
+  placement is settled by lowest backend id on every node (new
+  `router_remote_routes_converged_total`) instead of refused under the trust ladder,
+  so the cluster converges on one backend per prefix. The node's own learns obey the
+  same order at the local batch flush: a learn that lands after a peer's lower-id
+  route arrived is dropped before fan-out and gossip (new
+  `router_local_routes_converged_total`) instead of moving the prefix back. New gauge
+  `backend_resident_route_tokens` (per backend) exports the placement weight. PUSH
+  routes and the default `hash` placement are untouched. Motivated by the 2026-10-02 fitted-suite leg A: with every divert mechanism
+  off, prefix affinity still lost 8–12% P99 at 13B/20 users against round-robin,
+  because hash placement of 16 prefixes over 8 backends left one backend holding four
+  prefixes (23% of requests) and another none (0.6%), and the busiest backend's queue
+  sets the tail. A miss has no cache to preserve, so placement is free in cache terms;
+  hits are untouched. New counter `router_miss_placements_rebalanced_total`;
+  `bench.sh --miss-placement`, `bench-runner.sh --suite placement` (the acceptance
+  test: fitted 13B 20u turns negative with the prefix arm's Gini near round-robin's).
+  Balances prefix count, not popularity; hot-prefix replication is a separate item.
+
+- **Bounded-load diversion targets the least-loaded backend** — `bounded_load_select`
+  used to send an over-cap primary to the first under-cap bucket in jump-probe order,
+  and the route scorer's dispatch tie order reproduced the same rule for ART-hit
+  diverts. That pushed load off hot anchors without ever pulling it toward the
+  coldest backend: every prefix arm of the 2026-10-02 fitted suite left one backend
+  35–45% below the fleet mean with 30% of requests already diverted, a consistent
+  +10% P99 TTFT regression at 13B/20 users. A divert now goes to the least-loaded
+  live candidate (jump-probe order breaks equal loads, keeping equal-load targets
+  deterministic), on both the hash-miss and ART-hit paths. An under-cap primary
+  still keeps affinity; a uniformly saturated fleet stays on the primary and no
+  longer counts a divert. **Acceptance run failed** (same box, 13B 20u P99 vs
+  round-robin: +10.5, +24.1, +17.5 against +11.7, +11.0, +3.9 for the previous rule):
+  the change balances completions without moving the tail, because in the benchmark
+  deployment "load" was the 5 s-stale scraped vLLM score rather than queue depth. It
+  ships in this release under the new defaults above, where "load" is the node-local
+  in-flight count and the divert target is the backend that is actually coldest; see
+  BACKLOG §27 and `docs/benchmarks/benchmark-results-current.md`.
 
 - **Unified weighted route scorer** (BACKLOG §20.1 P0.2) — The post-anchor
   routing decision is now one weighted ranking over the live candidates

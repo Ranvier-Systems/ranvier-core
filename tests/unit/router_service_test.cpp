@@ -48,6 +48,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -681,6 +685,7 @@ TEST_F(RouterServiceTest, ResidencyWeightModulatesAffinityContinuously) {
 TEST_F(RouterServiceTest, BoundedLoadArtOverCapDivertsOffWarmBackend) {
     cfg_.load_aware_routing = true;
     cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+    cfg_.bounded_load_epsilon = 0.25;  // the cap arithmetic below assumes 1.25x (default is 1.0 since 2026-10-05)
     recreate_router(cfg_);
     register_three_backends();
     std::vector<int32_t> tokens = {155, 156, 157, 158};
@@ -885,6 +890,129 @@ TEST_F(RouterServiceTest, HashModeExcludesDecodePools) {
         ASSERT_TRUE(result.backend_id.has_value());
         EXPECT_NE(result.backend_id.value(), 3) << "seed=" << seed;
     }
+}
+
+// ---------------------------------------------------------------------------
+// LEAST_LOADED routing mode: the strongest no-affinity baseline arm. Lowest
+// capacity-adjusted composite load (in-flight count here: no GPU score cached,
+// headroom weight 0), ties uniformly at random, never consults the ART.
+// ---------------------------------------------------------------------------
+
+TEST_F(RouterServiceTest, LeastLoadedModePicksLowestInFlight) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    register_two_backends();  // ids 1, 2
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080));
+
+    BackendRequestGuard g1(1), g2(1), g3(1);  // backend 1: 3 in flight
+    BackendRequestGuard g4(2);                // backend 2: 1 in flight
+                                              // backend 3: idle
+
+    for (int i = 0; i < 20; ++i) {
+        auto result = router_->route_request({1, 2, 3});
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 3) << "draw " << i;
+        EXPECT_EQ(result.original_selected, 3);
+        EXPECT_EQ(result.routing_mode, "least_loaded");
+        EXPECT_FALSE(result.cache_hit);
+        EXPECT_EQ(result.matched_prefix_depth, 0u);
+        EXPECT_DOUBLE_EQ(result.backend_load_at_decision, 0.0);
+    }
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeTieBreaksAcrossIdleBackends) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    register_two_backends();
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080));
+
+    // An idle fleet must not herd onto one id: ties are broken at random.
+    std::map<BackendId, int> seen;
+    for (int i = 0; i < 300; ++i) {
+        auto result = router_->route_request({1, 2, 3});
+        ASSERT_TRUE(result.backend_id.has_value());
+        seen[result.backend_id.value()]++;
+    }
+    EXPECT_EQ(seen.size(), 3u);
+    for (const auto& [id, n] : seen) {
+        EXPECT_GT(n, 0) << "backend " << id << " never chosen";
+    }
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeIgnoresLearnedRoutes) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    register_two_backends();
+
+    // A learned route points this prefix at backend 1; backend 1 is also the
+    // busier one. PREFIX mode would honour the route; LEAST_LOADED must not.
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+    RouterService::insert_route_for_testing(tokens, 1);
+    BackendRequestGuard g1(1), g2(1);
+
+    for (int i = 0; i < 10; ++i) {
+        auto result = router_->route_request(tokens);
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 2) << "draw " << i;
+        EXPECT_FALSE(result.cache_hit);
+    }
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeExcludesDecodePools) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::UNIFIED);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+
+    // The decode pool is idle and the unified backend is busy: still unified.
+    BackendRequestGuard g1(1), g2(1);
+    for (int i = 0; i < 20; ++i) {
+        auto result = router_->route_request({1, 2, 3});
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 1) << "draw " << i;
+    }
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeAllDecodeValveStillRoutes) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0,
+                                                 BackendType::VLLM, PoolRole::DECODE);
+
+    auto result = router_->route_request({1, 2, 3});
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeStaysInHighestPriorityGroup) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080), 100, 0);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080), 100, 1);
+
+    // Priority groups come before load, as in RANDOM mode: the busy priority-0
+    // backend still wins over the idle priority-1 one.
+    BackendRequestGuard g1(1), g2(1);
+    for (int i = 0; i < 20; ++i) {
+        auto result = router_->route_request({1, 2, 3});
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 1) << "draw " << i;
+    }
+}
+
+TEST_F(RouterServiceTest, LeastLoadedModeNoBackendsIsAnError) {
+    cfg_.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    recreate_router(cfg_);
+
+    auto result = router_->route_request({1, 2, 3});
+    EXPECT_FALSE(result.backend_id.has_value());
+    EXPECT_EQ(result.routing_mode, "least_loaded");
+    EXPECT_FALSE(result.error_message.empty());
 }
 
 TEST_F(RouterServiceTest, ResidencyColdAndDecodeExclusionsCompose) {
@@ -2364,6 +2492,15 @@ TEST(RoutingConfigTest, ModeHelpers) {
 
     cfg.routing_mode = RoutingConfig::RoutingMode::RANDOM;
     EXPECT_TRUE(cfg.is_random_mode());
+    EXPECT_FALSE(cfg.is_least_loaded_mode());
+    EXPECT_FALSE(cfg.uses_art());
+    EXPECT_FALSE(cfg.should_learn_routes());
+
+    cfg.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
+    EXPECT_TRUE(cfg.is_least_loaded_mode());
+    EXPECT_FALSE(cfg.is_prefix_mode());
+    EXPECT_FALSE(cfg.is_hash_mode());
+    EXPECT_FALSE(cfg.is_random_mode());
     EXPECT_FALSE(cfg.uses_art());
     EXPECT_FALSE(cfg.should_learn_routes());
 }
@@ -2376,8 +2513,11 @@ TEST(RoutingConfigTest, DefaultValues) {
     EXPECT_EQ(cfg.block_alignment, 16u);
     EXPECT_TRUE(cfg.is_prefix_mode());
     EXPECT_EQ(cfg.hash_strategy, RoutingConfig::HashStrategy::BOUNDED_LOAD);
-    EXPECT_DOUBLE_EQ(cfg.bounded_load_epsilon, 0.25);
+    EXPECT_DOUBLE_EQ(cfg.bounded_load_epsilon, 1.0);   // 2026-10-05: was 0.25 (see config_schema.hpp)
     EXPECT_EQ(cfg.p2c_load_bias, 2u);
+    EXPECT_TRUE(cfg.cross_shard_load_sync);              // 2026-10-05: node-local in-flight signal on
+    EXPECT_DOUBLE_EQ(cfg.gpu_load_weight, 0.0);          // 2026-10-05: scraped score out of the divert signal
+    EXPECT_DOUBLE_EQ(cfg.capacity_headroom_weight, 0.0);
 }
 
 // =============================================================================
@@ -2423,6 +2563,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -2614,6 +2758,379 @@ TEST_F(BoundedLoadTest, NoARTOverrideWhenLoadAwareDisabled) {
     EXPECT_TRUE(result.art_hit);
 }
 
+// ---- least-loaded diversion (fitted-suite finding, 2026-10-02) ----
+//
+// An over-cap primary diverts to the LEAST-LOADED live candidate, not to the
+// first under-cap bucket in jump-probe order. The former rule pushed load away
+// from hot anchors but never pulled it toward the coldest backend, leaving one
+// backend 35-45% below the fleet mean in every fitted-suite prefix arm.
+
+TEST_F(BoundedLoadTest, OverCapPrimaryDivertsToColdestBackend) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {71, 72, 73, 74, 75};
+
+    // Discover the primary hash bucket while the fleet is idle.
+    auto idle = router_->get_backend_for_prefix(tokens, "ll-probe");
+    ASSERT_TRUE(idle.backend_id.has_value());
+    const BackendId primary = idle.backend_id.value();
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 0u);
+
+    // Loads: primary 6, two peers 2 each, one peer 0. avg = 2.5,
+    // cap = ceil(2.5 * 1.25) = 4; 6 >= 4 forfeits the primary. Both warm peers
+    // are under cap, so the first-under-cap rule could have landed on either;
+    // least-loaded must land on the idle one.
+    std::vector<BackendId> peers;
+    for (BackendId id = 1; id <= 4; ++id) {
+        if (id != primary) peers.push_back(id);
+    }
+    const BackendId coldest = peers[2];
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 6; ++i) guards.emplace_back(primary);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(peers[0]);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(peers[1]);
+
+    auto result = router_->get_backend_for_prefix(tokens, "ll-divert");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), coldest)
+        << "primary=" << primary << " must divert to the idle backend, not the "
+           "first under-cap probe";
+    EXPECT_FALSE(result.art_hit);
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 1u);
+}
+
+TEST_F(BoundedLoadTest, UnderCapPrimaryKeepsAffinityEvenWithColderPeer) {
+    // No pull rule: while the primary is under cap, a colder peer does not
+    // attract the request. Affinity only breaks at the cap.
+    register_four_backends();
+    std::vector<int32_t> tokens = {81, 82, 83, 84, 85};
+
+    auto idle = router_->get_backend_for_prefix(tokens, "keep-probe");
+    ASSERT_TRUE(idle.backend_id.has_value());
+    const BackendId primary = idle.backend_id.value();
+
+    // Loads: primary 1, two peers 2 each, one peer 0. avg = 1.25,
+    // cap = ceil(1.25 * 1.25) = 2; 1 < 2 keeps the primary although a peer
+    // sits at 0.
+    std::vector<BackendId> peers;
+    for (BackendId id = 1; id <= 4; ++id) {
+        if (id != primary) peers.push_back(id);
+    }
+    std::vector<BackendRequestGuard> guards;
+    guards.emplace_back(primary);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(peers[0]);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(peers[1]);
+
+    auto result = router_->get_backend_for_prefix(tokens, "keep");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), primary);
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 0u);
+}
+
+TEST_F(BoundedLoadTest, UniformSaturationStaysOnPrimaryWithoutCountingDivert) {
+    // epsilon 0 makes cap == avg, so a uniformly loaded fleet puts every
+    // backend at cap. Nothing is colder than the primary: stay put, and do
+    // not count a divert that did not happen.
+    cfg_.bounded_load_epsilon = 0.0;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+    std::vector<int32_t> tokens = {91, 92, 93, 94, 95};
+
+    auto idle = router_->get_backend_for_prefix(tokens, "sat-probe");
+    ASSERT_TRUE(idle.backend_id.has_value());
+    const BackendId primary = idle.backend_id.value();
+
+    std::vector<BackendRequestGuard> guards;
+    for (BackendId id = 1; id <= 4; ++id) {
+        guards.emplace_back(id);
+        guards.emplace_back(id);
+    }
+
+    auto result = router_->get_backend_for_prefix(tokens, "sat");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), primary);
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 0u);
+}
+
+TEST_F(BoundedLoadTest, ArtHitOverAllowanceDivertsToColdestBackend) {
+    // Same rule on the ART-hit path, which goes through the scorer: the
+    // under-allowance candidates tie on score and the least-loaded key wins
+    // ahead of probe rank.
+    register_four_backends();
+    std::vector<int32_t> tokens = {101, 102, 103, 104, 105};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Loads [1:6, 2:2, 3:2, 4:0]: allowance = cap - 1 = 3; 6 > 3 forfeits the
+    // warm route; backend 4 is the coldest under-allowance candidate.
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 6; ++i) guards.emplace_back(1);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(2);
+    for (int i = 0; i < 2; ++i) guards.emplace_back(3);
+
+    auto result = router_->route_request(tokens, "art-coldest");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 4);
+    EXPECT_TRUE(result.cache_hit);
+    EXPECT_EQ(result.original_selected, 1) << "load diverts are transient, never learned";
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 1u);
+}
+
+// ---- cache-miss placement: least_loaded (fitted-suite leg A, 2026-10-02) ----
+//
+// Pure affinity regressed P99 by 8-12% with zero diverts because hash placement
+// is balls-into-bins (16 prefixes over 8 backends: one backend at 23% of
+// requests, one at 0.6%). miss_placement=least_loaded places a NEW prefix on
+// the candidate with the fewest learned routes, then the lowest load, then
+// jump-probe order. Hits and the default (hash) placement are unchanged.
+
+TEST_F(BoundedLoadTest, DefaultMissPlacementIsLeastLoaded) {
+    // 2026-10-05: was HASH. See the MissPlacement comment in config_schema.hpp.
+    EXPECT_EQ(RoutingConfig{}.miss_placement, RoutingConfig::MissPlacement::LEAST_LOADED);
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementSpreadsNewPrefixesEvenly) {
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    // Eight distinct prefixes, each learned where it was placed (as the
+    // HttpController does on response). Balls-into-bins by hash would leave
+    // some backend with 0 and some with 3-4; least-loaded gives 2 each.
+    std::vector<int> placed(5, 0);
+    for (int p = 0; p < 8; ++p) {
+        std::vector<int32_t> tokens = {1000 + p * 10, 1001 + p * 10, 1002 + p * 10, 1003 + p * 10};
+        auto r = router_->get_backend_for_prefix(tokens, "place-" + std::to_string(p));
+        ASSERT_TRUE(r.backend_id.has_value());
+        EXPECT_FALSE(r.art_hit);
+        RouterService::insert_route_for_testing(tokens, *r.backend_id);
+        placed[static_cast<size_t>(*r.backend_id)]++;
+    }
+    for (BackendId id = 1; id <= 4; ++id) {
+        EXPECT_EQ(placed[static_cast<size_t>(id)], 2)
+            << "backend " << id << " should anchor exactly 2 of 8 prefixes";
+    }
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementWeighsRoutesByTokens) {
+    // The first placement run (2026-10-03) balanced route COUNTS, and ~70
+    // short one-off prompts outvoted the 16 long shared prefixes. Placement
+    // must weigh routes by key length: a backend holding one 64-token route
+    // is fuller than one holding eight 4-token routes.
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+
+    std::vector<int32_t> long_route(64);
+    for (int i = 0; i < 64; ++i) long_route[static_cast<size_t>(i)] = 5000 + i;
+    RouterService::insert_route_for_testing(long_route, 1);          // b1: 1 route, 64 tokens
+    for (int p = 0; p < 8; ++p) {
+        std::vector<int32_t> t = {6000 + p * 10, 6001 + p * 10, 6002 + p * 10, 6003 + p * 10};
+        RouterService::insert_route_for_testing(t, 2);              // b2: 8 routes, 32 tokens
+    }
+
+    std::vector<int32_t> fresh = {7001, 7002, 7003, 7004};
+    auto r = router_->get_backend_for_prefix(fresh, "place-tokens");
+    ASSERT_TRUE(r.backend_id.has_value());
+    EXPECT_EQ(*r.backend_id, 2) << "fewer route tokens wins over fewer routes";
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementBreaksRouteTiesByLoadThenProbeOrder) {
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    // No learned routes anywhere (all tie at 0); in-flight loads [2, 2, 1, 0]
+    // -> the idle backend 4 takes the new prefix regardless of its hash bucket.
+    std::vector<BackendRequestGuard> guards;
+    guards.emplace_back(1); guards.emplace_back(1);
+    guards.emplace_back(2); guards.emplace_back(2);
+    guards.emplace_back(3);
+    std::vector<int32_t> tokens = {2001, 2002, 2003, 2004};
+    auto r = router_->get_backend_for_prefix(tokens, "place-load");
+    ASSERT_TRUE(r.backend_id.has_value());
+    EXPECT_EQ(*r.backend_id, 4);
+
+    // Everything tied (no routes, no load): placement is deterministic for a
+    // given prefix, so the same prefix asked twice lands on the same backend.
+    guards.clear();
+    std::vector<int32_t> other = {2101, 2102, 2103, 2104};
+    auto a = router_->get_backend_for_prefix(other, "tie-a");
+    auto b = router_->get_backend_for_prefix(other, "tie-b");
+    ASSERT_TRUE(a.backend_id.has_value() && b.backend_id.has_value());
+    EXPECT_EQ(*a.backend_id, *b.backend_id);
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementLeavesArtHitsAlone) {
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    // Backend 1 anchors the most routes by far; a learned prefix still goes
+    // to it — placement only decides misses.
+    std::vector<int32_t> warm = {3001, 3002, 3003, 3004};
+    RouterService::insert_route_for_testing(warm, 1);
+    for (int p = 0; p < 5; ++p) {
+        std::vector<int32_t> t = {3100 + p * 10, 3101 + p * 10, 3102 + p * 10, 3103 + p * 10};
+        RouterService::insert_route_for_testing(t, 1);
+    }
+    auto r = router_->get_backend_for_prefix(warm, "hit");
+    ASSERT_TRUE(r.backend_id.has_value());
+    EXPECT_EQ(*r.backend_id, 1);
+    EXPECT_TRUE(r.art_hit);
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementConvergesConflictingGossipRoutes) {
+    // Two nodes placed the same new prefix on different backends; each gossips
+    // its LOCAL route. Under least_loaded the receiver moves to the lower id
+    // instead of refusing, so the cluster converges and the prefix is warm on
+    // exactly one backend.
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    std::vector<int32_t> tokens = {8001, 8002, 8003, 8004};
+    RouterService::insert_route_for_testing(tokens, 3);            // our LOCAL placement
+    RouterService::learn_remote_route_for_testing(tokens, 2);      // peer placed it lower
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 2);
+    EXPECT_EQ(RouterService::remote_routes_converged_for_testing(), 1u);
+
+    RouterService::learn_remote_route_for_testing(tokens, 4);      // another peer, higher id
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 2);
+    EXPECT_EQ(RouterService::remote_routes_trust_refused_for_testing(), 1u);
+    EXPECT_EQ(RouterService::remote_routes_converged_for_testing(), 1u);
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementLocalLearnYieldsToLowerGossipedRoute) {
+    // The eager learn is buffered at placement and lands ~20 ms later; if a
+    // peer's lower-id route arrived by gossip in between, the flush must not
+    // move the prefix back (placement v3, 2026-10-03: the flush used plain
+    // latest-wins, converged stayed 0 and ~220 announcements per node were
+    // refused). The losing learn is dropped from the batch so it is never
+    // fanned out or gossiped.
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    std::vector<int32_t> tokens = {8301, 8302, 8303, 8304};
+    RouterService::learn_remote_route_for_testing(tokens, 2);   // peer placed it first
+    RouterService::learn_route_for_testing(tokens, 3);          // our late local flush
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 2);
+    EXPECT_EQ(RouterService::local_routes_converged_for_testing(), 1u);
+
+    RouterService::learn_route_for_testing(tokens, 1);          // a lower id still wins
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 1);
+    EXPECT_EQ(RouterService::local_routes_converged_for_testing(), 1u);
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementKeepsSubAlignmentLearnsInTheBatch) {
+    // A learn shorter than block_alignment stores nothing (plain insert() and
+    // insert_if_trusted() both refuse it), but under hash placement it still
+    // rode the batch to the other shards and over gossip. The least-loaded
+    // flush must not read that refusal as a convergence yield: the counter
+    // stays at zero and nothing is dropped. (Caught by the mock-cluster
+    // integration suite, whose prompts are shorter than one 16-token block:
+    // router_cluster_sync_sent stayed at 0, 2026-10-05.)
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    cfg_.block_alignment = 16;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    std::vector<int32_t> tokens = {8501, 8502, 8503, 8504, 8505};  // 5 < 16: aligned length 0
+    RouterService::learn_route_for_testing(tokens, 2);
+    EXPECT_EQ(RouterService::local_routes_converged_for_testing(), 0u);
+    EXPECT_FALSE(RouterService::lookup_backend_for_testing(tokens).has_value());
+}
+
+TEST_F(BoundedLoadTest, HashPlacementLocalLearnStillOverridesGossip) {
+    // Hash placement: the flush is the plain insert it always was (a
+    // node's own learn outranks a gossiped route, latest wins among LOCAL).
+    cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+    std::vector<int32_t> tokens = {8401, 8402, 8403, 8404};
+    RouterService::learn_remote_route_for_testing(tokens, 2);
+    RouterService::learn_route_for_testing(tokens, 3);
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 3);
+    EXPECT_EQ(RouterService::local_routes_converged_for_testing(), 0u);
+}
+
+TEST_F(BoundedLoadTest, LeastLoadedPlacementDoesNotRelearnASettledPrefix) {
+    // A first-byte learn that disagrees with the settled (placed + converged)
+    // backend is dropped while that backend is live, so a request dispatched
+    // before convergence cannot re-open the conflict.
+    cfg_.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+
+    std::vector<int32_t> tokens = {8201, 8202, 8203, 8204};
+    RouterService::insert_route_for_testing(tokens, 2);   // settled
+    // The guard short-circuits with a ready future (no buffering, no reactor
+    // needed), so .get() is safe here. The dead-backend branch buffers through
+    // the batch coroutine and is not exercised reactor-free.
+    auto fut = router_->learn_route_global(tokens, 3, "late-learn", 0);
+    ASSERT_TRUE(fut.available());
+    EXPECT_FALSE(fut.get());
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 2);
+}
+
+TEST_F(BoundedLoadTest, HashPlacementKeepsTrustLadderForGossipConflicts) {
+    // Hash placement: a gossiped route for a different backend never
+    // displaces this node's LOCAL route (invariant T7 unchanged).
+    cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+    std::vector<int32_t> tokens = {8101, 8102, 8103, 8104};
+    RouterService::insert_route_for_testing(tokens, 3);
+    RouterService::learn_remote_route_for_testing(tokens, 2);
+    EXPECT_EQ(RouterService::lookup_backend_for_testing(tokens).value_or(0), 3);
+    EXPECT_EQ(RouterService::remote_routes_trust_refused_for_testing(), 1u);
+    EXPECT_EQ(RouterService::remote_routes_converged_for_testing(), 0u);
+}
+
+TEST_F(BoundedLoadTest, HashPlacementIgnoresRouteCounts) {
+    // Hash mode: a backend holding every learned route still receives the
+    // prefixes whose hash bucket it is. (Pin so the knob is a real A/B.)
+    cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_four_backends();
+    std::vector<int32_t> tokens = {4001, 4002, 4003, 4004};
+    auto idle = router_->get_backend_for_prefix(tokens, "hash-probe");
+    ASSERT_TRUE(idle.backend_id.has_value());
+    const BackendId primary = *idle.backend_id;
+    for (int p = 0; p < 6; ++p) {
+        std::vector<int32_t> t = {4100 + p * 10, 4101 + p * 10, 4102 + p * 10, 4103 + p * 10};
+        RouterService::insert_route_for_testing(t, primary);
+    }
+    auto again = router_->get_backend_for_prefix(tokens, "hash-again");
+    ASSERT_TRUE(again.backend_id.has_value());
+    EXPECT_EQ(*again.backend_id, primary);
+    EXPECT_FALSE(again.art_hit);
+}
+
 // =============================================================================
 // 22. Hash Strategy: Power of Two Choices (P2C)
 // =============================================================================
@@ -2625,6 +3142,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -2744,6 +3265,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -2796,6 +3321,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -3062,6 +3591,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -3193,6 +3726,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -3677,6 +4214,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
@@ -3998,6 +4539,10 @@ protected:
 
     void SetUp() override {
         cfg_ = RoutingConfig{};
+        // These fixtures test hash-bucket / probe-order / divert semantics; pin the
+        // placement knob (default least_loaded since 2026-10-05). Least-loaded
+        // tests set cfg_.miss_placement = LEAST_LOADED explicitly.
+        cfg_.miss_placement = RoutingConfig::MissPlacement::HASH;
         cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);

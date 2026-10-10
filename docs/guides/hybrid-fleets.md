@@ -92,7 +92,7 @@ Backends without `api_key_env` register normally and receive no auth header — 
 
 ## Performance expectations
 
-Ranvier's headline benchmark numbers (e.g. README's "44% faster TTFT" on Llama-3.1-70B, the "~49% → 81%" cache-hit rate in [`prefix-affinity-routing.md`](../internals/prefix-affinity-routing.md)) measure what prefix-affinity routing earns when Ranvier can actually steer requests to specific physical backends. They do not credit Ranvier for anything happening on a managed-API backend in a hybrid fleet, because Ranvier doesn't choose which Cerebras (or OpenAI, or other managed) instance handles a request — the provider's internal scheduler does, and any cache reuse there is invisible to us. Reporting the prefix-affinity headline for traffic that landed on a managed backend would be miscredited.
+Ranvier's headline benchmark numbers (the July 2026 "−9 to −13% P99 TTFT under load" in the README, the "~49% → 81%" route-consistency figure in [`prefix-affinity-routing.md`](../internals/prefix-affinity-routing.md)) measure what prefix-affinity routing earns when Ranvier can actually steer requests to specific physical backends. They do not credit Ranvier for anything happening on a managed-API backend in a hybrid fleet, because Ranvier doesn't choose which Cerebras (or OpenAI, or other managed) instance handles a request — the provider's internal scheduler does, and any cache reuse there is invisible to us. Reporting the prefix-affinity headline for traffic that landed on a managed backend would be miscredited.
 
 When measuring a hybrid fleet:
 

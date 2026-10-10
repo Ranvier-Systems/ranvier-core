@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include <gtest/gtest.h>
+#include <cstdio>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -21,6 +22,7 @@ protected:
         unsetenv("RANVIER_DB_PATH");
         unsetenv("RANVIER_HEALTH_CHECK_INTERVAL");
         unsetenv("RANVIER_MIN_TOKEN_LENGTH");
+        unsetenv("RANVIER_ROUTING_MODE");
         unsetenv("RANVIER_POOL_MAX_PER_HOST");
         unsetenv("RANVIER_TOKENIZER_PATH");
         unsetenv("RANVIER_TLS_ENABLED");
@@ -368,6 +370,36 @@ TEST_F(ConfigTest, EnvironmentVariablesOverrideDefaults) {
 }
 
 // Test invalid environment variables are ignored
+TEST_F(ConfigTest, RoutingModeLeastLoadedParsesFromYamlAndEnv) {
+    writeTestConfig("test_mode.yaml", R"(
+routing:
+  routing_mode: least_loaded
+)");
+    auto from_yaml = RanvierConfig::load("test_mode.yaml");
+    EXPECT_EQ(from_yaml.routing.routing_mode, RoutingConfig::RoutingMode::LEAST_LOADED);
+    EXPECT_TRUE(from_yaml.routing.is_least_loaded_mode());
+    EXPECT_FALSE(from_yaml.routing.uses_art());
+
+    // The env var wins over the file, as for every other routing key.
+    writeTestConfig("test_mode_prefix.yaml", R"(
+routing:
+  routing_mode: prefix
+)");
+    setenv("RANVIER_ROUTING_MODE", "least_loaded", 1);
+    auto from_env = RanvierConfig::load("test_mode_prefix.yaml");
+    EXPECT_EQ(from_env.routing.routing_mode, RoutingConfig::RoutingMode::LEAST_LOADED);
+    unsetenv("RANVIER_ROUTING_MODE");
+
+    // The benchmark's baseline alias still maps to RANDOM.
+    setenv("RANVIER_ROUTING_MODE", "round_robin", 1);
+    auto alias = RanvierConfig::load("test_mode_prefix.yaml");
+    EXPECT_EQ(alias.routing.routing_mode, RoutingConfig::RoutingMode::RANDOM);
+    unsetenv("RANVIER_ROUTING_MODE");
+
+    std::remove("test_mode.yaml");
+    std::remove("test_mode_prefix.yaml");
+}
+
 TEST_F(ConfigTest, InvalidEnvVarsAreIgnored) {
     setenv("RANVIER_API_PORT", "not_a_number", 1);
 

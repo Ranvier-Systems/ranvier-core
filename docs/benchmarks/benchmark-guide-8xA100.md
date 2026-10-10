@@ -16,12 +16,19 @@ single-file guide (~2,500 lines, ~60% dated lab notebook) was split on 2026-07-0
 
 ## TL;DR (read this before quoting any number)
 
-**The representative-workload headline is measured** (50 prefixes, current defaults, commit
-`817a1b5`, median-of-3): prefix-aware routing's P99 effect is **load-dependent, not a uniform
-win** — a reliable **−9 to −13%** improvement under load (8B/20u, 13B/30u), a **wash** at
-moderate load (13B/20u), and a reliable **+29% regression** at light load (13B/10u) — tracking
-cluster throughput. Cache-hit rate rises ~3× in every config but is **decoupled** from P99. Full
-table + interpretation: **[benchmark-results-current.md](benchmark-results-current.md)**.
+**Current headline (2026-10-05 routing defaults, 8×A100, 3 nodes):** CodeLlama-13B at 20 users
+on the fitted 16-prefix set, **P99 TTFT −57.5% median vs round-robin** (−60.4, −57.5, −55.2;
+both arm orders), P50 −28%, KV prefix hits 69–73%. The standard 50-prefix matrix re-run at three
+repeats on the 2.2.0 image (2026-10-06): 8B/20u **−26.7%**, 13B/30u −14.1% (P99 of completed
+requests, timeouts in both arms), 13B/20u **−21.0%**, 13B/10u **−38.8%**; all twelve repeats
+improved. Fitted suite at three repeats on the same image: 13B/10u −28.6%, 13B/20u −56.6%,
+13B/30u **−42.0% with zero timeouts and +15% throughput**. The 2026-10-01 re-baseline under the previous defaults (−17% at 8B/20u, **+11%** at
+13B/20u) and the July 2026 matrix it superseded (−9 to −13% under load, +29% at light load,
+commit `817a1b5`) are both on record; the 13B regressions were the load-divert policy reading a
+stale signal at too tight a threshold, not the affinity. Cache-hit rate rises 4–5× in every
+config; the per-backend request distribution stays uneven in every prefix arm, and the tail is
+decided by whether the divert policy sees the queue live. Full tables, counters and every
+intermediate leg: **[benchmark-results-current.md](benchmark-results-current.md)**.
 
 Every headline the OLD guide advertised — P99 TTFT **−80% to −85%**, **+13-22%** throughput —
 was measured on the now-**deprecated 5-prefix workload** (all source runs, Instances 1–9,

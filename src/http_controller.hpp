@@ -325,6 +325,7 @@ struct HttpControllerConfig {
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingConfig::RoutingMode::HASH; }
     bool is_random_mode() const { return routing_mode == RoutingConfig::RoutingMode::RANDOM; }
+    bool is_least_loaded_mode() const { return routing_mode == RoutingConfig::RoutingMode::LEAST_LOADED; }
     bool uses_art() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
     bool should_learn_routes() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
 };

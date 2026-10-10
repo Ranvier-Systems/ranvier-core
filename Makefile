@@ -569,11 +569,11 @@ benchmark:
 	@echo "Starting test cluster..."
 	@if [ "$(BENCHMARK_BUILD)" = "1" ]; then \
 		RANVIER_ENABLE_TOKEN_FORWARDING=$(BENCHMARK_TOKEN_FORWARDING) \
-		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d --build; \
+		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile full --profile benchmark up -d --build; \
 	else \
 		echo "  (using cached images, set BENCHMARK_BUILD=1 to rebuild)"; \
 		RANVIER_ENABLE_TOKEN_FORWARDING=$(BENCHMARK_TOKEN_FORWARDING) \
-		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d; \
+		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile full --profile benchmark up -d; \
 	fi
 	@echo "Waiting for cluster to become healthy..."
 	@sleep 15
@@ -581,7 +581,7 @@ benchmark:
 	@echo "Starting Locust load test..."
 	@echo "Run name: $(BENCHMARK_RUN_NAME)"
 	@P99_LATENCY_THRESHOLD_MS=$(P99_LATENCY_THRESHOLD_MS) \
-	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark run --rm \
+	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile full --profile benchmark run --rm \
 		-e P99_LATENCY_THRESHOLD_MS=$(P99_LATENCY_THRESHOLD_MS) \
 		-e BENCHMARK_RUN_NAME=$(BENCHMARK_RUN_NAME) \
 		locust \
@@ -602,7 +602,7 @@ benchmark:
 		-o $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_stats.csv \
 		2>/dev/null || echo "  (parser not available, raw log saved)"; \
 	echo "Stopping test cluster..."; \
-	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark down -v --remove-orphans; \
+	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile full --profile benchmark down -v --remove-orphans; \
 	echo ""; \
 	if [ $$LOCUST_EXIT -ne 0 ]; then \
 		echo "======================================"; \

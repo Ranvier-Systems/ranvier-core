@@ -163,7 +163,7 @@ void RanvierConfig::apply_env_overrides() {
             routing.routing_mode = RoutingConfig::RoutingMode::RANDOM;
         }
     }
-    // RANVIER_ROUTING_MODE: "prefix", "hash", or "random"
+    // RANVIER_ROUTING_MODE: "prefix", "hash", "random", or "least_loaded"
     if (auto v = get_env("RANVIER_ROUTING_MODE")) {
         if (*v == "prefix") {
             routing.routing_mode = RoutingConfig::RoutingMode::PREFIX;
@@ -172,6 +172,8 @@ void RanvierConfig::apply_env_overrides() {
         } else if (*v == "random" || *v == "round_robin") {
             // "round_robin" accepted as alias for backward compatibility
             routing.routing_mode = RoutingConfig::RoutingMode::RANDOM;
+        } else if (*v == "least_loaded") {
+            routing.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
         }
     }
     if (auto v = get_env_as<size_t>("RANVIER_PREFIX_TOKEN_LENGTH")) {
@@ -268,6 +270,14 @@ void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env_as<uint64_t>("RANVIER_P2C_LOAD_BIAS")) {
         routing.p2c_load_bias = *v;
+    }
+    // Cache-miss placement (hash bucket vs least-loaded candidate)
+    if (auto v = get_env("RANVIER_MISS_PLACEMENT")) {
+        if (*v == "hash") {
+            routing.miss_placement = RoutingConfig::MissPlacement::HASH;
+        } else if (*v == "least_loaded") {
+            routing.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+        }
     }
 
     // Timeout overrides
@@ -1093,7 +1103,7 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                     config.routing.routing_mode = RoutingConfig::RoutingMode::RANDOM;
                 }
             }
-            // routing_mode: "prefix", "hash", or "random"
+            // routing_mode: "prefix", "hash", "random", or "least_loaded"
             if (r["routing_mode"]) {
                 std::string mode = r["routing_mode"].as<std::string>();
                 if (mode == "prefix") {
@@ -1103,6 +1113,8 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 } else if (mode == "random" || mode == "round_robin") {
                     // "round_robin" accepted as alias for backward compatibility
                     config.routing.routing_mode = RoutingConfig::RoutingMode::RANDOM;
+                } else if (mode == "least_loaded") {
+                    config.routing.routing_mode = RoutingConfig::RoutingMode::LEAST_LOADED;
                 }
             }
             if (r["prefix_token_length"]) {
@@ -1166,6 +1178,15 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             }
             if (r["p2c_load_bias"]) {
                 config.routing.p2c_load_bias = r["p2c_load_bias"].as<uint64_t>();
+            }
+            // Cache-miss placement
+            if (r["miss_placement"]) {
+                std::string placement = r["miss_placement"].as<std::string>();
+                if (placement == "hash") {
+                    config.routing.miss_placement = RoutingConfig::MissPlacement::HASH;
+                } else if (placement == "least_loaded") {
+                    config.routing.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
+                }
             }
             // GPU load integration (vLLM-aware routing)
             if (r["gpu_load_weight"]) {

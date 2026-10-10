@@ -25,7 +25,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <random>
+#include <vector>
 
 // ============================================================================
 // RouterService: Central Routing Orchestration
@@ -223,6 +225,7 @@ struct ShardLocalState {
         // Load-aware routing stats
         uint64_t load_aware_fallbacks = 0;       // Times we chose non-preferred backend due to load
         uint64_t gpu_load_redirects = 0;         // Times GPU-load-driven redirect occurred
+        uint64_t miss_placements_rebalanced = 0; // Misses placed off their hash bucket (miss_placement=least_loaded)
         // Local route batching stats (per-shard)
         uint64_t local_routes_batched = 0;        // Routes added to local buffer
         uint64_t local_batch_flushes = 0;          // Number of local flush operations
@@ -259,6 +262,8 @@ struct ShardLocalState {
         uint64_t native_routes_materialized = 0;    // PUSH routes inserted from BlockStored token chains
         uint64_t native_materialize_trust_skips = 0; // Materializations refused by a higher-trust route
         uint64_t remote_routes_trust_refused = 0;    // Gossip REMOTE announcements refused by a higher-trust LOCAL/PUSH route
+        uint64_t remote_routes_converged = 0;        // Gossip REMOTE announcements that moved a conflicting route to the lower backend id (miss_placement=least_loaded)
+        uint64_t local_routes_converged = 0;         // LOCAL learns dropped at batch flush because a lower backend id already held the prefix (miss_placement=least_loaded)
 
         void reset() {
             cache_hits = 0;
@@ -276,6 +281,7 @@ struct ShardLocalState {
             compaction_runs = 0;
             load_aware_fallbacks = 0;
             gpu_load_redirects = 0;
+            miss_placements_rebalanced = 0;
             local_routes_batched = 0;
             local_batch_flushes = 0;
             local_routes_deduplicated = 0;
@@ -304,6 +310,8 @@ struct ShardLocalState {
             native_routes_materialized = 0;
             native_materialize_trust_skips = 0;
             remote_routes_trust_refused = 0;
+            remote_routes_converged = 0;
+            local_routes_converged = 0;
         }
     } stats;
 
@@ -327,11 +335,12 @@ struct ShardLocalState {
         RoutingConfig::HashStrategy hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
         double bounded_load_epsilon = 0.25;
         uint64_t p2c_load_bias = 2;
+        RoutingConfig::MissPlacement miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;  // mirrors RoutingConfig (default since 2026-10-05)
         // Cross-shard load sync configuration
-        bool cross_shard_load_sync = false;
+        bool cross_shard_load_sync = true;   // mirrors RoutingConfig (default on since 2026-10-05)
         std::chrono::milliseconds cross_shard_load_sync_interval{100};
         // GPU load integration (vLLM-aware routing)
-        double gpu_load_weight = 10.0;
+        double gpu_load_weight = 0.0;   // mirrors RoutingConfig (default 0 since 2026-10-05)
         std::chrono::seconds gpu_load_cache_ttl{30};
         // Cost-based routing configuration
         bool cost_routing_enabled = false;
@@ -340,7 +349,7 @@ struct ShardLocalState {
         bool cost_routing_fast_lane = true;
         double cost_routing_imbalance_factor = 2.0;
         // Capacity-aware hash fallback
-        double capacity_headroom_weight = 5.0;
+        double capacity_headroom_weight = 0.0;   // mirrors RoutingConfig (default 0 since 2026-10-05)
         // Compression-aware route TTL
         double max_ttl_multiplier = 4.0;
         // Cache-residency-aware routing: minimum gossiped residency below which
@@ -650,6 +659,7 @@ struct ShardLocalState {
         config.hash_strategy = cfg.hash_strategy;
         config.bounded_load_epsilon = cfg.bounded_load_epsilon;
         config.p2c_load_bias = cfg.p2c_load_bias;
+        config.miss_placement = cfg.miss_placement;
         // Cross-shard load sync configuration
         config.cross_shard_load_sync = cfg.cross_shard_load_sync;
         config.cross_shard_load_sync_interval = cfg.cross_shard_load_sync_interval;
@@ -705,6 +715,7 @@ struct ShardLocalState {
         config.hash_strategy = cfg.hash_strategy;
         config.bounded_load_epsilon = cfg.bounded_load_epsilon;
         config.p2c_load_bias = cfg.p2c_load_bias;
+        config.miss_placement = cfg.miss_placement;
         // Cross-shard load sync configuration
         config.cross_shard_load_sync = cfg.cross_shard_load_sync;
         config.cross_shard_load_sync_interval = cfg.cross_shard_load_sync_interval;
@@ -997,6 +1008,22 @@ uint64_t get_resident_routes(BackendId id) {
     const auto& by_backend = g_shard_state->tree->routes_by_backend();
     auto it = by_backend.find(id);
     return it == by_backend.end() ? 0 : static_cast<uint64_t>(it->second);
+}
+
+// Live route key length (TokenIds) summed over the routes pinned to backend
+// `id` in this shard's ART: the weight least-loaded cache-miss placement
+// balances on (RadixTree::route_tokens_by_backend). Shard-local, lock-free
+// read; Prometheus sums across shards = cluster total. Exported so a placement
+// run can tell an uneven placement (uneven tokens) from a popular prefix (even
+// tokens, uneven traffic) — the route COUNT above cannot, because one-off
+// prompts are routes too.
+uint64_t get_resident_route_tokens(BackendId id) {
+    if (!g_shard_state || !g_shard_state->tree) {
+        return 0;
+    }
+    const auto& by_backend = g_shard_state->tree->route_tokens_by_backend();
+    auto it = by_backend.find(id);
+    return it == by_backend.end() ? 0 : it->second;
 }
 
 // Operator-declared GPU count for backend `id` on this shard (observe-only).
@@ -1379,11 +1406,28 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
         // re-confirmation still land (OVERWROTE / TOUCHED_SAME). This ends the
         // route-flap where two peers serving the same prefix ping-pong the
         // backend, each flip a KV-cache miss.
+        //
+        // Under least-loaded cache-miss placement the ladder alone splits
+        // prefixes across nodes (each node's own LOCAL placement wins locally
+        // and refuses the others' forever), so conflicts are instead settled
+        // by lowest backend id on every node — see RadixTree::insert_if_trusted.
+        const bool converge =
+            state.config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED;
+        std::optional<BackendId> prior;
+        if (converge) {
+            prior = tree->lookup(std::span<const TokenId>(route.tokens.data(), route.tokens.size()));
+        }
         TrustInsertResult inserted =
-            tree->insert_if_trusted(route.tokens, route.backend, RouteOrigin::REMOTE);
+            tree->insert_if_trusted(route.tokens, route.backend, RouteOrigin::REMOTE, converge);
         if (inserted == TrustInsertResult::REFUSED) {
             state.stats.remote_routes_trust_refused++;
             continue;  // route untouched — do not index a backend it never claimed
+        }
+        const bool converged_move =
+            converge && prior.has_value() && *prior != route.backend &&
+            inserted == TrustInsertResult::OVERWROTE;
+        if (converged_move) {
+            state.stats.remote_routes_converged++;
         }
 
         // Update prefix hash reverse index for O(1) eviction lookup. Gated on
@@ -1402,7 +1446,11 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
             size_t prefix_len = route.tokens.size();
             if (prefix_len > 0) {
                 uint64_t ph = hash_prefix(route.tokens.data(), prefix_len, state.config.block_alignment);
-                state.prefix_hash_index[ph].insert(route.backend);
+                auto& claimants = state.prefix_hash_index[ph];
+                if (converged_move) {
+                    claimants.erase(*prior);  // the route no longer points there
+                }
+                claimants.insert(route.backend);
             }
         }
     }
@@ -1436,15 +1484,31 @@ inline int32_t jump_consistent_hash(uint64_t key, int32_t num_buckets) {
 // Hash Strategy: Bounded-Load Consistent Hashing
 // ============================================================================
 // Mirrokni, Thorup, Zadimoghaddam (Google, 2018).
-// Caps each backend at ceil(avg_load * (1 + epsilon)). When the primary
-// jump-hash bucket exceeds capacity, probe subsequent buckets until one
-// with headroom is found. Falls back to least-loaded on full saturation.
+// Caps each backend at ceil(avg_load * (1 + epsilon)). The primary jump-hash
+// bucket keeps the request while it is under cap (affinity). When it is over
+// cap the request is DIVERTED to the least-loaded live candidate; equal loads
+// break in jump-probe order (deterministic), then by position.
+//
+// Why least-loaded and not first-under-cap (the Mirrokni paper's rule): the
+// 2026-10-02 fitted-suite GPU campaign showed that first-under-cap probing
+// only pushes load away from hot anchors and never pulls it toward the
+// coldest backend. With epsilon 0.25 on 8 backends every prefix arm left one
+// backend 35-45% below the fleet mean while 30% of requests were already
+// being diverted; once the fleet was queue-bound that stranded eighth of the
+// capacity was a consistent +10% P99 regression (BACKLOG section 27). A
+// divert is already an affinity break, so sending it to the coldest backend
+// costs nothing in cache terms and removes the stranding. The probe sequence
+// itself is part of the problem: for n = 8 the n jump probes of one key
+// visit every bucket for well under 1% of keys, so under the old rule some
+// backends were simply unreachable from a given prefix. Saturation (every
+// candidate at or over cap) needs no separate path: least-loaded is the
+// answer there too.
 //
 // Load awareness is built into the hash selection itself, so the post-anchor
 // load term does not re-apply to BOUNDED_LOAD hash anchors.
 //
 // Rule #1: Lock-free — all reads are shard-local plain integers.
-// Rule #4: probe loop bounded by live_backends.size().
+// Rule #4: both loops bounded by live_backends.size() (<= 64, discovery cap).
 static BackendId bounded_load_select(
     uint64_t prefix_hash,
     const std::vector<BackendId>& live_backends,
@@ -1468,50 +1532,66 @@ static BackendId bounded_load_select(
     // Compute total capacity-adjusted load across all live backends for average.
     // When cache headroom data is available and capacity_headroom_weight > 0,
     // backends with fuller caches appear more loaded — especially for large requests.
+    // Loads are read once per candidate and reused by the divert scan below.
+    // Rule #4: scratch sized by the live set (<= 64).
+    std::vector<uint64_t> loads;
+    loads.reserve(static_cast<size_t>(n));
     uint64_t total_load = 0;
     for (BackendId id : live_backends) {
-        total_load += get_capacity_adjusted_load(id, estimated_cost);
+        loads.push_back(get_capacity_adjusted_load(id, estimated_cost));
+        total_load += loads.back();
     }
     double avg = static_cast<double>(total_load) / static_cast<double>(n);
     // Cap: at least 1 to avoid starving all backends when idle
     uint64_t cap = std::max(static_cast<uint64_t>(1),
                             static_cast<uint64_t>(std::ceil(avg * (1.0 + epsilon))));
 
-    // Probe from primary hash bucket, then sequential offsets
+    // Primary bucket under cap: affinity holds, no divert.
+    const int32_t primary_idx = jump_consistent_hash(prefix_hash, n);
+    const uint64_t primary_load = loads[static_cast<size_t>(primary_idx)];
+    if (primary_load < cap) {
+        return live_backends[primary_idx];
+    }
+
+    // Primary over cap: divert to the least-loaded candidate. Ties break by
+    // jump-probe rank (first appearance in the probe sequence
+    // jump_consistent_hash(prefix_hash + k, n), k = 0..n-1) so equal-load
+    // targets stay deterministic and cluster-consistent; candidates the probe
+    // sequence never reaches rank after all probed ones, then by position.
+    std::vector<uint32_t> probe_rank(static_cast<size_t>(n),
+                                     std::numeric_limits<uint32_t>::max());
     for (int32_t probe = 0; probe < n; ++probe) {
-        int32_t idx = jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n);
-        BackendId candidate = live_backends[idx];
-        uint64_t load = get_capacity_adjusted_load(candidate, estimated_cost);
-        if (load < cap) {
-            if (probe > 0) {
-                // Diverted from primary — record as load-aware fallback
-                g_shard_state->stats.load_aware_fallbacks++;
-                if (g_metrics) {
-                    metrics().record_load_aware_fallback();
-                }
-                log_router.debug("[{}] Bounded-load: primary over cap ({}>{}), "
-                                 "probe {} -> backend {} (load={})",
-                                 request_id, get_capacity_adjusted_load(live_backends[jump_consistent_hash(prefix_hash, n)], estimated_cost),
-                                 cap, probe, candidate, load);
-            }
-            return candidate;
+        auto idx = static_cast<size_t>(
+            jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n));
+        if (probe_rank[idx] == std::numeric_limits<uint32_t>::max()) {
+            probe_rank[idx] = static_cast<uint32_t>(probe);
         }
     }
 
-    // All backends at or above cap — fall back to least-loaded
-    auto [least_id, least_load] = get_least_loaded_backend(live_backends);
-    if (least_id != 0) {
-        g_shard_state->stats.load_aware_fallbacks++;
-        if (g_metrics) {
-            metrics().record_load_aware_fallback();
+    size_t best = static_cast<size_t>(primary_idx);
+    for (size_t i = 0; i < static_cast<size_t>(n); ++i) {
+        if (i == best) continue;
+        if (loads[i] < loads[best] ||
+            (loads[i] == loads[best] && probe_rank[i] < probe_rank[best])) {
+            best = i;
         }
-        log_router.debug("[{}] Bounded-load: all over cap ({}), least-loaded -> backend {} (load={})",
-                         request_id, cap, least_id, least_load);
-        return least_id;
     }
 
-    // Absolute fallback: primary bucket
-    return live_backends[jump_consistent_hash(prefix_hash, n)];
+    if (best == static_cast<size_t>(primary_idx)) {
+        // Nothing colder than the primary (uniform saturation): stay put. Not
+        // a divert, so not counted as one.
+        return live_backends[primary_idx];
+    }
+
+    g_shard_state->stats.load_aware_fallbacks++;
+    if (g_metrics) {
+        metrics().record_load_aware_fallback();
+    }
+    log_router.debug("[{}] Bounded-load: primary backend {} over cap (load={} >= cap={}), "
+                     "least-loaded -> backend {} (load={}, probe_rank={})",
+                     request_id, live_backends[primary_idx], primary_load, cap,
+                     live_backends[best], loads[best], probe_rank[best]);
+    return live_backends[best];
 }
 
 // ============================================================================
@@ -1581,6 +1661,102 @@ static BackendId p2c_select(
     return primary;
 }
 
+// ============================================================================
+// Cache-Miss Placement: Least-Loaded
+// ============================================================================
+// Where a prefix with no learned route is placed (routing.miss_placement =
+// least_loaded). The hash strategies place by bucket, which is cluster-
+// consistent but balls-into-bins: with 16 prefixes over 8 backends the
+// busiest backend holds ~2x the mean and its queue sets P99 (fitted-suite leg
+// A, 2026-10-02: pure affinity +8..12% P99 vs round-robin with one backend at
+// 23% of requests and one at 0.6%). A miss has no cache to preserve, so the
+// new prefix can go wherever the fleet is lightest at no cache cost; once the
+// route is learned (and gossiped) every hit follows it.
+//
+// Order: fewest learned-route TOKENS (RadixTree::route_tokens_by_backend —
+// the sum of each live route's key length; counts LOCAL, PUSH and gossiped
+// REMOTE routes, so it converges on cluster placement), then fewest routes,
+// then lowest capacity-adjusted load, then jump-probe order so equal states
+// place deterministically. Tokens lead counts because a workload mixes
+// one-off short prompts with long shared prefixes: the first placement run
+// (2026-10-03) balanced route COUNTS, which ~70 short one-off routes
+// dominated, and the 16 long prefixes landed as unevenly as by hash. A
+// 3000-token prefix must weigh thirty 100-token one-offs. Routes lead load
+// because new prefixes arrive in bursts (warm-up, deploy) when every
+// in-flight count is ~0 and a load-first rule would collapse to probe order.
+//
+// Rule #1: Lock-free — shard-local tree and load reads.
+// Rule #4: loops bounded by candidates.size() (<= 64, discovery cap).
+static BackendId least_loaded_placement(
+    uint64_t prefix_hash,
+    const std::vector<BackendId>& candidates,
+    double estimated_cost,
+    const std::string& request_id)
+{
+    const auto n = static_cast<int32_t>(candidates.size());
+    if (n <= 0) return 0;
+    if (n == 1) return candidates[0];
+
+    const RadixTree* tree = g_shard_state ? g_shard_state->tree.get() : nullptr;
+    const std::unordered_map<BackendId, size_t>* routes_by_backend =
+        tree ? &tree->routes_by_backend() : nullptr;
+    const std::unordered_map<BackendId, uint64_t>* tokens_by_backend =
+        tree ? &tree->route_tokens_by_backend() : nullptr;
+
+    std::vector<uint32_t> probe_rank(static_cast<size_t>(n),
+                                     std::numeric_limits<uint32_t>::max());
+    for (int32_t probe = 0; probe < n; ++probe) {
+        auto idx = static_cast<size_t>(
+            jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n));
+        if (probe_rank[idx] == std::numeric_limits<uint32_t>::max()) {
+            probe_rank[idx] = static_cast<uint32_t>(probe);
+        }
+    }
+
+    auto routes_of = [routes_by_backend](BackendId id) -> size_t {
+        if (!routes_by_backend) return 0;
+        auto it = routes_by_backend->find(id);
+        return it == routes_by_backend->end() ? 0 : it->second;
+    };
+    auto tokens_of = [tokens_by_backend](BackendId id) -> uint64_t {
+        if (!tokens_by_backend) return 0;
+        auto it = tokens_by_backend->find(id);
+        return it == tokens_by_backend->end() ? 0 : it->second;
+    };
+
+    size_t best = 0;
+    uint64_t best_tokens = tokens_of(candidates[0]);
+    size_t best_routes = routes_of(candidates[0]);
+    uint64_t best_load = get_capacity_adjusted_load(candidates[0], estimated_cost);
+    for (size_t i = 1; i < static_cast<size_t>(n); ++i) {
+        const uint64_t tokens = tokens_of(candidates[i]);
+        const size_t routes = routes_of(candidates[i]);
+        const uint64_t load = get_capacity_adjusted_load(candidates[i], estimated_cost);
+        bool better = false;
+        if (tokens != best_tokens) {
+            better = tokens < best_tokens;
+        } else if (routes != best_routes) {
+            better = routes < best_routes;
+        } else if (load != best_load) {
+            better = load < best_load;
+        } else {
+            better = probe_rank[i] < probe_rank[best];
+        }
+        if (better) {
+            best = i;
+            best_tokens = tokens;
+            best_routes = routes;
+            best_load = load;
+        }
+    }
+
+    log_router.debug("[{}] Miss placement (least-loaded): backend {} (route_tokens={}, routes={}, "
+                     "load={}, probe_rank={})",
+                     request_id, candidates[best], best_tokens, best_routes, best_load,
+                     probe_rank[best]);
+    return candidates[best];
+}
+
 RouterService::RouterService() : RouterService(RoutingConfig{}) {}
 
 RouterService::RouterService(const RoutingConfig& config)
@@ -1607,9 +1783,11 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     case RoutingConfig::HashStrategy::JUMP:
     default:                                        strategy_name = "jump"; break;
     }
-    log_router.info("Hash strategy: {} (epsilon={}, p2c_bias={})",
+    log_router.info("Hash strategy: {} (epsilon={}, p2c_bias={}), miss placement: {}",
                     strategy_name, routing_config.bounded_load_epsilon,
-                    routing_config.p2c_load_bias);
+                    routing_config.p2c_load_bias,
+                    routing_config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED
+                        ? "least_loaded" : "hash");
 
     // When the hash strategy has built-in load awareness, the external median
     // override (load_imbalance_factor/floor) is not applied. Honor the
@@ -1884,6 +2062,11 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             [] { return g_shard_state ? g_shard_state->stats.load_aware_fallbacks : 0UL; },
             seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth")),
 
+        // Counter: cache misses whose least-loaded placement differed from the hash bucket
+        seastar::metrics::make_counter("router_miss_placements_rebalanced_total",
+            [] { return g_shard_state ? g_shard_state->stats.miss_placements_rebalanced : 0UL; },
+            seastar::metrics::description("Cache misses placed on a backend other than their consistent-hash bucket by miss_placement=least_loaded")),
+
         // ====================================================================
         // Local Route Batching Metrics
         // ====================================================================
@@ -2056,6 +2239,17 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             [] { return g_shard_state ? g_shard_state->stats.native_materialize_trust_skips : 0UL; },
             seastar::metrics::description("Materializations refused because a higher-trust "
                                          "route holds the prefix")),
+        seastar::metrics::make_counter("router_remote_routes_converged_total",
+            [] { return g_shard_state ? g_shard_state->stats.remote_routes_converged : 0UL; },
+            seastar::metrics::description("Gossip REMOTE route announcements that moved a conflicting "
+                                         "LOCAL/REMOTE route to the lower backend id "
+                                         "(miss_placement=least_loaded convergence)")),
+        seastar::metrics::make_counter("router_local_routes_converged_total",
+            [] { return g_shard_state ? g_shard_state->stats.local_routes_converged : 0UL; },
+            seastar::metrics::description("This node's own route learns dropped at batch flush "
+                                         "because a lower backend id already held the prefix "
+                                         "(miss_placement=least_loaded convergence); the learn "
+                                         "yields instead of re-splitting the prefix")),
         seastar::metrics::make_counter("router_remote_routes_trust_refused_total",
             [] { return g_shard_state ? g_shard_state->stats.remote_routes_trust_refused : 0UL; },
             seastar::metrics::description("Gossip REMOTE route announcements refused because a "
@@ -2514,6 +2708,7 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
 //   - PREFIX: ART lookup + consistent hash fallback (learns routes)
 //   - HASH: Consistent hash only (baseline comparison)
 //   - RANDOM: Weighted random (no affinity)
+//   - LEAST_LOADED: lowest live load, no affinity (strongest no-affinity baseline)
 //
 RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
                                          const std::string& request_id,
@@ -2593,6 +2788,24 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
             result.cache_hit = true;  // Hash always provides affinity
             result.original_selected = hash_backend.value();
             result.matched_prefix_depth = static_cast<uint32_t>(effective_prefix_len);
+        } else {
+            result.error_message = "No backends registered";
+        }
+    } else if (routing_mode == RoutingConfig::RoutingMode::LEAST_LOADED) {
+        // LEAST_LOADED mode: lowest capacity-adjusted composite load, no
+        // affinity. The benchmark's strongest no-affinity baseline: it reads
+        // the same live load signal the PREFIX divert policy reads, so
+        // prefix-vs-least_loaded isolates what affinity adds over balancing.
+        result.routing_mode = "least_loaded";
+        auto ll_id = select_least_loaded_backend(estimated_cost);
+
+        if (ll_id.has_value()) {
+            result.backend_id = ll_id.value();
+            result.cache_hit = false;  // Never consults the ART
+            result.original_selected = ll_id.value();
+            result.backend_load_at_decision =
+                static_cast<double>(get_composite_backend_load(ll_id.value()));
+            // matched_prefix_depth stays 0 — no affinity.
         } else {
             result.error_message = "No backends registered";
         }
@@ -2755,6 +2968,93 @@ std::optional<BackendId> RouterService::get_random_backend() {
 
     // Fallback (shouldn't reach here)
     return last_candidate;
+}
+
+// ============================================================================
+// select_least_loaded_backend() - LEAST_LOADED mode (HOT PATH)
+// ============================================================================
+//
+// HARD RULE #1 (No Blocking on Hot Path): shard-local reads only. The load
+// signal is get_capacity_adjusted_load(), the same function the PREFIX mode's
+// bounded-load divert and least-loaded placement consult: local in-flight
+// count + the cross-shard in-flight mirror (cross_shard_load_sync) + the
+// scraped GPU score and cache-headroom terms when their weights are non-zero.
+// Under the shipping defaults (weights 0) it is the node's live in-flight count.
+//
+// Candidate set and valves mirror get_random_backend(): live backends, DECODE
+// pools excluded unless nothing else is live, highest priority group, weight
+// > 0. Ties (an idle fleet, or equal queues) are broken uniformly at random
+// so the arm does not herd onto the lowest backend id and behave like a
+// single-backend fleet at low load.
+//
+std::optional<BackendId> RouterService::select_least_loaded_backend(double estimated_cost) {
+    if (!g_shard_state) return std::nullopt;
+    auto& state = shard_state();
+
+    if (state.backend_ids.empty()) {
+        return std::nullopt;
+    }
+
+    auto live_infos = state.get_live_backend_infos();
+
+    // Pool-role filter with the same availability valve as get_random_backend().
+    {
+        std::vector<std::pair<BackendId, const BackendInfo*>> eligible;
+        eligible.reserve(live_infos.size());
+        for (const auto& entry : live_infos) {
+            if (entry.second->pool_role != PoolRole::DECODE) {
+                eligible.push_back(entry);
+            }
+        }
+        if (eligible.empty() && !live_infos.empty()) {
+            state.stats.pool_role_fallbacks++;
+            log_router.debug("Pool-role valve: only decode-role backends live; "
+                             "least-loaded selection over the full live set");
+        } else {
+            live_infos = std::move(eligible);
+        }
+    }
+
+    // Highest priority group (lowest priority number) among weight > 0 backends.
+    uint32_t min_priority = std::numeric_limits<uint32_t>::max();
+    for (const auto& [id, info] : live_infos) {
+        if (info->weight > 0 && info->priority < min_priority) {
+            min_priority = info->priority;
+        }
+    }
+    if (min_priority == std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;  // No live backends with weight > 0
+    }
+
+    // Min scan. `ties` is bounded by the live backend count (Hard Rule #4:
+    // bounded by design, no growth beyond the fleet size).
+    uint64_t best_load = std::numeric_limits<uint64_t>::max();
+    std::vector<BackendId> ties;
+    ties.reserve(live_infos.size());
+    for (const auto& [id, info] : live_infos) {
+        if (info->priority != min_priority || info->weight == 0) continue;
+        const uint64_t load = get_capacity_adjusted_load(id, estimated_cost);
+        if (load < best_load) {
+            best_load = load;
+            ties.clear();
+            ties.push_back(id);
+        } else if (load == best_load) {
+            ties.push_back(id);
+        }
+    }
+    if (ties.empty()) {
+        return std::nullopt;  // Unreachable: min_priority came from this set
+    }
+
+    BackendId chosen = ties[0];
+    if (ties.size() > 1) {
+        std::uniform_int_distribution<size_t> dist(0, ties.size() - 1);
+        chosen = ties[dist(state.rng)];
+    }
+
+    log_router.debug("Least-loaded routing: backend {} (load={}, ties={})",
+                     chosen, best_load, ties.size());
+    return chosen;
 }
 
 // ============================================================================
@@ -3017,6 +3317,19 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
             candidates = &filtered;
         }
 
+        if (state.config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED) {
+            // Least-loaded placement replaces the hash strategy for misses:
+            // fewest learned routes, then lowest load, then probe order (see
+            // least_loaded_placement). The hash bucket is kept only to count
+            // how often placement moved off it.
+            hash_index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(candidates->size()));
+            const BackendId hash_bucket = (*candidates)[static_cast<size_t>(hash_index)];
+            selected = least_loaded_placement(prefix_hash, *candidates, estimated_cost, request_id);
+            if (selected == 0) selected = hash_bucket;
+            if (selected != hash_bucket) {
+                state.stats.miss_placements_rebalanced++;
+            }
+        } else
         switch (state.config.hash_strategy) {
         case RoutingConfig::HashStrategy::BOUNDED_LOAD:
             // Bounded-load has built-in load awareness — no separate step 3 needed.
@@ -3065,6 +3378,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         // consume the capacity-adjusted load; both anchor on the same
         // jump-hash primary bucket.
         if (estimated_cost > 0.0 && state.config.capacity_headroom_weight > 0.0 &&
+            state.config.miss_placement == RoutingConfig::MissPlacement::HASH &&
             (state.config.hash_strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD ||
              state.config.hash_strategy == RoutingConfig::HashStrategy::P2C)) {
             BackendId primary = (*candidates)[jump_consistent_hash(
@@ -3334,12 +3648,14 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         scored.push_back(c);
     }
 
-    // BOUNDED_LOAD spillover order: when an ART anchor forfeits its
-    // allowance, the former override re-probed the jump-hash sequence and
-    // took the first under-cap candidate — a deterministic, cluster-
-    // consistent target. Probe ranks reproduce it through the comparator,
-    // filled only for under-allowance candidates so the saturated case falls
-    // through to the least-loaded tie-break.
+    // BOUNDED_LOAD spillover tie order: when an ART anchor forfeits its
+    // allowance, every under-allowance candidate scores equal (zero hinge, no
+    // affinity) and the scorer's tie keys pick the target: least loaded
+    // first, then jump-probe rank. Probe ranks are filled here so equal-load
+    // targets stay deterministic and cluster-consistent; they no longer
+    // outrank load (the first-under-cap rule stranded the coldest backend,
+    // see bounded_load_select). Filled only for under-allowance candidates so
+    // the saturated case falls through to the least-loaded key unchanged.
     if (load_term && strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD &&
         art_hit && load_hinge(scored[anchor_index].load, allowance) > 0.0) {
         prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
@@ -3604,6 +3920,27 @@ seastar::future<bool> RouterService::learn_route_global(std::vector<int32_t> tok
             log_router.debug("[{}] Route dedup: prefix ({} tokens) -> backend {} already in ART, skipping",
                              request_id.empty() ? "N/A" : request_id, tokens.size(), backend);
             return seastar::make_ready_future<bool>(false);
+        }
+        // Under least-loaded placement the prefix's backend is settled by the
+        // placement plus cluster convergence (lowest backend id wins). A
+        // first-byte learn that disagrees — the request was dispatched before
+        // convergence landed — must not move it back: that re-opens the
+        // conflict for one gossip round per in-flight request. Skip it while
+        // the settled backend is live; a dead or draining one may be replaced.
+        if (existing.has_value() &&
+            cfg.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED) {
+            auto bit = state.backends.find(existing.value());
+            const bool settled_live = bit != state.backends.end() &&
+                                      !bit->second.is_draining &&
+                                      !state.dead_backends.contains(existing.value());
+            if (settled_live) {
+                state.stats.routes_deduplicated_pre_buffer++;
+                log_router.debug("[{}] Route settled: prefix ({} tokens) -> backend {} already placed; "
+                                 "not moving it to backend {} (miss_placement=least_loaded)",
+                                 request_id.empty() ? "N/A" : request_id, tokens.size(),
+                                 existing.value(), backend);
+                return seastar::make_ready_future<bool>(false);
+            }
         }
     }
 
@@ -3934,13 +4271,34 @@ seastar::future<> RouterService::flush_route_batch() {
 
 // Apply a batch of locally-learned routes to the local shard's RadixTree.
 // Similar to apply_route_batch_to_local_tree but uses LOCAL origin.
-static void apply_local_batch_to_tree(const std::vector<PendingLocalRoute>& batch) {
+// Applies a flushed batch of this node's own learns to this shard's tree.
+//
+// Under least-loaded cache-miss placement the batch is also FILTERED: a route
+// that loses to a lower backend id already holding its key is removed from
+// `batch` (counted in local_routes_converged), so the caller's cross-shard
+// fan-out and gossip never carry it. Placement is decided per shard and the
+// learn lands here ~20 ms later; in that window a peer's lower-id route may
+// already have arrived by gossip, and a plain latest-wins insert would move the
+// prefix back, announce the move, and leave the cluster split — the lower side
+// refuses the announcement (invariant T7 / the convergence order) and never
+// re-announces. Placement v3 (2026-10-03) showed exactly that:
+// router_remote_routes_converged_total = 0 on every node while ~220
+// announcements per node were refused. Under the default hash placement the
+// insert is unconditional, as before (every shard computes the same bucket, so
+// LOCAL-vs-LOCAL conflicts do not arise there).
+//
+// Rule #1: shard-local tree, no locks. Rule #4: one pass over the batch.
+static void apply_local_batch_to_tree(std::vector<PendingLocalRoute>& batch) {
     if (!g_shard_state) return;
     auto& state = shard_state();
     RadixTree* tree = state.tree.get();
     if (!tree) return;
 
-    for (const auto& route : batch) {
+    const bool converge =
+        state.config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED;
+    size_t write = 0;
+    for (size_t read = 0; read < batch.size(); ++read) {
+        const auto& route = batch[read];
         // LRU eviction: if at capacity, evict oldest routes first
         if (state.config.max_routes > 0) {
             while (tree->route_count() >= state.config.max_routes) {
@@ -3953,7 +4311,34 @@ static void apply_local_batch_to_tree(const std::vector<PendingLocalRoute>& batc
         }
 
         // Insert with LOCAL origin (direct request on this node)
-        tree->insert(route.tokens, route.backend, RouteOrigin::LOCAL);
+        std::optional<BackendId> prior;
+        if (converge) {
+            prior = tree->lookup(std::span<const TokenId>(route.tokens.data(), route.tokens.size()));
+            TrustInsertResult inserted = tree->insert_if_trusted(
+                std::span<const TokenId>(route.tokens.data(), route.tokens.size()),
+                route.backend, RouteOrigin::LOCAL, /*converge_local_conflicts=*/true);
+            // REFUSED means one of two things. With a prior route to a different
+            // backend it is the convergence rule: a lower id holds the key and
+            // this learn yields, dropped from the batch so no shard or peer sees
+            // it. Without a prior route it is a key shorter than block_alignment,
+            // which insert_if_trusted refuses where the plain insert() silently
+            // stores nothing: that route must stay in the batch exactly as under
+            // hash placement (fanned out and gossiped; peers apply the same
+            // no-op), or a cluster whose prompts are shorter than one block never
+            // announces anything (integration test_07_gossip_counters_increment,
+            // 2026-10-05).
+            if (inserted == TrustInsertResult::REFUSED &&
+                prior.has_value() && *prior != route.backend) {
+                state.stats.local_routes_converged++;
+                log_router.debug("Shard {}: local route ({} tokens) -> backend {} yields to settled "
+                                 "backend {} (miss_placement=least_loaded)",
+                                 seastar::this_shard_id(), route.tokens.size(), route.backend,
+                                 prior.value_or(-1));
+                continue;
+            }
+        } else {
+            tree->insert(route.tokens, route.backend, RouteOrigin::LOCAL);
+        }
 
         // Update prefix hash reverse index for O(1) eviction lookup.
         // Hash at the route's full stored depth — tokens are pre-truncated to
@@ -3963,10 +4348,19 @@ static void apply_local_batch_to_tree(const std::vector<PendingLocalRoute>& batc
             size_t prefix_len = route.tokens.size();
             if (prefix_len > 0) {
                 uint64_t ph = hash_prefix(route.tokens.data(), prefix_len, state.config.block_alignment);
-                state.prefix_hash_index[ph].insert(route.backend);
+                auto& claimants = state.prefix_hash_index[ph];
+                if (converge && prior.has_value() && *prior != route.backend) {
+                    claimants.erase(*prior);  // the route no longer points there
+                }
+                claimants.insert(route.backend);
             }
         }
+        if (write != read) {
+            batch[write] = std::move(batch[read]);
+        }
+        ++write;
     }
+    batch.resize(write);
 }
 
 // FNV-1a hash over raw token bytes (no block alignment, used only for dedup)
@@ -5065,7 +5459,9 @@ seastar::future<> RouterService::update_routing_config(const RoutingConfig& conf
     _config = config;
 
     const char* mode_str = config.routing_mode == RoutingConfig::RoutingMode::PREFIX ? "prefix" :
-                           config.routing_mode == RoutingConfig::RoutingMode::HASH ? "hash" : "random";
+                           config.routing_mode == RoutingConfig::RoutingMode::HASH ? "hash" :
+                           config.routing_mode == RoutingConfig::RoutingMode::LEAST_LOADED ? "least_loaded" :
+                           "random";
     log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s, drain_timeout={}s, mode={}, prefix_len={})",
                   config.max_routes, config.ttl_seconds.count(), config.backend_drain_timeout.count(),
                   mode_str, config.prefix_token_length);
@@ -5819,9 +6215,29 @@ uint64_t RouterService::headroom_redirects_for_testing() {
     return shard_state().stats.headroom_redirects;
 }
 
+uint64_t RouterService::load_aware_fallbacks_for_testing() {
+    if (!g_shard_state) return 0;
+    return shard_state().stats.load_aware_fallbacks;
+}
+
+bool RouterService::eager_learn_on_miss() {
+    if (!g_shard_state) return false;
+    return shard_state().config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED;
+}
+
 uint64_t RouterService::remote_routes_trust_refused_for_testing() {
     if (!g_shard_state) return 0;
     return shard_state().stats.remote_routes_trust_refused;
+}
+
+uint64_t RouterService::remote_routes_converged_for_testing() {
+    if (!g_shard_state) return 0;
+    return shard_state().stats.remote_routes_converged;
+}
+
+uint64_t RouterService::local_routes_converged_for_testing() {
+    if (!g_shard_state) return 0;
+    return shard_state().stats.local_routes_converged;
 }
 
 std::optional<BackendId> RouterService::lookup_backend_for_testing(

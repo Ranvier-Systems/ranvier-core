@@ -20,10 +20,17 @@ including our own.
 
 Two consequences worth internalizing:
 
-- **Our baseline already gets cache hits.** With prefix caching on, `random`
-  routing lands a request on a backend that already holds the prefix roughly
-  **1/N** of the time — ~12.5% at 8 backends, ~49% at 2. Affinity's job is to
-  push that toward ~1.0. The baseline is *not* "cold on every request."
+- **"Cache hit rate" in our reports is route consistency, not a KV-cache
+  measurement.** The Locust client counts a request as a "hit" when it landed
+  on the same backend as the previous request carrying that prefix. Under
+  `random` routing that proxy sits at **1/N** by construction (~12.5% at 8
+  backends) whatever the GPUs hold. The real KV picture is different: with
+  prefix caching on and a bounded prefix set, every backend soon holds every
+  hot prefix, so random routing's true hit rate is high and the baseline is
+  *not* "cold on every request." Since 2026-09-30 the locustfile also reports
+  the vLLM `prefix_cache_hits/queries` delta over the run as **KV prefix-cache
+  hit rate**; quote that when you mean cache behaviour, and route consistency
+  when you mean affinity.
 - **Our P50 is often flat; the win is in the tail.** In a validated 30-minute
   run, P50 TTFT moved −3.8% while P99 moved −78% and hit rate went 12.5% → 74%.
   On real backends the median request frequently already benefits from

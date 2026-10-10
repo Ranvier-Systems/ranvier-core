@@ -7,10 +7,12 @@
 # Tracks progress, captures results, and produces a summary report.
 #
 # Usage:
-#   ./scripts/bench-runner.sh                          # Run default suite
-#   ./scripts/bench-runner.sh --suite high             # High-priority runs only
-#   ./scripts/bench-runner.sh --suite medium            # High + medium priority
-#   ./scripts/bench-runner.sh --suite all               # All runs
+#   ./scripts/bench-runner.sh                          # Default: --suite rebaseline (x3 repeats)
+#   ./scripts/bench-runner.sh --suite rebaseline       # The citable 4-config matrix, A/B, x3
+#   ./scripts/bench-runner.sh --suite epsilon          # Historical Leg V1: bounded-load epsilon 0.5, x3
+#   ./scripts/bench-runner.sh --suite fitted           # 13B (10u, 20u, 30u) with a prefix set that fits its KV cache, x3
+#   ./scripts/bench-runner.sh --suite low              # Exploratory: 70B, 64-user stress
+#   ./scripts/bench-runner.sh --suite all              # rebaseline + epsilon + fitted + low
 #   ./scripts/bench-runner.sh --suite custom --file runs.txt  # Custom run file
 #   ./scripts/bench-runner.sh --dry-run                # Preview what would run
 #   ./scripts/bench-runner.sh --resume 3               # Resume from run #3
@@ -48,9 +50,12 @@ ORIGINAL_CMD="$0 $*"
 # State
 RESUME_FROM=0
 DRY_RUN=false
-SUITE="high"
+SUITE="rebaseline"
+REPEAT_SET=false   # true when --repeat was passed; rebaseline/epsilon default to 3
 CUSTOM_FILE=""
 STOP_ON_FAILURE=false
+STARTUP_RETRY_SECS=180   # --startup-retry N: re-run once a run that fails within N s (0 = off)
+BUILD_IMAGE=false
 SKIP_RUNS_RAW=""   # comma-separated list from --skip
 REPEAT=1           # --repeat N: run each config N times, then aggregate (median/IQR)
 
@@ -168,7 +173,7 @@ extract_metrics() {
         ttft_improv=$(grep "TTFT Improvement:" "$log_file" 2>/dev/null | tail -1 | grep -oP '\-?[0-9.]+(?=%)' || echo "")
         if [[ -n "$hit_rate" || -n "$ttft_improv" ]]; then
             echo -ne "    ${label:+${BOLD}${label}:${NC} }"
-            [[ -n "$hit_rate" ]] && echo -ne "Cache: ${hit_rate}%"
+            [[ -n "$hit_rate" ]] && echo -ne "Route consistency: ${hit_rate}%"
             [[ -n "$hit_rate" && -n "$cache_hits" ]] && echo -ne " (${cache_hits} hits)"
             [[ -n "$ttft_improv" ]] && echo -ne " | TTFT Improv: ${ttft_improv}%"
             echo ""
@@ -178,7 +183,8 @@ extract_metrics() {
 
     # Parse JSON with lightweight field extraction (no jq dependency)
     local hit_rate cache_hits ttft_improv total_reqs failed_reqs tokens_sec
-    hit_rate=$(echo "$json_line" | grep -oP '"cache_hit_rate_pct":\s*[0-9.]+' | grep -oP '[0-9.]+$' || echo "")
+    # route_consistency_pct since 2026-09-30; cache_hit_rate_pct in older logs.
+    hit_rate=$(echo "$json_line" | grep -oP '"(route_consistency_pct|cache_hit_rate_pct)":\s*[0-9.]+' | head -1 | grep -oP '[0-9.]+$' || echo "")
     cache_hits=$(echo "$json_line" | grep -oP '"cache_hits":\s*[0-9]+' | grep -oP '[0-9]+$' || echo "")
     ttft_improv=$(echo "$json_line" | grep -oP '"ttft_improvement_pct":\s*-?[0-9.]+' | grep -oP '\-?[0-9.]+$' || echo "")
     total_reqs=$(echo "$json_line" | grep -oP '"total_requests":\s*[0-9]+' | grep -oP '[0-9]+$' || echo "")
@@ -186,7 +192,7 @@ extract_metrics() {
     tokens_sec=$(echo "$json_line" | grep -oP '"tokens_per_second":\s*[0-9.]+' | grep -oP '[0-9.]+$' || echo "")
 
     echo -ne "    ${label:+${BOLD}${label}:${NC} }"
-    [[ -n "$hit_rate" ]] && echo -ne "Cache: ${hit_rate}%"
+    [[ -n "$hit_rate" ]] && echo -ne "Route consistency: ${hit_rate}%"
     [[ -n "$cache_hits" ]] && echo -ne " (${cache_hits} hits)"
     [[ -n "$ttft_improv" ]] && echo -ne " | TTFT Improv: ${ttft_improv}%"
     [[ -n "$tokens_sec" ]] && echo -ne " | Tok/s: ${tokens_sec}"
@@ -233,10 +239,7 @@ USAGE:
     ./scripts/bench-runner.sh [OPTIONS]
 
 OPTIONS:
-    --suite LEVEL       Which benchmark suite to run (default: high)
-                          high   - 3 high-priority runs (~45 min)
-                          medium - high + 3 medium-priority runs (~2.5 hours)
-                          all    - all 9 runs (~4+ hours)
+    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, saturation, low, all, custom
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
@@ -244,6 +247,17 @@ OPTIONS:
     --skip LIST         Skip specific runs by number (comma-separated, e.g., --skip 9,10)
     --pause SECONDS     Pause between runs for GPU cooldown (default: 60)
     --stop-on-failure   Stop the suite if any run fails (default: continue)
+    --startup-retry N   Re-run a failed run once, immediately, when it failed within
+                        N seconds, i.e. before any measurement (a vLLM engine-core
+                        init failure, a port still held by the previous run). 0
+                        disables. Default 180. The 2026-10-06 rebaseline lost its
+                        13B 20u rep 2 to a 47 s start-up failure and needed a
+                        manual rerun; measured runs that fail are never retried.
+    --build-image       Build ranvier:latest from this checkout once, before the
+                        first run. REQUIRED when the suite is the acceptance test
+                        for a C++ change on a branch: bench.sh otherwise reuses
+                        whatever ranvier:latest exists (and refuses if it predates
+                        the newest src/ commit).
     --output-dir DIR    Output directory (default: benchmark-reports)
     --repeat N          Run each config N times, then aggregate median/IQR per
                         config and print a verdict (default: 1). Variance is the
@@ -255,26 +269,124 @@ OPTIONS:
     -h, --help          Show this help
 
 BUILT-IN SUITES:
-    high (3 runs, ~1.5h):
-      1. 13B at 20 users (compare load-aware vs Jan baseline 38.9%)
-      2. 8B at 20 users  (compare load-aware vs Jan baseline 43.7%)
-      3. 13B at 10 users (compare load-aware vs Jan baseline 48.2%)
+    rebaseline (4 configs x 2 arms x 3 repeats, ~8h) — the DEFAULT:
+      The 2026-07-13 headline matrix, re-run on the fixed tooling (audit
+      2026-09-30: routing DB no longer carried across arms, seeded prefix
+      pool, exact TTFT percentiles, route consistency + KV hit rate).
+      Unflagged, so the prefix arm runs whatever defaults the image ships
+      (2.2.0: epsilon 1.0, live in-flight signal, least-loaded placement).
+      Run it after every defaults change; it is the citable README table.
+      1. 8B  20 users 10m   --compare --warmup
+      2. 13B 30 users 30m   --compare --warmup
+      3. 13B 20 users 10m   --compare --warmup
+      4. 13B 10 users 10m   --compare --warmup
+      Pre-registered rule: the July headline is REPRODUCED only if the
+      aggregate prints CONSISTENT IMPROVEMENT for 1 and 2 and CONSISTENT
+      REGRESSION for 4. MIXED or NO RELIABLE EFFECT is reported as such.
 
-    medium (adds 4 runs, ~4h total):
-      4. 13B 30-minute validated run at 30 users
-      5. 8B 30-minute validated run at 30 users
-      6. 13B prefix ratio 0.7
-      7. 13B prefix ratio 0.5
+    epsilon (2 configs x 2 arms x 3 repeats, ~4h) — HISTORICAL. Leg V1 of the
+      load-gating proposal, designed when 0.25 was the default: the knob that
+      actually moves diversion under the shipped bounded_load strategy
+      (--bounded-load-epsilon 0.5 vs the then-default 0.25). Since 2.2.0 the
+      default is 1.0, so this suite now pins a TIGHTER threshold than
+      shipping; the open question is 0.1 on the fitted set, not 0.5.
+      5. 13B 30 users 30m   --compare --warmup --bounded-load-epsilon 0.5
+      6. 13B 10 users 10m   --compare --warmup --bounded-load-epsilon 0.5
+      The treatment is each run's PREFIX arm; compare it against the
+      rebaseline suite's prefix arm for the same config:
+        results_parser.py aggregate <eps0.5 prefix dirs> --baseline <rebaseline prefix dirs>
+      Rule: adopt 0.5 only if median P99 improves >= 10% with no incomplete-
+      rate regression; record whether it WORSENS 13B/10u (Option 0 evidence).
+      For the factor/floor variant add --hash-strategy jump, or bench.sh refuses.
 
-    all (adds 4 more, ~6.5h total):
-      8.  13B client tokenization comparison
-      9.  8B high concurrency stress test (64 users)
-      10. 70B model test (TP=4, 2 backends on 8xA100 40GB)
-      11. 8B with 16K max prefix (tests larger-than-default prefixes)
+    fitted (3 configs x 2 arms x 3 repeats, ~6.5h) — 13B in the regime where routing
+      can matter. The rebaseline 13B rows run a ~250k-token hot set against
+      ~11.6k tokens of KV per backend (measured 2026-10-01 on A100-40GB: KV
+      hit rate 5% round-robin vs 14% prefix at 30 users, with preemptions),
+      so every backend evicts whatever the router does. These rows shrink
+      the set to 16 prefixes of 2000..4000 tokens (~48k, ~6k per backend):
+      7. 13B 10 users 10m   --compare --warmup --num-prefixes 16 --prefix-max-tokens 4000
+         A backend's share plus 10 users' in-flight requests fits comfortably.
+      8. 13B 20 users 10m   same set. Marginal: ~6k share + ~7.5k in-flight
+         slightly exceeds 11.6k, so expect some eviction; it is the load
+         gradient point between row 7 and the rebaseline rows, not a clean fit.
+      9. 13B 30 users 30m   same set. The rebaseline 30u row times out in both
+         arms (eviction regime: 50 prefixes x 2000..8000 tokens against 11.6k
+         KV tokens per backend); this row gives the high-load regime a
+         measurement without timeouts. Measured 2026-10-06/07 on 2.2.0:
+         -43.1 / -42.0 / -34.1% P99, zero incompletes both arms, +15% rps.
+      Compare row 7 with rebaseline row 4, row 8 with rebaseline row 3 and
+      row 9 with rebaseline row 2 (same load, default set). If the low-load
+      regression persists on the fitted set, it is not a cache-capacity
+      artefact. (Resolved 2026-10-05: it was the divert policy, see
+      docs/benchmarks/benchmark-results-current.md; rows 7 and 8 under the
+      2.2.0 defaults measured -34.5% and -57.5% median P99.)
+
+    low (2 runs, exploratory, not part of any headline):
+      10. 70B model test (16 users, TP auto)
+      11. 8B high-concurrency stress (64 users, single arm)
+
+    baseline (2 configs x 2 arms x 3 repeats, ~4.5h) — prefix vs LEAST-LOADED, the
+      strongest no-affinity baseline (--baseline-mode least_loaded: lowest live
+      in-flight count, no ART, no learning; the same load signal the prefix
+      divert policy reads). Fitted set, 13B 20u/10m and 30u/30m: the two rows
+      where the prefix-vs-round-robin win is largest (-57% / -42% P99). Reads:
+      the prefix arm's margin here is what affinity adds over load balancing;
+      least_loaded's own margin over round-robin is the fitted-suite number
+      minus this one on the same row. Requires an image with the least_loaded
+      routing mode (2.3.0+); bench.sh aborts the arm on a mode mismatch.
+      12. 13B 20 users 10m   --compare --baseline-mode least_loaded --num-prefixes 16 --prefix-max-tokens 4000
+      13. 13B 30 users 30m   same
+      Measured 2026-10-08: 20u P99 -14.6/-13.8/-20.8% (3/3), 30u -6.5/+6.6/+11.3%
+      (mixed); P50 -27..-29% and rps +6..+9% at both loads. Least-loaded alone is
+      ~-50%/-41% P99 vs round-robin, so the tail win is mostly load balancing.
+
+    saturation (3 configs x 2 arms x 3 repeats, ~8h) — can a tighter divert cap recover
+      the saturation tail against LEAST-LOADED without giving back P50 / KV?
+      The baseline suite (2026-10-08) found prefix has no reliable P99 edge over
+      least_loaded at 30 users (-6.5 / +6.6 / +11.3) because the prefix arm's
+      concentration (Gini 0.08-0.11 vs 0.002-0.005) is itself the tail; the 2x
+      cap (epsilon 1.0) permits it. Same fitted 30u/30m row, baseline arm
+      least_loaded, prefix arm at epsilon 0.5 and 0.25; plus the 50-prefix 20u
+      row vs least_loaded, which has one repeat (P99 parity, P50 -16.6%).
+      Pre-registered reading: an epsilon that matches least_loaded's P99 at 30u
+      (MIXED or better, no CONSISTENT REGRESSION) while keeping P50 within 5
+      points of -28% and KV above 40% becomes the default; if none does both,
+      1.0 stays and the docs state the trade-off. Compare rows 14/15 with the
+      baseline suite's 30u row (epsilon 1.0) in results/2026-10-08-baseline-least-loaded/.
+      14. 13B 30 users 30m   --compare --baseline-mode least_loaded --bounded-load-epsilon 0.5  (fitted set)
+      15. 13B 30 users 30m   same at --bounded-load-epsilon 0.25
+      16. 13B 20 users 10m   --compare --baseline-mode least_loaded  (50-prefix set)
+      Measured 2026-10-09 (KV reset 8/8 every arm): epsilon 0.5 P99 -7.3/+6.0/+1.3 (MIXED,
+      KV 42-44%, diverts 24%); epsilon 0.25 +11.1/+4.8/+25.4 (CONSISTENT REGRESSION, KV
+      32-37%, diverts 30%); no epsilon recovers the tail, 1.0 stays. 50-prefix 20u vs
+      least_loaded: +22.9/+24.9/+21.7 P99 (the 10-08 carry-over rep's parity was the
+      cache), P50 -9..-16%, KV 3-5x, fewer timeouts. Record: results/2026-10-09-saturation/.
+
+    all = rebaseline + epsilon + fitted + placement + baseline + saturation + low (every suite;
+      the historical epsilon and placement rows included — pass --skip to drop them).
+
+    Retired (see .dev-context/benchmark-accuracy-audit-2026-09-30.md):
+      - prefix-ratio 0.5/0.7 sweep: SHARED_PREFIX_RATIO only governs 20% of the
+        stress distribution, so those rows never measured what they said.
+      - client-tokenization comparison: client tokenization runs outside the
+        TTFT timer and server tokenization inside it (finding 13); re-add once
+        the timer is placed consistently.
+      - 8B 16K-prefix run: superseded by the KV-regime check (manifest now
+        records each backend's KV capacity next to the prefix working set).
+
+    placement (2 configs x 2 arms x 3 repeats, ~3h) — HISTORICAL. The fitted 20u
+      and 10u rows with --miss-placement least_loaded: the acceptance test for
+      least-loaded cache-miss placement (BACKLOG section 27), run as v1..v4 on
+      2026-10-03..05. least_loaded is the default since 2.2.0, so this suite is
+      now identical to fitted on a 2.2.0 image; keep it for re-running the leg
+      against an older image or with --miss-placement hash on the rr arm.
+
+    rebaseline, epsilon, fitted, placement, baseline and saturation default to --repeat 3; pass --repeat 1 for a smoke run.
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
-      add_run <priority> "<label>" <bench.sh args...>
+      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | saturation | low
     Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
@@ -284,12 +396,12 @@ CUSTOM RUN FILE FORMAT:
     --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 30 --max-model-len 8192
 
 EXAMPLES:
-    # Preview the default high-priority suite
+    # Preview the default rebaseline suite (12 runs: 4 configs x 3 repeats)
     ./scripts/bench-runner.sh --dry-run
 
-    # Run high-priority benchmarks
+    # Run the Leg V1 epsilon suite
     export HF_TOKEN=hf_xxx
-    ./scripts/bench-runner.sh --suite high
+    ./scripts/bench-runner.sh --suite epsilon
 
     # Run all benchmarks, stop if one fails
     ./scripts/bench-runner.sh --suite all --stop-on-failure
@@ -322,8 +434,10 @@ while [[ $# -gt 0 ]]; do
         --skip)             SKIP_RUNS_RAW="$2"; shift 2 ;;
         --pause)            PAUSE_BETWEEN_RUNS="$2"; shift 2 ;;
         --stop-on-failure)  STOP_ON_FAILURE=true; shift ;;
+        --startup-retry)    STARTUP_RETRY_SECS="$2"; shift 2 ;;
+        --build-image)      BUILD_IMAGE=true; shift ;;
         --output-dir)       RUNNER_OUTPUT_DIR="$2"; shift 2 ;;
-        --repeat)           REPEAT="$2"; shift 2 ;;
+        --repeat)           REPEAT="$2"; REPEAT_SET=true; shift 2 ;;
         -h|--help)          print_help; exit 0 ;;
         *)                  log_error "Unknown option: $1"; echo "Run with --help for usage."; exit 1 ;;
     esac
@@ -332,26 +446,26 @@ done
 # -----------------------------------------------------------------------------
 # Define benchmark suites
 # -----------------------------------------------------------------------------
-# Each run is defined as:  add_run <priority> <label> <bench.sh args...>
+# Each run is defined as:  add_run <suite> <label> <bench.sh args...>
 #
-# Priority levels (cumulative):
-#   high   = runs 1-3       (included in --suite high, medium, all)
-#   medium = runs 4-7       (included in --suite medium, all)
-#   low    = runs 8-10      (included in --suite all only)
+# Suites (not cumulative, except `all`):
+#   rebaseline = the citable 4-config A/B matrix        (--suite rebaseline, all)
+#   epsilon    = Leg V1 bounded-load epsilon 0.5 leg    (--suite epsilon, all)
+#   fitted     = 13B with a KV-fitting prefix set         (--suite fitted, all)
+#   placement  = fitted set, --miss-placement least_loaded (--suite placement; historical, default since 2.2.0)
+#   low        = exploratory runs outside any headline  (--suite low, all)
 #
-# To add a new benchmark, append an add_run line at the end of the
-# appropriate priority section. Run numbers are assigned in order.
+# Run numbers are assigned in definition order within the selected suite.
 # Use --dry-run to verify numbering after changes.
 
 add_run() {
-    local priority="$1"
+    local suite="$1"
     local label="$2"
     shift 2
     local args="$*"
 
     case "$SUITE" in
-        high)   [[ "$priority" != "high" ]] && return ;;
-        medium) [[ "$priority" == "low" ]] && return ;;
+        rebaseline|epsilon|fitted|placement|baseline|saturation|low) [[ "$suite" != "$SUITE" ]] && return ;;
         all)    ;;  # include everything
         *)      return ;;  # custom suite doesn't use add_run
     esac
@@ -364,54 +478,145 @@ define_runs() {
     RUNS=()
     LABELS=()
 
-    # --- High priority: re-run Jan baselines with load-aware routing ----------
-    add_run high "13B moderate load (20 users)" \
-        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-        --warmup --duration 10m --users 20 --max-model-len 8192
-
-    add_run high "8B moderate load (20 users)" \
+    # --- rebaseline: the 2026-07-13 headline matrix on the fixed tooling -----
+    # Same four configs, same durations and user counts, so the new numbers are
+    # comparable in design to the July campaign (not in value: those runs carried
+    # the routing DB across arms and generated different prefixes per arm).
+    add_run rebaseline "8B 20u/10m A/B" \
         --compare --model meta-llama/Llama-3.1-8B-Instruct \
         --warmup --duration 10m --users 20
 
-    add_run high "13B low load (10 users)" \
-        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-        --warmup --duration 10m --users 10 --max-model-len 8192
-
-    # --- Medium priority: long runs and prefix ratio sweep --------------------
-    add_run medium "13B 30min validated (30 users)" \
+    add_run rebaseline "13B 30u/30m A/B" \
         --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 30m --users 30 --max-model-len 8192
 
-    add_run medium "8B 30min validated (30 users)" \
-        --compare --model meta-llama/Llama-3.1-8B-Instruct \
-        --warmup --duration 30m --users 30
-
-    add_run medium "13B prefix ratio 0.7 (20 users)" \
+    add_run rebaseline "13B 20u/10m A/B" \
         --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-        --warmup --duration 10m --users 20 --prefix-ratio 0.7 --max-model-len 8192
+        --warmup --duration 10m --users 20 --max-model-len 8192
 
-    add_run medium "13B prefix ratio 0.5 (20 users)" \
+    add_run rebaseline "13B 10u/10m A/B" \
         --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-        --warmup --duration 10m --users 20 --prefix-ratio 0.5 --max-model-len 8192
+        --warmup --duration 10m --users 10 --max-model-len 8192
 
-    # --- Lower priority: client tokenization, stress, large models ------------
-    add_run low "13B client tokenization (30 users)" \
-        --compare --client-tokenize --model meta-llama/CodeLlama-13b-Instruct-hf \
-        --warmup --duration 10m --users 30 --max-model-len 8192
+    # --- epsilon: Leg V1 (prefix-routing-load-gating-proposal.md §5) ----------
+    # Historical. Treatment = the prefix arm at epsilon 0.5; baseline = the
+    # rebaseline suite's prefix arm at the 0.25 that shipped before 2.2.0.
+    # The default is 1.0 since 2.2.0 (combo leg, 2026-10-05), so 0.5 is now
+    # tighter than shipping, not looser.
+    add_run epsilon "13B 30u/30m A/B, bounded-load epsilon 0.5" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192 \
+        --bounded-load-epsilon 0.5
 
-    add_run low "8B high concurrency stress (64 users)" \
-        --warmup --duration 15m --users 64 --spawn-rate 4 \
-        --model meta-llama/Llama-3.1-8B-Instruct
+    add_run epsilon "13B 10u/10m A/B, bounded-load epsilon 0.5" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 10 --max-model-len 8192 \
+        --bounded-load-epsilon 0.5
 
+    # --- fitted: 13B inside its KV cache ----------------------------------------
+    # 16 prefixes x 2000..4000 tokens (~48k) against ~11.6k KV tokens/backend: a
+    # backend's share (~6k) plus 10 users' in-flight requests fits. Pairs with
+    # rebaseline row 4 to separate the low-load regression from cache capacity.
+    add_run fitted "13B 10u/10m A/B, fitted prefix set (16 x 2000..4000)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 10 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    # Same set at 20 users: a backend's ~6k share plus ~7.5k in-flight slightly
+    # exceeds 11.6k, so this is the gradient point between row 7 and the
+    # rebaseline rows rather than a clean fit. Pairs with rebaseline row 3.
+    add_run fitted "13B 20u/10m A/B, fitted prefix set (16 x 2000..4000, marginal)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    # Same set at 30 users for 30 minutes. The rebaseline 30u/30m row times out
+    # in both arms (eviction regime), so the high-load point of the matrix had
+    # no valid measurement; on the fitted set the hot set fits and the row
+    # reports real TTFT percentiles. Pairs with rebaseline row 2. Measured
+    # 2026-10-06/07 on 2.2.0: -42.0% median P99, zero incompletes, +15% rps.
+    add_run fitted "13B 30u/30m A/B, fitted prefix set (16 x 2000..4000)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    # --- placement: least-loaded cache-miss placement on the fitted set -----------
+    # Historical (v1..v4, 2026-10-03..05): least_loaded is the default since
+    # 2.2.0, so on a 2.2.0 image these rows are the fitted rows. Kept so the
+    # leg can be re-run against an older image.
+    # Leg A (2026-10-02) showed the 13B 20u regression is hash placement itself:
+    # pure affinity, zero diverts, +8..12% P99 with one backend at 23% of requests
+    # and one at 0.6%. --miss-placement least_loaded places each new prefix on the
+    # backend holding the fewest learned-route tokens. Acceptance: 20u turns negative with
+    # the prefix arm's Gini near round-robin's and P50 still ~-25%.
+    add_run placement "13B 20u/10m A/B, fitted set, miss placement least_loaded" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000 \
+        --miss-placement least_loaded
+
+    add_run placement "13B 10u/10m A/B, fitted set, miss placement least_loaded" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 10 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000 \
+        --miss-placement least_loaded
+
+    # --- baseline: prefix vs least-loaded (no affinity) ----------------------------
+    # Every headline number is prefix vs the round-robin arm, the weakest baseline
+    # there is. These rows run the same fitted 20u and 30u configs with the
+    # baseline arm in least_loaded mode: lowest live in-flight count, no ART, no
+    # learning, the same load signal the prefix mode's divert policy reads. The
+    # prefix arm's margin over this arm is what affinity adds beyond load
+    # balancing; least_loaded's margin over round-robin follows by subtraction
+    # from the fitted suite on the same rows.
+    add_run baseline "13B 20u/10m A/B vs least_loaded, fitted set" \
+        --compare --baseline-mode least_loaded \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    add_run baseline "13B 30u/30m A/B vs least_loaded, fitted set" \
+        --compare --baseline-mode least_loaded \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    # --- saturation: tighter divert cap vs least_loaded at 30 users -----------------
+    # The baseline suite showed prefix with no reliable P99 edge over least_loaded
+    # at 30 users: the prefix arm's concentration (two backends at ~2,100-2,460
+    # requests vs ~1,300) is the tail there, and the 2x cap (epsilon 1.0) permits
+    # it. These rows tighten the cap on the same row against the same baseline.
+    # The env var reaches both arms; the least_loaded arm has no divert path, so it
+    # is a no-op there and the baseline is identical across rows 14 and 15.
+    add_run saturation "13B 30u/30m A/B vs least_loaded, fitted set, epsilon 0.5" \
+        --compare --baseline-mode least_loaded --bounded-load-epsilon 0.5 \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    add_run saturation "13B 30u/30m A/B vs least_loaded, fitted set, epsilon 0.25" \
+        --compare --baseline-mode least_loaded --bounded-load-epsilon 0.25 \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    # The 50-prefix 20u row vs least_loaded: one carry-over repeat 2026-10-08 (P99 parity),
+    # three clean repeats 2026-10-09 (+22.9/+24.9/+21.7 P99, P50 -9..-16%; see --help).
+    add_run saturation "13B 20u/10m A/B vs least_loaded, 50-prefix set" \
+        --compare --baseline-mode least_loaded \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192
+
+    # --- low: exploratory, outside any headline --------------------------------
     # TP, max-model-len, and gpu-mem-util are auto-detected from GPU VRAM.
     # Explicit overrides: --tp 4 --max-model-len 4096 --gpu-mem-util 0.92 (for 40GB)
     add_run low "70B model test (16 users)" \
         --compare --model meta-llama/Llama-3.1-70B-Instruct \
         --warmup --duration 15m --users 16
 
-    add_run low "8B 16K prefix test (20 users)" \
-        --compare --model meta-llama/Llama-3.1-8B-Instruct \
-        --warmup --duration 10m --users 20 --prefix-max-tokens 16000
+    add_run low "8B high concurrency stress (64 users)" \
+        --warmup --duration 15m --users 64 --spawn-rate 4 \
+        --model meta-llama/Llama-3.1-8B-Instruct
 
     # --- Custom file ----------------------------------------------------------
     if [[ "$SUITE" == "custom" ]]; then
@@ -442,6 +647,12 @@ define_runs
 # machinery — adaptive ETA, --skip/--resume numbering, the SIGINT summary — works
 # unchanged. GROUP_OF[i] records which original config an expanded run belongs to,
 # so the post-suite aggregation can gather each config's repeats. See BACKLOG §25.
+# A single run is not a result (review F3): the headline suites default to
+# three repeats so the aggregate can issue a CONSISTENT / MIXED verdict.
+if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" || "$SUITE" == "placement" || "$SUITE" == "baseline" || "$SUITE" == "saturation" ) ]]; then
+    REPEAT=3
+    log_info "Suite '$SUITE' defaults to --repeat 3 (pass --repeat 1 for a smoke run)"
+fi
 if ! [[ "$REPEAT" =~ ^[0-9]+$ ]] || [[ "$REPEAT" -lt 1 ]]; then
     log_error "--repeat must be a positive integer (got: $REPEAT)"
     exit 1
@@ -600,6 +811,22 @@ echo "============================================="
 echo ""
 
 # -----------------------------------------------------------------------------
+# Server image: build once from this checkout when asked. Every bench.sh run
+# then reuses it (and passes bench.sh's freshness check).
+# -----------------------------------------------------------------------------
+if [[ "$BUILD_IMAGE" = true ]]; then
+    log_info "Building ranvier:latest from commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown) (--build-image)..."
+    BUILD_START_TS=$(date +%s)
+    if docker build -t ranvier:latest -f "${SCRIPT_DIR}/../Dockerfile.production" "${SCRIPT_DIR}/.." > "${RUNNER_OUTPUT_DIR}/image_build.log" 2>&1; then
+        log_ok "ranvier:latest built in $(fmt_duration $(( $(date +%s) - BUILD_START_TS ))) (log: ${RUNNER_OUTPUT_DIR}/image_build.log)"
+    else
+        log_error "Image build failed — tail of ${RUNNER_OUTPUT_DIR}/image_build.log:"
+        tail -20 "${RUNNER_OUTPUT_DIR}/image_build.log"
+        exit 1
+    fi
+fi
+
+# -----------------------------------------------------------------------------
 # Execute runs
 # -----------------------------------------------------------------------------
 
@@ -705,6 +932,27 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
 
     RUN_END_TS=$(date +%s)
     RUN_ELAPSED=$((RUN_END_TS - RUN_START_TS))
+
+    # A run that dies within STARTUP_RETRY_SECS never measured anything (vLLM
+    # or Ranvier failed to come up), so one immediate retry costs nothing in
+    # comparability. A run that fails later is a real failure and stays one.
+    if [[ $EXIT_CODE -ne 0 && $STARTUP_RETRY_SECS -gt 0 && $RUN_ELAPSED -lt $STARTUP_RETRY_SECS ]]; then
+        log_warn "Run $RUN_NUM failed after ${RUN_ELAPSED}s (< ${STARTUP_RETRY_SECS}s: start-up failure, nothing measured); retrying once in ${PAUSE_BETWEEN_RUNS}s"
+        sleep "$PAUSE_BETWEEN_RUNS"
+        RETRY_START_TS=$(date +%s)
+        set +e
+        bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR"
+        EXIT_CODE=$?
+        set -e
+        RUN_END_TS=$(date +%s)
+        RUN_ELAPSED=$((RUN_END_TS - RETRY_START_TS))
+        if [[ $EXIT_CODE -eq 0 ]]; then
+            log_ok "Run $RUN_NUM retry succeeded"
+            LABELS[$i]="${LABELS[$i]} (retried after start-up failure)"
+        else
+            log_error "Run $RUN_NUM retry failed too (exit code $EXIT_CODE after ${RUN_ELAPSED}s)"
+        fi
+    fi
     DURATIONS+=($RUN_ELAPSED)
 
     # Update adaptive ETA data
@@ -748,7 +996,8 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
                         # became five lines of numbers). Only the top-level values are wanted.
                         hr=$(echo "$json_line" | python3 -c 'import json,sys
 try:
-    v = json.loads(sys.stdin.read()).get("cache_hit_rate_pct")
+    j = json.loads(sys.stdin.read())
+    v = j.get("route_consistency_pct", j.get("cache_hit_rate_pct"))
     print("" if v is None else "%.1f" % v)
 except Exception:
     pass' 2>/dev/null || echo "")
@@ -941,7 +1190,7 @@ if [[ "$REPEAT" -gt 1 ]]; then
                 # arm patterns below but hold warmup.log, not benchmark.log; passing one to the
                 # aggregator makes it exit before writing anything. They are not results.
                 [[ "$base" == warmup_* ]] && continue
-                if echo "$base" | grep -qE 'round_robin|random'; then
+                if echo "$base" | grep -qE 'round_robin|random|least_loaded|_hash'; then
                     RR_DIRS+=("$d")
                 elif echo "$base" | grep -qE 'prefix'; then
                     PREFIX_DIRS+=("$d")

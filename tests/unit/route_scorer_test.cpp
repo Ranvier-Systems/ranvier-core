@@ -167,9 +167,10 @@ TEST(DispatchLoad, OverAllowanceDivertsToLeastLoaded) {
     EXPECT_EQ(c[d.placement].id, 1);
 }
 
-TEST(DispatchLoad, ProbeRankBeatsLowerLoadAmongUnderAllowance) {
-    // BOUNDED_LOAD spillover: the former re-probe took the FIRST under-cap
-    // candidate in probe order, not the least loaded one.
+TEST(DispatchLoad, LowerLoadBeatsProbeRankAmongUnderAllowance) {
+    // BOUNDED_LOAD spillover: the divert goes to the LEAST-LOADED
+    // under-allowance candidate. The first-under-cap-in-probe-order rule this
+    // replaces stranded the coldest backend (fitted suite, 2026-10-02).
     std::vector<ScoreCandidate> c = {
         make_candidate(1, /*is_anchor=*/true),
         make_candidate(2),
@@ -178,14 +179,59 @@ TEST(DispatchLoad, ProbeRankBeatsLowerLoadAmongUnderAllowance) {
     for (auto& cand : c) cand.load_allowance = 4.0;
     c[0].affinity = 1.0;
     c[0].load = 9.0;
-    c[1].load = 3.0;  // higher load, but first in probe order
+    c[1].load = 3.0;  // first in probe order, but warmer
     c[1].probe_rank = 0;
-    c[2].load = 1.0;
+    c[2].load = 1.0;  // coldest
     c[2].probe_rank = 2;
 
     auto d = score_and_select(c.data(), c.size(), default_weights(), true);
-    EXPECT_EQ(c[d.dispatch].id, 2);
+    EXPECT_EQ(c[d.dispatch].id, 3);
     EXPECT_TRUE(d.load_diverted);
+    EXPECT_FALSE(d.cost_diverted);
+    EXPECT_EQ(c[d.placement].id, 1);  // transient: placement unmoved
+}
+
+TEST(DispatchLoad, ProbeRankBreaksEqualLoadTiesAmongUnderAllowance) {
+    // Equal loads: probe order decides, ahead of lower id, so equal-load
+    // spillover stays deterministic and cluster-consistent.
+    std::vector<ScoreCandidate> c = {
+        make_candidate(1, /*is_anchor=*/true),
+        make_candidate(2),
+        make_candidate(3),
+    };
+    for (auto& cand : c) cand.load_allowance = 4.0;
+    c[0].affinity = 1.0;
+    c[0].load = 9.0;
+    c[1].load = 2.0;
+    c[1].probe_rank = 3;
+    c[2].load = 2.0;
+    c[2].probe_rank = 1;  // same load, earlier in the probe sequence
+
+    auto d = score_and_select(c.data(), c.size(), default_weights(), true);
+    EXPECT_EQ(c[d.dispatch].id, 3);
+    EXPECT_TRUE(d.load_diverted);
+}
+
+TEST(DispatchLoad, CostPressureStillOutranksLoadAndProbeRank) {
+    // The fast-lane "prefer least-cost" key keeps its place ahead of load:
+    // moving probe_rank below load must not reorder cost_pressure vs load.
+    std::vector<ScoreCandidate> c = {
+        make_candidate(1, /*is_anchor=*/true),
+        make_candidate(2),
+        make_candidate(3),
+    };
+    for (auto& cand : c) cand.load_allowance = 4.0;
+    c[0].affinity = 1.0;
+    c[0].load = 9.0;
+    c[1].load = 3.0;
+    c[1].cost_pressure = 0.1;  // lower budget pressure: wins before load
+    c[1].probe_rank = 5;
+    c[2].load = 1.0;
+    c[2].cost_pressure = 0.5;
+    c[2].probe_rank = 0;
+
+    auto d = score_and_select(c.data(), c.size(), default_weights(), true);
+    EXPECT_EQ(c[d.dispatch].id, 2);
 }
 
 TEST(DispatchLoad, AllOverAllowanceFallsBackToLeastExcess) {

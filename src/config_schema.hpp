@@ -55,8 +55,17 @@ struct RoutingConfig {
     // Routing mode: determines how requests are routed to backends
     // - "prefix": ART lookup + consistent hash fallback (best for KV cache, learns routes)
     // - "hash": Consistent hash only (no ART, no learning - measures hash baseline)
-    // - "random": Weighted random distribution (baseline, no affinity)
-    enum class RoutingMode { PREFIX, HASH, RANDOM };
+    // - "random": Weighted random distribution (baseline, no affinity).
+    //   "round_robin" is accepted as an alias: with equal weights the expected
+    //   distribution is the same, and the benchmark tooling labels this arm
+    //   "Round-Robin".
+    // - "least_loaded": the live backend with the lowest capacity-adjusted
+    //   composite load (under the shipping defaults: the node's in-flight count
+    //   summed across shards), ties broken uniformly at random. No ART, no
+    //   learning. This is the strongest no-affinity baseline: it sees the same
+    //   load signal the prefix mode's divert policy sees, so a prefix-vs-
+    //   least_loaded A/B isolates what affinity adds over load balancing alone.
+    enum class RoutingMode { PREFIX, HASH, RANDOM, LEAST_LOADED };
     RoutingMode routing_mode = RoutingMode::PREFIX;  // Default: prefix-affinity with ART
     size_t prefix_token_length = 128;  // Number of tokens to use as routing key (default: 128)
 
@@ -70,6 +79,8 @@ struct RoutingConfig {
     //                 Uses separate load_aware_routing threshold for load balancing.
     // - BOUNDED_LOAD: Jump hash + capacity cap (Mirrokni et al. 2018).
     //                 Each backend capped at ceil(avg_load * (1 + epsilon)).
+    //                 An over-cap primary diverts to the least-loaded live
+    //                 backend (probe order breaks equal loads).
     //                 Subsumes load_aware_routing — no separate threshold needed.
     // - P2C:          Power-of-two-choices with primary affinity bias.
     //                 Hashes to 2 candidates, prefers primary unless secondary
@@ -83,12 +94,65 @@ struct RoutingConfig {
     // Each backend accepts at most ceil(avg_load * (1 + epsilon)) in-flight requests.
     // Lower epsilon = tighter balance but more affinity breaks.
     // Typical values: 0.25 (tight), 0.5 (moderate), 1.0 (loose).
-    double bounded_load_epsilon = 0.25;
+    //
+    // Default 1.0 (was 0.25 until 2026-10-05). Loads here are small integers:
+    // at ~1 in-flight request per backend per node, 0.25 gives a cap of 1-2 and
+    // nearly any load at all diverts (25-30% of requests on the 13B fitted
+    // suite), which spends the affinity without touching the tail. At 1.0 a
+    // divert needs a backend at twice the mean, i.e. a real queue. Measured
+    // with the node-local in-flight signal below (13B 20 users, 8xA100, 3
+    // repeats, both arm orders): P99 TTFT -60.4 / -57.5 / -55.2% against
+    // round-robin, P50 -28%, KV prefix hits 69-73%, diverts 23-27%; 13B 10u
+    // -34.5%, 8B 20u -22.6%, no row regressed. The previous default gave
+    // +3..+21% on the same 20-user row across twelve runs.
+    double bounded_load_epsilon = 1.0;
 
     // P2C load bias: minimum load difference to prefer secondary over primary.
     // Higher bias = stronger affinity to primary (hash-preferred) backend.
     // Only switch to secondary when: secondary_load + p2c_load_bias < primary_load.
     uint64_t p2c_load_bias = 2;
+
+    // Cache-miss placement: where a prefix with no learned route is placed.
+    // - HASH:         the hash strategy's bucket. Cluster-consistent, but
+    //                 placement is balls-into-bins: 16 prefixes over 8
+    //                 backends give a busiest backend holding ~2x the mean,
+    //                 and the busiest backend's queue sets P99 (fitted-suite
+    //                 leg A, 2026-10-02: pure affinity +8..12% P99 with one
+    //                 backend at 23% of traffic and one at 0.6%).
+    // - LEAST_LOADED: the live candidate holding the fewest learned-route
+    //                 TOKENS (RadixTree::route_tokens_by_backend — sum of
+    //                 route key lengths, gossip-converged so it reflects
+    //                 cluster placement; a 3000-token prefix outweighs
+    //                 thirty 100-token one-offs), then fewest routes, then
+    //                 lowest capacity-adjusted load, then probe order. A miss
+    //                 has no cache to preserve, so this costs nothing in
+    //                 cache terms; ART hits are unaffected. Shards and nodes
+    //                 that see a brand-new prefix before its route propagates
+    //                 place it independently (each keeps its LOCAL route under
+    //                 the trust ladder; the prefix is then warm on two
+    //                 backends). Two mitigations: the HttpController learns a
+    //                 placed miss at dispatch rather than at first byte
+    //                 (window ~1 TTFT -> one 20 ms route-batch flush), and a
+    //                 gossiped route that still conflicts is settled by lowest
+    //                 backend id on every node (RadixTree::insert_if_trusted
+    //                 converge_local_conflicts) instead of refused, so the
+    //                 cluster converges on one backend. Balances prefix tokens,
+    //                 not popularity: a skewed hot prefix still needs
+    //                 replication (BACKLOG section 27).
+    // Env: RANVIER_MISS_PLACEMENT=hash|least_loaded. YAML: routing.miss_placement.
+    //
+    // Default LEAST_LOADED since 2026-10-05 (was HASH). On its own, placement
+    // never moved the tail (four variants, +3..+21% P99 at 13B 20 users): the
+    // route table cannot see which routes carry traffic. With the live divert
+    // policy (bounded_load_epsilon, cross_shard_load_sync) it earns its place by
+    // needing fewer diverts: one home per prefix, so against hash placement
+    // under the same signal, 3 repeats each, same box and day: P99 -57.5% vs
+    // -51.8% median, KV prefix hits 69-73% vs 49-55%, route consistency 50-53%
+    // vs 39-45%, diverts 23-27% vs 30-33%. HASH stays one env var away and is
+    // the right choice on a single node without gossip, where the convergence
+    // rules have nothing to do.
+    enum class MissPlacement { HASH, LEAST_LOADED };
+    MissPlacement miss_placement = MissPlacement::LEAST_LOADED;
 
     // Prefix boundary detection for multi-turn conversations
     // When enabled, system messages are tokenized separately to identify the "shared prefix"
@@ -138,7 +202,17 @@ struct RoutingConfig {
     // gpu_load_cache_ttl: How long to trust cached GPU load scores before
     //   treating them as stale. Should be ≥2x the health check interval to
     //   tolerate one missed scrape cycle.
-    double gpu_load_weight = 10.0;              // Scaling factor for GPU load score in composite
+    //
+    // Default 0.0 (was 10.0 until 2026-10-05): the scraped score is refreshed
+    // once per health interval (5 s), is identical on every shard of a node,
+    // and is a blend of queue and KV usage, not queue depth. As the divert
+    // signal it moved every backend's load together, so bounded-load either
+    // never diverted or diverted everything (fitted-suite legs, 2026-10-02/03).
+    // The node-local in-flight count (cross_shard_load_sync below) is the
+    // signal that lets diversion remove a queue without removing affinity.
+    // Set > 0 to blend the GPU score back in; the health scrape still runs
+    // for observability and residency routing either way.
+    double gpu_load_weight = 0.0;               // Scaling factor for GPU load score in composite
     std::chrono::seconds gpu_load_cache_ttl{30}; // Staleness threshold for GPU load cache (default: 2x typical scrape interval)
 
     // =========================================================================
@@ -162,10 +236,15 @@ struct RoutingConfig {
     // the reactor and inflate alien::run_on() completion latency (e.g.,
     // tokenization P50 from 12ms to 40ms).
     //
-    // Disabled by default until validated in production benchmarks.
-    // Enable via RANVIER_CROSS_SHARD_LOAD_SYNC=true with an appropriate
-    // interval for your shard count and request rate.
-    bool cross_shard_load_sync = false;                                    // Enable cross-shard load broadcasts
+    // Enabled by default since 2026-10-05: validated on the 13B fitted suite
+    // (8xA100, 3 nodes x 8 shards), where the node-local in-flight count is
+    // the signal that let bounded-load diversion take P99 TTFT from +3..+21%
+    // to -55..-60% against round-robin (see bounded_load_epsilon). The 100 ms
+    // interval costs ~1,120 SMP messages/s on 8 shards; a single-shard
+    // process skips the timer. Disable via RANVIER_CROSS_SHARD_LOAD_SYNC=false
+    // to fall back to shard-local counts (each shard sees only its own
+    // in-flight requests, ~1/shards of the node's).
+    bool cross_shard_load_sync = true;                                     // Enable cross-shard load broadcasts
     std::chrono::milliseconds cross_shard_load_sync_interval{100};         // Broadcast interval (ms)
 
     // =========================================================================
@@ -204,8 +283,14 @@ struct RoutingConfig {
     // capacity_headroom_weight: Scaling factor that converts effective cache
     //   pressure (0.0–1.0) into a load penalty comparable to active_requests.
     //   Higher values make cache fullness a stronger routing signal.
-    //   Set to 0.0 to disable capacity-aware hash fallback (default behavior).
-    double capacity_headroom_weight = 5.0;  // Env: RANVIER_CAPACITY_HEADROOM_WEIGHT
+    //   0.0 disables capacity-aware hash fallback.
+    //
+    // Default 0.0 (was 5.0 until 2026-10-05): like gpu_load_weight this reads
+    // the 5 s-stale scraped KV usage, identical across a node's shards, so as
+    // a divert input it herded rather than balanced. The 2026-10-05 result
+    // (bounded_load_epsilon comment) was measured with it off. Set > 0 to
+    // re-enable; residency routing (cache_residency_threshold) is separate.
+    double capacity_headroom_weight = 0.0;  // Env: RANVIER_CAPACITY_HEADROOM_WEIGHT
 
     // =========================================================================
     // Cache-Residency-Aware Routing
@@ -316,6 +401,7 @@ struct RoutingConfig {
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }
     bool is_random_mode() const { return routing_mode == RoutingMode::RANDOM; }
+    bool is_least_loaded_mode() const { return routing_mode == RoutingMode::LEAST_LOADED; }
     bool uses_art() const { return routing_mode == RoutingMode::PREFIX; }
     bool should_learn_routes() const { return routing_mode == RoutingMode::PREFIX; }
 };

@@ -74,6 +74,17 @@ prefix-first, rr-first — cancels order bias), and writes a per-config median/I
 
 ## 2. Threshold leg (item 5) — 2.0/2 vs 3.0/4
 
+> **Superseded as written (audit 2026-09-30, finding 7).** `--load-imbalance-factor/--floor`
+> govern the divert allowance only under the `jump`/`modular` hash strategies; the shipped
+> default is `bounded_load`, where the knob is `bounded_load_epsilon`. Every earlier
+> factor/floor run, D2 included, therefore measured the shipped allowance. `bench.sh` now
+> refuses factor/floor without `--hash-strategy jump`, and the two run files below carry that
+> flag, so they answer the question *under jump*. The live leg for the shipped strategy is
+> **Leg V1: `./scripts/bench-runner.sh --suite epsilon`** (0.5 vs the then-shipped 0.25, ×3; 1.0 ships since 2026-10-05), compared
+> against the `rebaseline` suite's prefix arms. The pre-registered rule in §2 applies unchanged
+> to epsilon. The `rebaseline` suite itself must be run first on the fixed tooling: the July
+> matrix carried the routing DB across arms and generated different prefixes per arm.
+
 D2 (2026-05-26) validated the **raised** thresholds `factor 3.0 / floor 4` at 50 prefixes
 (P99 **−6%**, 60% hit, incompletes below baseline). The **shipped** defaults `2.0 / 2` were
 **never tested at 50 prefixes**. This leg decides whether 3.0/4 should replace them.
