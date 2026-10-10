@@ -1,3 +1,8 @@
+# NOT TO BE RUN AS WRITTEN (2026-10-10). This rerun was superseded and never executed: it runs
+# 13B on the default 50-prefix set, an eviction regime per the 2026-10-01 re-baseline, and the
+# defaults it would have tested changed on 2026-10-05. Kept as the record of what was
+# pre-registered. See the load-gating proposal, "Closing note 2026-10-10".
+#
 # 50-prefix re-baseline — LEG V0, POWERED RERUN: cross_shard_load_sync A/B at 13B/10u, 30-minute runs
 #
 # Why this exists: the 10-minute V0 run on 2026-09-28 was inconclusive. Sync off gave a reliable
