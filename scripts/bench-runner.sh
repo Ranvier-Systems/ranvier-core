@@ -408,6 +408,8 @@ BUILT-IN SUITES:
       Reading: row 20 back near -12% with KV ~65% => materialization is the damage; row 21
       alone recovering => the depth defect dominates; row 22 is the configuration the
       kvevents suite should rerun with. One repeat each; promote the winner to x3.
+      Runs on the CURRENT image by design: pass --allow-stale-image, since this checkout's
+      src/ is newer than the image (the depth-gate fix) and bench.sh refuses otherwise.
 
     kvreset (1 config x 2 arms x 3 repeats, ~1h15m) — the 8B 20u row with the between-arm
       KV reset acknowledged. The reset exists for this row (2026-10-06: prefix-first
@@ -921,6 +923,13 @@ echo ""
 # Server image: build once from this checkout when asked. Every bench.sh run
 # then reuses it (and passes bench.sh's freshness check).
 # -----------------------------------------------------------------------------
+# Flags forwarded verbatim to every bench.sh invocation.
+EXTRA_BENCH_ARGS=""
+if [[ "$ALLOW_STALE_IMAGE" = true ]]; then
+    EXTRA_BENCH_ARGS+=" --allow-stale-image"
+    log_warn "--allow-stale-image: every run benchmarks the existing ranvier:latest even though this checkout has newer src/ commits; each manifest records the override"
+fi
+
 if [[ "$BUILD_IMAGE" = true ]]; then
     log_info "Building ranvier:latest from commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown) (--build-image)..."
     BUILD_START_TS=$(date +%s)
@@ -1033,7 +1042,7 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
 
     # Run bench.sh, capturing exit code
     set +e
-    bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR"
+    bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR" $EXTRA_BENCH_ARGS
     EXIT_CODE=$?
     set -e
 
@@ -1048,7 +1057,7 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
         sleep "$PAUSE_BETWEEN_RUNS"
         RETRY_START_TS=$(date +%s)
         set +e
-        bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR"
+        bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR" $EXTRA_BENCH_ARGS
         EXIT_CODE=$?
         set -e
         RUN_END_TS=$(date +%s)
