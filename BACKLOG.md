@@ -1306,14 +1306,15 @@ Follow-on P0/P1 (re-baseline campaign + statistics/manifest/3-node machinery) re
   epsilon 0.5 vs 0.25, ×3). Prerequisite: re-run the July matrix with `--suite rebaseline`
   (default, ×3) — the July runs carried the routing DB across arms and used unseeded,
   per-arm-different prefixes, so the −13%/−9%/+29% headline is unconfirmed until then.
-- [ ] **Load-gating Leg V0 — `cross_shard_load_sync` A/B at 13B/10u** (ran 2026-09-28, 8×A100):
-  **inconclusive.** Sync off reproduced a reliable +9.7% P99 regression; sync on shrank it to
-  +3.4% with no reliable effect, short of the pre-registered "≤ 0" bar. Sync stays off by
-  default. **Next: the powered V0 rerun** (30-minute runs, 4 repeats per arm, OFF-ON-OFF
-  blocks, ~9 h GPU), run file `docs/benchmarks/rebaseline/v0-xshard-30m.runs`, with its binding
-  rule and stopping rule pre-registered. Record, rule amendment, numbers and pre-registration:
-  `.dev-context/prefix-routing-load-gating-proposal.md` (Amendment, Result note and
-  Pre-registration, all 2026-09-28).
+- [x] **Load-gating Leg V0 — `cross_shard_load_sync` A/B at 13B/10u** (ran 2026-09-28, 8×A100):
+  **closed, superseded.** The 10-minute run was inconclusive (sync off +9.7% P99, sync on +3.4%)
+  on tooling the 2026-09-30 accuracy audit later found defective (shared routing DB restored into
+  each prefix arm, route-consistency proxy reported as cache hits, bucketed Locust P99). The
+  pre-registered powered rerun was never run: one start on 2026-09-30 was stopped before any
+  result was used, and the 2026-10-02 strategic assessment re-scoped it as measuring eviction
+  noise. The October fitted-set legs answered the question as a bundle, and
+  `cross_shard_load_sync=true` shipped on 2026-10-05 with the scraped GPU/KV weights at 0 and
+  ε 1.0. Record: `.dev-context/prefix-routing-load-gating-proposal.md` (Closing note 2026-10-10).
 
 ### P1 progress (follow-on branches)
 - [x] **Item 7 — `--repeat` + aggregation** (branch `claude/benchmark-p1-repeat-aggregate`,

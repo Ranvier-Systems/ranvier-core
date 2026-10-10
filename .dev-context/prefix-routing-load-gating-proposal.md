@@ -629,3 +629,50 @@ is no further V0 rerun, no extension of repeats, and no pooling with the 10-minu
 requests per second for both arms. **Known limit:** Locust reports P99 in 100 ms steps, about 3%
 at this latency. Longer runs make the P99 steadier but do not remove that step.
 
+---
+
+## Closing note 2026-10-10 — the powered V0 rerun was never run
+
+*Appended. The pre-registration above is left as written. It was never executed, so it produced
+no data and its rule decided nothing.*
+
+**One aborted start, 2026-09-30.** A first attempt began at 21:18 UTC on a fresh 8×A100-SXM4-40GB
+box at commit `fc9a046`. The box had no `numactl`, so the Ranvier nodes used the default cpusets
+0–7, 8–15 and 16–23; NUMA node 0 held CPUs 0–61, so those were NUMA-local. The maintainer stopped
+it the same evening for scheduling, during the first sync-off block and on the plan to stop
+before its first repeat finished, and terminated the instance. No result from it was used.
+
+**Why it was dropped rather than rerun.**
+
+1. The 2026-09-30 benchmark accuracy audit (`.dev-context/benchmark-accuracy-audit-2026-09-30.md`)
+   found defects in the tooling that produced the 2026-09-28 V0 runs. Every prefix arm restored
+   the previous run's routes from a SQLite file shared by all nodes and never cleared (finding 5).
+   "Cache-hit rate" was a route-consistency proxy that never read vLLM (finding 1). P99 came from
+   Locust's approximated table, bucketed at 100 ms above one second (finding 3). An n=3
+   "reliable" verdict is not statistically supported (finding 4). All four apply to the figures
+   in the Amendment and Result note above.
+2. The 2026-10-01 re-baseline on fixed tooling showed CodeLlama-13B on the default 50-prefix set
+   runs in an eviction regime. The 2026-10-02 strategic assessment
+   (`docs/audits/strategic-assessment-2026-10-02.md`) re-scoped this rerun, which uses exactly
+   that set, as measuring eviction noise.
+3. The October campaign answered the question on the fitted set, as part of a bundle
+   (`docs/benchmarks/benchmark-results-current.md`). Leg B, with sync on and the scraped GPU and
+   KV-headroom weights at zero but ε still 0.25, was mixed at 13B/20u (+14.2%, −1.0%). The
+   isolation leg, the same signal with ε 1.0 and hash placement, gave −51.8% median P99 over three
+   repeats. The combo with least-loaded placement gave −57.5%. That bundle became the default on
+   2026-10-05.
+
+**How to read the 2026-09-28 V0 result now.** The "inconclusive" verdict stands as recorded under
+the rule then in force, but its numbers are not citable. The "cache-hit rate" rows in the tables
+above are route consistency, not KV hits. Its direction matches what Leg B
+found later: the live load signal at ε 0.25 was not enough, and the threshold calibration was the
+missing part.
+
+**What the record does not isolate.** Every October leg that turned on `cross_shard_load_sync`
+also zeroed the scraped GPU and KV-headroom weights. The only test of sync on its own is the
+2026-09-28 V0b arm above, on the defective tooling. The record supports the shipped combination,
+not sync by itself.
+
+**Status.** The stopping rule is moot. `docs/benchmarks/rebaseline/v0-xshard-30m.runs` is kept for
+the record and marked not to be run as written.
+
