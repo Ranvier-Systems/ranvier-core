@@ -1199,6 +1199,39 @@ TEST_F(RouterServiceTest, FreshnessTtlZeroDisablesVerifiedPath) {
     EXPECT_TRUE(result.cache_hit);
 }
 
+TEST_F(RouterServiceTest, NativeVerifiedPathSkippedBeyondIndexedDepth) {
+    // The ledger indexes chains only to max_indexed_token_depth tokens. A hit
+    // routed deeper than that (fixture: alignment 1, so 4 tokens = depth 4 >
+    // depth cap 2) can never be in prefix_hash_index; its absence is "unknown",
+    // not "evicted", and the probabilistic gate decides. First hardware contact
+    // 2026-10-10: fitted-set prefixes of 2,000-4,000 tokens were downgraded
+    // with certainty by a 2,048-token index.
+    cfg_.kv_native_indexed_depth = 2;
+    recreate_router(cfg_);
+    register_two_backends();
+    std::vector<int32_t> tokens = {751, 752, 753, 754};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.9);  // gossip: resident
+    RouterService::set_native_fresh_for_testing(1);    // stream fresh, index empty
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+
+    // Within the indexed depth the verified verdict still applies (cap 4).
+    cfg_.kv_native_indexed_depth = 4;
+    recreate_router(cfg_);
+    register_two_backends();
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.9);
+    RouterService::set_native_fresh_for_testing(1);
+    auto downgraded = router_->route_request(tokens);
+    ASSERT_TRUE(downgraded.backend_id.has_value());
+    EXPECT_FALSE(downgraded.cache_hit);
+    EXPECT_EQ(downgraded.backend_id.value(), 2);
+}
+
 // ----- BACKLOG §21 Phase 5a: verified_resident_subset seam -----
 // The telemetry emitter calls this each window to find which of its hot-prefix
 // membership hashes its own backend verifies resident. It mirrors the routing

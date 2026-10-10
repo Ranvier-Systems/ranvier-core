@@ -969,6 +969,9 @@ void RanvierConfig::apply_env_overrides() {
     routing.kv_residency_freshness_ttl = kv_events.enabled
         ? std::chrono::seconds(kv_events.freshness_ttl_seconds)
         : std::chrono::seconds(0);
+    // Same mirroring for the indexed depth: the verified-residency check is
+    // only meaningful at routing depths the ledger actually tracks.
+    routing.kv_native_indexed_depth = kv_events.max_indexed_token_depth;
 }
 
 // =============================================================================
