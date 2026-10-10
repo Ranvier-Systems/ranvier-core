@@ -80,8 +80,10 @@ Record the numbers even on FAIL — a negative result is the deliverable.
    vllm serve <k3-model> \
      --enable-prefix-caching \
      --tokenizer <path>/kimi_fast/tokenizer.json \
-     --kv-events-config '{"enable_kv_cache_events": true, "endpoint": "tcp://0.0.0.0:5557"}'
-   # ^ endpoint/topic must match Ranvier's kv_events_port for that backend.
+     --kv-events-config '{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5557"}'
+   # ^ endpoint/topic must match Ranvier's kv_events_port for that backend. The
+   #   endpoint must contain "*": vLLM binds only then and connect()s otherwise
+   #   ("tcp://0.0.0.0:5557" publishes to nothing; observed 2026-10-10 on 0.15.1).
    ```
 2. Point Ranvier at it (`ranvier.yaml`):
    ```yaml

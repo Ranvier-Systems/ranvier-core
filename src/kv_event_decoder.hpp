@@ -6,11 +6,20 @@
 // `vllm/distributed/kv_events.py` and the documented subscriber example.
 //
 //   KVEventBatch  = [ ts: float64, events: [Event, ...], ...extras ]
-//   BlockStored   = [ "BlockStored", block_hashes: [int...],
-//                     parent_block_hash: int|nil, token_ids: [int...],
+//   BlockStored   = [ "BlockStored", block_hashes: [hash...],
+//                     parent_block_hash: hash|nil, token_ids: [int...],
 //                     block_size: int, lora_id: int|nil, ...extras ]
-//   BlockRemoved  = [ "BlockRemoved", block_hashes: [int...], ...extras ]
+//   BlockRemoved  = [ "BlockRemoved", block_hashes: [hash...], ...extras ]
 //   AllBlocksCleared = [ "AllBlocksCleared" ]
+//
+// `hash` is vLLM's ExternalBlockHash = bytes | int. Since vLLM 0.11 the
+// block hash is 32 bytes (sha256) and is published as msgpack BIN unless the
+// engine runs with VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1, which converts it to
+// int.from_bytes(h, "big") & (2^64 - 1), i.e. the LAST 8 bytes big-endian.
+// This decoder accepts both and folds bytes the same way, so either encoding
+// of one hash yields the same 64-bit key; the ledger compares keys for
+// identity only. (First hardware contact 2026-10-10, vLLM 0.15.1: the BIN
+// form is the default on the wire.)
 //
 // Forward-compatibility posture: UNKNOWN event tags are skipped (counted, not
 // fatal), EXTRA trailing array elements are skipped, and absent trailing
@@ -46,6 +55,7 @@ inline constexpr size_t kKvMaxEventsPerBatch = 8192;
 inline constexpr size_t kKvMaxHashesPerEvent = 16384;
 inline constexpr size_t kKvMaxTokensPerEvent = 256 * 1024;
 inline constexpr size_t kKvMaxSkipDepth      = 16;
+inline constexpr size_t kKvMaxHashBytes      = 64;   // sha256 is 32; reject absurd lengths
 
 struct KvBlockStored {
     std::vector<uint64_t> block_hashes;
@@ -203,10 +213,30 @@ inline bool read_str(Reader& r, std::string_view& out, size_t max_len = 64) {
     return true;
 }
 
-// Integer array → uint64 values (vLLM block hashes are 64-bit ints; negative
-// Python hashes arrive as int64 — stored bit-cast, which is fine because the
-// ledger only ever compares them for identity).
-inline bool read_u64_array(Reader& r, std::vector<uint64_t>& out, size_t max_n) {
+// One block hash whose header has already been read: INT → raw value bits
+// (negative Python ints arrive as int64 and are stored bit-cast; the ledger
+// only compares keys for identity); BIN/STR → the last 8 bytes big-endian,
+// exactly the fold vLLM applies for VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES, so an
+// int-publishing and a bytes-publishing backend agree on every key. The
+// cursor is left after the bytes.
+inline bool hash_from_header(Reader& r, const Header& e, uint64_t& out) {
+    if (e.kind == Kind::INT) {
+        out = e.uval;
+        return true;
+    }
+    if (e.kind != Kind::BIN && e.kind != Kind::STR) return false;
+    if (e.uval == 0 || e.uval > kKvMaxHashBytes || !r.ok(e.uval)) return false;
+    const uint8_t* stop = r.p + e.uval;
+    const uint8_t* start = e.uval > 8 ? stop - 8 : r.p;
+    uint64_t v = 0;
+    for (const uint8_t* q = start; q < stop; ++q) v = (v << 8) | *q;
+    r.p = stop;
+    out = v;
+    return true;
+}
+
+// Block-hash array → uint64 keys (INT or BIN/STR elements, see hash_from_header).
+inline bool read_hash_array(Reader& r, std::vector<uint64_t>& out, size_t max_n) {
     Header h;
     if (!read_header(r, h) || h.kind != Kind::ARR || h.uval > max_n) return false;
     // Reserve at most what the remaining payload can encode: every element is
@@ -217,8 +247,9 @@ inline bool read_u64_array(Reader& r, std::vector<uint64_t>& out, size_t max_n) 
     out.reserve(out.size() + (h.uval < fits ? h.uval : fits));
     for (uint64_t i = 0; i < h.uval; ++i) {
         Header e;
-        if (!read_header(r, e) || e.kind != Kind::INT) return false;
-        out.push_back(e.uval);
+        uint64_t v = 0;
+        if (!read_header(r, e) || !hash_from_header(r, e, v)) return false;
+        out.push_back(v);
     }
     return true;
 }
@@ -226,7 +257,7 @@ inline bool read_u64_array(Reader& r, std::vector<uint64_t>& out, size_t max_n) 
 inline bool read_token_array(Reader& r, std::vector<int32_t>& out, size_t max_n) {
     Header h;
     if (!read_header(r, h) || h.kind != Kind::ARR || h.uval > max_n) return false;
-    // See read_u64_array: clamp the reserve to the bytes actually remaining so a
+    // See read_hash_array: clamp the reserve to the bytes actually remaining so a
     // small payload's inflated array length can't force a large transient alloc.
     const size_t fits = r.remaining();
     out.reserve(out.size() + (h.uval < fits ? h.uval : fits));
@@ -302,14 +333,14 @@ inline std::optional<KvEventBatch> decode_kv_event_batch(const uint8_t* data, si
             // [lora_id], [extras...] — trailing optionals may be omitted.
             if (remaining < 4) return std::nullopt;
             KvBlockStored ev_out;
-            if (!read_u64_array(r, ev_out.block_hashes, kKvMaxHashesPerEvent)) return std::nullopt;
+            if (!read_hash_array(r, ev_out.block_hashes, kKvMaxHashesPerEvent)) return std::nullopt;
 
             Header parent;
             if (!read_header(r, parent)) return std::nullopt;
-            if (parent.kind == Kind::INT) {
-                ev_out.parent_block_hash = parent.uval;
-            } else if (parent.kind != Kind::NIL) {
-                return std::nullopt;
+            if (parent.kind != Kind::NIL) {
+                uint64_t pv = 0;
+                if (!hash_from_header(r, parent, pv)) return std::nullopt;
+                ev_out.parent_block_hash = pv;
             }
 
             if (!read_token_array(r, ev_out.token_ids, kKvMaxTokensPerEvent)) return std::nullopt;
@@ -327,7 +358,7 @@ inline std::optional<KvEventBatch> decode_kv_event_batch(const uint8_t* data, si
         } else if (tag == "BlockRemoved") {
             if (remaining < 1) return std::nullopt;
             KvBlockRemoved ev_out;
-            if (!read_u64_array(r, ev_out.block_hashes, kKvMaxHashesPerEvent)) return std::nullopt;
+            if (!read_hash_array(r, ev_out.block_hashes, kKvMaxHashesPerEvent)) return std::nullopt;
             if (!skip_rest(remaining - 1)) return std::nullopt;
             out.order_removed.push_back(static_cast<uint32_t>(i));
             out.removed.push_back(std::move(ev_out));
@@ -356,8 +387,11 @@ inline std::optional<KvEventBatch> decode_kv_event_batch(const uint8_t* data, si
 // vLLM's publisher pairs the PUB stream with an optional ROUTER socket: a
 // consumer sends the missed start sequence as an 8-byte big-endian integer
 // and receives buffered batches as (seq, payload) messages, terminated by a
-// sentinel (seq = -1, empty payload). Byte-level helpers live here so the
-// protocol is unit-testable without ZMQ.
+// sentinel (seq = -1, empty payload). On the wire the ROUTER expects the
+// REQ-style envelope [identity, empty delimiter, seq]; a DEALER therefore
+// sends [empty, seq], and every reply arrives as [empty, seq, payload] (the
+// subscriber's frame splitter keys on shape, so the delimiter is harmless).
+// Byte-level helpers live here so the protocol is unit-testable without ZMQ.
 
 inline void encode_replay_request(uint64_t start_seq, uint8_t out[8]) {
     for (int i = 0; i < 8; ++i) {

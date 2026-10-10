@@ -947,6 +947,16 @@ nothing to do.
    eviction regime, and the holder-aware divert (BACKLOG §27) is the next change, now with
    its signal live. Either way the counters say how often the stream changed a decision
    (`verified_hits`, `verified_evictions`, `routes_materialized`), which no run has shown yet.
+   *First contact 2026-10-10:* the guard fired. Runs 1–2 (fitted 20u, −13.2 / −12.5% P99 vs
+   least-loaded, zero incompletes; valid as control repeats without the stream) ended with
+   `kv_ops=0` on both arms. Three defects, found from vLLM's own logs and source: the publisher
+   endpoint `tcp://0.0.0.0:5557` made vLLM connect() instead of bind() (nothing listened on
+   5557 while the replay socket on 5657 did); the replay request lacked the empty delimiter
+   frame vLLM's ROUTER expects ("Invalid replay request" in the vLLM log, every backfill failed);
+   and the decoder would have rejected vLLM's default byte-string block hashes once messages
+   arrived. All three fixed the same day (CHANGELOG, Fixed); bench.sh now verifies each
+   publisher port is listening after vLLM start. The suite restarts from run 1 on a rebuilt
+   image.
 8. Same session, after 7: `bench-runner.sh --suite kvreset --output-dir benchmark-reports-kvreset`
    (~1h15m): the 8B 20u row with the between-arm KV reset acknowledged, which the reset was
    built for and has never had (404 on 10-08; 13B rows only on 10-09). Expected: the rr-first

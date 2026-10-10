@@ -1307,23 +1307,31 @@ if [[ "$SKIP_VLLM" = false ]]; then
         # (BlockStored / BlockRemoved / AllBlocksCleared) over ZMQ PUB; Ranvier's
         # native subscriber (kv_events.enabled, WITH_KV_EVENTS) mirrors each
         # backend's cache block-exactly instead of estimating residency from the
-        # /metrics scrape. One publisher per instance, bound on 0.0.0.0 so the
+        # /metrics scrape. One publisher per instance on all interfaces so the
         # Ranvier containers reach it over the docker bridge; the replay ROUTER
-        # socket (sequence-gap recovery) sits +100. The between-arm
-        # /reset_prefix_cache shows up on the stream as AllBlocksCleared.
+        # socket (sequence-gap recovery) sits +100. The endpoint MUST be
+        # "tcp://*:PORT": vLLM's publisher binds only when the endpoint contains
+        # "*" and connect()s otherwise, so "tcp://0.0.0.0:PORT" published into
+        # the void (2026-10-10, first contact: two runs with kv_ops=0).
+        # VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1 makes vLLM send 64-bit int block
+        # hashes instead of 32-byte sha256 strings; the decoder accepts both,
+        # ints are a quarter of the bytes. The between-arm /reset_prefix_cache
+        # shows up on the stream as AllBlocksCleared.
         KV_EVENTS_VLLM_ARGS=()
+        KV_EVENTS_VLLM_ENV=()
         if [[ "$KV_EVENTS" = true ]]; then
             KV_PUB_PORT=$((KV_EVENTS_PORT_START + i))
             KV_REPLAY_PORT=$((KV_PUB_PORT + KV_EVENTS_REPLAY_OFFSET))
-            KV_EVENTS_VLLM_ARGS=(--kv-events-config "{\"enable_kv_cache_events\": true, \"publisher\": \"zmq\", \"endpoint\": \"tcp://0.0.0.0:${KV_PUB_PORT}\", \"replay_endpoint\": \"tcp://0.0.0.0:${KV_REPLAY_PORT}\"}")
+            KV_EVENTS_VLLM_ARGS=(--kv-events-config "{\"enable_kv_cache_events\": true, \"publisher\": \"zmq\", \"endpoint\": \"tcp://*:${KV_PUB_PORT}\", \"replay_endpoint\": \"tcp://*:${KV_REPLAY_PORT}\"}")
+            KV_EVENTS_VLLM_ENV=(VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1)
         fi
 
         # VLLM_SERVER_DEV_MODE=1: vLLM exposes POST /reset_prefix_cache (used
         # between --compare arms, see reset_vllm_prefix_cache) only as a
         # "development" endpoint behind this env var; without it the call is a
         # 404 (observed on vLLM 0.15.1, 2026-10-08) and the arms carry over KV.
-        CUDA_VISIBLE_DEVICES=$GPU_IDS HF_TOKEN="$HF_TOKEN" MASTER_PORT=$DIST_PORT \
-            VLLM_SERVER_DEV_MODE=1 \
+        env CUDA_VISIBLE_DEVICES=$GPU_IDS HF_TOKEN="$HF_TOKEN" MASTER_PORT=$DIST_PORT \
+            VLLM_SERVER_DEV_MODE=1 "${KV_EVENTS_VLLM_ENV[@]}" \
             python3 -m vllm.entrypoints.openai.api_server \
             --model "$MODEL" \
             --host 0.0.0.0 \
@@ -1391,6 +1399,20 @@ if [[ "$SKIP_VLLM" = false ]]; then
     echo ""
 
     if [[ "$ALL_HEALTHY" = true ]]; then
+        # --kv-events: prove each publisher is actually listening before Ranvier
+        # subscribes. The engine binds the PUB socket during init, so by the time
+        # the API server is healthy the port is either listening or never will be
+        # (a connect()ing publisher, see the endpoint note above, shows nothing).
+        if [[ "$KV_EVENTS" = true ]]; then
+            for ((i=0; i<NUM_BACKENDS; i++)); do
+                KV_PUB_PORT=$((KV_EVENTS_PORT_START + i))
+                if ss -ltn 2>/dev/null | grep -qE "[:.]${KV_PUB_PORT}[[:space:]]"; then
+                    log_ok "Instance $i: KV-event publisher listening on :${KV_PUB_PORT}"
+                else
+                    log_warn "Instance $i: nothing is listening on KV-event publisher port :${KV_PUB_PORT}; Ranvier's subscriber will receive no events from it (check --kv-events-config in /tmp/vllm_gpu${i}.log)"
+                fi
+            done
+        fi
         for ((i=0; i<NUM_BACKENDS; i++)); do
             PORT=$((DEFAULT_VLLM_PORT_START + i))
             if [[ "$TP_SIZE" -gt 1 ]]; then

@@ -64,6 +64,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (new item: holder-aware divert) updated.
 
 ### Fixed
+- Native KV-event stream, first hardware contact (2026-10-10, vLLM 0.15.1): three defects, each
+  of which alone kept `router_native_kv_ops_total` at zero. (1) `bench.sh --kv-events` passed
+  `tcp://0.0.0.0:<port>` as the publisher endpoint; vLLM binds only when the endpoint contains
+  `*` and connect()s otherwise, so the PUB socket never listened. The endpoint is now
+  `tcp://*:<port>` and bench.sh checks that every publisher port is listening once vLLM is
+  healthy. (2) The subscriber's replay request was the bare 8-byte sequence; vLLM's ROUTER
+  handler expects the REQ-style envelope and logged every request as "Invalid replay request",
+  so every connect-backfill and gap repair failed. The DEALER now sends the empty delimiter frame
+  first. (3) The decoder accepted only integer block hashes; vLLM publishes 32-byte sha256 BIN
+  hashes by default (ints only with `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1`). The decoder now
+  accepts both and folds bytes to the same low-64-bit key vLLM's int conversion produces, so a
+  stream with either encoding addresses the same ledger entries; bench.sh also sets the int
+  variable on the vLLM it launches. The two kvevents-suite runs made before the fix are valid
+  control repeats without the stream (fitted 13B 20u vs least-loaded, P99 −13.2 / −12.5%).
 - `bench.sh` launches vLLM with `VLLM_SERVER_DEV_MODE=1`: vLLM serves `POST /reset_prefix_cache`
   only as a development endpoint behind that variable, so the between-arm KV reset added in
   the previous entry returned 404 on vLLM 0.15.1 and the arms still carried KV over (first

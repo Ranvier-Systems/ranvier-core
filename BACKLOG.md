@@ -1505,7 +1505,9 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   `kv_events_port` on that endpoint, `bench.sh --kv-events`, `bench-runner.sh --suite kvevents`
   (fitted 20u + 50-prefix 20u vs least_loaded, ×3) and `--suite kvreset` (8B 20u with the reset
   acked). Next session runs those; the pre-registered reading is in the runner's --help and the
-  results doc's resume checklist item 7.**
+  results doc's resume checklist item 7.** **First contact same day: kv_ops=0 — vLLM connect()s
+  unless the endpoint has `*`, the replay request needed the empty delimiter frame, and block
+  hashes are bytes (sha256) not ints on 0.15.1. All three fixed; suite restarts on a rebuilt image.**
   Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
   `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
   `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement

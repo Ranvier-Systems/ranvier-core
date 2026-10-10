@@ -59,6 +59,15 @@ struct Packer {
         arr(vals.size());
         for (auto v : vals) u64(v);
     }
+    void bin(const std::vector<uint8_t>& bytes) {  // bin8
+        raw(0xc4);
+        raw(static_cast<uint8_t>(bytes.size()));
+        buf.insert(buf.end(), bytes.begin(), bytes.end());
+    }
+    void bin_arr(const std::vector<std::vector<uint8_t>>& vals) {
+        arr(vals.size());
+        for (const auto& v : vals) bin(v);
+    }
     void token_arr(const std::vector<int32_t>& toks) {
         arr(toks.size());
         for (auto t : toks) i64(t);
@@ -87,6 +96,34 @@ std::vector<uint8_t> stored_batch(double ts, const std::vector<uint64_t>& hashes
     p.token_arr(tokens);
     p.fixint(static_cast<uint8_t>(block_size));
     p.nil();           // lora_id
+    return p.buf;
+}
+
+// A 32-byte sha256-shaped block hash whose LAST 8 bytes are `tail` big-endian
+// (the bytes vLLM's int conversion keeps); the other 24 bytes are filler.
+std::vector<uint8_t> sha_like(uint64_t tail) {
+    std::vector<uint8_t> h(32, 0x5a);
+    for (int i = 0; i < 8; ++i) h[24 + i] = static_cast<uint8_t>((tail >> (8 * (7 - i))) & 0xff);
+    return h;
+}
+
+// Same as stored_batch but with vLLM's default BIN (bytes) block hashes.
+std::vector<uint8_t> stored_batch_bin(double ts, const std::vector<std::vector<uint8_t>>& hashes,
+                                      std::optional<std::vector<uint8_t>> parent,
+                                      const std::vector<int32_t>& tokens,
+                                      uint32_t block_size) {
+    Packer p;
+    p.arr(2);
+    p.f64(ts);
+    p.arr(1);
+    p.arr(7);          // [tag, hashes, parent, tokens, block_size, lora_id, medium]
+    p.str("BlockStored");
+    p.bin_arr(hashes);
+    if (parent) p.bin(*parent); else p.nil();
+    p.token_arr(tokens);
+    p.fixint(static_cast<uint8_t>(block_size));
+    p.nil();           // lora_id
+    p.nil();           // medium (vLLM >= 0.10)
     return p.buf;
 }
 
@@ -234,6 +271,55 @@ TEST(KvDecoder, NegativeBlockHashBitCast) {
     (void)buf;
 }
 
+TEST(KvDecoder, BinaryBlockHashesFoldToLow64BigEndian) {
+    // vLLM >= 0.11 publishes 32-byte sha256 hashes as msgpack BIN by default;
+    // with VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1 it sends
+    // int.from_bytes(h, "big") & (2^64-1) instead. The decoder must map both
+    // encodings of one hash to the same key: the last 8 bytes big-endian.
+    auto tokens = make_tokens(32);
+    auto buf = stored_batch_bin(1.0, {sha_like(0x0102030405060708ULL), sha_like(0xFFFFFFFFFFFFFFFFULL)},
+                                sha_like(0xABCDEF0011223344ULL), tokens, 16);
+    auto batch = decode_kv_event_batch(buf.data(), buf.size());
+    ASSERT_TRUE(batch.has_value());
+    ASSERT_EQ(batch->stored.size(), 1u);
+    ASSERT_EQ(batch->stored[0].block_hashes.size(), 2u);
+    EXPECT_EQ(batch->stored[0].block_hashes[0], 0x0102030405060708ULL);
+    EXPECT_EQ(batch->stored[0].block_hashes[1], 0xFFFFFFFFFFFFFFFFULL);
+    ASSERT_TRUE(batch->stored[0].parent_block_hash.has_value());
+    EXPECT_EQ(*batch->stored[0].parent_block_hash, 0xABCDEF0011223344ULL);
+    EXPECT_EQ(batch->stored[0].block_size, 16u);
+    EXPECT_EQ(batch->stored[0].token_ids.size(), 32u);
+
+    // The int encoding of the same hashes decodes to identical keys.
+    auto buf_int = stored_batch(1.0, {0x0102030405060708ULL, 0xFFFFFFFFFFFFFFFFULL},
+                                uint64_t{0xABCDEF0011223344ULL}, tokens, 16);
+    auto batch_int = decode_kv_event_batch(buf_int.data(), buf_int.size());
+    ASSERT_TRUE(batch_int.has_value());
+    EXPECT_EQ(batch_int->stored[0].block_hashes, batch->stored[0].block_hashes);
+    EXPECT_EQ(batch_int->stored[0].parent_block_hash, batch->stored[0].parent_block_hash);
+
+    // Short binary hashes (< 8 bytes) fold whatever is there; BlockRemoved too.
+    Packer p;
+    p.arr(2); p.f64(2.0); p.arr(1); p.arr(2); p.str("BlockRemoved");
+    p.bin_arr({{0x01, 0x02}, sha_like(0x0000000000000042ULL)});
+    auto rem = decode_kv_event_batch(p.buf.data(), p.buf.size());
+    ASSERT_TRUE(rem.has_value());
+    ASSERT_EQ(rem->removed.size(), 1u);
+    ASSERT_EQ(rem->removed[0].block_hashes.size(), 2u);
+    EXPECT_EQ(rem->removed[0].block_hashes[0], 0x0102u);
+    EXPECT_EQ(rem->removed[0].block_hashes[1], 0x42u);
+
+    // An empty or absurdly long BIN hash is a structural error, not UB.
+    Packer bad;
+    bad.arr(2); bad.f64(3.0); bad.arr(1); bad.arr(2); bad.str("BlockRemoved");
+    bad.arr(1); bad.raw(0xc4); bad.raw(0);  // bin8 of length 0
+    EXPECT_FALSE(decode_kv_event_batch(bad.buf.data(), bad.buf.size()).has_value());
+    Packer bad2;
+    bad2.arr(2); bad2.f64(3.0); bad2.arr(1); bad2.arr(2); bad2.str("BlockRemoved");
+    bad2.arr(1); bad2.bin(std::vector<uint8_t>(65, 0x11));  // > kKvMaxHashBytes
+    EXPECT_FALSE(decode_kv_event_batch(bad2.buf.data(), bad2.buf.size()).has_value());
+}
+
 TEST(KvDecoder, RejectsTruncatedAndGarbage) {
     auto tokens = make_tokens(16);
     auto good = stored_batch(7.0, {0x5}, std::nullopt, tokens, 16);
@@ -348,6 +434,41 @@ TEST(KvLedger, BridgingInvariant) {
     EXPECT_EQ(ops[2].prefix_hash, hash_prefix(tokens.data(), 48, 16));
     EXPECT_EQ(ops[0].ts_ms, 1000u);
     EXPECT_EQ(ops[2].ts_ms, 2000u);
+}
+
+TEST(KvLedger, BinaryHashesChainThroughTheLedger) {
+    // Same chain as BridgingInvariant, published with vLLM's default BIN
+    // hashes: C's parent is B's bytes, and the folded keys must link them so
+    // all three boundaries bridge to hash_prefix() of the token stream.
+    auto tokens = make_tokens(48);
+    KvBlockLedger ledger(limits());
+    std::vector<NativeKvOp> ops;
+
+    auto payload1 = stored_batch_bin(1.0, {sha_like(0xA), sha_like(0xB)}, std::nullopt,
+                                     {tokens.begin(), tokens.begin() + 32}, 16);
+    auto b1 = decode_kv_event_batch(payload1.data(), payload1.size());
+    ASSERT_TRUE(b1.has_value());
+    ASSERT_TRUE(ledger.translate(7, *b1, ops));
+
+    auto payload2 = stored_batch_bin(2.0, {sha_like(0xC)}, sha_like(0xB),
+                                     {tokens.begin() + 32, tokens.end()}, 16);
+    auto b2 = decode_kv_event_batch(payload2.data(), payload2.size());
+    ASSERT_TRUE(b2.has_value());
+    ASSERT_TRUE(ledger.translate(7, *b2, ops));
+
+    ASSERT_EQ(ops.size(), 3u);
+    EXPECT_EQ(ops[0].prefix_hash, hash_prefix(tokens.data(), 16, 16));
+    EXPECT_EQ(ops[1].prefix_hash, hash_prefix(tokens.data(), 32, 16));
+    EXPECT_EQ(ops[2].prefix_hash, hash_prefix(tokens.data(), 48, 16));
+
+    // A removal addressed by the int form of B's hash hits the same block.
+    auto payload3 = removed_batch(3.0, {0xB});
+    auto b3 = decode_kv_event_batch(payload3.data(), payload3.size());
+    ASSERT_TRUE(b3.has_value());
+    ASSERT_TRUE(ledger.translate(7, *b3, ops));
+    ASSERT_EQ(ops.size(), 4u);
+    EXPECT_EQ(ops[3].kind, NativeKvOp::Kind::REMOVE);
+    EXPECT_EQ(ops[3].prefix_hash, hash_prefix(tokens.data(), 32, 16));
 }
 
 TEST(KvLedger, RemovalEmitsTheSameBridgedHash) {
