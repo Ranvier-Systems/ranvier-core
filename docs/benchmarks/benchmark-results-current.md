@@ -926,6 +926,33 @@ nothing to do.
    Ranvier logs, `--date-prefix YYYYMMDD` for a directory holding several campaigns) **before**
    terminating the instance, and tar the raw run directories onto the release as an asset
    (`gh release upload vX.Y.Z <tarball>`): a suite is 50–100 MB raw and a few hundred KB summarised.
+7. Next GPU session: `bench-runner.sh --suite kvevents --output-dir benchmark-reports-kvevents`
+   (~2h50m, 6 runs; needs an image built from the commit that adds `kv_events_port` to
+   `POST /admin/backends`, so `--build-image` on the first run or a merged main). The native
+   KV-event subscriber has never run on GPUs: every `router_native_*` counter in every
+   archived dump is 0, because the benchmark registers backends through the admin API,
+   which had no way to opt them in. `bench.sh --kv-events` launches each vLLM with
+   `--kv-events-config` and registers every backend with its publisher port, for both arms.
+   **Read first:** the compare header's "Native KV events" line must show
+   `router_native_kv_ops_total` > 0 on both arms and the counter rows `stream_resets` near 0;
+   a 0 means the stream never connected and the run measured probabilistic residency again
+   (bench.sh logs an error; stop the suite and read `/tmp/vllm_gpu*.log` and the node logs
+   for "KV-event subscriber"). **Pre-registered reading:** row 17 (fitted 13B 20u vs
+   least-loaded; −14.6/−13.8/−20.8% P99 without the stream) must not regress. Row 18
+   (50-prefix 13B 20u vs least-loaded; +22.9/+24.9/+21.7% P99 on 2026-10-09) is the
+   eviction-regime acceptance row: a CONSISTENT IMPROVEMENT is the finding (verified
+   evictions stopped hits queueing on backends that had already evicted the prefix); MIXED
+   with KV above today's 23–32% is progress worth a second look at `verified_evictions`;
+   an unchanged CONSISTENT REGRESSION means block-exact residency alone does not fix the
+   eviction regime, and the holder-aware divert (BACKLOG §27) is the next change, now with
+   its signal live. Either way the counters say how often the stream changed a decision
+   (`verified_hits`, `verified_evictions`, `routes_materialized`), which no run has shown yet.
+8. Same session, after 7: `bench-runner.sh --suite kvreset --output-dir benchmark-reports-kvreset`
+   (~1h15m): the 8B 20u row with the between-arm KV reset acknowledged, which the reset was
+   built for and has never had (404 on 10-08; 13B rows only on 10-09). Expected: the rr-first
+   and prefix-first repeats converge on the −27% median; the compare header must read
+   `backends acked: 8/8` for both arms. If the order effect persists with the reset acked,
+   it was never the vLLM cache and the 8B row's write-up changes.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
@@ -966,7 +993,11 @@ now shows were measured in an eviction regime.
 - **Holder-aware divert** (BACKLOG §27): the eviction-regime and saturation rows say the next
   routing change is a divert that keeps the hit, not a knob. Acceptance: the 50-prefix 20u row
   vs least-loaded (now +23% P99) and the fitted 30u row (now MIXED) turn to improvements without
-  giving back KV.
+  giving back KV. **Blocked on a signal:** nothing in the benchmark deployment knows which
+  backends hold a prefix. The cluster `holders_of` index counts Ranvier *nodes* reporting a
+  hot prefix (telemetry sink, off), the route table holds one home per prefix by design, and
+  the native KV-event subscriber, the one block-exact per-backend source, has never been on
+  (resume checklist item 7 turns it on first).
 
 ## Adding an entry here
 

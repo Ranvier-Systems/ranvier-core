@@ -2804,6 +2804,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
 future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
     // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0&supports_token_ids=true&type=vllm&pool_role=unified
     // Also supports hostnames: POST /admin/backends?id=1&ip=host.docker.internal&port=11434
+    // Native KV events: &kv_events_port=5557[&kv_events_replay_port=5657] subscribes to the
+    // backend's vLLM --kv-events-config ZMQ publisher on that port (same host as `ip`).
     sstring id_str = req->get_query_param("id");
     sstring ip_str = req->get_query_param("ip");
     sstring port_str = req->get_query_param("port");
@@ -2813,6 +2815,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
     sstring compression_ratio_str = req->get_query_param("compression_ratio");
     sstring type_str = req->get_query_param("type");
     sstring pool_role_str = req->get_query_param("pool_role");
+    sstring kv_events_port_str = req->get_query_param("kv_events_port");
+    sstring kv_events_replay_port_str = req->get_query_param("kv_events_replay_port");
 
     // Check for required parameters
     if (id_str.empty() || port_str.empty() || ip_str.empty()) {
@@ -2921,6 +2925,36 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         pool_role = *role_opt;
     }
 
+    // kv_events_port / kv_events_replay_port: native KV-event opt-in, the admin
+    // equivalent of static YAML `kv_events_port` and the K8s annotation
+    // ranvier.io/kv-events-port. Omitted = leave any existing stream alone;
+    // 0 = drop the stream; 1-65535 = subscribe to tcp://<ip>:<port>. The replay
+    // port needs a stream to replay for. Invalid values are rejected (400).
+    bool kv_events_requested = !kv_events_port_str.empty();
+    uint16_t kv_events_port = 0;
+    uint16_t kv_events_replay_port = 0;
+    if (kv_events_requested && kv_events_port_str != "0") {
+        auto kv_port_opt = parse_port(std::string_view(kv_events_port_str));
+        if (!kv_port_opt) {
+            log_control.warn("POST /admin/backends: invalid kv_events_port '{}'", kv_events_port_str);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"Invalid kv_events_port: must be 0 (unsubscribe) or 1-65535\"}");
+            co_return std::move(rep);
+        }
+        kv_events_port = *kv_port_opt;
+    }
+    if (!kv_events_replay_port_str.empty() && kv_events_replay_port_str != "0") {
+        auto replay_opt = parse_port(std::string_view(kv_events_replay_port_str));
+        if (!replay_opt || kv_events_port == 0) {
+            log_control.warn("POST /admin/backends: invalid kv_events_replay_port '{}' (kv_events_port={})",
+                             kv_events_replay_port_str, kv_events_port);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"Invalid kv_events_replay_port: must be 1-65535 and requires kv_events_port\"}");
+            co_return std::move(rep);
+        }
+        kv_events_replay_port = *replay_opt;
+    }
+
     // Resolve address: supports both direct IP addresses and hostnames
     socket_address addr;
     std::string resolved_ip;
@@ -3004,15 +3038,42 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         });
     }
 
-    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={}, compression_ratio={}, type={}, pool_role={})",
+    // Native KV-event stream, after registration so the stream never precedes
+    // the backend in shard state. Not persisted: the SQLite backend row has no
+    // column for the port, so a restarted node needs it re-posted (static YAML
+    // and the K8s annotation re-apply theirs on every start).
+    const char* kv_events_status = "not_requested";
+    if (kv_events_requested) {
+        if (!_kv_events_subscribe) {
+            kv_events_status = "unavailable";
+            log_control.warn("POST /admin/backends: kv_events_port={} for backend {} ignored: native KV "
+                             "events are disabled (kv_events.enabled=false) or compiled out (WITH_KV_EVENTS=OFF)",
+                             kv_events_port, id);
+        } else if (kv_events_port == 0) {
+            kv_events_status = _kv_events_subscribe(id, "", "") ? "unsubscribed" : "queue_full";
+        } else {
+            std::string kv_endpoint = "tcp://" + resolved_ip + ":" + std::to_string(kv_events_port);
+            std::string replay_endpoint;
+            if (kv_events_replay_port > 0) {
+                replay_endpoint = "tcp://" + resolved_ip + ":" + std::to_string(kv_events_replay_port);
+            }
+            kv_events_status = _kv_events_subscribe(id, std::move(kv_endpoint), std::move(replay_endpoint))
+                ? "subscribed" : "queue_full";
+        }
+    }
+
+    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={}, compression_ratio={}, type={}, pool_role={}, kv_events={}{})",
         id, ip_str, port, weight, priority, supports_token_ids, compression_ratio,
-        backend_type_to_string(backend_type), pool_role_to_string(pool_role));
+        backend_type_to_string(backend_type), pool_role_to_string(pool_role), kv_events_status,
+        kv_events_port > 0 ? " port " + std::to_string(kv_events_port) : std::string());
     rep->write_body("json", "{\"status\": \"ok\", \"weight\": " + std::to_string(weight) +
         ", \"priority\": " + std::to_string(priority) +
         ", \"supports_token_ids\": " + (supports_token_ids ? "true" : "false") +
         ", \"compression_ratio\": " + std::to_string(compression_ratio) +
         ", \"type\": \"" + std::string(backend_type_to_string(backend_type)) +
-        "\", \"pool_role\": \"" + std::string(pool_role_to_string(pool_role)) + "\"}");
+        "\", \"pool_role\": \"" + std::string(pool_role_to_string(pool_role)) +
+        "\", \"kv_events\": \"" + std::string(kv_events_status) +
+        "\", \"kv_events_port\": " + std::to_string(kv_events_port) + "}");
     co_return std::move(rep);
 }
 
