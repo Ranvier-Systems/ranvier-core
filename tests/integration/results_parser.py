@@ -191,6 +191,11 @@ class BenchmarkResults:
     native_verified_cold_honored_total: Optional[int] = None
     native_routes_materialized_total: Optional[int] = None
     native_stream_resets_total: Optional[int] = None
+    # stream_completes: streams seen from publisher sequence 0 (absence trusted);
+    # absence_untrusted: hits absent from the index of a fresh but incomplete
+    # stream (after a reset or a trimmed backfill), decided by the gossip gate.
+    native_stream_completes_total: Optional[int] = None
+    native_absence_untrusted_total: Optional[int] = None
     # Per-backend request distribution — printed as a sorted list so prefix-
     # concentration hot-spotting shows up directly in the comparison output.
     # Aggregated across ALL ranvier nodes (see parse_prometheus_report).
@@ -661,6 +666,8 @@ _NATIVE_KEYS = (
     "native_verified_cold_honored_total",
     "native_routes_materialized_total",
     "native_stream_resets_total",
+    "native_stream_completes_total",
+    "native_absence_untrusted_total",
 )
 _PROM_NATIVE_RES = {
     k: re.compile(r"^(?:seastar_)?ranvier_router_" + k + r"(?:\{[^}]*\})?\s+([0-9.eE+-]+)")
@@ -1847,7 +1854,9 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
                     "verified_cold_honored = verified-cold hits served by another verified holder / kept "
                     "on the home; verified_evictions = cold hits downgraded to re-placement (0 since the "
                     "2026-10-11 policy); routes_materialized = PUSH routes learned from BlockStored; "
-                    "stream_resets > 0 means sequence gaps wiped a backend's ledger)"
+                    "stream_resets > 0 means sequence gaps wiped a backend's ledger; stream_completes "
+                    "= streams seen from publisher sequence 0, so absence counts as eviction; "
+                    "absence_untrusted > 0 means hits on an incomplete stream fell back to gossip)"
                 )
 
         # Per-backend request distribution. Print as sorted list with min/max

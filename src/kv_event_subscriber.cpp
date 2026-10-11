@@ -103,7 +103,12 @@ bool split_seq_payload(const Message& msg, uint64_t& seq,
 // reset path. Connect-backfill (upto_exclusive == UINT64_MAX): the first
 // received sequence sets the base (the buffer's tail is trimmed by design),
 // contiguity is required after it, and reaching the sentinel is success —
-// even with zero batches (fresh publisher).
+// even with zero batches (fresh publisher). `started_at_publisher_start`
+// (optional) reports whether the first replayed batch was sequence 0, i.e.
+// the replay covered the publisher's whole history from an empty cache rather
+// than a buffer whose older batches were trimmed. It stays false when no batch
+// was replayed: a silent buffer cannot tell a fresh publisher from one whose
+// replay buffer is disabled, so the first live frame decides instead.
 //
 // Runs entirely on the worker thread; blocking inside the poll deadline is
 // legal here (Rule #12: off-reactor).
@@ -117,7 +122,8 @@ bool attempt_replay(void* ctx, Subscription& sub, BackendId backend,
                     const std::function<void(std::vector<NativeKvOp>&&)>& flush_ops,
                     uint32_t flush_threshold,
                     std::atomic<uint64_t>& replay_batches,
-                    std::atomic<uint64_t>& decode_errors) {
+                    std::atomic<uint64_t>& decode_errors,
+                    bool* started_at_publisher_start = nullptr) {
     // Bound on accepted replay messages: comfortably above vLLM's default
     // replay buffer (10k batches); a publisher streaming beyond this is
     // misbehaving and the replay fails closed to the reset path.
@@ -189,6 +195,9 @@ bool attempt_replay(void* ctx, Subscription& sub, BackendId backend,
                 }
                 next_expected = s;
                 first = false;
+                if (started_at_publisher_start != nullptr) {
+                    *started_at_publisher_start = (s == 0);
+                }
             }
             if (s != next_expected) {
                 ok = false;  // hole inside the replay stream
@@ -455,13 +464,21 @@ void KvEventSubscriberService::worker_loop(seastar::alien::instance& alien) {
                 auto flush = [this, &alien](std::vector<NativeKvOp>&& v) {
                     ship(alien, std::move(v));
                 };
+                bool from_publisher_start = false;
                 if (!attempt_replay(ctx, added, cmd.backend, 0, UINT64_MAX,
                                     _cfg.replay_timeout_ms, ledger, ops,
                                     flush, _cfg.max_ops_per_shipment,
-                                    _replay_batches, _decode_errors)) {
+                                    _replay_batches, _decode_errors,
+                                    &from_publisher_start)) {
                     _replay_failures.fetch_add(1, std::memory_order_relaxed);
                     log_kv.warn("Connect-backfill failed for backend {}; starting "
                                 "from live stream only", cmd.backend);
+                } else if (from_publisher_start) {
+                    // The replay began at sequence 0, so the ledger has seen
+                    // every block this publisher ever reported: absence from
+                    // the index now means "evicted". A trimmed buffer leaves
+                    // absence untrusted until a CLEAR or a sequence-0 frame.
+                    ops.push_back({NativeKvOp::Kind::COMPLETE, cmd.backend, 0, now_ms()});
                 }
             }
         }
@@ -536,6 +553,14 @@ void KvEventSubscriberService::worker_loop(seastar::alien::instance& alien) {
                 }
                 sub.next_seq = seq + 1;
                 sub.synced = true;
+
+                // Sequence 0 is the publisher's first batch: the engine (re)started
+                // with an empty cache, and any rewind was reset above, so from here
+                // the stream is complete and absence may be trusted. Emitted before
+                // this batch's ops so wire order stays RESET -> COMPLETE -> stores.
+                if (seq == 0) {
+                    ops.push_back({NativeKvOp::Kind::COMPLETE, backend, 0, now_ms()});
+                }
 
                 auto batch = decode_kv_event_batch(payload->data(), payload->size());
                 if (!batch.has_value()) {

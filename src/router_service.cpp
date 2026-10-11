@@ -255,6 +255,8 @@ struct ShardLocalState {
         uint64_t native_removes = 0;                // Index entries removed from BlockRemoved
         uint64_t native_clears = 0;                 // AllBlocksCleared purges
         uint64_t native_resets = 0;                 // Stream faults (gap/decode) dropping verified trust
+        uint64_t native_completes = 0;              // Streams marked complete since a known-empty cache (COMPLETE ops)
+        uint64_t native_absence_untrusted = 0;      // Fresh-stream ART hits absent from the index on an incomplete stream: probabilistic path used
         uint64_t native_index_overflow = 0;         // Upserts dropped at the per-backend index cap
         uint64_t native_verified_hits = 0;          // ART hits confirmed resident by the native index
         uint64_t native_verified_downgrades = 0;    // ART hits downgraded because the native index lacked the prefix
@@ -305,6 +307,8 @@ struct ShardLocalState {
             native_removes = 0;
             native_clears = 0;
             native_resets = 0;
+            native_completes = 0;
+            native_absence_untrusted = 0;
             native_index_overflow = 0;
             native_verified_hits = 0;
             native_verified_downgrades = 0;
@@ -519,8 +523,17 @@ struct ShardLocalState {
     // entries created per backend so native upserts stay bounded even if the
     // worker-side ledger cap is ever bypassed (Rule #4 defense in depth;
     // the ledger's caps are the authoritative bound).
+    //
+    // `complete` is the second, narrower trust: backends whose stream has been
+    // seen in full since a known-empty cache (COMPLETE: a backfill or live frame
+    // from publisher sequence 0; CLEAR: AllBlocksCleared). Freshness alone only
+    // proves the subscription is alive, and ALIVE heartbeats keep it alive
+    // regardless of what the index is missing, so a fresh backend's PRESENCE in
+    // the index is trusted but its ABSENCE is "evicted" only while it is also
+    // complete. RESET revokes completeness; only COMPLETE or CLEAR restore it.
     struct NativeKvState {
         absl::flat_hash_map<BackendId, std::chrono::steady_clock::time_point> fresh;
+        absl::flat_hash_set<BackendId> complete;  // bounded by MAX_BACKENDS (Rule #4)
         absl::flat_hash_map<BackendId, uint32_t> index_entries;
         static constexpr size_t MAX_BACKENDS = 256;               // Hard Rule #4
         static constexpr uint32_t MAX_ENTRIES_PER_BACKEND = 65536; // Hard Rule #4
@@ -541,6 +554,20 @@ struct ShardLocalState {
             return;  // bounded; an untracked backend simply stays unverified
         }
         native_kv.fresh[id] = std::chrono::steady_clock::now();
+    }
+
+    // True when absence from prefix_hash_index may be read as "verified
+    // evicted": the stream is fresh AND complete since a known-empty cache.
+    bool native_absence_trusted(BackendId id) const {
+        return native_residency_fresh(id) && native_kv.complete.contains(id);
+    }
+
+    void mark_native_complete(BackendId id) {
+        if (!native_kv.complete.contains(id) &&
+            native_kv.complete.size() >= NativeKvState::MAX_BACKENDS) {
+            return;  // bounded; an untracked backend keeps absence untrusted
+        }
+        native_kv.complete.insert(id);
     }
 
     // ========================================================================
@@ -782,6 +809,7 @@ struct ShardLocalState {
 
         // Clear native KV-event state
         native_kv.fresh.clear();
+        native_kv.complete.clear();
         native_kv.index_entries.clear();
 
         // Clear cross-shard load sync state
@@ -2247,6 +2275,17 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             [] { return g_shard_state ? g_shard_state->stats.native_resets : 0UL; },
             seastar::metrics::description("Native KV streams reset after a sequence gap or "
                                          "decode failure (verified residency suspended)")),
+        seastar::metrics::make_counter("router_native_stream_completes_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_completes : 0UL; },
+            seastar::metrics::description("Native KV streams marked complete since a known-empty "
+                                         "cache (seen from publisher sequence 0): absence from "
+                                         "the index is then a verified eviction")),
+        seastar::metrics::make_counter("router_native_absence_untrusted_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_absence_untrusted : 0UL; },
+            seastar::metrics::description("ART hits on a fresh native stream whose prefix was "
+                                         "absent from the index while the stream was not "
+                                         "complete (after a reset or a trimmed backfill): "
+                                         "probabilistic residency used")),
         seastar::metrics::make_counter("router_native_index_overflow_total",
             [] { return g_shard_state ? g_shard_state->stats.native_index_overflow : 0UL; },
             seastar::metrics::description("Native index upserts dropped at the per-backend cap")),
@@ -3240,10 +3279,16 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 // and counting a downgrade at the verdict would report the
                 // same decision as both a downgrade and a cache hit (I-8).
                 bool native_verified_cold = false;
+                // The native index decides only what it can vouch for. Presence
+                // needs a fresh stream. Absence ("evicted") also needs the stream
+                // complete since a known-empty cache: after a RESET or a trimmed
+                // connect-backfill the index misses blocks the backend still
+                // holds, and reading that silence as eviction would redirect
+                // requests off a warm home. Anything the index cannot vouch for
+                // falls through to the probabilistic gate below.
                 // The index only tracks block chains to kv_native_indexed_depth
                 // tokens, so at a deeper routing depth its silence means
-                // "unknown", never "evicted": that lookup falls through to the
-                // probabilistic gate below (counted so the compare can show it).
+                // "unknown", never "evicted" (counted so the compare can show it).
                 const bool native_stream_fresh =
                     state.config.kv_residency_freshness_ttl.count() > 0 &&
                     state.native_residency_fresh(art_backend);
@@ -3252,6 +3297,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 if (native_stream_fresh && !within_indexed_depth) {
                     state.stats.native_verified_depth_skips++;
                 }
+                bool native_decided = false;
                 if (native_stream_fresh && within_indexed_depth) {
                     uint64_t request_hash = hash_prefix(tokens.data(), prefix_len,
                                                         state.config.block_alignment);
@@ -3259,9 +3305,14 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     bool resident = idx_it != state.prefix_hash_index.end() &&
                                     idx_it->second.contains(art_backend);
                     if (resident) {
+                        native_decided = true;
                         anchor_residency = 1.0;
                         state.stats.native_verified_hits++;
+                    } else if (!state.native_absence_trusted(art_backend)) {
+                        // Fresh but incomplete: absence is "unknown".
+                        state.stats.native_absence_untrusted++;
                     } else {
+                        native_decided = true;
                         native_verified_cold = true;
                         BackendId holder = 0;
                         uint64_t holder_load = 0;
@@ -3271,6 +3322,11 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                                 if (std::find(live_backends.begin(), live_backends.end(), cand) ==
                                     live_backends.end()) continue;
                                 if (!state.role_eligible(cand)) continue;
+                                // A holder is only as good as its own stream: an
+                                // entry for a backend without fresh native trust
+                                // may be a learned-route claim (route learning
+                                // writes the same index), not a stored block.
+                                if (!state.native_residency_fresh(cand)) continue;
                                 uint64_t load = get_composite_backend_load(cand);
                                 if (holder == 0 || load < holder_load ||
                                     (load == holder_load && cand < holder)) {
@@ -3293,7 +3349,8 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                             anchor_residency = 0.0;
                         }
                     }
-                } else {
+                }
+                if (!native_decided) {
                     if (state.config.cache_residency_threshold > 0.0 ||
                         state.config.scoring.residency_weight > 0.0) {
                         anchor_residency = get_cached_residency(art_backend);
@@ -6058,7 +6115,18 @@ void RouterService::apply_native_kv_ops_local(const NativeKvOp* ops, size_t coun
             break;
         }
         case NativeKvOp::Kind::ALIVE:
+            // Liveness only. Deliberately does not restore completeness after
+            // a RESET: the subscription being alive says nothing about the
+            // blocks the purged index no longer lists.
             state.touch_native_fresh(op.backend);
+            break;
+        case NativeKvOp::Kind::COMPLETE:
+            // The subscriber saw this stream from publisher sequence 0 (a full
+            // connect-backfill, or a live frame from a (re)started engine):
+            // absence from the index is now a verified eviction.
+            state.mark_native_complete(op.backend);
+            state.touch_native_fresh(op.backend);
+            state.stats.native_completes++;
             break;
         case NativeKvOp::Kind::MATERIALIZE: {
             if (op.boundary_step == 0 || op.tokens.empty() ||
@@ -6160,11 +6228,18 @@ static void native_purge_backend_local(BackendId backend, bool clear_routes,
             }
         }
         state.stats.native_clears++;
-        // Stream is alive and exact (it just told us the cache is empty).
+        // Stream is alive and exact (it just told us the cache is empty), and
+        // empty is a known starting point: every later store is reported, so
+        // absence is a verified eviction from here on.
         state.touch_native_fresh(backend);
+        state.mark_native_complete(backend);
     }
     if (drop_trust) {
+        // The ledger and this backend's index entries were just wiped while its
+        // cache stays warm: absence stays untrusted until a CLEAR or COMPLETE,
+        // however soon ALIVE heartbeats make the stream fresh again.
         state.native_kv.fresh.erase(backend);
+        state.native_kv.complete.erase(backend);
         state.stats.native_resets++;
     }
 }
@@ -6222,12 +6297,24 @@ RouterService::NativeKvStatsSnapshot RouterService::get_native_kv_stats() {
             st.native_clears, st.native_resets, st.native_index_overflow,
             st.native_verified_hits, st.native_verified_downgrades,
             st.native_verified_cold_honored, st.native_holder_redirects,
-            st.native_routes_materialized, st.native_materialize_trust_skips};
+            st.native_routes_materialized, st.native_materialize_trust_skips,
+            st.native_completes, st.native_absence_untrusted};
 }
 
-void RouterService::set_native_fresh_for_testing(BackendId id) {
+void RouterService::set_native_fresh_for_testing(BackendId id, bool complete) {
     if (!g_shard_state) return;
     g_shard_state->touch_native_fresh(id);
+    if (complete) {
+        g_shard_state->mark_native_complete(id);
+    } else {
+        g_shard_state->native_kv.complete.erase(id);
+    }
+}
+
+void RouterService::native_purge_backend_local_for_testing(BackendId backend,
+                                                           bool clear_routes,
+                                                           bool drop_trust) {
+    native_purge_backend_local(backend, clear_routes, drop_trust);
 }
 
 void RouterService::set_fail_open_for_testing(bool active) {

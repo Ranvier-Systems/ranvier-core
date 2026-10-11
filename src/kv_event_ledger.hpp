@@ -61,6 +61,11 @@ struct NativeKvOp {
                        // verified-residency trust for this backend must drop
         ALIVE,         // subscription heartbeat: stream healthy, refresh freshness
         MATERIALIZE,   // insert PUSH routes for tokens at the new boundaries
+        COMPLETE,      // the backend's stream has been seen in full since a
+                       // known-empty cache (publisher sequence 0), so ABSENCE
+                       // from the index may be read as "evicted". Presence never
+                       // needs this; a RESET revokes it and only COMPLETE or
+                       // CLEAR grants it again (ALIVE never does).
     };
     Kind kind = Kind::ALIVE;
     BackendId backend = 0;

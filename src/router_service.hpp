@@ -771,10 +771,18 @@ public:
     // alien::run_on → shard 0). Applies translated ops to every shard:
     // UPSERT/REMOVE maintain prefix_hash_index as an exact per-(hash, backend)
     // residency mirror; CLEAR purges the backend's routes + index entries
-    // (AllBlocksCleared — the backend's cache is empty); RESET drops
-    // verified-residency trust after a stream fault (sequence gap / decode
-    // failure) so routing falls back to the probabilistic gossip signal;
-    // ALIVE refreshes per-backend stream freshness.
+    // (AllBlocksCleared — the backend's cache is empty) and marks the stream
+    // complete; RESET drops verified-residency trust after a stream fault
+    // (sequence gap / decode failure) so routing falls back to the
+    // probabilistic gossip signal; ALIVE refreshes per-backend stream
+    // freshness; COMPLETE marks a stream seen in full since publisher
+    // sequence 0.
+    //
+    // Two trust levels. A fresh stream (any op or ALIVE within the TTL) makes
+    // PRESENCE in prefix_hash_index a verified hit. ABSENCE is a verified
+    // eviction only while the stream is also complete (COMPLETE or CLEAR, and
+    // no RESET since): ALIVE keeps a stream fresh after a reset or a trimmed
+    // connect-backfill while its index still misses blocks the backend holds.
     //
     // Per-block native evictions deliberately do NOT touch the RadixTree:
     // the existing remove path purges every route of a backend per event —
@@ -785,7 +793,8 @@ public:
     // Rule #21/#22: coroutine takes ops by value.
     static seastar::future<> apply_native_kv_ops(std::vector<NativeKvOp> ops);
 
-    // Shard-local synchronous batch apply (UPSERT/REMOVE/ALIVE only — CLEAR
+    // Shard-local synchronous batch apply (UPSERT/REMOVE/ALIVE/COMPLETE/
+    // MATERIALIZE only — CLEAR
     // and RESET dispatch through their own per-backend sweep). Public so
     // reactor-free unit tests can drive it directly. Each shipment from the
     // subscriber is capped (kv_events.max_ops_per_shipment), keeping one
@@ -807,12 +816,24 @@ public:
         uint64_t holder_redirects = 0;
         uint64_t routes_materialized = 0;
         uint64_t materialize_trust_skips = 0;
+        uint64_t completes = 0;
+        uint64_t absence_untrusted = 0;
     };
     static NativeKvStatsSnapshot get_native_kv_stats();
 
     // Mark a backend's native stream fresh in shard-local state (testing only;
     // production freshness comes from applied ops / ALIVE heartbeats).
-    static void set_native_fresh_for_testing(BackendId id);
+    // `complete` (default true, the steady state of a stream seen from
+    // sequence 0) also lets absence from the index count as an eviction;
+    // false models a stream after a RESET or a trimmed connect-backfill.
+    static void set_native_fresh_for_testing(BackendId id, bool complete = true);
+
+    // Run the shard-local CLEAR (clear_routes) / RESET (drop_trust) sweep
+    // synchronously (testing only; production dispatches it from
+    // apply_native_kv_ops on every shard, in wire order).
+    static void native_purge_backend_local_for_testing(BackendId backend,
+                                                       bool clear_routes,
+                                                       bool drop_trust);
 
     // Force the shard-local fail-open posture (testing only; production state is
     // mirrored from quorum transitions via broadcast_fail_open).
