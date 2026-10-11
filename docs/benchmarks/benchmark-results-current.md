@@ -540,6 +540,8 @@ before termination after all): summaries in this tree, raw data as a release ass
 | Fitted suite under 2.2.0 defaults, incl. new 30u row (2026-10-06/07) | `results/2026-10-07-fitted-2.2.0/` |
 | Baseline suite: prefix vs least-loaded (2026-10-08) | `results/2026-10-08-baseline-least-loaded/` |
 | Saturation suite: ε 0.5 / 0.25 vs least-loaded at 30u, 50-prefix 20u vs least-loaded (2026-10-09) | `results/2026-10-09-saturation/` |
+| Native KV events, first contact: 3 stream-off control reps + the first live-stream run (2026-10-10) | `results/2026-10-10-kvevents-first-contact/` (compare files only; raw dirs lost with the instance) |
+| kvablate: materialize off / depth 4096 / both vs least-loaded, ×1 (2026-10-11) | `results/2026-10-11-kvablate/` (compare files only) |
 
 The raw run directories (Locust CSVs, per-request logs, vLLM logs, per-node Ranvier logs where
 captured; 4.6 GB, 610 MB compressed) are attached to the
@@ -992,6 +994,10 @@ nothing to do.
    the home to re-prefill, never to re-placement. The kvevents suite reruns on an image with
    that change; the pre-registered reading for row 17 is unchanged (must not regress against
    −12.5%), and `holder_redirects` is the counter that says whether the stream added anything.
+   Archive: `results/2026-10-10-kvevents-first-contact/` (the three stream-off controls and the
+   live run 1) and `results/2026-10-11-kvablate/`. Compare files only: the instance was
+   terminated before `bench-archive.sh` ran, so the manifests, aggregates and Prometheus dumps
+   of both runs are lost; the compare files were reconstructed verbatim from the session.
 8. Same session, after 7: `bench-runner.sh --suite kvreset --output-dir benchmark-reports-kvreset`
    (~1h15m): the 8B 20u row with the between-arm KV reset acknowledged, which the reset was
    built for and has never had (404 on 10-08; 13B rows only on 10-09). Expected: the rr-first
