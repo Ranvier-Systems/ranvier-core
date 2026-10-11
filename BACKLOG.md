@@ -1512,7 +1512,10 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   vs least_loaded (stream off) to +84.8% with it on; KV 68→27%, Gini 0.14, 87k routes
   materialized, 3.4% verified downgrades. Verified lookups beyond the 2,048-token index were
   "absent" by construction → fixed (depth gate + counter). Materialization at ≤128 tokens is
-  the other suspect → `--suite kvablate` separates them.**
+  the other suspect → `--suite kvablate` separates them.** **Ablation 10-11: neither (materialize
+  off +163%, depth 4096 +77%). The driver is the downgrade itself: verified-cold → miss placement
+  → re-learn = a home migration per evicted block (~110/arm). Fixed: verified-cold goes to another
+  verified holder (hit) or stays home to re-prefill; never re-placed. Rerun kvevents on that image.**
   Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
   `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
   `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement

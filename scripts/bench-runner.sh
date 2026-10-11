@@ -410,6 +410,11 @@ BUILT-IN SUITES:
       kvevents suite should rerun with. One repeat each; promote the winner to x3.
       Runs on the CURRENT image by design: pass --allow-stale-image, since this checkout's
       src/ is newer than the image (the depth-gate fix) and bench.sh refuses otherwise.
+      Measured 2026-10-11: row 20 +163.2% P99 (KV 22.5%, Gini 0.19, 119 verified evictions),
+      row 21 +77.0% (KV 25%, Gini 0.15, 109 evictions). Neither knob is the driver: the
+      downgrade of a verified-cold hit to miss placement re-learned the prefix elsewhere on
+      every evicted block (~110 home migrations per arm). Policy changed on the branch
+      (verified-cold -> another verified holder, else stay home); rerun kvevents on that image.
 
     kvreset (1 config x 2 arms x 3 repeats, ~1h15m) — the 8B 20u row with the between-arm
       KV reset acknowledged. The reset exists for this row (2026-10-06: prefix-first

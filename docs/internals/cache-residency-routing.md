@@ -130,8 +130,17 @@ backend graduates from the probabilistic estimate above to a VERIFIED,
 block-exact signal: `BlockStored`/`BlockRemoved` events maintain
 `prefix_hash_index` as a live mirror of the backend's cache, and an ART hit
 checks the request's prefix hash against it directly — present means
-resident (the probabilistic gate is skipped entirely), absent means evicted
-(the downgrade fires with certainty). Freshness is per backend
+resident (the probabilistic gate is skipped entirely); absent means the home
+has evicted it, and the request goes to another backend the index shows
+holding the same prefix (a verified hit; that backend becomes the learned
+home) or, with no other holder, stays on the home to re-prefill. A verified-cold
+hit is never downgraded to miss placement: measured on 8×A100 (2026-10-10/11,
+13B 20 users, 16 prefixes of 2,000–4,000 tokens) that re-placed and re-learned
+the prefix on every evicted block, about 110 home migrations per 10-minute
+run, which took the KV hit rate from 68% to 22–27% and P99 TTFT from −12% to
++77…+163% against a least-loaded router. The lookup is also skipped at routing
+depths beyond `max_indexed_token_depth`, where the index cannot contain the
+hash. Freshness is per backend
 (`freshness_ttl_seconds`, kept alive by events and subscriber heartbeats);
 when the stream goes stale or faults (sequence gap), routing falls back to
 the probabilistic path above with no operator action needed. See

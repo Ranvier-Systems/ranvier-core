@@ -258,7 +258,8 @@ struct ShardLocalState {
         uint64_t native_index_overflow = 0;         // Upserts dropped at the per-backend index cap
         uint64_t native_verified_hits = 0;          // ART hits confirmed resident by the native index
         uint64_t native_verified_downgrades = 0;    // ART hits downgraded because the native index lacked the prefix
-        uint64_t native_verified_cold_honored = 0;  // Verified-cold ART hits honored (no alternative backend live)
+        uint64_t native_verified_cold_honored = 0;  // Verified-cold ART hits kept on the home (no other verified holder): re-prefill there
+        uint64_t native_holder_redirects = 0;       // Verified-cold ART hits served by another verified holder of the same prefix
         uint64_t native_verified_depth_skips = 0;   // Fresh-stream ART hits deeper than the indexed depth: probabilistic path used
         uint64_t native_routes_materialized = 0;    // PUSH routes inserted from BlockStored token chains
         uint64_t native_materialize_trust_skips = 0; // Materializations refused by a higher-trust route
@@ -308,6 +309,7 @@ struct ShardLocalState {
             native_verified_hits = 0;
             native_verified_downgrades = 0;
             native_verified_cold_honored = 0;
+            native_holder_redirects = 0;
             native_verified_depth_skips = 0;
             native_routes_materialized = 0;
             native_materialize_trust_skips = 0;
@@ -2225,12 +2227,17 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
                                          "backend's KV cache via the native event stream")),
         seastar::metrics::make_counter("router_native_verified_evictions_total",
             [] { return g_shard_state ? g_shard_state->stats.native_verified_downgrades : 0UL; },
-            seastar::metrics::description("ART hits whose prefix was verified ABSENT from the "
-                                         "backend's KV cache via the native event stream")),
+            seastar::metrics::description("ART hits downgraded to miss placement because the native "
+                                         "stream verified the prefix ABSENT (the native path no "
+                                         "longer does this: see holder_redirects / cold_honored)")),
         seastar::metrics::make_counter("router_native_verified_cold_honored_total",
             [] { return g_shard_state ? g_shard_state->stats.native_verified_cold_honored : 0UL; },
-            seastar::metrics::description("Verified-cold ART hits honored because no alternative "
-                                         "backend was live")),
+            seastar::metrics::description("Verified-cold ART hits kept on their home backend to "
+                                         "re-prefill because no other verified holder was live")),
+        seastar::metrics::make_counter("router_native_holder_redirects_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_holder_redirects : 0UL; },
+            seastar::metrics::description("Verified-cold ART hits served by another backend the "
+                                         "native stream shows holding the same prefix")),
         seastar::metrics::make_counter("router_native_verified_depth_skips_total",
             [] { return g_shard_state ? g_shard_state->stats.native_verified_depth_skips : 0UL; },
             seastar::metrics::description("ART hits on a fresh native stream routed deeper than "
@@ -3213,6 +3220,20 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 // vLLM BlockStored/BlockRemoved events. Without stream
                 // freshness, fall back to the probabilistic gossiped estimate
                 // and its threshold gate (the engine-agnostic path).
+                //
+                // A verified-cold home is NOT downgraded to miss placement.
+                // Measured 2026-10-10/11 (kvevents run 1, kvablate runs 1-2,
+                // 13B 20u fitted set vs least_loaded): treating it as a miss
+                // re-placed the prefix on the least-loaded backend and
+                // re-learned it there, so every evicted block became a home
+                // migration plus a cold prefill, ~110 of them per 10-minute arm
+                // on 16 prefixes; KV hits fell 68% -> 22-27%, Gini rose 0.08 ->
+                // 0.14-0.19 and P99 went from -12% to +77..+163% against
+                // least_loaded. The exact signal is used the other way: another
+                // verified holder of the hash takes the request as a hit and
+                // becomes the learned home; with none, the home keeps it and
+                // re-prefills (the stream-off behaviour). The load divert cap
+                // still applies afterwards exactly as for any hit.
                 bool cache_cold = false;
                 // Verified-cold verdicts are counted at the DECISION below,
                 // not here: with one live backend the cold route is honored,
@@ -3241,9 +3262,36 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                         anchor_residency = 1.0;
                         state.stats.native_verified_hits++;
                     } else {
-                        anchor_residency = 0.0;
-                        cache_cold = true;
                         native_verified_cold = true;
+                        BackendId holder = 0;
+                        uint64_t holder_load = 0;
+                        if (idx_it != state.prefix_hash_index.end()) {
+                            for (BackendId cand : idx_it->second) {
+                                if (cand == art_backend) continue;
+                                if (std::find(live_backends.begin(), live_backends.end(), cand) ==
+                                    live_backends.end()) continue;
+                                if (!state.role_eligible(cand)) continue;
+                                uint64_t load = get_composite_backend_load(cand);
+                                if (holder == 0 || load < holder_load ||
+                                    (load == holder_load && cand < holder)) {
+                                    holder = cand;
+                                    holder_load = load;
+                                }
+                            }
+                        }
+                        if (holder != 0) {
+                            // Verified hit on the least-loaded other holder; it
+                            // becomes the learned home (original_selected).
+                            art_backend = holder;
+                            anchor_residency = 1.0;
+                            native_verified_cold = false;
+                            state.stats.native_holder_redirects++;
+                        } else {
+                            // No other holder: stay home and re-prefill. Residency
+                            // 0.0 is informational for the scorer only; cache_cold
+                            // stays false so no downgrade / re-placement happens.
+                            anchor_residency = 0.0;
+                        }
                     }
                 } else {
                     if (state.config.cache_residency_threshold > 0.0 ||
@@ -3273,10 +3321,10 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     state.stats.cache_hits++;
                     state.stats.prefix_affinity_routes++;
                     if (native_verified_cold) {
-                        // Verified-cold but no alternative backend was live:
-                        // the route is honored, counted separately so hits,
-                        // downgrades, and cold-honored stay pairwise disjoint
-                        // per decision.
+                        // Verified-cold with no other verified holder: the home
+                        // keeps the request and re-prefills. Counted separately
+                        // so verified hits, holder redirects and cold-honored
+                        // stay pairwise disjoint per decision.
                         state.stats.native_verified_cold_honored++;
                     }
                     if (g_metrics) {
@@ -6173,7 +6221,7 @@ RouterService::NativeKvStatsSnapshot RouterService::get_native_kv_stats() {
     return {st.native_ops_applied, st.native_upserts, st.native_removes,
             st.native_clears, st.native_resets, st.native_index_overflow,
             st.native_verified_hits, st.native_verified_downgrades,
-            st.native_verified_cold_honored,
+            st.native_verified_cold_honored, st.native_holder_redirects,
             st.native_routes_materialized, st.native_materialize_trust_skips};
 }
 

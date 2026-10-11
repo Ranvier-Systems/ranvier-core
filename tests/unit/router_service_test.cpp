@@ -1081,8 +1081,11 @@ TEST_F(RouterServiceTest, PoolRoleToStringRoundTrip) {
 // =============================================================================
 // When a backend's native KV stream is fresh, an ART hit is checked EXACTLY
 // against prefix_hash_index: present = verified resident (overrides the
-// probabilistic gossip gate), absent = verified evicted (downgrade fires with
-// certainty). Without freshness, the probabilistic path is unchanged.
+// probabilistic gossip gate); absent = verified cold, which does NOT downgrade
+// to miss placement (measured 2026-10-10/11: that re-placed and re-learned the
+// prefix on every evicted block, a migration storm) — the request goes to
+// another verified holder of the hash as a hit if one is live, else stays on
+// the home to re-prefill. Without freshness, the probabilistic path is unchanged.
 // Fixture note: block_alignment=1 and prefix_token_length=128, so the
 // request's routing hash is hash_prefix(tokens, tokens.size(), 1).
 
@@ -1103,20 +1106,47 @@ TEST_F(RouterServiceTest, NativeVerifiedResidentOverridesProbabilisticGate) {
     EXPECT_TRUE(result.cache_hit);
 }
 
-TEST_F(RouterServiceTest, NativeVerifiedEvictedDowngradesDespiteHighGossip) {
+TEST_F(RouterServiceTest, NativeVerifiedColdWithoutHolderStaysHome) {
     register_two_backends();
     std::vector<int32_t> tokens = {711, 712, 713, 714};
     RouterService::insert_route_for_testing(tokens, 1);
-    // Gossip says plenty of residency (would keep the route)...
-    RouterService::set_residency_for_testing(1, 0.9);
-    // ...but the fresh native stream has no entry at this prefix: verified
-    // evicted, so the downgrade fires and the cold backend is skipped.
+    RouterService::set_residency_for_testing(1, 0.01);  // gossip would downgrade
+    // Fresh stream, no entry at this prefix on any backend: verified cold on
+    // the home and nobody else holds it. The home keeps the request and
+    // re-prefills; no re-placement, no downgrade counted.
     RouterService::set_native_fresh_for_testing(1);
 
     auto result = router_->route_request(tokens);
     ASSERT_TRUE(result.backend_id.has_value());
-    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.verified_cold_honored, 1u);
+    EXPECT_EQ(stats.verified_downgrades, 0u);
+    EXPECT_EQ(stats.holder_redirects, 0u);
+}
+
+TEST_F(RouterServiceTest, NativeVerifiedColdRedirectsToVerifiedHolder) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {715, 716, 717, 718};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.9);
+    RouterService::set_native_fresh_for_testing(1);
+    // The stream says backend 2 holds this prefix and the home (1) does not:
+    // the request is a verified hit on 2, and 2 becomes the learned home.
+    RouterService::update_prefix_hash_index_for_testing(
+        hash_prefix(tokens.data(), tokens.size(), 1), 2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
     EXPECT_EQ(result.backend_id.value(), 2);
+    EXPECT_TRUE(result.cache_hit);
+    EXPECT_EQ(result.original_selected, 2);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.holder_redirects, 1u);
+    EXPECT_EQ(stats.verified_cold_honored, 0u);
+    EXPECT_EQ(stats.verified_downgrades, 0u);
+    EXPECT_EQ(stats.verified_hits, 0u);
 }
 
 TEST_F(RouterServiceTest, NoNativeFreshnessFallsBackToProbabilistic) {
@@ -1165,22 +1195,22 @@ TEST_F(RouterServiceTest, NativeVerifiedColdSingleBackendCountsHonoredNotDowngra
     EXPECT_EQ(stats.verified_downgrades, 0u);
 }
 
-TEST_F(RouterServiceTest, NativeVerifiedColdTwoBackendsCountsDowngradeNotHonored) {
+TEST_F(RouterServiceTest, NativeVerifiedColdTwoBackendsNoHolderCountsHonoredOnce) {
     register_two_backends();
     std::vector<int32_t> tokens = {771, 772, 773, 774};
     RouterService::insert_route_for_testing(tokens, 1);
     RouterService::set_native_fresh_for_testing(1);
 
-    // An alternative exists: the downgrade actually happens and is counted;
-    // the honored counter stays untouched.
+    // An alternative backend exists but the stream does not show it holding
+    // the prefix: no re-placement. One decision, counted once as honored.
     auto result = router_->route_request(tokens);
     ASSERT_TRUE(result.backend_id.has_value());
-    EXPECT_EQ(result.backend_id.value(), 2);
-    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
 
     auto stats = RouterService::get_native_kv_stats();
-    EXPECT_EQ(stats.verified_downgrades, 1u);
-    EXPECT_EQ(stats.verified_cold_honored, 0u);
+    EXPECT_EQ(stats.verified_downgrades, 0u);
+    EXPECT_EQ(stats.verified_cold_honored, 1u);
 }
 
 TEST_F(RouterServiceTest, FreshnessTtlZeroDisablesVerifiedPath) {
@@ -1219,17 +1249,23 @@ TEST_F(RouterServiceTest, NativeVerifiedPathSkippedBeyondIndexedDepth) {
     EXPECT_EQ(result.backend_id.value(), 1);
     EXPECT_TRUE(result.cache_hit);
 
-    // Within the indexed depth the verified verdict still applies (cap 4).
+    auto skipped = RouterService::get_native_kv_stats();
+    EXPECT_EQ(skipped.verified_hits, 0u);
+    EXPECT_EQ(skipped.verified_cold_honored, 0u);  // verification never ran
+
+    // Within the indexed depth the verified verdict applies (cap 4): cold on
+    // the home with no other holder is counted as honored.
     cfg_.kv_native_indexed_depth = 4;
     recreate_router(cfg_);
     register_two_backends();
     RouterService::insert_route_for_testing(tokens, 1);
     RouterService::set_residency_for_testing(1, 0.9);
     RouterService::set_native_fresh_for_testing(1);
-    auto downgraded = router_->route_request(tokens);
-    ASSERT_TRUE(downgraded.backend_id.has_value());
-    EXPECT_FALSE(downgraded.cache_hit);
-    EXPECT_EQ(downgraded.backend_id.value(), 2);
+    auto verified = router_->route_request(tokens);
+    ASSERT_TRUE(verified.backend_id.has_value());
+    EXPECT_EQ(verified.backend_id.value(), 1);
+    EXPECT_TRUE(verified.cache_hit);
+    EXPECT_EQ(RouterService::get_native_kv_stats().verified_cold_honored, 1u);
 }
 
 // ----- BACKLOG §21 Phase 5a: verified_resident_subset seam -----
@@ -1308,20 +1344,23 @@ TEST_F(RouterServiceTest, ApplyNativeOpsLocalUpsertRemoveAndStaleness) {
     ASSERT_TRUE(r2.backend_id.has_value());
     EXPECT_EQ(r2.backend_id.value(), 1);
 
-    // Fresh REMOVE (t=2000) verifies eviction: downgrade to backend 2.
+    // Fresh REMOVE (t=2000) verifies eviction on the home. Nobody else holds
+    // the prefix, so the home keeps the request and re-prefills (honored), not
+    // a downgrade to backend 2 (that re-placement was the 2026-10-10 storm).
     NativeKvOp remove{NativeKvOp::Kind::REMOVE, 1, h, 2000};
     RouterService::apply_native_kv_ops_local(&remove, 1);
     auto r3 = router_->route_request(tokens);
     ASSERT_TRUE(r3.backend_id.has_value());
-    EXPECT_FALSE(r3.cache_hit);
-    EXPECT_EQ(r3.backend_id.value(), 2);
+    EXPECT_TRUE(r3.cache_hit);
+    EXPECT_EQ(r3.backend_id.value(), 1);
 
     auto stats = RouterService::get_native_kv_stats();
     EXPECT_EQ(stats.upserts, 1u);
     EXPECT_EQ(stats.removes, 1u);
     // r1 and r2 both verified resident (the stale remove left the entry).
     EXPECT_EQ(stats.verified_hits, 2u);
-    EXPECT_EQ(stats.verified_downgrades, 1u);
+    EXPECT_EQ(stats.verified_cold_honored, 1u);
+    EXPECT_EQ(stats.verified_downgrades, 0u);
 }
 
 // =============================================================================
