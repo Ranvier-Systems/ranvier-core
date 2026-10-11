@@ -87,6 +87,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stays for compatibility and reads 0 from the native path.
 
 ### Fixed
+- Native verified residency no longer treats a backend's absence from the index as an
+  eviction unless its stream has been seen in full since a known-empty cache. Freshness only
+  proved the subscription was alive: the subscriber's heartbeat restored it within five
+  seconds of a stream reset, over an index the reset had just purged, and a Ranvier node that
+  started against warm backends backfilled only what vLLM's replay buffer still held. In both
+  cases every warm prefix the index no longer listed read as "verified evicted", and under the
+  2026-10-11 policy a hit on such a home was redirected to another holder and its learned home
+  moved. The subscriber now emits a COMPLETE op when a connect-backfill starts at the
+  publisher's sequence 0 or a live frame carries sequence 0; AllBlocksCleared also grants
+  completeness and a RESET revokes it. Presence still needs only freshness. Absence on an
+  incomplete stream uses the probabilistic gate (`router_native_absence_untrusted_total`);
+  `router_native_stream_completes_total` counts completions. Benchmark arms are unaffected:
+  bench.sh resets every vLLM cache while Ranvier is stopped, and each arm's backfill replays
+  that AllBlocksCleared. Static analysis; not yet built or run.
+- A holder redirect now requires the holder's own native stream to be fresh. The index also
+  holds learned-route claims, so a backend without a fresh stream could be picked as a
+  "verified holder" on a route claim alone (mixed fleets, or a backend whose stream lapsed).
 - Verified residency is skipped beyond the native index's depth. The ledger tracks a backend's
   block chains only to `kv_events.max_indexed_token_depth` tokens (2,048), but the ART hit
   was checked at the request's routing depth, which with prefix-boundary detection is the

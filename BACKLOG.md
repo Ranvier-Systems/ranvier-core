@@ -1516,6 +1516,16 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   off +163%, depth 4096 +77%, both +188%). The driver is the downgrade itself: verified-cold → miss placement
   → re-learn = a home migration per evicted block (~110/arm). Fixed: verified-cold goes to another
   verified holder (hit) or stays home to re-prefill; never re-placed. Rerun kvevents on that image.**
+  **10-11 static check of that policy (branch `claude/festive-thompson-ta0tgj`): freshness proved
+  only that the subscription was alive, since heartbeats restore it within 5 s of a RESET over the
+  purged index and a node starting against warm vLLMs backfills only the replay buffer; absence
+  then read as "evicted" for warm prefixes and the redirect moved their homes. Fixed: absence is
+  trusted only on a stream complete since publisher sequence 0 or an AllBlocksCleared (new
+  COMPLETE op; RESET revokes), otherwise the gossip gate decides
+  (`router_native_absence_untrusted_total`); a redirect target needs its own fresh stream.
+  Benchmark unaffected (caches reset while Ranvier is down; each arm's backfill replays the
+  clear). Add to the kvevents reading: `stream_resets` 0 and `absence_untrusted` 0 on both arms;
+  nonzero means that arm ran partly on gossip.**
   Shipping (branch): `cross_shard_load_sync` true, `gpu_load_weight` 0,
   `capacity_headroom_weight` 0, `bounded_load_epsilon` 1.0 as defaults; `miss_placement` stays
   `hash` until the isolation leg (hash placement + same signal, 20u ×3) says whether placement
@@ -1552,6 +1562,14 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   row 16 (50-prefix 20u vs least_loaded, now +23%) and `--suite baseline` row 13 (fitted 30u, now
   MIXED) turn to improvements without KV or route consistency falling below today's. Record:
   "Saturation suite" in `docs/benchmarks/benchmark-results-current.md`.
+- [ ] **[LOW] KV-event subscriber: a duplicate live frame after a connect-backfill resets the
+  backend.** The SUB socket connects before the backfill, so a batch published during the replay
+  window arrives twice; the live loop treats any sequence below the expected one as a publisher
+  restart and resets the ledger and index. Not seen in benchmarks (vLLM is idle when Ranvier
+  subscribes), but a node restart against a busy fleet would reset every backend once, and since
+  the 10-11 trust fix that leaves absence untrusted until the next clear. Fix: drop frames with
+  `seq < next_seq` while they fall inside the range just replayed; keep the reset for a real
+  rewind (`seq` far below, or 0). `src/kv_event_subscriber.cpp` live loop.
 - [ ] **[STRATEGIC] KV-aware dispatch.** Extend the backend load signal with the already-scraped
   `gpu_cache_usage_percent` (`health_service.cpp:425`, `vllm_metrics.hpp:21`) and add a
   `kv_pressure` candidate field + weight to `route_scorer.hpp`, so dispatch diverts off an anchor

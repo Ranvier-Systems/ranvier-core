@@ -142,8 +142,26 @@ run, which took the KV hit rate from 68% to 22–27% and P99 TTFT from −12% to
 depths beyond `max_indexed_token_depth`, where the index cannot contain the
 hash. Freshness is per backend
 (`freshness_ttl_seconds`, kept alive by events and subscriber heartbeats);
-when the stream goes stale or faults (sequence gap), routing falls back to
-the probabilistic path above with no operator action needed. See
+when the stream goes stale, routing falls back to the probabilistic path
+above with no operator action needed.
+
+Trust is asymmetric. A fresh stream makes *presence* in the index a verified
+hit, because a stored-block event is exact whenever it arrives. *Absence* is a
+verified eviction only while the stream is also **complete**: seen in full
+since a known-empty cache. The subscriber marks a stream complete when its
+connect-backfill begins at the publisher's sequence 0 or a live frame carries
+sequence 0 (the engine started or restarted empty); an `AllBlocksCleared`
+event does the same. A stream fault (a sequence gap replay cannot fill, a
+decode failure) resets the backend and revokes completeness, and so does
+starting from a backfill whose older batches the publisher has already
+trimmed. Heartbeats keep such a stream fresh, so its presence entries still
+count, but absence falls back to the probabilistic gate
+(`router_native_absence_untrusted_total`) until a clear or a sequence-0 frame:
+otherwise a Ranvier restart against a warm fleet, or any reset, would read
+every block the index no longer lists as evicted and redirect requests off
+warm homes. A redirect target must also have a fresh stream of its own, since
+learned routes write the same index and a backend without one may appear in it
+on a route claim alone. See
 `src/kv_event_ledger.hpp` for how vLLM block hashes are bridged to Ranvier
 prefix hashes without sharing a hash function.
 

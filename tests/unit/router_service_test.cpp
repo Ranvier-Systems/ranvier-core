@@ -1086,6 +1086,11 @@ TEST_F(RouterServiceTest, PoolRoleToStringRoundTrip) {
 // prefix on every evicted block, a migration storm) — the request goes to
 // another verified holder of the hash as a hit if one is live, else stays on
 // the home to re-prefill. Without freshness, the probabilistic path is unchanged.
+// Trust is asymmetric: a fresh stream makes PRESENCE a verified hit, but ABSENCE
+// is a verified eviction only while the stream is also complete since a
+// known-empty cache (COMPLETE / CLEAR, no RESET since). set_native_fresh_for_testing
+// defaults to complete; `false` models a stream after a reset or trimmed backfill.
+// A redirect target must have a fresh stream of its own.
 // Fixture note: block_alignment=1 and prefix_token_length=128, so the
 // request's routing hash is hash_prefix(tokens, tokens.size(), 1).
 
@@ -1132,6 +1137,7 @@ TEST_F(RouterServiceTest, NativeVerifiedColdRedirectsToVerifiedHolder) {
     RouterService::insert_route_for_testing(tokens, 1);
     RouterService::set_residency_for_testing(1, 0.9);
     RouterService::set_native_fresh_for_testing(1);
+    RouterService::set_native_fresh_for_testing(2);
     // The stream says backend 2 holds this prefix and the home (1) does not:
     // the request is a verified hit on 2, and 2 becomes the learned home.
     RouterService::update_prefix_hash_index_for_testing(
@@ -1147,6 +1153,149 @@ TEST_F(RouterServiceTest, NativeVerifiedColdRedirectsToVerifiedHolder) {
     EXPECT_EQ(stats.verified_cold_honored, 0u);
     EXPECT_EQ(stats.verified_downgrades, 0u);
     EXPECT_EQ(stats.verified_hits, 0u);
+}
+
+TEST_F(RouterServiceTest, NativeHolderWithoutFreshStreamIsNotARedirectTarget) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {781, 782, 783, 784};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.9);
+    RouterService::set_native_fresh_for_testing(1);
+    // Backend 2 appears in the index for this prefix but has no fresh stream of
+    // its own, so the entry may be a learned-route claim rather than a stored
+    // block. It must not be treated as a verified holder: the home keeps the
+    // request and re-prefills.
+    RouterService::update_prefix_hash_index_for_testing(
+        hash_prefix(tokens.data(), tokens.size(), 1), 2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.holder_redirects, 0u);
+    EXPECT_EQ(stats.verified_cold_honored, 1u);
+}
+
+TEST_F(RouterServiceTest, NativePresenceTrustedOnIncompleteStream) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {785, 786, 787, 788};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.01);  // gossip would downgrade
+    // Fresh but NOT complete: a stored-block entry is still exact evidence.
+    RouterService::set_native_fresh_for_testing(1, /*complete=*/false);
+    RouterService::update_prefix_hash_index_for_testing(
+        hash_prefix(tokens.data(), tokens.size(), 1), 1);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.verified_hits, 1u);
+    EXPECT_EQ(stats.absence_untrusted, 0u);
+}
+
+TEST_F(RouterServiceTest, NativeAbsenceOnIncompleteStreamDefersToGossip) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {791, 792, 793, 794};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.9);  // gossip: resident
+    // Fresh, incomplete home; a fresh holder 2 is in the index. Absence on the
+    // home is "unknown", so there is no verified-cold verdict and no redirect:
+    // the probabilistic gate keeps the route, exactly as with the stream off.
+    RouterService::set_native_fresh_for_testing(1, /*complete=*/false);
+    RouterService::set_native_fresh_for_testing(2);
+    RouterService::update_prefix_hash_index_for_testing(
+        hash_prefix(tokens.data(), tokens.size(), 1), 2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.absence_untrusted, 1u);
+    EXPECT_EQ(stats.holder_redirects, 0u);
+    EXPECT_EQ(stats.verified_cold_honored, 0u);
+    EXPECT_EQ(stats.verified_hits, 0u);
+}
+
+TEST_F(RouterServiceTest, NativeAbsenceOnIncompleteStreamDowngradesLikeStreamOff) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {795, 796, 797, 798};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.05);  // gossip: cold
+    RouterService::set_native_fresh_for_testing(1, /*complete=*/false);
+
+    // Same outcome as LowResidencyDowngradesAndSkipsColdBackend: the gossip
+    // gate, not the incomplete index, decides.
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 2);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.absence_untrusted, 1u);
+    EXPECT_EQ(stats.verified_cold_honored, 0u);
+}
+
+TEST_F(RouterServiceTest, NativeResetRevokesAbsenceTrustUntilComplete) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {801, 802, 803, 804};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.9);
+    RouterService::set_native_fresh_for_testing(1);  // fresh and complete
+
+    // A stream fault: the ledger and index entries are wiped, trust dropped.
+    RouterService::native_purge_backend_local_for_testing(1, /*clear_routes=*/false,
+                                                          /*drop_trust=*/true);
+    // The next heartbeat makes the stream fresh again, but must not restore
+    // absence trust: the purged index no longer lists what the cache holds.
+    NativeKvOp alive{NativeKvOp::Kind::ALIVE, 1, 0, 1000};
+    RouterService::apply_native_kv_ops_local(&alive, 1);
+
+    auto after_reset = router_->route_request(tokens);
+    ASSERT_TRUE(after_reset.backend_id.has_value());
+    EXPECT_EQ(after_reset.backend_id.value(), 1);
+    EXPECT_TRUE(after_reset.cache_hit);
+    auto s1 = RouterService::get_native_kv_stats();
+    EXPECT_EQ(s1.resets, 1u);
+    EXPECT_EQ(s1.absence_untrusted, 1u);
+    EXPECT_EQ(s1.verified_cold_honored, 0u);
+
+    // COMPLETE (a live frame at publisher sequence 0: the engine restarted
+    // empty) restores it: absence is now a verified eviction again.
+    NativeKvOp complete{NativeKvOp::Kind::COMPLETE, 1, 0, 2000};
+    RouterService::apply_native_kv_ops_local(&complete, 1);
+    auto after_complete = router_->route_request(tokens);
+    ASSERT_TRUE(after_complete.backend_id.has_value());
+    EXPECT_EQ(after_complete.backend_id.value(), 1);
+    auto s2 = RouterService::get_native_kv_stats();
+    EXPECT_EQ(s2.completes, 1u);
+    EXPECT_EQ(s2.absence_untrusted, 1u);
+    EXPECT_EQ(s2.verified_cold_honored, 1u);
+}
+
+TEST_F(RouterServiceTest, NativeClearGrantsAbsenceTrust) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {805, 806, 807, 808};
+    RouterService::set_residency_for_testing(1, 0.9);
+    // Fresh but incomplete (e.g. a connect-backfill trimmed by the publisher's
+    // buffer), then AllBlocksCleared: the cache is known empty, so every later
+    // store is reported and absence becomes trustworthy.
+    RouterService::set_native_fresh_for_testing(1, /*complete=*/false);
+    RouterService::native_purge_backend_local_for_testing(1, /*clear_routes=*/true,
+                                                          /*drop_trust=*/false);
+    // CLEAR removed the backend's routes; learn one afterwards.
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.clears, 1u);
+    EXPECT_EQ(stats.absence_untrusted, 0u);
+    EXPECT_EQ(stats.verified_cold_honored, 1u);
 }
 
 TEST_F(RouterServiceTest, NoNativeFreshnessFallsBackToProbabilistic) {
@@ -1330,6 +1479,13 @@ TEST_F(RouterServiceTest, ApplyNativeOpsLocalUpsertRemoveAndStaleness) {
     RouterService::insert_route_for_testing(tokens, 1);
     uint64_t h = hash_prefix(tokens.data(), tokens.size(), 1);
 
+    // The stream starts the way the subscriber opens one seen from publisher
+    // sequence 0: COMPLETE first, so absence later counts as an eviction.
+    // Without it, the REMOVE below would leave absence "unknown" and the gossip
+    // gate would decide (NativeAbsenceOnIncompleteStreamDefersToGossip).
+    NativeKvOp complete{NativeKvOp::Kind::COMPLETE, 1, 0, 900};
+    RouterService::apply_native_kv_ops_local(&complete, 1);
+
     // UPSERT at t=1000 marks resident + fresh.
     NativeKvOp upsert{NativeKvOp::Kind::UPSERT, 1, h, 1000};
     RouterService::apply_native_kv_ops_local(&upsert, 1);
@@ -1355,12 +1511,14 @@ TEST_F(RouterServiceTest, ApplyNativeOpsLocalUpsertRemoveAndStaleness) {
     EXPECT_EQ(r3.backend_id.value(), 1);
 
     auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.completes, 1u);
     EXPECT_EQ(stats.upserts, 1u);
     EXPECT_EQ(stats.removes, 1u);
     // r1 and r2 both verified resident (the stale remove left the entry).
     EXPECT_EQ(stats.verified_hits, 2u);
     EXPECT_EQ(stats.verified_cold_honored, 1u);
     EXPECT_EQ(stats.verified_downgrades, 0u);
+    EXPECT_EQ(stats.absence_untrusted, 0u);
 }
 
 // =============================================================================
