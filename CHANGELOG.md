@@ -25,6 +25,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the manifest records `kv_events_enabled`; `results_parser.py compare` prints the native
   counters (kv_ops, verified_hits, verified_evictions, routes_materialized, stream_resets)
   for both arms whenever any is non-zero or a manifest says the run asked for the stream.
+- `bench.sh --kv-events-materialize on|off` and `--kv-events-depth N` (forwarded as
+  `RANVIER_KV_EVENTS_MATERIALIZE` / `RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH`, recorded in
+  the compare header and manifest), and `bench-runner.sh --suite kvablate`: the fitted 13B 20u
+  row vs `least_loaded` with materialization off, with the index depth at 4096, and with both,
+  one repeat each, to separate the two effects the live stream had on kvevents run 1
+  (P99 +84.8% vs least-loaded where the stream-off control is −12.5%; KV hits 68% → 27%;
+  87,015 routes materialized; 98 verified-eviction downgrades).
 - `bench-runner.sh --suite kvevents` (fitted 13B 20u and 50-prefix 13B 20u vs `least_loaded`
   with `--kv-events`, ×3, ~2h40m; the pre-registered reading is in `--help`) and
   `--suite kvreset` (the 8B 20u row vs round-robin ×3 with the between-arm KV reset working,
@@ -63,7 +70,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   2026-10-08 was the inherited cache. README, results doc, strategic assessment and BACKLOG §27
   (new item: holder-aware divert) updated.
 
+### Changed
+- A verified-cold ART hit (the native KV-event index shows the home backend no longer holds
+  the request's prefix) is no longer downgraded to miss placement. First live-stream runs
+  (2026-10-10/11, kvevents run 1 and the kvablate ablation, 13B 20u fitted set vs
+  `least_loaded`) showed why: the downgrade re-placed the prefix on the least-loaded backend
+  and re-learned it there, so every evicted block became a home migration plus a cold prefill,
+  about 110 per 10-minute arm on 16 prefixes; KV hits fell from 68% to 22–27%, the per-backend
+  Gini rose from 0.08 to 0.14–0.19 and P99 went from −12% to +77…+188% against least-loaded,
+  with materialization off (+163%), the index depth raised to 4096 (+77%) or both (+188%)
+  making no difference. The exact signal is now used the other way round: the request goes to another
+  live backend the index shows holding the prefix, as a verified hit that becomes the learned
+  home (`router_native_holder_redirects_total`), or with no other holder stays on the home to
+  re-prefill (`router_native_verified_cold_honored_total`), which is the stream-off behaviour.
+  The load divert cap applies afterwards as for any hit. `router_native_verified_evictions_total`
+  stays for compatibility and reads 0 from the native path.
+
 ### Fixed
+- Verified residency is skipped beyond the native index's depth. The ledger tracks a backend's
+  block chains only to `kv_events.max_indexed_token_depth` tokens (2,048), but the ART hit
+  was checked at the request's routing depth, which with prefix-boundary detection is the
+  whole system prompt (2,000–4,000 tokens on the fitted set); past the indexed depth the
+  prefix is absent by construction and every such hit was downgraded as "verified evicted".
+  The router now mirrors the depth (`routing.kv_native_indexed_depth`) and uses the
+  probabilistic gate for deeper hits, counting them in
+  `router_native_verified_depth_skips_total` (also printed by the compare). Found on the
+  first live-stream run (kvevents run 1, 2026-10-10).
 - Native KV-event stream, first hardware contact (2026-10-10, vLLM 0.15.1): three defects, each
   of which alone kept `router_native_kv_ops_total` at zero. (1) `bench.sh --kv-events` passed
   `tcp://0.0.0.0:<port>` as the publisher endpoint; vLLM binds only when the endpoint contains

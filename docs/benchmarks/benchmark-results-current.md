@@ -957,6 +957,41 @@ nothing to do.
    arrived. All three fixed the same day (CHANGELOG, Fixed); bench.sh now verifies each
    publisher port is listening after vLLM start. The suite restarts from run 1 on a rebuilt
    image.
+   *Second contact, same day, published image 818f6e3:* the stream is live (kv_ops 1.2 M on the
+   least-loaded arm, 2.0 M on the prefix arm, zero stream resets, 394 verified hits, 98 verified
+   evictions, 87,015 routes materialized) and run 1 (fitted 20u, rr-first) is a regression
+   caused by the stream: **P99 +84.8% vs least-loaded** where the three stream-off control reps
+   of the same day read −13.2 / −12.5 / −7.1%; P50 −16.5% (control −27%); KV hits 27% (control
+   61–68%); route consistency 37% (53%); Gini 0.141 (0.08–0.10); residency downgrades 3.4%
+   (0.4–0.6%); route-changed P99 3.6 s vs 1.8 s. Two mechanisms, one confirmed in code: the
+   verified lookup is made at the routing depth (the system-prompt boundary, 2,000–4,000 tokens
+   here) against an index that tracks chains only to 2,048 tokens, so a deep hit is absent by
+   construction and downgraded with certainty (fixed: verification is skipped beyond the indexed
+   depth, counted in `verified_depth_skips`). The second is route materialization: 87,015 PUSH
+   routes in ten minutes, one per block boundary up to 128 tokens of every prefill, so any
+   header shared by prompts becomes an ART anchor that captures requests whose longer prefix is
+   not yet learned and funnels unrelated prefixes onto one backend (b4 = 480 requests vs b8 =
+   230). The `kvablate` suite (materialize off / depth 4096 / both, one repeat each) separates
+   them before the kvevents suite reruns with the winning configuration.
+   *Ablation, 2026-10-11 (published image, knobs via env):* neither knob recovers anything.
+   Materialization off: P99 **+163.2%** vs least-loaded, P50 −23.0%, KV 20 → 22.5%, consistency
+   47.8%, Gini 0.191, 119 verified evictions (4.2% of requests), zero routes materialized.
+   Depth 4096 with materialization on: **+77.0%**, P50 −15.0%, KV 23 → 25%, consistency 33%,
+   Gini 0.145, 109 verified evictions, 88,143 routes materialized. Both knobs together:
+   **+187.8%** (P99 5.05 s, the first fitted-set arm to fail the 5 s validation gate), P50
+   −24.9%, KV 21 → 24.5%, consistency 49%, Gini 0.139, 97 verified evictions. So neither
+   suspect is the driver, and the ~100–120 verified evictions per arm are real block evictions,
+   not the depth artefact. The mechanism is the downgrade itself: a verified-cold hit was treated as a miss,
+   re-placed on the least-loaded backend and re-learned there, so each evicted block became a
+   home migration plus a cold prefill. Sixteen prefixes migrating ~110 times in ten minutes is
+   the whole picture: KV hits at least-loaded's level despite 33–48% route consistency, the
+   request distribution following the load swings (Gini 0.14–0.19), and a route-consistent P99
+   of 2.4–5.0 s from queueing behind full prefills. Under the probabilistic signal the same
+   downgrade fires ~0.5% of the time and homes stay put. Fixed on the branch: a verified-cold
+   hit goes to another verified holder of the prefix (a hit; it becomes the home) or stays on
+   the home to re-prefill, never to re-placement. The kvevents suite reruns on an image with
+   that change; the pre-registered reading for row 17 is unchanged (must not regress against
+   −12.5%), and `holder_redirects` is the counter that says whether the stream added anything.
 8. Same session, after 7: `bench-runner.sh --suite kvreset --output-dir benchmark-reports-kvreset`
    (~1h15m): the 8B 20u row with the between-arm KV reset acknowledged, which the reset was
    built for and has never had (404 on 10-08; 13B rows only on 10-09). Expected: the rr-first

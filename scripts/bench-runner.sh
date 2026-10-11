@@ -56,6 +56,7 @@ CUSTOM_FILE=""
 STOP_ON_FAILURE=false
 STARTUP_RETRY_SECS=180   # --startup-retry N: re-run once a run that fails within N s (0 = off)
 BUILD_IMAGE=false
+ALLOW_STALE_IMAGE=false  # --allow-stale-image: forward to every bench.sh run (image older than this checkout's src/)
 SKIP_RUNS_RAW=""   # comma-separated list from --skip
 REPEAT=1           # --repeat N: run each config N times, then aggregate (median/IQR)
 
@@ -239,7 +240,7 @@ USAGE:
     ./scripts/bench-runner.sh [OPTIONS]
 
 OPTIONS:
-    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, saturation, kvevents, kvreset, low, all, custom
+    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, saturation, kvevents, kvablate, kvreset, low, all, custom
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
@@ -258,6 +259,11 @@ OPTIONS:
                         for a C++ change on a branch: bench.sh otherwise reuses
                         whatever ranvier:latest exists (and refuses if it predates
                         the newest src/ commit).
+    --allow-stale-image Forward bench.sh's --allow-stale-image to every run: benchmark
+                        the existing ranvier:latest although this checkout has newer
+                        src/ commits. For suites that deliberately run on the current
+                        image (kvablate: the knobs are env, the depth defect is masked
+                        by --kv-events-depth 4096); every manifest records the override.
     --output-dir DIR    Output directory (default: benchmark-reports)
     --repeat N          Run each config N times, then aggregate median/IQR per
                         config and print a verdict (default: 1). Variance is the
@@ -384,6 +390,33 @@ BUILT-IN SUITES:
       17. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --num-prefixes 16 --prefix-max-tokens 4000
       18. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events  (50-prefix set)
 
+    kvablate (3 configs x 2 arms x 1 repeat, ~1h25m) — separates the two things the native
+      stream does to routing, after kvevents run 1 (2026-10-10, stream live: kv_ops 2.0M)
+      turned the fitted 20u row from -12.5% P99 vs least_loaded (control, stream off) into
+      +84.8%, with KV hits 68% -> 27%, route consistency 53% -> 37%, Gini 0.08 -> 0.14,
+      87,015 routes materialized and 98 verified-eviction downgrades (3.4%).
+      Suspect A, route materialization: PUSH routes at every block boundary up to 128
+      tokens of every prefill, so a short header shared by prompts becomes an affinity
+      anchor that funnels unrelated prefixes onto one backend. Suspect B, the verified
+      lookup at a routing depth beyond the 2,048-token index: the fitted prefixes are
+      2,000-4,000 tokens, so a deep hit is "absent" by construction and downgraded with
+      certainty (fixed on the branch by skipping verification beyond the indexed depth;
+      --kv-events-depth 4096 masks it on an image without the fix).
+      20. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off   (fitted set)
+      21. 13B 20 users 10m   same, --kv-events-depth 4096 (materialize on)
+      22. 13B 20 users 10m   same, --kv-events-materialize off --kv-events-depth 4096
+      Reading: row 20 back near -12% with KV ~65% => materialization is the damage; row 21
+      alone recovering => the depth defect dominates; row 22 is the configuration the
+      kvevents suite should rerun with. One repeat each; promote the winner to x3.
+      Runs on the CURRENT image by design: pass --allow-stale-image, since this checkout's
+      src/ is newer than the image (the depth-gate fix) and bench.sh refuses otherwise.
+      Measured 2026-10-11: row 20 +163.2% P99 (KV 22.5%, Gini 0.19, 119 verified evictions),
+      row 21 +77.0% (KV 25%, Gini 0.15, 109 evictions), row 22 +187.8% (KV 24.5%, Gini 0.14,
+      97 evictions; P99 5.05 s failed the validation gate). Neither knob is the driver: the
+      downgrade of a verified-cold hit to miss placement re-learned the prefix elsewhere on
+      every evicted block (~110 home migrations per arm). Policy changed on the branch
+      (verified-cold -> another verified holder, else stay home); rerun kvevents on that image.
+
     kvreset (1 config x 2 arms x 3 repeats, ~1h15m) — the 8B 20u row with the between-arm
       KV reset acknowledged. The reset exists for this row (2026-10-06: prefix-first
       repeats ~9 points weaker because round-robin inherited the prefix arm's warm cache)
@@ -393,8 +426,8 @@ BUILT-IN SUITES:
       19. 8B 20 users 10m    --compare  (50-prefix set; matrix row 1 with the reset working)
 
     all = rebaseline + epsilon + fitted + placement + baseline + saturation + kvevents +
-      kvreset + low (every suite; the historical epsilon and placement rows included —
-      pass --skip to drop them).
+      kvablate + kvreset + low (every suite; the historical epsilon and placement rows
+      included — pass --skip to drop them).
 
     Retired (see .dev-context/benchmark-accuracy-audit-2026-09-30.md):
       - prefix-ratio 0.5/0.7 sweep: SHARED_PREFIX_RATIO only governs 20% of the
@@ -416,7 +449,7 @@ BUILT-IN SUITES:
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
-      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | saturation | kvevents | kvreset | low
+      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | saturation | kvevents | kvablate | kvreset | low
     Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
@@ -466,6 +499,7 @@ while [[ $# -gt 0 ]]; do
         --stop-on-failure)  STOP_ON_FAILURE=true; shift ;;
         --startup-retry)    STARTUP_RETRY_SECS="$2"; shift 2 ;;
         --build-image)      BUILD_IMAGE=true; shift ;;
+        --allow-stale-image) ALLOW_STALE_IMAGE=true; shift ;;
         --output-dir)       RUNNER_OUTPUT_DIR="$2"; shift 2 ;;
         --repeat)           REPEAT="$2"; REPEAT_SET=true; shift 2 ;;
         -h|--help)          print_help; exit 0 ;;
@@ -484,6 +518,7 @@ done
 #   fitted     = 13B with a KV-fitting prefix set         (--suite fitted, all)
 #   placement  = fitted set, --miss-placement least_loaded (--suite placement; historical, default since 2.2.0)
 #   kvevents   = fitted 20u + 50-prefix 20u vs least_loaded with --kv-events (--suite kvevents)
+#   kvablate   = fitted 20u vs least_loaded, --kv-events with materialize off / depth 4096 / both, x1 (--suite kvablate)
 #   kvreset    = 8B 20u vs round-robin with the between-arm KV reset working (--suite kvreset)
 #   low        = exploratory runs outside any headline  (--suite low, all)
 #
@@ -497,7 +532,7 @@ add_run() {
     local args="$*"
 
     case "$SUITE" in
-        rebaseline|epsilon|fitted|placement|baseline|saturation|kvevents|kvreset|low) [[ "$suite" != "$SUITE" ]] && return ;;
+        rebaseline|epsilon|fitted|placement|baseline|saturation|kvevents|kvablate|kvreset|low) [[ "$suite" != "$SUITE" ]] && return ;;
         all)    ;;  # include everything
         *)      return ;;  # custom suite doesn't use add_run
     esac
@@ -657,6 +692,28 @@ define_runs() {
         --compare --baseline-mode least_loaded --kv-events \
         --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 10m --users 20 --max-model-len 8192
+
+    # --- kvablate: which half of the native stream broke affinity? ------------------
+    # One repeat each (not in the --repeat 3 default list): these are diagnostic
+    # arms to pick the configuration the kvevents suite reruns with, not headline
+    # rows. See --help for the first-contact numbers behind them.
+    add_run kvablate "13B 20u/10m A/B vs least_loaded, fitted set, kv-events, materialize off" \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    add_run kvablate "13B 20u/10m A/B vs least_loaded, fitted set, kv-events, depth 4096" \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-depth 4096 \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    add_run kvablate "13B 20u/10m A/B vs least_loaded, fitted set, kv-events, materialize off + depth 4096" \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --kv-events-depth 4096 \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
 
     # --- kvreset: the 8B order effect with the between-arm KV reset working -------
     # Same args as rebaseline row 1. The reset was built for this row and has not
@@ -872,6 +929,13 @@ echo ""
 # Server image: build once from this checkout when asked. Every bench.sh run
 # then reuses it (and passes bench.sh's freshness check).
 # -----------------------------------------------------------------------------
+# Flags forwarded verbatim to every bench.sh invocation.
+EXTRA_BENCH_ARGS=""
+if [[ "$ALLOW_STALE_IMAGE" = true ]]; then
+    EXTRA_BENCH_ARGS+=" --allow-stale-image"
+    log_warn "--allow-stale-image: every run benchmarks the existing ranvier:latest even though this checkout has newer src/ commits; each manifest records the override"
+fi
+
 if [[ "$BUILD_IMAGE" = true ]]; then
     log_info "Building ranvier:latest from commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown) (--build-image)..."
     BUILD_START_TS=$(date +%s)
@@ -984,7 +1048,7 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
 
     # Run bench.sh, capturing exit code
     set +e
-    bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR"
+    bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR" $EXTRA_BENCH_ARGS
     EXIT_CODE=$?
     set -e
 
@@ -999,7 +1063,7 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
         sleep "$PAUSE_BETWEEN_RUNS"
         RETRY_START_TS=$(date +%s)
         set +e
-        bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR"
+        bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR" $EXTRA_BENCH_ARGS
         EXIT_CODE=$?
         set -e
         RUN_END_TS=$(date +%s)

@@ -396,6 +396,14 @@ struct RoutingConfig {
     // shard-local routing config is built from RoutingConfig. 0 disables the
     // verified path entirely.
     std::chrono::seconds kv_residency_freshness_ttl{300};
+    // Mirror of kv_events.max_indexed_token_depth: the native index tracks a
+    // backend's block chains only to this token depth, so an ART hit routed
+    // at a deeper prefix (the request's system-prompt boundary can be 2,000+
+    // tokens) can never be found there and must NOT be read as "verified
+    // evicted". Beyond this depth the probabilistic path applies. First
+    // hardware contact 2026-10-10: without this gate every fitted-set hit
+    // deeper than 2,048 tokens was downgraded with certainty.
+    uint32_t kv_native_indexed_depth = 2048;
 
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
@@ -650,7 +658,7 @@ struct KvEventsConfig {
     uint32_t max_ops_per_shipment = 512;        // Bounds one reactor application (Rule #17)
     uint32_t max_inflight_shipments = 4;        // Worker→shard-0 backpressure cap
     uint32_t max_tracked_blocks_per_backend = 65536;  // Ledger entry cap (Rule #4)
-    uint32_t max_indexed_token_depth = 2048;    // Chains tracked only to routable depth
+    uint32_t max_indexed_token_depth = 2048;    // Chains tracked only to this depth; mirrored into routing.kv_native_indexed_depth
     uint32_t freshness_ttl_seconds = 300;       // Mirrored into routing.kv_residency_freshness_ttl
 
     // Route materialization (the push-eviction design's Phase 3c, realized

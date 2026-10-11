@@ -186,6 +186,9 @@ class BenchmarkResults:
     native_kv_ops_total: Optional[int] = None
     native_verified_hits_total: Optional[int] = None
     native_verified_evictions_total: Optional[int] = None
+    native_verified_depth_skips_total: Optional[int] = None
+    native_holder_redirects_total: Optional[int] = None
+    native_verified_cold_honored_total: Optional[int] = None
     native_routes_materialized_total: Optional[int] = None
     native_stream_resets_total: Optional[int] = None
     # Per-backend request distribution — printed as a sorted list so prefix-
@@ -653,6 +656,9 @@ _NATIVE_KEYS = (
     "native_kv_ops_total",
     "native_verified_hits_total",
     "native_verified_evictions_total",
+    "native_verified_depth_skips_total",
+    "native_holder_redirects_total",
+    "native_verified_cold_honored_total",
     "native_routes_materialized_total",
     "native_stream_resets_total",
 )
@@ -1837,9 +1843,11 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
                 )
             elif _native_any(new):
                 lines.append(
-                    "  (verified_hits / verified_evictions = ART hits the stream confirmed resident / "
-                    "absent; routes_materialized = PUSH routes learned from BlockStored; stream_resets "
-                    "> 0 means sequence gaps wiped a backend's ledger)"
+                    "  (verified_hits = ART hits the stream confirmed resident; holder_redirects / "
+                    "verified_cold_honored = verified-cold hits served by another verified holder / kept "
+                    "on the home; verified_evictions = cold hits downgraded to re-placement (0 since the "
+                    "2026-10-11 policy); routes_materialized = PUSH routes learned from BlockStored; "
+                    "stream_resets > 0 means sequence gaps wiped a backend's ledger)"
                 )
 
         # Per-backend request distribution. Print as sorted list with min/max
