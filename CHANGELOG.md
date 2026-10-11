@@ -77,9 +77,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `least_loaded`) showed why: the downgrade re-placed the prefix on the least-loaded backend
   and re-learned it there, so every evicted block became a home migration plus a cold prefill,
   about 110 per 10-minute arm on 16 prefixes; KV hits fell from 68% to 22–27%, the per-backend
-  Gini rose from 0.08 to 0.14–0.19 and P99 went from −12% to +77…+163% against least-loaded,
-  with materialization off (+163%) or the index depth raised to 4096 (+77%) making no
-  difference. The exact signal is now used the other way round: the request goes to another
+  Gini rose from 0.08 to 0.14–0.19 and P99 went from −12% to +77…+188% against least-loaded,
+  with materialization off (+163%), the index depth raised to 4096 (+77%) or both (+188%)
+  making no difference. The exact signal is now used the other way round: the request goes to another
   live backend the index shows holding the prefix, as a verified hit that becomes the learned
   home (`router_native_holder_redirects_total`), or with no other holder stays on the home to
   re-prefill (`router_native_verified_cold_honored_total`), which is the stream-off behaviour.

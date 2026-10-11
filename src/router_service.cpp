@@ -3228,7 +3228,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 // re-learned it there, so every evicted block became a home
                 // migration plus a cold prefill, ~110 of them per 10-minute arm
                 // on 16 prefixes; KV hits fell 68% -> 22-27%, Gini rose 0.08 ->
-                // 0.14-0.19 and P99 went from -12% to +77..+163% against
+                // 0.14-0.19 and P99 went from -12% to +77..+188% against
                 // least_loaded. The exact signal is used the other way: another
                 // verified holder of the hash takes the request as a hit and
                 // becomes the learned home; with none, the home keeps it and

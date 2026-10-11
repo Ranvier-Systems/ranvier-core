@@ -411,7 +411,8 @@ BUILT-IN SUITES:
       Runs on the CURRENT image by design: pass --allow-stale-image, since this checkout's
       src/ is newer than the image (the depth-gate fix) and bench.sh refuses otherwise.
       Measured 2026-10-11: row 20 +163.2% P99 (KV 22.5%, Gini 0.19, 119 verified evictions),
-      row 21 +77.0% (KV 25%, Gini 0.15, 109 evictions). Neither knob is the driver: the
+      row 21 +77.0% (KV 25%, Gini 0.15, 109 evictions), row 22 +187.8% (KV 24.5%, Gini 0.14,
+      97 evictions; P99 5.05 s failed the validation gate). Neither knob is the driver: the
       downgrade of a verified-cold hit to miss placement re-learned the prefix elsewhere on
       every evicted block (~110 home migrations per arm). Policy changed on the branch
       (verified-cold -> another verified holder, else stay home); rerun kvevents on that image.

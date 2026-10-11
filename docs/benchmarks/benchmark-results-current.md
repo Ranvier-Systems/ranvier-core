@@ -977,9 +977,11 @@ nothing to do.
    Materialization off: P99 **+163.2%** vs least-loaded, P50 −23.0%, KV 20 → 22.5%, consistency
    47.8%, Gini 0.191, 119 verified evictions (4.2% of requests), zero routes materialized.
    Depth 4096 with materialization on: **+77.0%**, P50 −15.0%, KV 23 → 25%, consistency 33%,
-   Gini 0.145, 109 verified evictions, 88,143 routes materialized. So neither suspect is the
-   driver, and the ~110 verified evictions per arm are real block evictions, not the depth
-   artefact. The mechanism is the downgrade itself: a verified-cold hit was treated as a miss,
+   Gini 0.145, 109 verified evictions, 88,143 routes materialized. Both knobs together:
+   **+187.8%** (P99 5.05 s, the first fitted-set arm to fail the 5 s validation gate), P50
+   −24.9%, KV 21 → 24.5%, consistency 49%, Gini 0.139, 97 verified evictions. So neither
+   suspect is the driver, and the ~100–120 verified evictions per arm are real block evictions,
+   not the depth artefact. The mechanism is the downgrade itself: a verified-cold hit was treated as a miss,
    re-placed on the least-loaded backend and re-learned there, so each evicted block became a
    home migration plus a cold prefill. Sixteen prefixes migrating ~110 times in ten minutes is
    the whole picture: KV hits at least-loaded's level despite 33–48% route consistency, the
