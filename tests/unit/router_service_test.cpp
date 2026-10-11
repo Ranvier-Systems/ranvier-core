@@ -1479,6 +1479,13 @@ TEST_F(RouterServiceTest, ApplyNativeOpsLocalUpsertRemoveAndStaleness) {
     RouterService::insert_route_for_testing(tokens, 1);
     uint64_t h = hash_prefix(tokens.data(), tokens.size(), 1);
 
+    // The stream starts the way the subscriber opens one seen from publisher
+    // sequence 0: COMPLETE first, so absence later counts as an eviction.
+    // Without it, the REMOVE below would leave absence "unknown" and the gossip
+    // gate would decide (NativeAbsenceOnIncompleteStreamDefersToGossip).
+    NativeKvOp complete{NativeKvOp::Kind::COMPLETE, 1, 0, 900};
+    RouterService::apply_native_kv_ops_local(&complete, 1);
+
     // UPSERT at t=1000 marks resident + fresh.
     NativeKvOp upsert{NativeKvOp::Kind::UPSERT, 1, h, 1000};
     RouterService::apply_native_kv_ops_local(&upsert, 1);
@@ -1504,12 +1511,14 @@ TEST_F(RouterServiceTest, ApplyNativeOpsLocalUpsertRemoveAndStaleness) {
     EXPECT_EQ(r3.backend_id.value(), 1);
 
     auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.completes, 1u);
     EXPECT_EQ(stats.upserts, 1u);
     EXPECT_EQ(stats.removes, 1u);
     // r1 and r2 both verified resident (the stale remove left the entry).
     EXPECT_EQ(stats.verified_hits, 2u);
     EXPECT_EQ(stats.verified_cold_honored, 1u);
     EXPECT_EQ(stats.verified_downgrades, 0u);
+    EXPECT_EQ(stats.absence_untrusted, 0u);
 }
 
 // =============================================================================
