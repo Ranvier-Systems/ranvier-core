@@ -309,10 +309,12 @@ BENCHMARK OPTIONS:
                         Publisher port of the first backend (default 5557).
     --kv-events-materialize on|off
                         Route materialization from BlockStored chains (PUSH routes at
-                        every block boundary up to 128 tokens; server default on).
-                        "off" is the ablation arm: first contact 2026-10-10 showed the
-                        stream collapsing affinity (KV 68% -> 27%, Gini 0.14) with
-                        87k routes materialized in a 10-minute arm.
+                        every block boundary up to 128 tokens). Server default OFF since
+                        2026-10-13: with it on, the second --compare arm replays the
+                        first arm's history and materializes routes that capture the
+                        first requests, regressing P99 12-73 points vs least_loaded
+                        (four reps); off, the same reps read -13.2/-10.1/-12.7% against
+                        a -12.5% control. "on" is now the ablation arm.
     --kv-events-depth N Native index depth, kv_events.max_indexed_token_depth (default
                         2048). Fitted-set prefixes are 2,000-4,000 tokens; 4096 covers
                         them so verified lookups at the full prefix depth can succeed.
@@ -540,7 +542,7 @@ BASELINE_MODE="round_robin"  # --baseline-mode: routing mode of the --compare ba
 KV_EVENTS=false              # --kv-events: vLLM publishes KV-cache events over ZMQ; Ranvier subscribes (native residency)
 KV_EVENTS_PORT_START=5557    # --kv-events-port-start: publisher port of vLLM instance 0 (instance i: +i)
 KV_EVENTS_REPLAY_OFFSET=100  # replay ROUTER socket of each instance = its publisher port + 100
-KV_EVENTS_MATERIALIZE=""     # --kv-events-materialize on|off: PUSH routes from BlockStored chains (server default on)
+KV_EVENTS_MATERIALIZE=""     # --kv-events-materialize on|off: PUSH routes from BlockStored chains (server default off since 2026-10-13)
 KV_EVENTS_DEPTH=""           # --kv-events-depth N: kv_events.max_indexed_token_depth (server default 2048)
 SKIP_SETUP=false
 SKIP_VLLM=false
@@ -1954,7 +1956,7 @@ write_manifest() {
         # counters whenever this says true, so a stream that never connected
         # shows up as kv_ops=0 in the compare instead of passing silently.
         printf '    "kv_events_enabled": "%s",\n' "$(_json_escape "${RANVIER_KV_EVENTS_ENABLED:-false}")"
-        printf '    "kv_events_materialize": "%s",\n' "$(_json_escape "${RANVIER_KV_EVENTS_MATERIALIZE:-true}")"
+        printf '    "kv_events_materialize": "%s",\n' "$(_json_escape "${RANVIER_KV_EVENTS_MATERIALIZE:-false}")"
         printf '    "kv_events_max_indexed_token_depth": "%s",\n' "$(_json_escape "${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}")"
         printf '    "kv_events_port_start": "%s"\n' "$(_json_escape "$([[ "$KV_EVENTS" = true ]] && echo "$KV_EVENTS_PORT_START")")"
         printf '  },\n'
@@ -2622,7 +2624,7 @@ if [[ "$COMPARE" = true ]]; then
             echo "vLLM KV cache NOT reset between arms (--no-kv-reset; Ranvier-only restart)"
         fi
         if [[ "$KV_EVENTS" = true ]]; then
-            echo "Native KV events: ON (--kv-events; vLLM --kv-events-config zmq on ports ${KV_EVENTS_PORT_START}+, RANVIER_KV_EVENTS_ENABLED=true, materialize=${RANVIER_KV_EVENTS_MATERIALIZE:-true}, indexed depth=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}); router_native_kv_ops_total at end of arm: ${BASELINE_MODE}=${NATIVE_OPS_BASELINE} prefix=${NATIVE_OPS_PREFIX}"
+            echo "Native KV events: ON (--kv-events; vLLM --kv-events-config zmq on ports ${KV_EVENTS_PORT_START}+, RANVIER_KV_EVENTS_ENABLED=true, materialize=${RANVIER_KV_EVENTS_MATERIALIZE:-false}, indexed depth=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}); router_native_kv_ops_total at end of arm: ${BASELINE_MODE}=${NATIVE_OPS_BASELINE} prefix=${NATIVE_OPS_PREFIX}"
         else
             echo "Native KV events: off (residency estimated from the vLLM /metrics scrape)"
         fi
