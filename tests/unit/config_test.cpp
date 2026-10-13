@@ -2779,13 +2779,21 @@ kv_events:
     auto error = RanvierConfig::validate(config);
     EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
 
-    // Materialize cap must not exceed the indexed depth cap.
+    // Materialize cap must not exceed the indexed depth cap — enforced only
+    // when materialization is on (off by default since 2026-10-13), since an
+    // inert cap cannot hurt anything.
     RanvierConfig bad;
     bad.kv_events.enabled = true;
+    bad.kv_events.materialize_routes = true;
     bad.kv_events.max_materialize_tokens = 4096;  // > max_indexed_token_depth (2048)
     error = RanvierConfig::validate(bad);
     ASSERT_TRUE(error.has_value());
     EXPECT_NE(error->find("max_materialize_tokens"), std::string::npos);
+
+    RanvierConfig inert = bad;
+    inert.kv_events.materialize_routes = false;  // the default
+    error = RanvierConfig::validate(inert);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
 
     RanvierConfig bad2;
     bad2.kv_events.enabled = true;
