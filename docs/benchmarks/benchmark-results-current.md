@@ -419,10 +419,10 @@ row in both arms, as always.
    being applied, so the first real requests hit those routes and are learned at full depth on
    the backends the first arm's random history picked. The clear removes only the materialized
    routes, not the learned ones, and the homes for the whole run are set by replay order rather
-   than least-loaded placement. This is the working explanation, not a measured one. It would
-   also apply to a Ranvier restart in front of warm backends in production, which is why it is
-   not dismissed as a benchmark artefact. The ablation that tests it is row 17 with
-   `--kv-events-materialize off`, three reps alternating order (resume checklist item 9).
+   than least-loaded placement. The ablation below measured the consequence (materialization
+   off removes the whole effect with the replay still applied); the capture-at-warm-up step is
+   the inferred mechanism. It applies equally to a Ranvier restart in front of warm backends in
+   production, which is why it is a default change and not a benchmark footnote.
 
 ### Materialization ablation (kvmat, 2026-10-13, same instance and image)
 
@@ -470,7 +470,7 @@ like. The row's citable number moves from −26.7% to **−21.3%**: about a fift
 figure was the carry-over cache. KV hit rate, P50 and throughput are unchanged by the reset, as
 expected on a fleet that is cache-warm under either policy. README updated.
 
-Archive: `results/2026-10-13-kvevents/`, `results/2026-10-13-kvreset/`.
+Archive: `results/2026-10-13-kvevents/`, `results/2026-10-13-kvmat/`, `results/2026-10-13-kvreset/`.
 
 ## Representative-workload re-baseline (measured 2026-10-01, fixed tooling, previous defaults)
 
@@ -648,6 +648,7 @@ before termination after all): summaries in this tree, raw data as a release ass
 | Saturation suite: ε 0.5 / 0.25 vs least-loaded at 30u, 50-prefix 20u vs least-loaded (2026-10-09) | `results/2026-10-09-saturation/` |
 | Native KV-event suite on the verified-cold policy: fitted 20u + 50-prefix 20u vs least-loaded, ×3 (2026-10-13) | `results/2026-10-13-kvevents/` |
 | 8B 20u vs round-robin with the between-arm KV reset acknowledged, ×3 (2026-10-13) | `results/2026-10-13-kvreset/` |
+| kvmat: fitted 20u vs least-loaded, stream on, materialization off, ×3 (2026-10-13) | `results/2026-10-13-kvmat/` |
 | Native KV events, first contact: 3 stream-off control reps + the first live-stream run (2026-10-10) | `results/2026-10-10-kvevents-first-contact/` (compare files only; raw dirs lost with the instance) |
 | kvablate: materialize off / depth 4096 / both vs least-loaded, ×1 (2026-10-11) | `results/2026-10-11-kvablate/` (compare files only) |
 
@@ -1109,26 +1110,29 @@ nothing to do.
    *Measured 2026-10-13 on the policy image:* see "Native KV-event suite" above. Storm gone
    (0 evictions, 107–134 cold-honored per arm); clean-start reps −10.3% (fitted) and +2.1%
    (50-prefix, was +23%); every second-arm rep regressed 12–73 points with 3.4× the
-   materialized routes from the replayed first-arm history. Verdict deferred to item 9.
+   materialized routes from the replayed first-arm history. Resolved by item 9: materialization
+   was the whole effect; row 17 is neutral at −13.2 / −10.1 / −12.7%.
 8. ~~Same session, after 7: `bench-runner.sh --suite kvreset`.~~ Done 2026-10-13: −23.7 /
    −19.4 / −21.3% (median −21.3, 3/3) with `8/8` acked on every arm; the order gap fell from 9
    points to 4 and the row's number moves from −26.7% to −21.3%. README updated.
-9. Next GPU session, first thing, on the published image (no rebuild): row 17 with route
-   materialization off, three reps alternating order, the custom file below. Pre-registered
-   reading: if both rr-first reps land within 5 points of −12.5% with KV above 60%, the
-   replayed-history materialization is the second-arm regression and `materialize_routes`
-   defaults to off (or materialization skips replayed history); the kvevents suite is then
-   rerun ×3 with that default and row 18's parity rep gets its two companions. If the
-   rr-first reps still regress while prefix-first stays at the control, the replay itself is
-   the problem and the fix is to not backfill history older than the last cache clear.
+9. ~~Row 17 with route materialization off, three reps alternating order.~~ Done 2026-10-13,
+   same instance ("Materialization ablation" above): −13.2 / −10.1 / −12.7% with KV 65–68%,
+   both rr-first reps within a point of the control. Pre-registered first clause met:
+   `materialize_routes` defaults to off (server, benchmark compose, runner rows). Archive:
+   `results/2026-10-13-kvmat/`.
+10. Next GPU session: row 18 (50-prefix 13B 20u vs least-loaded) three repeats with
+   materialization off, which the kvevents rows now pass explicitly, so it reads the same on an
+   image with or without the new default:
    ```
-   cat > kvmat.runs <<'EOF'
-   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192 --num-prefixes 16 --prefix-max-tokens 4000 --order rr-first
-   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192 --num-prefixes 16 --prefix-max-tokens 4000 --order prefix-first
-   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192 --num-prefixes 16 --prefix-max-tokens 4000 --order rr-first
-   EOF
-   ./scripts/bench-runner.sh --suite custom --file kvmat.runs --output-dir benchmark-reports-kvmat
+   ./scripts/bench-runner.sh --suite kvevents --resume 4 --output-dir benchmark-reports-kvevents
    ```
+   (`--resume 4` skips the settled row 17; drop it to re-measure both rows, ~2h50m.)
+   Pre-registered reading for row 18, unchanged from item 7: a CONSISTENT IMPROVEMENT against
+   least-loaded is the finding; MIXED with KV above the stream-off 23–32% is progress; an
+   unchanged consistent regression means the stream does not fix the eviction regime and the
+   holder-aware divert needs a second holder to exist (replication). The one clean rep so far
+   is +2.1% with Gini 0.056 against +22.9 / +24.9 / +21.7% stream-off. Archive before
+   terminating.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
