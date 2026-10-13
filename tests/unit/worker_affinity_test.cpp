@@ -105,7 +105,7 @@ int first_set_bit(const cpu_set_t& s) {
 seastar::future<cpu_set_t> survey_reactor_union() {
     cpu_set_t accumulator;
     CPU_ZERO(&accumulator);
-    for (unsigned shard = 0; shard < seastar::smp::count; ++shard) {
+    for (unsigned shard = 0; shard < seastar::smp::shard_count(); ++shard) {
         cpu_set_t s = co_await seastar::smp::submit_to(shard,
             []() -> cpu_set_t {
                 cpu_set_t local;
@@ -124,7 +124,7 @@ seastar::future<cpu_set_t> survey_reactor_union() {
 }
 
 seastar::future<> run_experiment() {
-    g_obs.smp_count = seastar::smp::count;
+    g_obs.smp_count = seastar::smp::shard_count();
 
     // Independent ground-truth survey for the success-path assertion.
     g_obs.reactor_union_observed = co_await survey_reactor_union();

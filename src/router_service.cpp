@@ -721,7 +721,7 @@ struct ShardLocalState {
         // Pre-allocate cross-shard load snapshot storage (one entry per shard)
         // Resized to smp::count so we can index by shard_id without bounds checks.
         // Each entry starts empty; populated on first broadcast receive.
-        shard_load_snapshots.resize(seastar::smp::count);
+        shard_load_snapshots.resize(seastar::smp::shard_count());
 
         // Pre-allocate local route batch buffer to avoid reallocations during operation
         pending_local_routes.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
@@ -2326,7 +2326,7 @@ seastar::future<> RouterService::initialize_shards() {
     RoutingConfig cfg = _config;  // Copy config for cross-shard transfer
     bool has_gossip = (_gossip != nullptr);
 
-    return seastar::parallel_for_each(boost::irange(1u, seastar::smp::count),
+    return seastar::parallel_for_each(boost::irange(1u, seastar::smp::shard_count()),
         [cfg, has_gossip](unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [cfg, has_gossip] {
                 // Initialize ShardLocalState with unified init() method
@@ -2619,7 +2619,7 @@ void RouterService::run_ttl_cleanup() {
     // Keep gate holder alive for duration of async work via do_with
     (void)seastar::do_with(std::move(holder), std::move(backend_cutoffs),
         [default_cutoff](auto& /*holder*/, auto& cutoffs) {
-        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()),
             [default_cutoff, &cutoffs](unsigned shard_id) {
             // Rule #17: ttl_cleanup_on_shard is a named coroutine that yields
             // between tree phases to avoid reactor stalls on large trees.
@@ -4341,7 +4341,7 @@ seastar::future<> RouterService::flush_route_batch() {
     auto batch = std::move(_pending_remote_routes);
 
     log_router.debug("Broadcasting batch of {} routes to {} shards",
-                     batch.size(), seastar::smp::count);
+                     batch.size(), seastar::smp::shard_count());
 
     // Send ONE message per shard containing the entire batch.
     //
@@ -4355,7 +4355,7 @@ seastar::future<> RouterService::flush_route_batch() {
     // Note: Gate holder is kept alive via do_with for duration of async work.
     return seastar::do_with(std::move(holder), std::move(batch),
         [](seastar::gate::holder&, std::vector<PendingRemoteRoute>& batch) {
-        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()),
             [&batch](unsigned shard_id) {
                 // Create a copy wrapped in foreign_ptr for this shard
                 // The copy is allocated on shard 0, foreign_ptr ensures it's freed on shard 0
@@ -4609,7 +4609,7 @@ seastar::future<> RouterService::flush_local_route_batch() {
     state.stats.local_routes_deduplicated += deduped;
 
     log_router.debug("Shard {}: Flushing local batch of {} routes ({} deduplicated) to {} shards",
-                     seastar::this_shard_id(), batch.size(), deduped, seastar::smp::count);
+                     seastar::this_shard_id(), batch.size(), deduped, seastar::smp::shard_count());
 
     // Apply to local tree directly (no SMP needed for THIS shard)
     apply_local_batch_to_tree(batch);
@@ -4627,7 +4627,7 @@ seastar::future<> RouterService::flush_local_route_batch() {
         [should_gossip, this_shard](seastar::gate::holder&, std::vector<PendingLocalRoute>& batch) {
             // Broadcast to all OTHER shards
             auto shard_future = seastar::parallel_for_each(
-                boost::irange(0u, seastar::smp::count),
+                boost::irange(0u, seastar::smp::shard_count()),
                 [&batch, this_shard](unsigned shard_id) {
                     if (shard_id == this_shard) {
                         // Already applied to local tree above
@@ -4864,7 +4864,7 @@ static seastar::future<> broadcast_load_snapshot() {
         [this_shard](seastar::gate::holder&,
                      seastar::foreign_ptr<std::unique_ptr<SnapshotVec>>& snapshot) {
             return seastar::parallel_for_each(
-                boost::irange(0u, seastar::smp::count),
+                boost::irange(0u, seastar::smp::shard_count()),
                 [this_shard, &snapshot](unsigned target_shard) {
                     if (target_shard == this_shard) {
                         return seastar::make_ready_future<>();
@@ -4898,7 +4898,7 @@ void RouterService::start_load_sync_timer() {
     }
 
     // Only meaningful with multiple shards
-    if (seastar::smp::count < 2) {
+    if (seastar::smp::shard_count() < 2) {
         log_router.debug("Shard {}: Cross-shard load sync skipped (single shard)", seastar::this_shard_id());
         return;
     }
@@ -5187,7 +5187,7 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
              uint32_t& shared_priority, bool& shared_supports_token_ids,
              double& shared_compression_ratio, BackendType& shared_type,
              PoolRole& shared_pool_role) {
-        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()),
             [id, now, &shared_addr, &shared_weight, &shared_priority, &shared_supports_token_ids,
              &shared_compression_ratio, &shared_type, &shared_pool_role] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [id, now, addr = shared_addr,
@@ -5228,7 +5228,7 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
 }
 
 seastar::future<> RouterService::unregister_backend_global(BackendId id) {
-    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id] (unsigned shard_id) {
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()), [id] (unsigned shard_id) {
         return seastar::smp::submit_to(shard_id, [id] {
             if (!g_shard_state) return seastar::make_ready_future<>();
             auto& state = shard_state();
@@ -5278,7 +5278,7 @@ seastar::future<> RouterService::set_backend_api_key_global(BackendId id, std::s
     // matching the pattern at the load-snapshot broadcast above.
     return seastar::do_with(std::move(api_key),
         [id](std::string& shared_key) {
-            return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+            return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()),
                 [id, &shared_key](unsigned shard_id) {
                     auto clone = std::make_unique<std::string>(shared_key);
                     auto foreign = seastar::make_foreign(std::move(clone));
@@ -5323,7 +5323,7 @@ seastar::future<> RouterService::set_backend_labels_global(
 
     return seastar::do_with(std::move(model_family),
         [id, hardware_label](std::string& shared_family) {
-            return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+            return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()),
                 [id, hardware_label, &shared_family](unsigned shard_id) {
                     auto clone = std::make_unique<std::string>(shared_family);
                     auto foreign = seastar::make_foreign(std::move(clone));
@@ -5358,7 +5358,7 @@ seastar::future<> RouterService::set_backend_hardware_cost_global(
 
     return seastar::do_with(std::move(gpu_tier),
         [id, cost_per_hour](std::string& shared_tier) {
-            return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+            return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()),
                 [id, cost_per_hour, &shared_tier](unsigned shard_id) {
                     auto clone = std::make_unique<std::string>(shared_tier);
                     auto foreign = seastar::make_foreign(std::move(clone));
@@ -5395,7 +5395,7 @@ seastar::future<> RouterService::set_backend_gpu_count_global(
     // segments. steady_clock; time_point rides the captures by value.
     auto now = std::chrono::steady_clock::now();
 
-    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()),
         [id, gpu_count, now](unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [id, gpu_count, now] {
                 if (!g_shard_state) return seastar::make_ready_future<>();
@@ -5550,7 +5550,7 @@ seastar::future<> RouterService::set_backend_status_global(BackendId id, bool is
     auto now = std::chrono::steady_clock::now();
 
     // Broadcast to all cores
-    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id, is_alive, now] (unsigned shard_id) {
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()), [id, is_alive, now] (unsigned shard_id) {
         return seastar::smp::submit_to(shard_id, [id, is_alive, now] {
             if (!g_shard_state) return seastar::make_ready_future<>();
             auto& state = shard_state();
@@ -5597,7 +5597,7 @@ seastar::future<> RouterService::update_routing_config(const RoutingConfig& conf
     // Broadcast to all shards using Seastar's async message passing
     // Copy config for cross-shard transfer
     RoutingConfig cfg = config;
-    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()),
         [cfg](unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [cfg] {
                 if (!g_shard_state) return seastar::make_ready_future<>();
@@ -5622,7 +5622,7 @@ seastar::future<> RouterService::drain_backend_global(BackendId id) {
     auto now = std::chrono::steady_clock::now();
 
     // Broadcast draining state to all shards
-    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id, now](unsigned shard_id) {
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()), [id, now](unsigned shard_id) {
         return seastar::smp::submit_to(shard_id, [id, now] {
             if (!g_shard_state) return seastar::make_ready_future<>();
             auto& state = shard_state();
@@ -5826,7 +5826,7 @@ seastar::future<> RouterService::handle_node_state_change(BackendId backend, Nod
         // The is_draining flag is checked by get_live_backends()/get_live_backend_infos(),
         // which all routing paths use.  We intentionally preserve the original weight so
         // it is restored correctly when the backend returns to ACTIVE.
-        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()),
             [backend](unsigned shard_id) {
                 return seastar::smp::submit_to(shard_id, [backend] {
                     if (!g_shard_state) return seastar::make_ready_future<>();
@@ -5843,7 +5843,7 @@ seastar::future<> RouterService::handle_node_state_change(BackendId backend, Nod
             });
     } else if (node_state == NodeState::ACTIVE) {
         log_router.info("Received ACTIVE notification for backend {} - restoring to active", backend);
-        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::shard_count()),
             [backend](unsigned shard_id) {
                 return seastar::smp::submit_to(shard_id, [backend] {
                     if (!g_shard_state) return seastar::make_ready_future<>();
@@ -5930,7 +5930,7 @@ seastar::future<uint32_t> RouterService::evict_by_prefix_hash_global(
     // Rule #14: use invoke_on_all pattern via parallel_for_each
     uint32_t total_evicted = 0;
     co_await seastar::parallel_for_each(
-        boost::irange(0u, seastar::smp::count),
+        boost::irange(0u, seastar::smp::shard_count()),
         [prefix_hash, backend_id, event_timestamp_ms, &total_evicted](unsigned shard_id) {
             return seastar::smp::submit_to(shard_id,
                 [prefix_hash, backend_id, event_timestamp_ms] {
@@ -6015,7 +6015,7 @@ seastar::future<uint32_t> RouterService::load_route_global(
     // prefix_hash_index and updates its own timestamp map.
     uint32_t total_applied = 0;
     co_await seastar::parallel_for_each(
-        boost::irange(0u, seastar::smp::count),
+        boost::irange(0u, seastar::smp::shard_count()),
         [prefix_hash, backend_id, event_timestamp_ms, &total_applied](unsigned shard_id) {
             return seastar::smp::submit_to(shard_id,
                 [prefix_hash, backend_id, event_timestamp_ms] {

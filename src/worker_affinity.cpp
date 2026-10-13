@@ -113,8 +113,8 @@ seastar::future<> initialize_non_reactor_cpuset() {
     // deliberate — startup is already broken if this fails, and silently
     // falling back to M=0 would mask the real problem.
     std::vector<seastar::future<cpu_set_t>> per_shard;
-    per_shard.reserve(seastar::smp::count);
-    for (unsigned shard = 0; shard < seastar::smp::count; ++shard) {
+    per_shard.reserve(seastar::smp::shard_count());
+    for (unsigned shard = 0; shard < seastar::smp::shard_count(); ++shard) {
         per_shard.push_back(seastar::smp::submit_to(shard, []() -> cpu_set_t {
             cpu_set_t local;
             CPU_ZERO(&local);

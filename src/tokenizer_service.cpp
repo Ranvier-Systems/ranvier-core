@@ -185,7 +185,7 @@ bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
         return false;
     }
 
-    if (seastar::smp::count <= 1) {
+    if (seastar::smp::shard_count() <= 1) {
         return false;
     }
 
@@ -199,7 +199,7 @@ bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
 
 uint32_t TokenizerService::select_tokenization_shard() const {
     uint32_t local = seastar::this_shard_id();
-    uint32_t shard_count = seastar::smp::count;
+    uint32_t shard_count = seastar::smp::shard_count();
 
     if (shard_count <= 1) {
         return local;

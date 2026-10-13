@@ -179,7 +179,7 @@ public:
             log_rejected("ip_denied", source_ip);
             rep->set_status(seastar::http::reply::status_type::forbidden);
             rep->_content = "Forbidden\n";
-            rep->done("text/plain");
+            rep->set_content_type("text/plain");
             return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
         }
 
@@ -191,7 +191,7 @@ public:
                 log_rejected("auth_failed", source_ip);
                 rep->set_status(seastar::http::reply::status_type::unauthorized);
                 rep->_content = "Unauthorized\n";
-                rep->done("text/plain");
+                rep->set_content_type("text/plain");
                 return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
             }
         }
