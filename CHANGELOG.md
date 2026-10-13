@@ -82,6 +82,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (new item: holder-aware divert) updated.
 
 ### Changed
+- `kv_events.materialize_routes` defaults to **off** (was on). Measured 2026-10-13 on 8×A100
+  (13B, 20 users, 16 prefixes vs `least_loaded`, verified-cold policy): every repeat in which
+  the Ranvier nodes started in front of backends holding the previous arm's history regressed
+  P99 by 12–73 points (+73.0, +25.7, +24.6, +12.5) with 3.4× the materialized routes, while the
+  repeats starting against fresh publishers sat at the stream-off control. With materialization
+  off and the same replay still applied (1.6 M ops), three repeats of the fitted 20u row read
+  −13.2 / −10.1 / −12.7% against a control of −12.5%. The replayed `BlockStored` history
+  materializes a route for every prefix head at whichever backend last stored it before
+  placement has seen a request; those routes capture the first requests and the homes for the
+  run are set by replay order. The same thing would happen to a production node restarting in
+  front of warm backends. `RANVIER_KV_EVENTS_MATERIALIZE=true` / `materialize_routes: true`
+  turns it back on for fleets where other frontends compute prefixes nothing else will learn.
+  The benchmark compose default and `bench.sh --kv-events-materialize` follow.
 - A verified-cold ART hit (the native KV-event index shows the home backend no longer holds
   the request's prefix) is no longer downgraded to miss placement. First live-stream runs
   (2026-10-10/11, kvevents run 1 and the kvablate ablation, 13B 20u fitted set vs

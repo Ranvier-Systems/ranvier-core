@@ -424,11 +424,33 @@ row in both arms, as always.
    not dismissed as a benchmark artefact. The ablation that tests it is row 17 with
    `--kv-events-materialize off`, three reps alternating order (resume checklist item 9).
 
-**Verdict against the pre-registered reading.** Row 17 "must not regress": it does not on a
-clean start and does on a replayed one, so the reading is deferred to the ablation rather than
-called either way. Row 18: the one clean rep is parity, the best this row has ever read; it
-needs two more clean reps before the README carries it. Until the ablation lands, the native
-stream stays opt-in and the shipping defaults are unchanged.
+### Materialization ablation (kvmat, 2026-10-13, same instance and image)
+
+Row 17 with `--kv-events-materialize off`, three repeats alternating order, everything else as in
+the kvevents suite. The replay still runs on the second arm (prefix-arm `kv_ops` 1.58–1.65 M
+against 0.43 M when it runs first); only what it materializes is gone (`routes_materialized` 0).
+
+| Fitted 20u vs least-loaded, stream on, materialization off | Prefix arm ran | P99 | P50 | KV hit | Consistency | Gini | Diverts | Throughput |
+|---|---|---|---|---|---|---|---|---|
+| rep 1 | second | **−13.2%** | −27.2% | 21 → 66.0% | 53.6% | 0.075 | 23.7% | +8.0% |
+| rep 2 | first | **−10.1%** | −27.7% | 20 → 65.2% | 52.5% | 0.079 | 24.9% | +6.6% |
+| rep 3 | second | **−12.7%** | −27.4% | 17 → 68.3% | 49.7% | 0.115 | 24.7% | +7.6% |
+| *stream off, control* | both | *−13.2 / −12.5 / −7.1%* | *−27%* | *61–68%* | *53%* | *0.08–0.10* | *22–23%* | *+6…+8%* |
+
+Median −12.7%, every repeat improved, and the two second-arm repeats, the order that regressed
++73.0 and +25.7% with materialization on, read −13.2 and −12.7%. The pre-registered reading of
+item 9 is met on its first clause: the materialized routes from the replayed first-arm history
+were the whole second-arm effect, since the replay itself (1.6 M ops) stayed and the regression
+went. What the stream added on top of that is nothing measurable on this row: three
+materialization-off repeats sit on the stream-off control to within a point, `holder_redirects`
+is 0 (one home per prefix), and `verified_cold_honored` 119–135 per arm cost nothing visible.
+
+**Verdict against the pre-registered reading.** Row 17 "must not regress": three clean repeats
+at −13.2 / −10.1 / −12.7% against −12.5%, so it does not; the stream is **neutral** on the fitted
+row. `kv_events.materialize_routes` **defaults to off** from this measurement, on the server, in
+the benchmark compose and in the runner's kvevents rows. Row 18: the one clean rep is parity
+(+2.1%), the best this row has ever read; it needs two more materialization-off repeats before
+the README carries it (item 10). The native stream stays opt-in.
 
 ### The 8B 20u row with the KV reset acknowledged (`--suite kvreset`)
 

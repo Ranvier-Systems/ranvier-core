@@ -669,7 +669,19 @@ struct KvEventsConfig {
     // are never overwritten. max_materialize_tokens bounds per-chain token
     // retention on the subscriber's worker thread; must be
     // <= max_indexed_token_depth.
-    bool materialize_routes = true;
+    //
+    // OFF by default since 2026-10-13. Measured on 8×A100 (13B, 20 users, 16
+    // prefixes vs a least-loaded router): a Ranvier node starting in front of
+    // warm backends replays their history and materializes routes for every
+    // prefix head at whichever backend last stored it, before any request is
+    // placed; those routes capture the first requests and are learned at full
+    // depth, so the homes for the whole run are set by replay order rather
+    // than placement. Four such starts regressed P99 by 12-73 points against
+    // the stream-off control; with materialization off and the replay still
+    // applied (1.6 M ops), three repeats read -13.2 / -10.1 / -12.7% against a
+    // control of -12.5%. Opt in where prefixes are computed by other frontends
+    // and nothing else will ever learn them.
+    bool materialize_routes = false;
     uint32_t max_materialize_tokens = 128;
 
     // Sequence-gap replay (vLLM's optional ROUTER replay socket; per-backend

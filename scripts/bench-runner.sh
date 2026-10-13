@@ -387,14 +387,18 @@ BUILT-IN SUITES:
       is progress; an unchanged consistent regression means verified residency alone
       does not fix the eviction regime and the holder-aware divert (BACKLOG section 27)
       is the next change.
-      17. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --num-prefixes 16 --prefix-max-tokens 4000
-      18. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events  (50-prefix set)
-      Measured 2026-10-13 (verified-cold policy, image a298ad6; 0 evictions, 107-134 cold
-      hits re-prefilled per arm): row 17 +73.0 / -10.3 / +25.7, row 18 +24.6 / +2.1 / +12.5.
-      The prefix-first reps (-10.3, +2.1) sit at or above the stream-off control; every
-      rep where the prefix arm ran SECOND regressed, with 3.4x the materialized routes
-      from the replayed first-arm history. Next: row 17 with --kv-events-materialize off
-      x3 (results doc, resume checklist item 9) before any verdict.
+      17. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --num-prefixes 16 --prefix-max-tokens 4000
+      18. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off  (50-prefix set)
+      Measured 2026-10-13 with materialization ON (verified-cold policy, image a298ad6;
+      0 evictions, 107-134 cold hits re-prefilled per arm): row 17 +73.0 / -10.3 / +25.7,
+      row 18 +24.6 / +2.1 / +12.5. The prefix-first reps (-10.3, +2.1) sat at or above the
+      stream-off control; every rep where the prefix arm ran SECOND regressed, with 3.4x
+      the materialized routes from the replayed first-arm history. The kvmat ablation the
+      same day (row 17, materialization off, x3) read -13.2 / -10.1 / -12.7 (control
+      -12.5) with the replay still applied: materialization was the whole second-arm
+      effect, so it is now off by default and these rows pass --kv-events-materialize off
+      explicitly (identical on an image with the new default). Row 17 verdict: neutral.
+      Row 18 needs its three materialization-off reps (one rep at +2.1 vs +23 stream-off).
 
     kvablate (3 configs x 2 arms x 1 repeat, ~1h25m) — separates the two things the native
       stream does to routing, after kvevents run 1 (2026-10-10, stream live: kv_ops 2.0M)
@@ -414,6 +418,8 @@ BUILT-IN SUITES:
       Reading: row 20 back near -12% with KV ~65% => materialization is the damage; row 21
       alone recovering => the depth defect dominates; row 22 is the configuration the
       kvevents suite should rerun with. One repeat each; promote the winner to x3.
+      (HISTORICAL: these rows measured the pre-2026-10-11 downgrade policy; row 20's
+      question was re-asked under the new policy as the kvmat custom run, see kvevents.)
       Runs on the CURRENT image by design: pass --allow-stale-image, since this checkout's
       src/ is newer than the image (the depth-gate fix) and bench.sh refuses otherwise.
       Measured 2026-10-11: row 20 +163.2% P99 (KV 22.5%, Gini 0.19, 119 verified evictions),
@@ -691,13 +697,13 @@ define_runs() {
     # eviction-regime acceptance row (+22.9/+24.9/+21.7% P99 vs least_loaded on
     # 2026-10-09). Read the first compare's kv_ops counter before trusting any of it.
     add_run kvevents "13B 20u/10m A/B vs least_loaded, fitted set, native KV events" \
-        --compare --baseline-mode least_loaded --kv-events \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off \
         --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 10m --users 20 --max-model-len 8192 \
         --num-prefixes 16 --prefix-max-tokens 4000
 
     add_run kvevents "13B 20u/10m A/B vs least_loaded, 50-prefix set, native KV events" \
-        --compare --baseline-mode least_loaded --kv-events \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off \
         --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 10m --users 20 --max-model-len 8192
 

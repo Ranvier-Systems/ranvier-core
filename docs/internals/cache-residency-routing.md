@@ -180,11 +180,19 @@ what was preserved. Index growth is observable per shard via the
 `router_prefix_hash_index_size` gauge.
 
 Two extensions complete the native mode. **Route materialization**
-(`kv_events.materialize_routes`, default on): `BlockStored` token chains
+(`kv_events.materialize_routes`, default **off** since 2026-10-13): `BlockStored` token chains
 insert `RouteOrigin::PUSH` routes at every covered block boundary, so
 prefixes computed without Ranvier's involvement — engine warm-up, other
 frontends, replay backfill — become routable without waiting for traffic to
-learn them. The trust order is enforced at insertion (locally-learned routes
+learn them. It is off by default because of what that does on a restart in
+front of warm backends: the replayed history materializes a route for every
+prefix head at whichever backend last stored it before placement has seen a
+single request, those routes capture the first requests, and the homes for the
+whole run are set by replay order. On 8×A100 (13B, 20 users, 16 prefixes vs a
+least-loaded router) four such starts regressed P99 by 12–73 points; with
+materialization off and the same replay still applied, three repeats read
+−13.2 / −10.1 / −12.7% against a stream-off control of −12.5%. Turn it on
+where other frontends compute prefixes that nothing else will learn. The trust order is enforced at insertion (locally-learned routes
 are never overwritten; PUSH outranks gossip) and at eviction
 (`evict_lowest_trust()`: REMOTE, then PUSH, then LOCAL). **Replay**
 (per-backend `kv_events_replay_port`): forward sequence gaps recover the
