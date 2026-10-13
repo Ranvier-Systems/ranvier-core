@@ -1516,6 +1516,11 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   off +163%, depth 4096 +77%, both +188%). The driver is the downgrade itself: verified-cold → miss placement
   → re-learn = a home migration per evicted block (~110/arm). Fixed: verified-cold goes to another
   verified holder (hit) or stays home to re-prefill; never re-placed. Rerun kvevents on that image.**
+  **Rerun 10-13 (image a298ad6): storm gone (0 evictions). Clean-start reps: fitted 20u −10.3%
+  (control −12.5%), 50-prefix 20u +2.1% with Gini 0.056 (stream off: +23%, the best this row has
+  read). Second-arm reps regress 12–73 pts with 3.4× materialized routes from the replayed
+  first-arm history → materialize-off ablation ×3 next (results doc item 9). 8B 20u with the
+  reset acked: −21.3% median (was −26.7% carry-over); README updated.**
   **10-11 static check of that policy (branch `claude/festive-thompson-ta0tgj`): freshness proved
   only that the subscription was alive, since heartbeats restore it within 5 s of a RESET over the
   purged index and a node starting against warm vLLMs backfills only the replay buffer; absence

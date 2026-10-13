@@ -366,6 +366,90 @@ prefix count, not popularity). Backlog §27 carries the item with these numbers 
 Archive: `docs/benchmarks/results/2026-10-09-saturation/`; raw run directories on the v2.2.0
 release as `ranvier-benchmark-runs-2026-10-09.tar.gz`.
 
+## Native KV-event suite and the 8B reset row (measured 2026-10-13)
+
+**Question.** With the verified-cold policy of 2026-10-11 (a hit whose home verifiably evicted
+the prefix goes to another verified holder or stays home; never re-placed) and the completeness
+rule that followed it, does the native vLLM KV-event stream earn its place on the two rows that
+matter: the fitted 13B 20u row (control −12.5% P99 vs least-loaded, stream off) and the 50-prefix
+13B 20u row (+23% vs least-loaded, stream off)? And with the between-arm KV reset finally
+acknowledged on the 8B row, how much of its −27% was the carry-over cache?
+
+**Method.** `bench-runner.sh --suite kvevents` then `--suite kvreset`, fresh 8×A100 instance,
+published image built from `a298ad6`. Every arm of the kvevents suite: `kv_ops` 0.5–2.7 M,
+`stream_resets` 0, `stream_completes` 20–24 of 24, `absence_untrusted` 0, `verified_evictions` 0,
+`holder_redirects` 0 (one home per prefix, so no second holder ever exists on this workload),
+`verified_cold_honored` 107–134 per prefix arm (the home re-prefilled instead of migrating),
+`verified_hits` 384–463. Zero incompletes on the fitted row; 1.2–2.1% timeouts on the 50-prefix
+row in both arms, as always.
+
+| Row, vs least-loaded | Prefix arm ran | P99 TTFT | P50 | KV hit (LL → prefix) | Consistency | Gini | Diverts | Routes materialized | Prefix-arm `kv_ops` |
+|---|---|---|---|---|---|---|---|---|---|
+| **Fitted 20u**, control (stream off, 10-10, 3 reps) | both | −13.2 / −12.5 / −7.1% | −27% | 20 → 61–68% | 53% | 0.08–0.10 | 22–23% | 0 | 0 |
+| Fitted 20u, run 1 | second | **+73.0%** | −21.7% | 20 → 34.9% | 38.5% | 0.194 | 36.8% | 83,790 | 1.93 M |
+| Fitted 20u, run 2 | **first** | **−10.3%** | −27.2% | 20 → 64.7% | 51.6% | 0.103 | 23.2% | 24,828 | 0.48 M |
+| Fitted 20u, run 3 | second | **+25.7%** | −24.6% | 20 → 43.6% | 38.4% | 0.200 | 34.3% | 83,481 | 1.84 M |
+| **50-prefix 20u**, stream off (10-09, 3 reps) | both | +22.9 / +24.9 / +21.7% | −9…−16% | 7 → 23–32% | 45–48% | 0.09–0.17 | 22–23% | 0 | 0 |
+| 50-prefix 20u, run 4 | second | +24.6% | −13.4% | 6.2 → 14.1% | 44.9% | 0.144 | 30.0% | 89,508 | 1.98 M |
+| 50-prefix 20u, run 5 | **first** | **+2.1%** | −21.8% | 8.7 → 28.0% | 52.3% | **0.056** | 22.7% | 36,804 | 0.78 M |
+| 50-prefix 20u, run 6 | second | +12.5% | −21.6% | 4.5 → 17.5% | 45.2% | 0.151 | 28.9% | 88,944 | 1.96 M |
+
+**Reading.** Three things, in order of certainty.
+
+1. **The migration storm is gone.** No verified eviction was ever turned into a re-placement
+   (`verified_evictions` 0, residency downgrades 0), the home re-prefilled 107–134 times per
+   arm, and no arm fell anywhere near the +77…+188% of the first contact. The 2026-10-11 policy
+   did what it was built for.
+2. **On a clean start the stream is neutral on the fitted row and turns the eviction-regime
+   row from a consistent regression into parity.** The two prefix-first reps, where the prefix
+   arm ran against publishers that had just started, read −10.3% on the fitted row (the control
+   to the decimal: KV 65%, Gini 0.10, diverts 23%) and **+2.1% on the 50-prefix row**, where the
+   stream-off measurement was +22.9 / +24.9 / +21.7%. That rep also has P50 −21.8%, throughput
+   +4.6%, equal timeouts in both arms, and a per-backend Gini of 0.056, the flattest prefix arm
+   measured on any row of the campaign (stream off: 0.09–0.17). In the eviction regime the
+   stream's exact knowledge that the home has evicted the prefix, combined with the home
+   re-prefilling rather than the request queueing behind a stale hit, stops the hits piling up
+   on a few backends. One rep each; not yet citable on its own.
+3. **Every rep where the prefix arm ran second regressed, by 12 to 73 points.** The four
+   second-arm reps share one signature: 3.4× the materialized routes (83–90 k vs 25–37 k), 2.5–4×
+   the `kv_ops` (1.8–2.0 M vs 0.5–0.8 M), diverts at 29–37% instead of 23%, Gini 0.14–0.20.
+   On the second arm the connect-backfill replays the first arm's history from the publishers'
+   buffers, materializing routes for every prefix head at whichever backend last stored it
+   before the replayed cache-clear purges them; the warm-up runs while that replay is still
+   being applied, so the first real requests hit those routes and are learned at full depth on
+   the backends the first arm's random history picked. The clear removes only the materialized
+   routes, not the learned ones, and the homes for the whole run are set by replay order rather
+   than least-loaded placement. This is the working explanation, not a measured one. It would
+   also apply to a Ranvier restart in front of warm backends in production, which is why it is
+   not dismissed as a benchmark artefact. The ablation that tests it is row 17 with
+   `--kv-events-materialize off`, three reps alternating order (resume checklist item 9).
+
+**Verdict against the pre-registered reading.** Row 17 "must not regress": it does not on a
+clean start and does on a replayed one, so the reading is deferred to the ablation rather than
+called either way. Row 18: the one clean rep is parity, the best this row has ever read; it
+needs two more clean reps before the README carries it. Until the ablation lands, the native
+stream stays opt-in and the shipping defaults are unchanged.
+
+### The 8B 20u row with the KV reset acknowledged (`--suite kvreset`)
+
+The between-arm `/reset_prefix_cache` was added for this row on 2026-10-06, when the prefix-first
+repeat read 9 points weaker because round-robin inherited the prefix arm's warm cache, and had
+never run on it with vLLM acknowledging. Three repeats, both arm orders, `backends acked: 8/8` on
+every arm, zero incompletes:
+
+| 8B 20u vs round-robin | Order | P99 TTFT | KV hit | P50 | Throughput | Prefix Gini |
+|---|---|---|---|---|---|---|
+| 2026-10-06 matrix, carry-over KV | rr / prefix / rr | −26.7 / −17.7 / −27.1% (median −26.7) | 72–76 → 93–97% | −1% | +1–2% | 0.10–0.14 |
+| **2026-10-13, reset acked** | rr / prefix / rr | **−23.7 / −19.4 / −21.3% (median −21.3; 3/3 improved)** | 72–74 → 93% | −0.4…−0.9% | +1.5…+2.2% | 0.106–0.136 |
+
+The order gap shrank from 9 points to 4 (rr-first 21.3–23.7 vs prefix-first 19.4), and the two
+round-robin arms now agree across orders (885–903 ms P99), which is what a clean start looks
+like. The row's citable number moves from −26.7% to **−21.3%**: about a fifth of the earlier
+figure was the carry-over cache. KV hit rate, P50 and throughput are unchanged by the reset, as
+expected on a fleet that is cache-warm under either policy. README updated.
+
+Archive: `results/2026-10-13-kvevents/`, `results/2026-10-13-kvreset/`.
+
 ## Representative-workload re-baseline (measured 2026-10-01, fixed tooling, previous defaults)
 
 **Prefix-aware routing's P99 effect depends on whether the backends' KV cache can hold the hot
@@ -540,6 +624,8 @@ before termination after all): summaries in this tree, raw data as a release ass
 | Fitted suite under 2.2.0 defaults, incl. new 30u row (2026-10-06/07) | `results/2026-10-07-fitted-2.2.0/` |
 | Baseline suite: prefix vs least-loaded (2026-10-08) | `results/2026-10-08-baseline-least-loaded/` |
 | Saturation suite: ε 0.5 / 0.25 vs least-loaded at 30u, 50-prefix 20u vs least-loaded (2026-10-09) | `results/2026-10-09-saturation/` |
+| Native KV-event suite on the verified-cold policy: fitted 20u + 50-prefix 20u vs least-loaded, ×3 (2026-10-13) | `results/2026-10-13-kvevents/` |
+| 8B 20u vs round-robin with the between-arm KV reset acknowledged, ×3 (2026-10-13) | `results/2026-10-13-kvreset/` |
 | Native KV events, first contact: 3 stream-off control reps + the first live-stream run (2026-10-10) | `results/2026-10-10-kvevents-first-contact/` (compare files only; raw dirs lost with the instance) |
 | kvablate: materialize off / depth 4096 / both vs least-loaded, ×1 (2026-10-11) | `results/2026-10-11-kvablate/` (compare files only) |
 
@@ -998,12 +1084,29 @@ nothing to do.
    live run 1) and `results/2026-10-11-kvablate/`. Compare files only: the instance was
    terminated before `bench-archive.sh` ran, so the manifests, aggregates and Prometheus dumps
    of both runs are lost; the compare files were reconstructed verbatim from the session.
-8. Same session, after 7: `bench-runner.sh --suite kvreset --output-dir benchmark-reports-kvreset`
-   (~1h15m): the 8B 20u row with the between-arm KV reset acknowledged, which the reset was
-   built for and has never had (404 on 10-08; 13B rows only on 10-09). Expected: the rr-first
-   and prefix-first repeats converge on the −27% median; the compare header must read
-   `backends acked: 8/8` for both arms. If the order effect persists with the reset acked,
-   it was never the vLLM cache and the 8B row's write-up changes.
+   *Measured 2026-10-13 on the policy image:* see "Native KV-event suite" above. Storm gone
+   (0 evictions, 107–134 cold-honored per arm); clean-start reps −10.3% (fitted) and +2.1%
+   (50-prefix, was +23%); every second-arm rep regressed 12–73 points with 3.4× the
+   materialized routes from the replayed first-arm history. Verdict deferred to item 9.
+8. ~~Same session, after 7: `bench-runner.sh --suite kvreset`.~~ Done 2026-10-13: −23.7 /
+   −19.4 / −21.3% (median −21.3, 3/3) with `8/8` acked on every arm; the order gap fell from 9
+   points to 4 and the row's number moves from −26.7% to −21.3%. README updated.
+9. Next GPU session, first thing, on the published image (no rebuild): row 17 with route
+   materialization off, three reps alternating order, the custom file below. Pre-registered
+   reading: if both rr-first reps land within 5 points of −12.5% with KV above 60%, the
+   replayed-history materialization is the second-arm regression and `materialize_routes`
+   defaults to off (or materialization skips replayed history); the kvevents suite is then
+   rerun ×3 with that default and row 18's parity rep gets its two companions. If the
+   rr-first reps still regress while prefix-first stays at the control, the replay itself is
+   the problem and the fix is to not backfill history older than the last cache clear.
+   ```
+   cat > kvmat.runs <<'EOF'
+   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192 --num-prefixes 16 --prefix-max-tokens 4000 --order rr-first
+   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192 --num-prefixes 16 --prefix-max-tokens 4000 --order prefix-first
+   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192 --num-prefixes 16 --prefix-max-tokens 4000 --order rr-first
+   EOF
+   ./scripts/bench-runner.sh --suite custom --file kvmat.runs --output-dir benchmark-reports-kvmat
+   ```
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 

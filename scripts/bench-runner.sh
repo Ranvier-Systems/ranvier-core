@@ -389,6 +389,12 @@ BUILT-IN SUITES:
       is the next change.
       17. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --num-prefixes 16 --prefix-max-tokens 4000
       18. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events  (50-prefix set)
+      Measured 2026-10-13 (verified-cold policy, image a298ad6; 0 evictions, 107-134 cold
+      hits re-prefilled per arm): row 17 +73.0 / -10.3 / +25.7, row 18 +24.6 / +2.1 / +12.5.
+      The prefix-first reps (-10.3, +2.1) sit at or above the stream-off control; every
+      rep where the prefix arm ran SECOND regressed, with 3.4x the materialized routes
+      from the replayed first-arm history. Next: row 17 with --kv-events-materialize off
+      x3 (results doc, resume checklist item 9) before any verdict.
 
     kvablate (3 configs x 2 arms x 1 repeat, ~1h25m) — separates the two things the native
       stream does to routing, after kvevents run 1 (2026-10-10, stream live: kv_ops 2.0M)
@@ -424,6 +430,8 @@ BUILT-IN SUITES:
       2026-10-09. Expected: rr-first and prefix-first repeats converge on the -27% median
       and the compare header reads "backends acked: 8/8" for both arms.
       19. 8B 20 users 10m    --compare  (50-prefix set; matrix row 1 with the reset working)
+      Measured 2026-10-13, 8/8 acked every arm: -23.7 / -19.4 / -21.3 (median -21.3, 3/3);
+      the order gap fell from 9 points to 4 and the row's number moves from -26.7 to -21.3.
 
     all = rebaseline + epsilon + fitted + placement + baseline + saturation + kvevents +
       kvablate + kvreset + low (every suite; the historical epsilon and placement rows

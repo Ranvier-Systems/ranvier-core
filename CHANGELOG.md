@@ -53,6 +53,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and KV; the pre-registered reading is in the suite's help text and the results doc.
 
 ### Documentation
+- Native KV-event suite measured on the verified-cold policy (2026-10-13, image `a298ad6`): the
+  migration storm is gone (0 verified evictions, 107–134 cold hits re-prefilled on their home per
+  arm); with the prefix arm starting against freshly started publishers the stream reads −10.3%
+  P99 vs least-loaded on the fitted 13B 20u row (the stream-off control is −12.5%) and **+2.1%**
+  on the 50-prefix 13B 20u row where stream-off is a consistent +23%, with a per-backend Gini of
+  0.056; every rep where the prefix arm ran second regressed 12–73 points with 3.4× the
+  materialized routes from the replayed first-arm history. Verdict deferred to a
+  materialization-off ablation (results doc, resume checklist item 9); the stream stays opt-in.
+  The 8B 20u row re-measured with the between-arm KV reset acknowledged on every arm: −23.7 /
+  −19.4 / −21.3% P99 vs round-robin (median −21.3%, 3/3) against −26.7% with the cache carried
+  over; README and results doc carry the reset figure.
 - Baseline suite measured (2026-10-08): prefix routing vs the new `least_loaded` mode on the
   fitted 13B 20u and 30u rows, three repeats each. Least-loaded alone removes most of the P99
   tail against round-robin (−50% / −41%); prefix adds P50 −27…−29%, throughput +6…+9% and a

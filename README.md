@@ -1,6 +1,6 @@
 # Ranvier Core
 
-> **Prefix-aware routing for self-hosted LLM fleets, in C++20 on Seastar.** Ranvier sends requests that share a prompt prefix to the backend that already holds it in KV cache, and diverts only when a backend is genuinely queued. On an 8×A100 fleet that raises vLLM's prefix-cache hit rate three to five times, cuts median time-to-first-token by 27–29% on CodeLlama-13B and serves 6–15% more requests; against round-robin it also cuts P99 by 27% on Llama-3.1-8B and 21–57% on CodeLlama-13B, though a live least-loaded router without affinity gets most of that tail reduction on its own. Every number, and the campaign that produced it: [Benchmark Results](#benchmark-results).
+> **Prefix-aware routing for self-hosted LLM fleets, in C++20 on Seastar.** Ranvier sends requests that share a prompt prefix to the backend that already holds it in KV cache, and diverts only when a backend is genuinely queued. On an 8×A100 fleet that raises vLLM's prefix-cache hit rate three to five times, cuts median time-to-first-token by 27–29% on CodeLlama-13B and serves 6–15% more requests; against round-robin it also cuts P99 by 21% on Llama-3.1-8B and 21–57% on CodeLlama-13B, though a live least-loaded router without affinity gets most of that tail reduction on its own. Every number, and the campaign that produced it: [Benchmark Results](#benchmark-results).
 >
 > *Named for the Nodes of Ranvier—enabling signals to jump gaps, just as Ranvier enables inference to skip redundant computation.*
 
@@ -62,7 +62,7 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 | **Radix Tree Lookup** | < 50μs | Pure routing decision, O(L) in prefix length; component micro-benchmark (`make bench-hot-prefix`) |
 | **Per-request Routing Decision** | ~0.2 ms P50, ~10 ms P99 | Router-side time including tokenization (the P99 is boundary-detection tokenization); Prometheus histogram estimates from the October 2026 13B fitted suite, the same at 10 and 20 users ([raw compare files](docs/benchmarks/results/2026-10-02-fitted/)) |
 | **KV-cache hit rate vs round-robin** | 72% → 96% (8B); 7% → 26% (13B, 50-prefix set); 12% → 70% (13B, fitted set) | vLLM's own prefix-cache counter, token-level, median of three repeats |
-| **P99 TTFT vs round-robin** | −27% (8B) · −21% (13B, 20 users) · −39% (13B, 10 users) · −57% (13B, 20 users, fitted set) · −42% and +15% throughput (13B, 30 users, fitted set) | Median of three repeats, both arm orders; every repeat of every row improved. Earlier campaigns regressed the 13B rows; the diagnosis and every intermediate run are in [Benchmark Results](#benchmark-results) |
+| **P99 TTFT vs round-robin** | −21% (8B) · −21% (13B, 20 users) · −39% (13B, 10 users) · −57% (13B, 20 users, fitted set) · −42% and +15% throughput (13B, 30 users, fitted set) | Median of three repeats, both arm orders; every repeat of every row improved. Earlier campaigns regressed the 13B rows; the diagnosis and every intermediate run are in [Benchmark Results](#benchmark-results) |
 | **vs a least-loaded router (no affinity)** | P50 −27 to −29% · throughput +6 to +9% · KV hit 3–4× · P99 −15% at 20 users, no reliable change at 30 users; **P99 +23%** where the fleet's cache cannot hold the prefix set (13B, 50-prefix set, 20 users), with P50 −9 to −16% and KV hit 3–5× | The no-affinity control (13B, three repeats each). Least-loaded alone removes most of the P99 tail against round-robin; what affinity adds is the prefill saved on every hit and the capacity it frees. In the eviction regime it loses the tail to a load balancer |
 
 Figures from the superseded February and July 2026 campaigns (such as "58–98% cache hit rate", "~7 ms P50 overhead", "~2–16 ms overhead" and "+29% P99 at low load") are no longer quoted here; see [Benchmark Results](#benchmark-results) for why.
@@ -84,7 +84,7 @@ Under the previous defaults (next section) CodeLlama-13B regressed at 20 users i
 
 | Model, load (50-prefix set) | KV hit rate, round-robin → prefix | P99 TTFT vs round-robin | P50 TTFT | Throughput | Repeats |
 |---|---|---|---|---|---|
-| Llama-3.1-8B, 20 users | 72–76% → 93–97% | **−26.7%** median (−26.7, −17.7, −27.1) | −1% | +1–2% | 3, both arm orders |
+| Llama-3.1-8B, 20 users | 72–74% → 93% | **−21.3%** median (−23.7, −19.4, −21.3), vLLM's cache reset before each arm (Oct 13); the Oct 6 run with the cache carried over read −26.7% (−26.7, −17.7, −27.1), the gap being round-robin inheriting the prefix arm's warm cache | −1% | +2% | 3, both arm orders |
 | CodeLlama-13B, 30 users, 30 min (eviction regime) | 5–6% → 17–21% | **−14.1%** median (−14.1, −17.9, −13.1), P99 of completed requests; 1.3–1.8% timeouts in both arms | −18 to −22% | +5–6% | 3, both arm orders |
 | CodeLlama-13B, 20 users | 6–8% → 23–29% | **−21.0%** median (−18.4, −27.9, −21.0) | −18 to −24% | +5–7% | 3, both arm orders |
 | CodeLlama-13B, 10 users | 6–8% → 26–41% | **−38.8%** median (−38.8, −46.8, −36.8) | −7 to −11% | +1–4% | 3, both arm orders |
