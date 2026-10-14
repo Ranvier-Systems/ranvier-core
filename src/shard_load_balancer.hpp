@@ -69,7 +69,7 @@ class ShardLoadBalancer {
 public:
     explicit ShardLoadBalancer(ShardLoadBalancerConfig config = {})
         : _config(config)
-        , _shard_count(seastar::smp::shard_count())
+        , _shard_count(seastar::this_smp_shard_count())
         , _rng(std::random_device{}() + seastar::this_shard_id())
         , _local_dispatches(0)
         , _cross_shard_dispatches(0)

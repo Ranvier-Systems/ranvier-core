@@ -3370,7 +3370,7 @@ uint32_t HttpController::select_target_shard() {
     uint32_t local_shard = seastar::this_shard_id();
 
     // Fast path: load balancing disabled or single shard
-    if (!_lb_config.enabled || !_load_balancer || seastar::smp::shard_count() <= 1) {
+    if (!_lb_config.enabled || !_load_balancer || seastar::this_smp_shard_count() <= 1) {
         return local_shard;
     }
 

@@ -350,10 +350,10 @@ seastar::future<> TelemetryService::emit_async() {
     // into shard-0-local storage. The foreign_ptrs' destructors at scope
     // end return their unique_ptrs to the home shards for free.
     using ForeignSnap = seastar::foreign_ptr<std::unique_ptr<ShardSnapshot>>;
-    std::vector<ForeignSnap> per_shard(seastar::smp::shard_count());
+    std::vector<ForeignSnap> per_shard(seastar::this_smp_shard_count());
 
     co_await seastar::parallel_for_each(
-        boost::irange(0u, seastar::smp::shard_count()),
+        boost::irange(0u, seastar::this_smp_shard_count()),
         [this, &per_shard](unsigned shard_id) {
             return _container->invoke_on(shard_id, [](TelemetryService& s) {
                 return seastar::make_foreign(

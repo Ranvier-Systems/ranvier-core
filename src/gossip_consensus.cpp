@@ -337,7 +337,7 @@ void GossipConsensus::broadcast_prune(BackendId b_id) {
     }
 
     (void)seastar::parallel_for_each(
-        boost::irange<unsigned>(0, seastar::smp::shard_count()),
+        boost::irange<unsigned>(0, seastar::this_smp_shard_count()),
         [b_id](unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [b_id] {
                 if (s_local_prune_callback) {
