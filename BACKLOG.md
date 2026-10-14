@@ -38,6 +38,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 25. [Benchmark Tooling P0 — Re-anchor the Truth (2026-07-06)](#25-benchmark-tooling-p0--re-anchor-the-truth-2026-07-06)
 26. [Kimi (Moonshot) Model Support (2026-07-18)](#26-kimi-moonshot-model-support-2026-07-18)
 27. [Strategic Assessment (2026-10-02)](#27-strategic-assessment-2026-10-02)
+28. [Hot-Prefix Replication by Diversion (2026-10-14)](#28-hot-prefix-replication-by-diversion-2026-10-14)
 
 ---
 
@@ -1580,7 +1581,7 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   workload has one holder per prefix; row 18 read +23.1 / +14.7 / +18.9 with exact residency.
   The second half, replicating a hot single-holder prefix, is therefore the whole remaining item:
   the divert target has to be created before any divert policy can use it. Record: "Row 18 with
-  materialization off" in the results doc.
+  materialization off" in the results doc. **Plan: §28 below.**
 - [ ] **[LOW] KV-event subscriber: a duplicate live frame after a connect-backfill resets the
   backend.** The SUB socket connects before the backfill, so a batch published during the replay
   window arrives twice; the live loop treats any sequence below the expected one as a publisher
@@ -1620,6 +1621,257 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
 - [ ] **[STRATEGIC] Reframe the public claim** in README/docs once `fitted` lands: "prefix routing
   cuts P99 when the fleet's KV cache can hold its share of the hot set, and Ranvier tells you
   which regime you are in."
+
+## 28. Hot-Prefix Replication by Diversion (2026-10-14)
+
+Plan for the remaining half of the §27 holder-aware divert item. Written after row 18 of the
+native KV-event suite read +23.1 / +14.7 / +18.9% P99 against least-loaded with exact residency
+(`docs/benchmarks/benchmark-results-current.md`, "Row 18 with materialization off"). Steps are
+atomic and ordered; each has a done criterion. No implementation code here: `/implement` per step.
+
+### Why this and not a knob
+
+**What row 18 measured.** With the stream on, 25% of the prefix arm's requests were load diverts
+(`load_aware_fallbacks_total` 806–831 of ~3,250), every one of them an over-cap ART hit sent to
+the least-loaded *stranger* by the BOUNDED_LOAD spillover (`route_scorer.hpp` dispatch tie order:
+clean placement winner, cost pressure, load, probe rank, id). Each stranger prefilled the prefix,
+so vLLM stored its blocks and `BlockStored` upserted `(hash, stranger)` into `prefix_hash_index`:
+**the diverts were already creating replicas.** Yet `holder_redirects` was 0 in 376 verified-cold
+decisions, so by the time the home had evicted a prefix no other backend verifiably held it. The
+replicas evaporated: the overflow of one prefix was sprayed over seven strangers, each saw it once
+or twice, and in a fleet whose cache cannot hold the set a block touched once is the first block
+LRU drops. The next over-cap hit paid a fresh prefill somewhere else. A quarter of the traffic was
+spent building replicas that nothing ever read.
+
+**The mechanism.** Make the divert *holder-aware and sticky*, so one prefix's overflow goes to one
+replica, which both uses it and keeps it warm:
+
+1. **Verified-holder dispatch.** When the anchor forfeits its allowance, an under-allowance
+   candidate that the native index shows holding the request's prefix (fresh stream, within
+   `kv_native_indexed_depth`) outranks every stranger. A verified holder is a hit, not a miss; the
+   divert stops costing a prefill once a replica exists.
+2. **Deterministic replica designation.** When the anchor forfeits and no verified holder is under
+   allowance, the spillover target is the first *probe-order* under-allowance eligible candidate
+   (`jump_consistent_hash(prefix_hash + k, n)`, k ascending, skipping the anchor) instead of the
+   coldest. Same hash, same sorted live set (`get_live_backends()` sorts by id), so every shard on
+   every node sends this prefix's overflow to the same backend without any shared state; the
+   stream then confirms it as a holder and rule 1 takes over. This is NOT the pre-2026-10-02
+   "first-under-cap" rule that stranded the coldest backend: that rule chose the target for every
+   divert of every prefix; this one chooses only where a prefix's *first* replica is born, and only
+   while no replica exists.
+3. **Holder cap.** `routing.replication.max_holders` (anchor included). Below the cap, overflow
+   with every holder over allowance may designate a new replica (rule 2). At the cap, the dispatch
+   set is narrowed to the verified holders and the scorer picks the least-loaded one, over
+   allowance or not: at saturation a queued hit on a warm backend beat a cold prefill on a cold
+   one on every ε of the saturation suite (§27 running record, 2026-10-09), so the cap turns the
+   divert off for a hot prefix once its replicas exist instead of minting a third.
+
+Learning never moves: dispatch diverts leave `original_selected` (the placement winner) at the
+home, and `http_controller.cpp` learns from `original_selected` (eager learn at the route decision
+and the first-byte learn via `ctx->learn_target_backend`), so a replica is a dispatch target, not
+a second home. The home migrates only through the existing verified-cold path (home evicted,
+another fresh holder takes the route), which with replicas present will finally have a target.
+
+**What this needs and what it risks.** It needs the native stream (`kv_events.enabled`): without
+verified holders rule 1 has nothing to read and rule 3 nothing to count, and rule 2 alone is a
+consistency change that cannot be confirmed. This is the first routing decision the stream
+changes, which is also the first thing that would justify defaulting it on. The risk is the
+hypothesis itself: a replica is a second copy of a 2,000–4,000-token prefix in a fleet whose
+cache already cannot hold one copy of the set. Replication trades KV capacity for queueing; it
+can lose that trade, and the pre-registered reading below says what losing looks like. Expect the
+KV hit rate to move, in either direction, and read it before P99.
+
+### Decisions taken here (change them before Step 1 if you disagree)
+
+- **No hotness gate in v1.** Designation applies to any over-cap hit with no verified holder. On
+  the benchmark workloads every prefix is hot; a gate (the routing path already touches a
+  Space-Saving `StreamSummary` when telemetry tracking is on, `router_service.cpp` ~3541) is
+  Step 9 and runs only if row 17 regresses, since the fitted row is where spraying vs. designating
+  would show.
+- **Default `max_holders = 0` (off)** until measured, the same discipline as the stream and
+  materialization. Flipping the default is Step 8's outcome, not a step.
+- **At the cap, stay on the least-loaded holder** rather than mint a third replica.
+- **Scorer gets a tie key, not a weight.** `prefix_weight` defaults to 0.0, so affinity is inert
+  and stickiness lives in the dispatch tie order; a verified holder must win in that order, not
+  through a weight an operator has to tune. A `holder_rank` tie key (verified holder, then
+  designated replica, then everyone else) slots in after the clean-placement-winner preference and
+  before cost pressure and load. Placement score and placement tie order are untouched, so a
+  holder never becomes the placement winner and never gets learned as the home.
+
+### Prerequisites
+
+- [ ] Branch restarted from `main` after PR 674 (done 2026-10-14; `claude/sleepy-lamport-wxly0b`).
+- [x] `ctx->learn_target_backend` is assigned from `learn_target` (= `original_selected`,
+      `http_controller.cpp` ~2244) and re-pointed only on connect failover to the backend that
+      actually served (~829), never to a load-divert target. A replica is therefore a dispatch
+      target and never a learned home (verified 2026-10-14, static read).
+
+### Implementation Steps
+
+#### Step 1: `holder_rank` dispatch tie key in the scorer
+- **Files:** `src/route_scorer.hpp`, `tests/unit/route_scorer_test.cpp`
+- **Description:** Add `uint8_t holder_rank = 2` to `ScoreCandidate` (0 = verified holder,
+  1 = designated replica, 2 = none; the anchor keeps 2 and is governed by the clean-placement
+  key as today). In `score_and_select`'s dispatch tie chain insert `lower holder_rank wins`
+  immediately after the `placement_clean` preference and before `cost_pressure`. Update the tie
+  order comments at the top of the function and on `probe_rank`. Placement argmax unchanged.
+- **Tests:** anchor over allowance with one holder (rank 0) and colder strangers → holder wins;
+  anchor under allowance (clean) → anchor wins over a rank-0 holder; rank 1 beats rank 2 at equal
+  load, loses to rank 0 at higher load; holder_rank never changes `decision.placement`;
+  `load_diverted` still set when dispatch leaves the placement.
+- **Concerns:** None Seastar-related (pure header). Keep `ScoreCandidate` trivially copyable.
+- **Status:** [ ] Pending
+
+#### Step 2: `routing.replication.max_holders` config
+- **Files:** `src/config_schema.hpp` (RoutingConfig), `src/config_loader.cpp` (env
+  `RANVIER_REPLICATION_MAX_HOLDERS`, YAML `routing.replication.max_holders`, validation
+  0 ≤ v ≤ 64, startup log line), `src/router_service.cpp` (both config-apply sites, the blocks
+  that copy `cfg.miss_placement` ~697 and ~754, so hot reload carries it), `tests/unit/config_test.cpp`
+- **Description:** `uint32_t replication_max_holders = 0;` with a measured-rationale comment in the
+  style of `bounded_load_epsilon` and `materialize_routes`. 0 = off (rules 1–3 inert, byte-for-byte
+  today's dispatch). 1 = holder-aware dispatch only (rule 1; never designate; the anchor is the one
+  holder). ≥ 2 = full mechanism.
+- **Tests:** env + YAML parse, env wins over YAML, 65 rejected with the message, default 0.
+- **Concerns:** Hard Rule #10 (validating parse via `get_env_as`). Hot-reloadable like the other
+  routing knobs (shard-local config copy, Rule #1).
+- **Status:** [ ] Pending
+
+#### Step 3: Verified-holder dispatch (rule 1)
+- **Depends on:** Steps 1, 2
+- **Files:** `src/router_service.cpp` (the BOUNDED_LOAD spillover block ~3788, which already
+  hashes `prefix_hash` when the anchor forfeits; `ShardLocalState` helper; stats + metric
+  registration in the `make_counter` block ~2099–2310), `src/router_service.hpp`
+  (`NativeKvStatsSnapshot` or a sibling snapshot for the new stats), `tests/unit/router_service_test.cpp`
+- **Description:** Factor the verified-cold holder loop (~3318–3352: live, role-eligible,
+  `native_residency_fresh(cand)`, index contains `(hash, cand)`) into one shard-local helper
+  `verified_holders_of(hash, live_backends, exclude)` returning ids into a caller-provided
+  bounded buffer, and use it from both the verified-cold path and the spillover block. In the
+  spillover block, when `replication_max_holders ≥ 1` and `prefix_len ≤ kv_native_indexed_depth`,
+  mark each under-allowance verified holder `holder_rank = 0`. New stat/metric
+  `router_replica_dispatches_total` (dispatch landed on a rank-0 holder that is not the anchor);
+  log line at debug. Nothing else changes: with no holder the existing least-loaded spillover runs.
+- **Tests:** anchor over cap, backend 2 a fresh verified holder of the hash at higher load than
+  stranger 3 → dispatch 2, `cache_hit` true, `original_selected` 1, counter 1; same with backend 2
+  not fresh → dispatch 3 (today's behaviour), counter 0; `max_holders = 0` → dispatch 3; depth
+  beyond `kv_native_indexed_depth` → dispatch 3 and `native_verified_depth_skips` unchanged
+  (the hit path's own skip counter must not double count); existing holder-redirect tests
+  (`NativeVerifiedColdRedirectsToVerifiedHolder` and kin) still pass against the shared helper.
+- **Concerns:** Rule #1 lock-free (all reads shard-local); Rule #4/#17 loops bounded by the live
+  set (≤ 64) and the per-hash holder set (bounded by `MAX_ENTRIES_PER_BACKEND` × backends in the
+  index). No cross-shard call: `prefix_hash_index` is per-shard and already fed by the subscriber.
+  Hash computed once per forfeiting hit, the cost the spillover block already pays.
+- **Status:** [ ] Pending
+
+#### Step 4: Deterministic replica designation and the holder cap (rules 2 and 3)
+- **Depends on:** Step 3
+- **Files:** `src/router_service.cpp` (same spillover block), `tests/unit/router_service_test.cpp`
+- **Description:** In the spillover block, with `replication_max_holders ≥ 2`: count holders =
+  anchor + verified holders (any load). If no verified holder is under allowance and
+  holders < cap, walk `jump_consistent_hash(prefix_hash + k, n)` for k = 0..n−1 over
+  `dispatch_ids` and give the first under-allowance, role-eligible, non-anchor, non-holder
+  candidate `holder_rank = 1` (`router_replica_designations_total`); if the probe sequence
+  reaches none, fall through to least-loaded (today). If holders ≥ cap and every holder is over
+  allowance, rebuild `scored` from the holders only (anchor included) so `score_and_select` picks
+  the least-loaded holder (`router_replica_holders_saturated_total`); `load_diverted` stays true
+  when dispatch leaves the anchor. Debug log names the rule that fired.
+- **Tests:** designation is the probe-order candidate, not the coldest stranger, and identical
+  across two fixtures with the same live set and hash (cluster consistency); the designated
+  candidate changes when the probe-first one is over allowance; at the cap with every holder over
+  allowance dispatch is the least-loaded holder and no stranger; cap 1 never designates;
+  `original_selected` is the home in every case.
+- **Concerns:** Rule #17: the probe walk is ≤ n ≤ 64 iterations. No new container: designation is
+  stateless by construction (that is the point; a shard-local "replica hint" map was rejected
+  because three nodes × N shards would designate N×3 different replicas). Verify `dispatch_ids`
+  preserves `live_backends`' sorted order so the probe index is cluster-consistent.
+- **Status:** [ ] Pending
+
+#### Step 5: Verified-cold path hands the home to the least-loaded replica
+- **Depends on:** Step 3
+- **Files:** `src/router_service.cpp` (~3318–3352), `tests/unit/router_service_test.cpp`
+- **Description:** Already the behaviour (least-loaded fresh holder becomes the learned home;
+  `native_holder_redirects`). This step is verification only: the shared helper from Step 3 did
+  not change the ordering (load, then lower id) and the honored/redirect counters stay pairwise
+  disjoint per decision (invariant I-8 in the surrounding comments). Add one test: home evicted,
+  two fresh holders at different loads → the lighter one, `original_selected` = it.
+- **Status:** [ ] Pending
+
+#### Step 6: Observability and benchmark plumbing
+- **Depends on:** Steps 3, 4
+- **Files:** `tests/integration/results_parser.py` (`_NATIVE_KEYS`-style key tuple and dataclass
+  fields for `replica_dispatches_total`, `replica_designations_total`,
+  `replica_holders_saturated_total`; the "native KV events" compare rows; manifest field
+  `replication_max_holders`), `scripts/bench.sh` (`--replication N` → `RANVIER_REPLICATION_MAX_HOLDERS`,
+  echoed in the config summary, the "Native KV events" header line gains `replication=N`, manifest
+  line next to `kv_events_materialize`, and a warning when `--replication` ≥ 1 without
+  `--kv-events`), `docker-compose.benchmark-real.yml` (three node blocks: pass
+  `RANVIER_REPLICATION_MAX_HOLDERS=${RANVIER_REPLICATION_MAX_HOLDERS:-0}`), `scripts/bench-runner.sh`
+  (suite `kvrepl`: rows 17 and 18 with `--kv-events --kv-events-materialize off --replication 2`
+  vs `least_loaded`, ×3 alternating order; help text carries the pre-registered reading below),
+  `.dev-context/claude-locust-sync-map.md` (Prometheus table: the three counters, parser only;
+  the hash pipeline is untouched so `locustfile_real.py` needs no change)
+- **Done when:** a compare file from a stream-on run prints the three counters per arm and the
+  header shows `replication=2`; `--replication 2` without `--kv-events` warns in the log and the
+  header.
+- **Status:** [ ] Pending
+
+#### Step 7: Documentation
+- **Depends on:** Steps 1–4
+- **Files:** `docs/internals/cache-residency-routing.md` (new subsection under "Verified residency":
+  replication by diversion, the three rules, the cap, why designation is deterministic, why
+  learning never moves), `docs/internals/prefix-affinity-routing.md` (dispatch tie order and the
+  env/YAML tables), `CHANGELOG.md` (Added, default off), `BACKLOG.md` (this section's checkboxes)
+- **Status:** [ ] Pending
+
+#### Step 8: GPU session and verdict
+- **Depends on:** Steps 6, 7 merged and in the GHCR image
+- **Command:** `./scripts/bench-runner.sh --suite kvrepl --output-dir benchmark-reports-kvrepl`
+  (~2h50m; `--resume 4` for row 18 alone if row 17 must be cut). Archive before terminating.
+- **Read first:** `router_replica_designations_total` > 0 on the prefix arm of the first compare,
+  else designation never fired and the suite measured Step 3 alone; then
+  `router_replica_dispatches_total` > 0, else the stream never confirmed a replica (replicas
+  evaporated faster than overflow reached them) and the mechanism is untested, not refuted.
+- **Pre-registered reading, row 18 (50-prefix 13B 20u vs least-loaded, +23.1/+14.7/+18.9 today):**
+  - CONSISTENT IMPROVEMENT (3/3 negative) with KV hit ≥ 23%: the finding. Flip `max_holders` to 2
+    by default **only** if row 17 also holds; README carries it.
+  - MIXED with `replica_dispatches` ≫ 0 and KV ≥ 23–30%: the mechanism works and capacity does
+    not; next is the cap (try 3) or KV-aware dispatch (§27), not more replication logic.
+  - CONSISTENT REGRESSION with `replica_dispatches` ≈ 0 and designations ≫ 0: replicas do not
+    survive long enough to be read; replication by diversion is refuted on this fleet and the
+    next idea needs a pinned replica (an engine-side keep, out of Ranvier's hands today).
+  - CONSISTENT REGRESSION with `replica_dispatches` ≫ 0 and KV below 23%: replicas evicted the
+    rest of the set; replication costs more cache than it saves in this regime. Stop here; the
+    honest README line is the §27 "which regime you are in" claim.
+- **Row 17 (fitted 20u, control −12.5%):** must not regress (3/3 within a point of the control).
+  If it regresses while row 18 improves, Step 9.
+- **Status:** [ ] Pending
+
+#### Step 9 (conditional): Hotness gate
+- **Only if** Step 8 shows row 17 regressing with replication on.
+- **Files:** `src/router_service.cpp` (a routing-owned `StreamSummary` touched where the hot-prefix
+  telemetry touch already sits ~3541, decayed in `ttl_cleanup_on_shard` rather than by a new timer),
+  `src/config_schema.hpp` (`routing.replication.min_hits_per_window`), tests, docs
+- **Concerns:** Rule #4 (StreamSummary is fixed-capacity, 128 by default); Rule #5 avoided by
+  reusing the TTL sweep instead of a timer; shard-local only.
+- **Status:** [ ] Pending
+
+### Dependencies
+
+```
+1 (scorer) ─┐
+2 (config) ─┴─> 3 (holder dispatch) ─> 4 (designation + cap) ─> 6 (plumbing) ─> 8 (GPU) ─> 9?
+                        └─> 5 (verified-cold check)      └─> 7 (docs) ──┘
+```
+
+Steps 1 and 2 are independent and can land in one PR; 3–5 in a second; 6–7 in a third so the
+image the GPU session pulls carries everything.
+
+### Post-Implementation
+- [ ] `/review` (Hard Rules) on Steps 3–4: the spillover block is the hottest path that changes.
+- [ ] `/doc` after Step 7: unit tests listed above, docs, this section's boxes.
+- [ ] Deferred gates (developer's Docker): `make test-unit` after Steps 1–5;
+      `make lint` before each push; `make test-integration-fast` after Step 6 (the parser and
+      compare-file changes have no unit tests; `tests/integration/test_load_aware_routing.py`
+      covers the divert counters' names).
 
 ---
 
