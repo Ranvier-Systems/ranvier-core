@@ -98,7 +98,7 @@ std::string demangle(const char* mangled) {
 seastar::future<> run_experiment() {
     g_obs.reactor_started.store(true, std::memory_order_release);
 
-    if (seastar::smp::count < 2) {
+    if (seastar::this_smp_shard_count() < 2) {
         // Without a second shard there is no cross-shard `submit_to` to
         // observe; let the gtest assertion surface the misconfiguration.
         return seastar::make_ready_future<>();
@@ -106,7 +106,7 @@ seastar::future<> run_experiment() {
     g_obs.reactor_had_two_shards.store(true, std::memory_order_release);
 
     const unsigned target_shard =
-        (seastar::this_shard_id() + 1) % seastar::smp::count;
+        (seastar::this_shard_id() + 1) % seastar::this_smp_shard_count();
 
     // Mirrors the cross-shard call shape used by
     // `TokenizerService::encode_cached_async` — same return type, same

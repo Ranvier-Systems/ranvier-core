@@ -4,6 +4,7 @@
 #include "cache_event_parser.hpp"
 #include "logging.hpp"
 #include "parse_utils.hpp"
+#include "reactor_shard_count.hpp"
 #include "request_rewriter.hpp"
 #include "request_timeout.hpp"
 #include "response_usage_parser.hpp"
@@ -401,7 +402,6 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
                 [](auto /*req*/, auto rep) {
                     add_cors_headers(*rep);
                     rep->set_status(seastar::http::reply::status_type::no_content);
-                    rep->done();
                     return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
                 });
         };
@@ -3371,7 +3371,7 @@ uint32_t HttpController::select_target_shard() {
     uint32_t local_shard = seastar::this_shard_id();
 
     // Fast path: load balancing disabled or single shard
-    if (!_lb_config.enabled || !_load_balancer || seastar::smp::count <= 1) {
+    if (!_lb_config.enabled || !_load_balancer || ranvier::reactor_shard_count() <= 1) {
         return local_shard;
     }
 
