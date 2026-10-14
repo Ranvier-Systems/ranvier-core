@@ -1,4 +1,5 @@
 #include "tokenizer_service.hpp"
+#include "reactor_shard_count.hpp"
 #include "request_timeout.hpp"
 #include "shard_load_balancer.hpp"
 
@@ -185,7 +186,7 @@ bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
         return false;
     }
 
-    if (seastar::this_smp_shard_count() <= 1) {
+    if (ranvier::reactor_shard_count() <= 1) {
         return false;
     }
 
@@ -199,7 +200,7 @@ bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
 
 uint32_t TokenizerService::select_tokenization_shard() const {
     uint32_t local = seastar::this_shard_id();
-    uint32_t shard_count = seastar::this_smp_shard_count();
+    uint32_t shard_count = ranvier::reactor_shard_count();
 
     if (shard_count <= 1) {
         return local;

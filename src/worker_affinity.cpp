@@ -1,4 +1,5 @@
 #include "worker_affinity.hpp"
+#include "reactor_shard_count.hpp"
 
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
@@ -113,8 +114,8 @@ seastar::future<> initialize_non_reactor_cpuset() {
     // deliberate — startup is already broken if this fails, and silently
     // falling back to M=0 would mask the real problem.
     std::vector<seastar::future<cpu_set_t>> per_shard;
-    per_shard.reserve(seastar::this_smp_shard_count());
-    for (unsigned shard = 0; shard < seastar::this_smp_shard_count(); ++shard) {
+    per_shard.reserve(ranvier::reactor_shard_count());
+    for (unsigned shard = 0; shard < ranvier::reactor_shard_count(); ++shard) {
         per_shard.push_back(seastar::smp::submit_to(shard, []() -> cpu_set_t {
             cpu_set_t local;
             CPU_ZERO(&local);

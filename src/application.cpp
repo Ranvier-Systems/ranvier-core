@@ -8,6 +8,7 @@
 #include "logging.hpp"
 #include "metrics_auth_handler.hpp"
 #include "metrics_service.hpp"
+#include "reactor_shard_count.hpp"
 #include "routing_weights_provider.hpp"
 #include "shard_load_metrics.hpp"
 #include "tracing_service.hpp"
@@ -163,7 +164,7 @@ seastar::future<> Application::init_tokenizer() {
                     });
                 }).then([this] {
                     log_main.info("Tokenizer initialized on {} shards (cache: {}, max_entries: {})",
-                                  seastar::this_smp_shard_count(),
+                                  ranvier::reactor_shard_count(),
                                   _config.assets.tokenization_cache_enabled ? "enabled" : "disabled",
                                   _config.assets.tokenization_cache_size);
                     // Note: _tokenizer_json is kept for thread pool worker initialization
@@ -1048,7 +1049,7 @@ seastar::future<> Application::startup() {
         // This provides lock-free per-core access to configuration
         return _sharded_config.start(ShardedConfig(_config)).then([this] {
             _sharded_config_started = true;
-            log_main.info("Sharded config initialized on {} cores", seastar::this_smp_shard_count());
+            log_main.info("Sharded config initialized on {} cores", ranvier::reactor_shard_count());
         }).then([] {
             // 1b. Compute the non-reactor cpuset by surveying reactor
             // affinities. Used later when spawning the persistence worker
@@ -1131,7 +1132,7 @@ seastar::future<> Application::startup() {
         }).then([this] {
             if (_config.load_balancing.enabled) {
                 log_main.info("Shard load balancer initialized (P2C algorithm, {} shards)",
-                    seastar::this_smp_shard_count());
+                    ranvier::reactor_shard_count());
             } else {
                 log_main.info("Shard load balancer disabled (requests processed locally)");
             }
@@ -1178,7 +1179,7 @@ seastar::future<> Application::startup() {
                 if (pool_cfg.enabled) {
                     log_main.info("Tokenizer thread pool started on {} shards "
                                   "(queue_size={}, min_text={}, max_text={})",
-                                  seastar::this_smp_shard_count(),
+                                  ranvier::reactor_shard_count(),
                                   pool_cfg.max_queue_size,
                                   pool_cfg.min_text_length,
                                   pool_cfg.max_text_length);
@@ -2171,7 +2172,7 @@ seastar::future<> Application::reload_config() {
             return _sharded_config.invoke_on_all([cfg_ref](ShardedConfig& cfg) {
                 cfg.update(cfg_ref);
             }).then([this, &cfg_ref] {
-                log_main.debug("Sharded config updated on all {} cores", seastar::this_smp_shard_count());
+                log_main.debug("Sharded config updated on all {} cores", ranvier::reactor_shard_count());
 
                 // Step 2: Build updated controller config from the new config
                 auto ctrl_config = build_controller_config_from(cfg_ref);
