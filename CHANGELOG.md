@@ -64,6 +64,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The 8B 20u row re-measured with the between-arm KV reset acknowledged on every arm: −23.7 /
   −19.4 / −21.3% P99 vs round-robin (median −21.3%, 3/3) against −26.7% with the cache carried
   over; README and results doc carry the reset figure.
+- Row 18 (50-prefix 13B 20u vs least-loaded) measured 2026-10-14 with the stream on and
+  materialization off, three repeats on image `ee8283a`: **+23.1 / +14.7 / +18.9%** P99 (median
+  +18.9) against +22.9 / +24.9 / +21.7% stream-off, with the same P50 (−18…−20%), KV hit rate
+  (23–30%), timeouts and throughput; `holder_redirects` 0 on every arm (one home per prefix, so
+  a verified-cold hit never had a second holder to go to). The 2026-10-13 +2.1% repeat was
+  measured with materialization on and did not reproduce; it is withdrawn. The native stream is
+  neutral on both rows, stays opt-in, and is closed as a signal question; the eviction regime is
+  a replication question (BACKLOG §27). README, results doc and runner help updated.
 - Baseline suite measured (2026-10-08): prefix routing vs the new `least_loaded` mode on the
   fitted 13B 20u and 30u rows, three repeats each. Least-loaded alone removes most of the P99
   tail against round-robin (−50% / −41%); prefix adds P50 −27…−29%, throughput +6…+9% and a
