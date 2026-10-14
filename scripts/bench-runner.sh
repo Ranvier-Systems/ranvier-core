@@ -398,7 +398,13 @@ BUILT-IN SUITES:
       -12.5) with the replay still applied: materialization was the whole second-arm
       effect, so it is now off by default and these rows pass --kv-events-materialize off
       explicitly (identical on an image with the new default). Row 17 verdict: neutral.
-      Row 18 needs its three materialization-off reps (one rep at +2.1 vs +23 stream-off).
+      Row 18 measured 2026-10-14 with materialization off (image ee8283a, --resume 4, x3):
+      +23.1 / +14.7 / +18.9 against +22.9 / +24.9 / +21.7 stream-off, same P50 / KV /
+      timeouts / throughput; the 10-13 +2.1 rep did not reproduce and is withdrawn.
+      holder_redirects 0 on every arm (one home per prefix, no second holder to go to).
+      Row 18 verdict: neutral; the stream fixes neither row's standing vs least_loaded and
+      is closed as a signal question. The eviction regime is a replication question
+      (BACKLOG section 27). Both rows stay in the suite as the stream-on regression check.
 
     kvablate (3 configs x 2 arms x 1 repeat, ~1h25m) — separates the two things the native
       stream does to routing, after kvevents run 1 (2026-10-10, stream live: kv_ops 2.0M)
@@ -696,6 +702,8 @@ define_runs() {
     # least_loaded without the stream: must not regress); row 18 is the
     # eviction-regime acceptance row (+22.9/+24.9/+21.7% P99 vs least_loaded on
     # 2026-10-09). Read the first compare's kv_ops counter before trusting any of it.
+    # Measured: row 17 -13.2/-10.1/-12.7 (kvmat 2026-10-13), row 18 +23.1/+14.7/+18.9
+    # (2026-10-14), both with materialization off: the stream is neutral on both rows.
     add_run kvevents "13B 20u/10m A/B vs least_loaded, fitted set, native KV events" \
         --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off \
         --model meta-llama/CodeLlama-13b-Instruct-hf \

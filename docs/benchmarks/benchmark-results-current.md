@@ -409,7 +409,10 @@ row in both arms, as always.
    measured on any row of the campaign (stream off: 0.09–0.17). In the eviction regime the
    stream's exact knowledge that the home has evicted the prefix, combined with the home
    re-prefilling rather than the request queueing behind a stale hit, stops the hits piling up
-   on a few backends. One rep each; not yet citable on its own.
+   on a few backends. One rep each; not yet citable on its own. *Resolved 2026-10-14: the
+   50-prefix reading did not reproduce. Three materialization-off repeats read +23.1 / +14.7 /
+   +18.9%, the stream-off level ("Row 18 with materialization off" below); the +2.1% rep is
+   withdrawn, and the fitted-row half of this point stands via the kvmat ablation.*
 3. **Every rep where the prefix arm ran second regressed, by 12 to 73 points.** The four
    second-arm reps share one signature: 3.4× the materialized routes (83–90 k vs 25–37 k), 2.5–4×
    the `kv_ops` (1.8–2.0 M vs 0.5–0.8 M), diverts at 29–37% instead of 23%, Gini 0.14–0.20.
@@ -448,9 +451,51 @@ is 0 (one home per prefix), and `verified_cold_honored` 119–135 per arm cost n
 **Verdict against the pre-registered reading.** Row 17 "must not regress": three clean repeats
 at −13.2 / −10.1 / −12.7% against −12.5%, so it does not; the stream is **neutral** on the fitted
 row. `kv_events.materialize_routes` **defaults to off** from this measurement, on the server, in
-the benchmark compose and in the runner's kvevents rows. Row 18: the one clean rep is parity
-(+2.1%), the best this row has ever read; it needs two more materialization-off repeats before
-the README carries it (item 10). The native stream stays opt-in.
+the benchmark compose and in the runner's kvevents rows. Row 18 was measured the next day under
+this configuration (below). The native stream stays opt-in.
+
+### Row 18 with materialization off (kvevents `--resume 4`, 2026-10-14, image `ee8283a`)
+
+The 50-prefix 13B 20u row vs least-loaded, stream on, `--kv-events-materialize off`, three
+repeats alternating order on a fresh instance (vLLM 0.15.1), KV reset acked 8/8 on every arm.
+Every stream was complete (`stream_completes` 24/24, `stream_resets` 0, `absence_untrusted` 0),
+`verified_evictions` 0, `verified_hits` 435–445 and `verified_cold_honored` 123–127 per prefix
+arm, `routes_materialized` 0, and `holder_redirects` **0** on all three.
+
+| 50-prefix 20u vs least-loaded, stream on, materialization off | Prefix arm ran | P99 TTFT | P50 | KV hit (LL → prefix) | Consistency | Gini | Diverts | Timeouts (LL / prefix) | Throughput | Prefix-arm `kv_ops` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| rep 1 | second | **+23.1%** | −19.1% | 7.0 → 23.6% | 48.6% | 0.146 | 25.2% | 1.9% / 1.6% | +0.7% | 1.89 M |
+| rep 2 | first | **+14.7%** | −20.3% | 7.1 → 30.3% | 52.0% | 0.150 | 24.5% | 1.6% / 1.5% | +3.0% | 0.74 M |
+| rep 3 | second | **+18.9%** | −18.2% | 6.0 → 22.5% | 50.1% | 0.149 | 25.6% | 1.9% / 1.9% | +0.7% | 1.90 M |
+| *stream off (10-09, 3 reps)* | *both* | *+22.9 / +24.9 / +21.7%* | *−9…−16%* | *7 → 23–32%* | *45–48%* | *0.09–0.17* | *22–23%* | *1.8–2.1% / 1.5–1.7%* | *flat* | *0* |
+| *10-13 run 5, materialization ON* | *first* | *+2.1%* | *−21.8%* | *8.7 → 28.0%* | *52.3%* | *0.056* | *22.7%* | *equal* | *+4.6%* | *0.78 M* |
+
+**Reading.** Median +18.9%, all three worse than least-loaded, inside the stream-off row's range
+on every column that matters: the same P50 gain, the same KV hit rate, the same timeouts, the
+same throughput, Gini 0.15 against 0.09–0.17. The 2026-10-13 parity rep (+2.1%, Gini 0.056) did
+not reproduce under the final configuration and is **withdrawn**; it was measured with
+materialization on and the prefix arm first, and rep 2 here (also prefix first) read +14.7%, so
+arm order was not what produced it. Its 0.056 Gini, which no other prefix arm on this row has
+approached, is most plausibly the materialized PUSH routes of that run's own fresh stream
+spreading homes flatter than least-loaded placement did; with materialization off the row
+returns to its stream-off shape and the one rep is a configuration that no longer exists.
+
+The counters say why the stream cannot move this row. `holder_redirects` is 0 on every arm: a
+verified-cold hit found no second verified holder in 376 attempts (123–127 per arm), because
+this workload gives every prefix exactly one home and least-loaded placement never creates a
+second. The stream turned 123–127 stale hits per arm from "queue behind a hit that is a miss"
+into "re-prefill on the home", which is what a probabilistic miss already did, and the hit P99
+(large bucket 3.1–3.6 s vs least-loaded's 2.0–2.3 s) is still the hits queueing behind each
+other on the home. Exact residency changed what the router knows, not what it can do.
+
+**Verdict against the pre-registered reading (item 7/10).** "An unchanged consistent regression
+means the stream does not fix the eviction regime and the holder-aware divert needs a second
+holder to exist (replication)." That is the result: row 18 reads +23.1 / +14.7 / +18.9% with the
+stream against +22.9 / +24.9 / +21.7% without it. The native stream is **neutral on both rows**
+(row 17 via the kvmat ablation, row 18 here), stays opt-in, and is closed as a signal question.
+The eviction regime is a replication question (BACKLOG §27, holder-aware divert): a hot prefix
+with one holder needs a second before any divert, verified or probabilistic, has somewhere to
+send its overflow. README no longer carries the parity reading.
 
 ### The 8B 20u row with the KV reset acknowledged (`--suite kvreset`)
 
@@ -470,7 +515,8 @@ like. The row's citable number moves from −26.7% to **−21.3%**: about a fift
 figure was the carry-over cache. KV hit rate, P50 and throughput are unchanged by the reset, as
 expected on a fleet that is cache-warm under either policy. README updated.
 
-Archive: `results/2026-10-13-kvevents/`, `results/2026-10-13-kvmat/`, `results/2026-10-13-kvreset/`.
+Archive: `results/2026-10-13-kvevents/`, `results/2026-10-13-kvmat/`, `results/2026-10-13-kvreset/`,
+`results/2026-10-14-kvevents/` (row 18 ×3, materialization off).
 
 ## Representative-workload re-baseline (measured 2026-10-01, fixed tooling, previous defaults)
 
@@ -649,6 +695,7 @@ before termination after all): summaries in this tree, raw data as a release ass
 | Native KV-event suite on the verified-cold policy: fitted 20u + 50-prefix 20u vs least-loaded, ×3 (2026-10-13) | `results/2026-10-13-kvevents/` |
 | 8B 20u vs round-robin with the between-arm KV reset acknowledged, ×3 (2026-10-13) | `results/2026-10-13-kvreset/` |
 | kvmat: fitted 20u vs least-loaded, stream on, materialization off, ×3 (2026-10-13) | `results/2026-10-13-kvmat/` |
+| Row 18: 50-prefix 20u vs least-loaded, stream on, materialization off, ×3 (2026-10-14) | `results/2026-10-14-kvevents/` |
 | Native KV events, first contact: 3 stream-off control reps + the first live-stream run (2026-10-10) | `results/2026-10-10-kvevents-first-contact/` (compare files only; raw dirs lost with the instance) |
 | kvablate: materialize off / depth 4096 / both vs least-loaded, ×1 (2026-10-11) | `results/2026-10-11-kvablate/` (compare files only) |
 
@@ -1109,9 +1156,9 @@ nothing to do.
    of both runs are lost; the compare files were reconstructed verbatim from the session.
    *Measured 2026-10-13 on the policy image:* see "Native KV-event suite" above. Storm gone
    (0 evictions, 107–134 cold-honored per arm); clean-start reps −10.3% (fitted) and +2.1%
-   (50-prefix, was +23%); every second-arm rep regressed 12–73 points with 3.4× the
-   materialized routes from the replayed first-arm history. Resolved by item 9: materialization
-   was the whole effect; row 17 is neutral at −13.2 / −10.1 / −12.7%.
+   (50-prefix, was +23%; not reproduced, see item 10); every second-arm rep regressed 12–73
+   points with 3.4× the materialized routes from the replayed first-arm history. Resolved by
+   item 9: materialization was the whole effect; row 17 is neutral at −13.2 / −10.1 / −12.7%.
 8. ~~Same session, after 7: `bench-runner.sh --suite kvreset`.~~ Done 2026-10-13: −23.7 /
    −19.4 / −21.3% (median −21.3, 3/3) with `8/8` acked on every arm; the order gap fell from 9
    points to 4 and the row's number moves from −26.7% to −21.3%. README updated.
@@ -1120,19 +1167,21 @@ nothing to do.
    both rr-first reps within a point of the control. Pre-registered first clause met:
    `materialize_routes` defaults to off (server, benchmark compose, runner rows). Archive:
    `results/2026-10-13-kvmat/`.
-10. Next GPU session: row 18 (50-prefix 13B 20u vs least-loaded) three repeats with
-   materialization off, which the kvevents rows now pass explicitly, so it reads the same on an
-   image with or without the new default:
-   ```
-   ./scripts/bench-runner.sh --suite kvevents --resume 4 --output-dir benchmark-reports-kvevents
-   ```
-   (`--resume 4` skips the settled row 17; drop it to re-measure both rows, ~2h50m.)
-   Pre-registered reading for row 18, unchanged from item 7: a CONSISTENT IMPROVEMENT against
-   least-loaded is the finding; MIXED with KV above the stream-off 23–32% is progress; an
-   unchanged consistent regression means the stream does not fix the eviction regime and the
-   holder-aware divert needs a second holder to exist (replication). The one clean rep so far
-   is +2.1% with Gini 0.056 against +22.9 / +24.9 / +21.7% stream-off. Archive before
-   terminating.
+10. ~~Next GPU session: row 18 (50-prefix 13B 20u vs least-loaded) three repeats with
+   materialization off (`--suite kvevents --resume 4`).~~ Done 2026-10-14 on image `ee8283a`
+   ("Row 18 with materialization off" above): +23.1 / +14.7 / +18.9% P99 against the stream-off
+   +22.9 / +24.9 / +21.7%, with the same P50, KV, timeouts and throughput; `holder_redirects` 0
+   on every arm, `verified_cold_honored` 123–127. The pre-registered third clause is the result:
+   an unchanged consistent regression, so the stream does not fix the eviction regime and the
+   holder-aware divert needs a second holder to exist. The 10-13 +2.1% rep did not reproduce
+   and is withdrawn. The stream is neutral on both rows, stays opt-in, and is closed as a
+   signal question; the next mechanism is hot-prefix replication (BACKLOG §27). Archive:
+   `results/2026-10-14-kvevents/`.
+11. Next GPU session, if the eviction regime is pursued: design and measure replication of a
+   hot single-holder prefix (a second verified holder, then the holder-aware divert has a
+   target). Acceptance unchanged from BACKLOG §27: row 18 (now +19…+23% on the stream-off and
+   stream-on configurations alike) turns to an improvement without KV or route consistency
+   falling below today's 23–30% / 49–52%.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 

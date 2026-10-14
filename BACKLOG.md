@@ -1523,7 +1523,12 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   reset acked: −21.3% median (was −26.7% carry-over); README updated.** **kvmat same day:
   materialization off → −13.2 / −10.1 / −12.7 (control −12.5) with the replay still applied;
   `materialize_routes` defaults to off. Row 17 neutral, closed. Next: row 18 ×3 materialization
-  off (results doc item 10).**
+  off (results doc item 10).** **Row 18 on 10-14 (image ee8283a, materialization off ×3): +23.1 /
+  +14.7 / +18.9 against +22.9 / +24.9 / +21.7 stream-off, same P50 / KV / timeouts / throughput;
+  the 10-13 +2.1 rep did not reproduce and is withdrawn. `holder_redirects` 0 on every arm: with
+  one home per prefix the verified-cold path has nowhere to send a hit, so the stream changes what
+  the router knows and no routing decision. Neutral on both rows, opt-in, closed as a signal
+  question. The eviction regime is the replication half of the holder-aware divert item below.**
   **10-11 static check of that policy (branch `claude/festive-thompson-ta0tgj`): freshness proved
   only that the subscription was alive, since heartbeats restore it within 5 s of a RESET over the
   purged index and a node starting against warm vLLMs backfills only the replay buffer; absence
@@ -1569,7 +1574,13 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   its overflow (placement balances prefix count, not popularity). Acceptance: `--suite saturation`
   row 16 (50-prefix 20u vs least_loaded, now +23%) and `--suite baseline` row 13 (fitted 30u, now
   MIXED) turn to improvements without KV or route consistency falling below today's. Record:
-  "Saturation suite" in `docs/benchmarks/benchmark-results-current.md`.
+  "Saturation suite" in `docs/benchmarks/benchmark-results-current.md`. _Measured 2026-10-14:_
+  the native stream's verified-cold path is the first half of this (a cold hit goes to another
+  verified holder when one exists) and it fired 0 times in 376 cold hits on row 18, because the
+  workload has one holder per prefix; row 18 read +23.1 / +14.7 / +18.9 with exact residency.
+  The second half, replicating a hot single-holder prefix, is therefore the whole remaining item:
+  the divert target has to be created before any divert policy can use it. Record: "Row 18 with
+  materialization off" in the results doc.
 - [ ] **[LOW] KV-event subscriber: a duplicate live frame after a connect-backfill resets the
   backend.** The SUB socket connects before the backfill, so a batch published during the replay
   window arrives twice; the live loop treats any sequence below the expected one as a publisher
