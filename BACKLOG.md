@@ -1873,9 +1873,12 @@ image the GPU session pulls carries everything.
 ### Post-Implementation
 - [x] `/review` (Hard Rules) on Steps 3–4: the spillover block is the hottest path that changes (2026-10-15, clean).
 - [x] `/doc` after Step 7: unit tests listed above, docs, this section's boxes (2026-10-15).
-- [ ] Deferred gates (developer's Docker): `make test-unit` after Steps 1–5 (passed 2026-10-15);
-      `make lint` before each push (not yet run: clang-tidy is absent on the host; run it in
-      the sanitize image); `make test-integration-fast` after Step 6 (passed 2026-10-15 on a
+- [x] Deferred gates (developer's Docker): `make test-unit` after Steps 1–5 (passed 2026-10-15);
+      `make lint` before each push (2026-10-15, clang-tidy in the sanitize image on
+      router_service.cpp and config_loader.cpp with -D__GCC_DESTRUCTIVE_SIZE=64
+      -D__GCC_CONSTRUCTIVE_SIZE=64 so Seastar's cacheline.hh parses under clang: no findings
+      in the section 28 changes; two pre-existing ones, router_service.cpp:1859 dead store and
+      :4767 reserve on the moved-from pending_local_routes); `make test-integration-fast` after Step 6 (passed 2026-10-15 on a
       fresh `make docker-build`; the parser and
       compare-file changes have no unit tests; `tests/integration/test_load_aware_routing.py`
       covers the divert counters' names).
