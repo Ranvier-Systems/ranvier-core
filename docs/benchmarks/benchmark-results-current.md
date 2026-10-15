@@ -1177,11 +1177,12 @@ nothing to do.
    and is withdrawn. The stream is neutral on both rows, stays opt-in, and is closed as a
    signal question; the next mechanism is hot-prefix replication (BACKLOG §27). Archive:
    `results/2026-10-14-kvevents/`.
-11. Next GPU session, if the eviction regime is pursued: design and measure replication of a
-   hot single-holder prefix (a second verified holder, then the holder-aware divert has a
-   target). Acceptance unchanged from BACKLOG §27: row 18 (now +19…+23% on the stream-off and
-   stream-on configurations alike) turns to an improvement without KV or route consistency
-   falling below today's 23–30% / 49–52%.
+11. Next GPU session, if the eviction regime is pursued: replication by diversion (plan:
+   BACKLOG §28; suite `kvrepl` once implemented). Holder-aware, sticky diverts so one prefix's
+   overflow builds and then reads one replica instead of being sprayed over seven strangers.
+   Pre-registered reading is in §28 Step 8; acceptance unchanged from BACKLOG §27: row 18 (now
+   +19…+23% on the stream-off and stream-on configurations alike) turns to an improvement without
+   KV or route consistency falling below today's 23–30% / 49–52%, and row 17 holds at the control.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
