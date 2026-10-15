@@ -279,6 +279,10 @@ void RanvierConfig::apply_env_overrides() {
             routing.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
         }
     }
+    // Replication by diversion holder cap (0..64, checked in validate())
+    if (auto v = get_env_as<uint32_t>("RANVIER_REPLICATION_MAX_HOLDERS")) {
+        routing.replication_max_holders = *v;
+    }
 
     // Timeout overrides
     if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
@@ -1191,6 +1195,13 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                     config.routing.miss_placement = RoutingConfig::MissPlacement::LEAST_LOADED;
                 }
             }
+            // Replication by diversion (nested under routing)
+            if (r["replication"]) {
+                YAML::Node rep = r["replication"];
+                if (rep["max_holders"]) {
+                    config.routing.replication_max_holders = rep["max_holders"].as<uint32_t>();
+                }
+            }
             // GPU load integration (vLLM-aware routing)
             if (r["gpu_load_weight"]) {
                 config.routing.gpu_load_weight = r["gpu_load_weight"].as<double>();
@@ -2077,6 +2088,9 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     // Validate hash strategy settings
     if (config.routing.bounded_load_epsilon < 0.0 || config.routing.bounded_load_epsilon > 10.0) {
         return "routing.bounded_load_epsilon must be between 0.0 and 10.0";
+    }
+    if (config.routing.replication_max_holders > 64) {
+        return "routing.replication.max_holders must be between 0 and 64";
     }
     if (config.routing.capacity_headroom_weight < 0.0 || config.routing.capacity_headroom_weight > 100.0) {
         return "routing.capacity_headroom_weight must be between 0.0 and 100.0";

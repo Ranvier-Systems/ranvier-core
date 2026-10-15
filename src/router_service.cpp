@@ -373,6 +373,9 @@ struct ShardLocalState {
         // Depth the native index tracks (kv_events.max_indexed_token_depth);
         // verified residency is undefined for routing depths beyond it.
         uint32_t kv_native_indexed_depth = 2048;
+        // Replication by diversion holder cap (routing.replication.max_holders);
+        // 0 = off, 1 = holder-aware dispatch only, >= 2 = designation + cap.
+        uint32_t replication_max_holders = 0;
     } config;
 
     // ========================================================================
@@ -718,6 +721,8 @@ struct ShardLocalState {
         // Native KV-event verified-residency freshness and indexed depth
         config.kv_residency_freshness_ttl = cfg.kv_residency_freshness_ttl;
         config.kv_native_indexed_depth = cfg.kv_native_indexed_depth;
+        // Replication by diversion holder cap
+        config.replication_max_holders = cfg.replication_max_holders;
 
         // Pre-allocate cross-shard load snapshot storage (one entry per shard)
         // Resized to smp::count so we can index by shard_id without bounds checks.
@@ -775,6 +780,8 @@ struct ShardLocalState {
         // Native KV-event verified-residency freshness and indexed depth
         config.kv_residency_freshness_ttl = cfg.kv_residency_freshness_ttl;
         config.kv_native_indexed_depth = cfg.kv_native_indexed_depth;
+        // Replication by diversion holder cap
+        config.replication_max_holders = cfg.replication_max_holders;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -1821,11 +1828,13 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     case RoutingConfig::HashStrategy::JUMP:
     default:                                        strategy_name = "jump"; break;
     }
-    log_router.info("Hash strategy: {} (epsilon={}, p2c_bias={}), miss placement: {}",
+    log_router.info("Hash strategy: {} (epsilon={}, p2c_bias={}), miss placement: {}, "
+                    "replication max_holders: {}",
                     strategy_name, routing_config.bounded_load_epsilon,
                     routing_config.p2c_load_bias,
                     routing_config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED
-                        ? "least_loaded" : "hash");
+                        ? "least_loaded" : "hash",
+                    routing_config.replication_max_holders);
 
     // When the hash strategy has built-in load awareness, the external median
     // override (load_imbalance_factor/floor) is not applied. Honor the
