@@ -764,6 +764,11 @@ public:
     // Update prefix hash index entry for a specific backend (for testing).
     static void update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id);
 
+    // Live backends in BOUNDED_LOAD jump-probe first-appearance order for
+    // `tokens`' routing prefix (testing only): the order replica designation
+    // walks, so tests can name the probe-first candidate.
+    static std::vector<BackendId> replica_probe_order_for_testing(const std::vector<int32_t>& tokens);
+
     // ==========================================================================
     // Native KV-Event Support (vLLM block-granular stream → exact residency)
     // ==========================================================================

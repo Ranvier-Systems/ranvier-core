@@ -1578,6 +1578,171 @@ TEST_F(RouterServiceTest, ReplicaDispatchLeavesCleanHomeAlone) {
     EXPECT_EQ(stats.replica_holders_saturated, 0u);
 }
 
+// Rules 2 and 3 (max_holders >= 2), six backends: with epsilon 1.0 a backend
+// is over allowance only above twice the mean, and two heavy backends need
+// more than four live ones. Every backend's stream is fresh unless a test says
+// otherwise; the home is a verified holder.
+class ReplicaDesignationTest : public RouterServiceTest {
+protected:
+    // Probe order over the six backends is [2, 1, 6, 5, 3] (backend 4 is
+    // never reached in six probes, so it carries no probe rank).
+    std::vector<int32_t> tokens_ = {1911, 1912, 1913, 1914};
+
+    // Probe-ranked strangers (live backends other than the home, 1) in probe
+    // order.
+    std::vector<BackendId> setup(uint32_t max_holders, bool strangers_fresh = true) {
+        configure_replication(max_holders, 6);
+        RouterService::insert_route_for_testing(tokens_, 1);
+        mark_verified_holder(tokens_, 1);
+        if (strangers_fresh) {
+            for (BackendId id = 2; id <= 6; ++id) RouterService::set_native_fresh_for_testing(id);
+        }
+        std::vector<BackendId> strangers;
+        for (BackendId id : RouterService::replica_probe_order_for_testing(tokens_)) {
+            if (id != 1) strangers.push_back(id);
+        }
+        EXPECT_GE(strangers.size(), 3u);  // every test below needs three
+        return strangers;
+    }
+
+    static void load(std::vector<BackendRequestGuard>& guards, BackendId id, int n) {
+        for (int i = 0; i < n; ++i) guards.emplace_back(id);
+    }
+};
+
+TEST_F(ReplicaDesignationTest, DesignatesProbeOrderCandidateNotColdest) {
+    // Same live set and hash in two independent fixtures (two nodes, or two
+    // shards): the same replica both times, with no shared state.
+    std::optional<BackendId> first_run;
+    for (int run = 0; run < 2; ++run) {
+        auto strangers = setup(2);
+        const BackendId probe_first = strangers[0];
+        // Loads [10 home, 1 probe-first, 0 elsewhere]: cap = ceil(11/6 * 2) = 4,
+        // allowance 3. Least-loaded alone would pick a load-0 stranger.
+        std::vector<BackendRequestGuard> guards;
+        load(guards, 1, 10);
+        load(guards, probe_first, 1);
+
+        auto result = router_->route_request(tokens_);
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), probe_first);
+        EXPECT_TRUE(result.cache_hit);
+        EXPECT_EQ(result.original_selected, 1);
+        auto stats = RouterService::get_native_kv_stats();
+        EXPECT_EQ(stats.replica_designations, 1u);
+        EXPECT_EQ(stats.replica_dispatches, 0u);
+        EXPECT_EQ(stats.replica_holders_saturated, 0u);
+        if (first_run) {
+            EXPECT_EQ(result.backend_id.value(), *first_run);
+        }
+        first_run = result.backend_id.value();
+    }
+}
+
+TEST_F(ReplicaDesignationTest, SkipsProbeFirstCandidateOverAllowance) {
+    auto strangers = setup(2);
+    // Loads [10 home, 10 probe-first, 1 probe-second, 0 elsewhere]:
+    // cap = ceil(21/6 * 2) = 7, allowance 6.
+    std::vector<BackendRequestGuard> guards;
+    load(guards, 1, 10);
+    load(guards, strangers[0], 10);
+    load(guards, strangers[1], 1);
+
+    auto result = router_->route_request(tokens_);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), strangers[1]);
+    EXPECT_EQ(result.original_selected, 1);
+    EXPECT_EQ(RouterService::get_native_kv_stats().replica_designations, 1u);
+}
+
+TEST_F(ReplicaDesignationTest, CapOneNeverDesignates) {
+    auto strangers = setup(1);
+    std::vector<BackendRequestGuard> guards;
+    load(guards, 1, 10);
+    load(guards, strangers[0], 1);
+
+    // Today's spillover: least loaded, equal loads in probe order.
+    auto result = router_->route_request(tokens_);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), strangers[1]);
+    EXPECT_EQ(result.original_selected, 1);
+    EXPECT_EQ(RouterService::get_native_kv_stats().replica_designations, 0u);
+}
+
+TEST_F(ReplicaDesignationTest, DesignationNeedsCandidateWithFreshStream) {
+    // A replica no stream can confirm would never count toward the cap.
+    auto strangers = setup(2, /*strangers_fresh=*/false);
+    std::vector<BackendRequestGuard> guards;
+    load(guards, 1, 10);
+    load(guards, strangers[0], 1);
+
+    auto result = router_->route_request(tokens_);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), strangers[1]);
+    EXPECT_EQ(RouterService::get_native_kv_stats().replica_designations, 0u);
+}
+
+TEST_F(ReplicaDesignationTest, BelowCapCountsOverAllowanceHoldersAndDesignates) {
+    // Cap 3, holders = home + backend 2, both over allowance: below the cap,
+    // so a third replica is designated among the non-holders.
+    auto strangers = setup(3);
+    mark_verified_holder(tokens_, 2);
+    std::vector<BackendId> non_holders;
+    for (BackendId id : strangers) {
+        if (id != 2) non_holders.push_back(id);
+    }
+    std::vector<BackendRequestGuard> guards;
+    load(guards, 1, 10);
+    load(guards, 2, 10);
+    load(guards, non_holders[0], 1);
+
+    auto result = router_->route_request(tokens_);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), non_holders[0]);
+    EXPECT_EQ(result.original_selected, 1);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.replica_designations, 1u);
+    EXPECT_EQ(stats.replica_holders_saturated, 0u);
+}
+
+TEST_F(ReplicaDesignationTest, AtCapDispatchesToLeastLoadedHolderNotStranger) {
+    setup(2);
+    mark_verified_holder(tokens_, 2);
+    // Loads [10 home, 8 holder, 0 elsewhere]: cap = ceil(18/6 * 2) = 6,
+    // allowance 5; both holders over allowance, the cap (2) is reached.
+    std::vector<BackendRequestGuard> guards;
+    load(guards, 1, 10);
+    load(guards, 2, 8);
+
+    auto result = router_->route_request(tokens_);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 2);
+    EXPECT_TRUE(result.cache_hit);
+    EXPECT_EQ(result.original_selected, 1);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.replica_holders_saturated, 1u);
+    EXPECT_EQ(stats.replica_dispatches, 1u);
+    EXPECT_EQ(stats.replica_designations, 0u);
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 1u);  // left the home
+}
+
+TEST_F(ReplicaDesignationTest, AtCapKeepsHomeWhenItIsTheLightestHolder) {
+    setup(2);
+    mark_verified_holder(tokens_, 2);
+    std::vector<BackendRequestGuard> guards;
+    load(guards, 1, 8);
+    load(guards, 2, 10);
+
+    auto result = router_->route_request(tokens_);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_EQ(result.original_selected, 1);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.replica_holders_saturated, 1u);
+    EXPECT_EQ(stats.replica_dispatches, 0u);
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 0u);
+}
+
 // ----- BACKLOG §21 Phase 5a: verified_resident_subset seam -----
 // The telemetry emitter calls this each window to find which of its hot-prefix
 // membership hashes its own backend verifies resident. It mirrors the routing

@@ -3849,6 +3849,20 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     // second home. Inert with the stream off (TTL 0) or beyond the indexed
     // depth, where the index cannot vouch for anything; the hit path's
     // depth-skip counter already counted that request.
+    //
+    // With max_holders >= 2 and no holder under allowance, holders (anchor
+    // included) are counted at any load:
+    //   below the cap: the lowest-probe-rank under-allowance stranger with a
+    //     fresh stream is the designated replica (holder_rank 1). Stateless:
+    //     same hash, same sorted live set, so every shard on every node sends
+    //     this prefix's overflow to the same backend, which the stream then
+    //     confirms as a holder. Probe order chooses only where a prefix's
+    //     first replica is born, never the target of every divert. A fresh
+    //     stream is required so the replica can be confirmed and counted.
+    //   at the cap: scored narrows to the holders, so the least-loaded holder
+    //     serves the hit over allowance (a queued hit on a warm backend beat a
+    //     cold prefill on every epsilon of the saturation suite).
+    bool holders_saturated = false;
     if (load_term && strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD &&
         art_hit && load_hinge(scored[anchor_index].load, allowance) > 0.0) {
         prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
@@ -3870,12 +3884,53 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 state.verified_holders_of(prefix_hash, live_backends, selected, holders);
             // dispatch_ids filters the sorted live set in order, so it is
             // sorted too and scored is index-aligned with it.
+            bool holder_under_allowance = false;
             for (size_t h = 0; h < holder_count; ++h) {
                 auto pos = std::lower_bound(dispatch_ids.begin(), dispatch_ids.end(), holders[h]);
                 if (pos == dispatch_ids.end() || *pos != holders[h]) continue;
                 auto& cand = scored[static_cast<size_t>(pos - dispatch_ids.begin())];
                 if (load_hinge(cand.load, allowance) == 0.0) {
                     cand.holder_rank = kHolderRankVerified;
+                    holder_under_allowance = true;
+                }
+            }
+
+            const uint32_t max_holders = state.config.replication_max_holders;
+            const size_t holders_total = holder_count + 1;  // the anchor included
+            if (max_holders >= 2 && !holder_under_allowance) {
+                if (holders_total < max_holders) {
+                    // Only under-allowance candidates carry a probe rank, and
+                    // every holder is over allowance here, so the probe-ranked
+                    // candidates are exactly the non-anchor, non-holder ones.
+                    size_t designated = scored.size();
+                    for (size_t i = 0; i < scored.size(); ++i) {
+                        const auto& cand = scored[i];
+                        if (cand.is_anchor ||
+                            cand.probe_rank == std::numeric_limits<uint32_t>::max()) continue;
+                        if (!state.native_residency_fresh(cand.id)) continue;
+                        if (designated == scored.size() ||
+                            cand.probe_rank < scored[designated].probe_rank) {
+                            designated = i;
+                        }
+                    }
+                    if (designated != scored.size()) {
+                        scored[designated].holder_rank = kHolderRankDesignated;
+                    }
+                } else {
+                    // Every holder is over allowance (none was marked above).
+                    // The holder buffer is <= MAX_VERIFIED_HOLDERS, so the
+                    // membership scan is bounded by 64 x the live set.
+                    std::erase_if(scored, [&](const ScoreCandidate& cand) {
+                        if (cand.is_anchor) return false;
+                        return std::find(holders.begin(), holders.begin() +
+                                             static_cast<ptrdiff_t>(holder_count),
+                                         cand.id) ==
+                               holders.begin() + static_cast<ptrdiff_t>(holder_count);
+                    });
+                    for (auto& cand : scored) {
+                        if (!cand.is_anchor) cand.holder_rank = kHolderRankVerified;
+                    }
+                    holders_saturated = true;
                 }
             }
         }
@@ -3888,11 +3943,26 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
 
     {
         const ScoreCandidate& dispatched = scored[decision.dispatch];
+        if (holders_saturated) {
+            state.stats.replica_holders_saturated++;
+            log_router.debug("[{}] Replica cap: backend {} over allowance, holder cap {} "
+                             "reached with every holder over allowance; least-loaded holder "
+                             "{} serves the hit (load={:.1f})",
+                             request_id, selected, state.config.replication_max_holders,
+                             final_backend, dispatched.load);
+        }
         if (!dispatched.is_anchor && dispatched.holder_rank == kHolderRankVerified) {
             state.stats.replica_dispatches++;
             log_router.debug("[{}] Replica dispatch: backend {} over allowance, verified "
                              "holder {} serves the hit (load={:.1f})",
                              request_id, selected, final_backend, dispatched.load);
+        } else if (dispatched.holder_rank == kHolderRankDesignated) {
+            state.stats.replica_designations++;
+            log_router.debug("[{}] Replica designation: backend {} over allowance, no holder "
+                             "under allowance; probe-order replica {} takes the hit "
+                             "(probe_rank={}, load={:.1f})",
+                             request_id, selected, final_backend, dispatched.probe_rank,
+                             dispatched.load);
         }
     }
 
@@ -6420,6 +6490,26 @@ void RouterService::set_fail_open_for_testing(bool active) {
 void RouterService::update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id) {
     if (!g_shard_state) return;
     shard_state().prefix_hash_index[prefix_hash].insert(backend_id);
+}
+
+std::vector<BackendId> RouterService::replica_probe_order_for_testing(
+        const std::vector<int32_t>& tokens) {
+    std::vector<BackendId> order;
+    if (!g_shard_state) return order;
+    auto& state = shard_state();
+    const auto live = state.get_live_backends();
+    const size_t prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
+    const uint64_t hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
+    const auto n = static_cast<int32_t>(live.size());
+    order.reserve(live.size());
+    for (int32_t probe = 0; probe < n; ++probe) {
+        const BackendId id =
+            live[static_cast<size_t>(jump_consistent_hash(hash + static_cast<uint64_t>(probe), n))];
+        if (std::find(order.begin(), order.end(), id) == order.end()) {
+            order.push_back(id);
+        }
+    }
+    return order;
 }
 
 void RouterService::learn_route_for_testing(std::vector<int32_t> tokens, BackendId backend) {
