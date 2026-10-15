@@ -1838,6 +1838,16 @@ static BackendId least_loaded_placement(
     return candidates[best];
 }
 
+static const char* hash_strategy_name(RoutingConfig::HashStrategy strategy) {
+    switch (strategy) {
+    case RoutingConfig::HashStrategy::BOUNDED_LOAD: return "bounded_load";
+    case RoutingConfig::HashStrategy::P2C:          return "p2c";
+    case RoutingConfig::HashStrategy::MODULAR:      return "modular";
+    case RoutingConfig::HashStrategy::JUMP:
+    default:                                        return "jump";
+    }
+}
+
 RouterService::RouterService() : RouterService(RoutingConfig{}) {}
 
 RouterService::RouterService(const RoutingConfig& config)
@@ -1856,14 +1866,7 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     }
 
     // Log active hash strategy for operational visibility
-    const char* strategy_name = "jump";
-    switch (routing_config.hash_strategy) {
-    case RoutingConfig::HashStrategy::BOUNDED_LOAD: strategy_name = "bounded_load"; break;
-    case RoutingConfig::HashStrategy::P2C:          strategy_name = "p2c"; break;
-    case RoutingConfig::HashStrategy::MODULAR:      strategy_name = "modular"; break;
-    case RoutingConfig::HashStrategy::JUMP:
-    default:                                        strategy_name = "jump"; break;
-    }
+    const char* strategy_name = hash_strategy_name(routing_config.hash_strategy);
     log_router.info("Hash strategy: {} (epsilon={}, p2c_bias={}), miss placement: {}, "
                     "replication max_holders: {}",
                     strategy_name, routing_config.bounded_load_epsilon,
