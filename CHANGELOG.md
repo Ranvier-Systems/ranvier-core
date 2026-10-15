@@ -7,6 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Replication by diversion, **off by default** (`routing.replication.max_holders`, env
+  `RANVIER_REPLICATION_MAX_HOLDERS`, 0–64, hot-reloadable; BACKLOG §28). Acts only when an
+  ART hit's home forfeits its bounded-load allowance and the native KV-event stream is fresh
+  within `max_indexed_token_depth`. `1`: an under-allowance backend the stream shows holding
+  the prefix is dispatched to before any stranger. `>= 2`: with no holder under allowance
+  and fewer holders than the cap, the overflow goes to one deterministic jump-probe-order
+  replica, the same backend on every shard and node; at the cap with every holder over
+  allowance, the least-loaded holder serves the hit. A replica is a dispatch target only,
+  and route learning still pins the home. New counters `router_replica_dispatches_total`,
+  `router_replica_designations_total`, `router_replica_holders_saturated_total`. Benchmark
+  side: `bench.sh --replication N` (header, manifest, and a warning without
+  `--kv-events`), the `results_parser.py compare` "replication" rows, and
+  `bench-runner.sh --suite kvrepl` (kvevents rows 17 and 18 with `--replication 2` vs
+  `least_loaded`, x3), whose verdict decides the default. Motivated by row 18: a quarter of
+  requests were diverted to strangers whose one-off copies were evicted before anything
+  read them.
 - `POST /admin/backends?...&kv_events_port=P[&kv_events_replay_port=R]`: opt an
   admin-registered backend into the native KV-event stream (vLLM `--kv-events-config`
   ZMQ publisher at `tcp://<ip>:P`), the admin-API form of the static-YAML `kv_events_port`
