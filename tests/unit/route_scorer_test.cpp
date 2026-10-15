@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 using namespace ranvier;
@@ -20,6 +21,13 @@ using namespace ranvier;
 namespace {
 
 constexpr uint32_t kNoProbe = std::numeric_limits<uint32_t>::max();
+
+constexpr uint8_t kVerifiedHolder = 0;
+constexpr uint8_t kDesignatedReplica = 1;
+constexpr uint8_t kNoHolder = 2;
+
+// The router builds candidate arrays in a fixed buffer and copies them freely.
+static_assert(std::is_trivially_copyable_v<ScoreCandidate>);
 
 // Neutral defaults: pre-scorer behavior.
 ScoringWeights default_weights() {
@@ -488,6 +496,150 @@ TEST(Scorer, UnfilledProbeRanksAreInert) {
     c[1].load = 2.0;
     c[2].load = 1.0;
     EXPECT_EQ(c[1].probe_rank, kNoProbe);
+
+    auto d = score_and_select(c.data(), c.size(), default_weights(), true);
+    EXPECT_EQ(c[d.dispatch].id, 3);
+}
+
+// =============================================================================
+// Dispatch: holder_rank (replication by diversion, BACKLOG section 28)
+// =============================================================================
+
+TEST(DispatchHolderRank, DefaultIsNoHolder) {
+    EXPECT_EQ(ScoreCandidate{}.holder_rank, kNoHolder);
+}
+
+TEST(DispatchHolderRank, VerifiedHolderBeatsColderStrangersWhenAnchorForfeits) {
+    std::vector<ScoreCandidate> c = {
+        make_candidate(1, /*is_anchor=*/true),
+        make_candidate(2),
+        make_candidate(3),
+    };
+    for (auto& cand : c) cand.load_allowance = 4.0;
+    c[0].affinity = 1.0;
+    c[0].load = 9.0;
+    c[1].load = 3.0;  // warmer, but holds the prefix
+    c[1].holder_rank = kVerifiedHolder;
+    c[2].load = 0.0;  // coldest stranger, first in probe order
+    c[2].probe_rank = 0;
+
+    auto d = score_and_select(c.data(), c.size(), default_weights(), true);
+    EXPECT_EQ(c[d.dispatch].id, 2);
+    EXPECT_TRUE(d.load_diverted);
+    EXPECT_FALSE(d.cost_diverted);
+    EXPECT_EQ(c[d.placement].id, 1);
+}
+
+TEST(DispatchHolderRank, CleanAnchorKeepsSeatOverVerifiedHolder) {
+    std::vector<ScoreCandidate> c = {
+        make_candidate(1, /*is_anchor=*/true),
+        make_candidate(2),
+    };
+    for (auto& cand : c) cand.load_allowance = 4.0;
+    c[0].affinity = 1.0;
+    c[0].load = 4.0;  // at the allowance: clean
+    c[1].load = 0.0;
+    c[1].holder_rank = kVerifiedHolder;
+
+    auto d = score_and_select(c.data(), c.size(), default_weights(), true);
+    EXPECT_EQ(d.dispatch, 0u);
+    EXPECT_FALSE(d.load_diverted);
+}
+
+TEST(DispatchHolderRank, DesignatedReplicaBeatsStrangerAtEqualLoad) {
+    std::vector<ScoreCandidate> c = {
+        make_candidate(1, /*is_anchor=*/true),
+        make_candidate(2),
+        make_candidate(3),
+    };
+    for (auto& cand : c) cand.load_allowance = 4.0;
+    c[0].affinity = 1.0;
+    c[0].load = 9.0;
+    c[1].load = 2.0;
+    c[1].probe_rank = 0;  // earlier probe, lower id: would win without the key
+    c[2].load = 2.0;
+    c[2].probe_rank = 1;
+    c[2].holder_rank = kDesignatedReplica;
+
+    auto d = score_and_select(c.data(), c.size(), default_weights(), true);
+    EXPECT_EQ(c[d.dispatch].id, 3);
+    EXPECT_TRUE(d.load_diverted);
+}
+
+TEST(DispatchHolderRank, VerifiedHolderBeatsDesignatedReplicaAtHigherLoad) {
+    std::vector<ScoreCandidate> c = {
+        make_candidate(1, /*is_anchor=*/true),
+        make_candidate(2),
+        make_candidate(3),
+    };
+    for (auto& cand : c) cand.load_allowance = 4.0;
+    c[0].affinity = 1.0;
+    c[0].load = 9.0;
+    c[1].load = 1.0;
+    c[1].holder_rank = kDesignatedReplica;
+    c[2].load = 3.0;
+    c[2].holder_rank = kVerifiedHolder;
+
+    auto d = score_and_select(c.data(), c.size(), default_weights(), true);
+    EXPECT_EQ(c[d.dispatch].id, 3);
+    EXPECT_TRUE(d.load_diverted);
+}
+
+TEST(DispatchHolderRank, OverAllowanceHolderLosesOnScoreToUnderAllowanceStranger) {
+    // holder_rank is a tie key, not a weight: an over-allowance holder pays
+    // its hinge and loses to any under-allowance candidate. Steering to an
+    // over-allowance holder at the cap is the router's job (narrowed set).
+    std::vector<ScoreCandidate> c = {
+        make_candidate(1, /*is_anchor=*/true),
+        make_candidate(2),
+        make_candidate(3),
+    };
+    for (auto& cand : c) cand.load_allowance = 4.0;
+    c[0].affinity = 1.0;
+    c[0].load = 9.0;
+    c[1].load = 5.0;  // hinge 1.0
+    c[1].holder_rank = kVerifiedHolder;
+    c[2].load = 3.0;
+
+    auto d = score_and_select(c.data(), c.size(), default_weights(), true);
+    EXPECT_EQ(c[d.dispatch].id, 3);
+}
+
+TEST(DispatchHolderRank, NeverChangesPlacement) {
+    // Placement for every holder_rank permutation stays the anchor.
+    for (uint8_t a = 0; a <= kNoHolder; ++a) {
+        for (uint8_t b = 0; b <= kNoHolder; ++b) {
+            std::vector<ScoreCandidate> c = {
+                make_candidate(1),
+                make_candidate(2, /*is_anchor=*/true),
+                make_candidate(3),
+            };
+            for (auto& cand : c) cand.load_allowance = 4.0;
+            c[1].affinity = 1.0;
+            c[1].load = 9.0;
+            c[0].holder_rank = a;
+            c[2].holder_rank = b;
+
+            auto d = score_and_select(c.data(), c.size(), default_weights(), true);
+            EXPECT_EQ(c[d.placement].id, 2) << "a=" << int(a) << " b=" << int(b);
+            EXPECT_NE(c[d.dispatch].id, 2);
+            EXPECT_TRUE(d.load_diverted);
+        }
+    }
+}
+
+TEST(DispatchHolderRank, OutranksCostPressure) {
+    std::vector<ScoreCandidate> c = {
+        make_candidate(1, /*is_anchor=*/true),
+        make_candidate(2),
+        make_candidate(3),
+    };
+    for (auto& cand : c) cand.load_allowance = 4.0;
+    c[0].affinity = 1.0;
+    c[0].load = 9.0;
+    c[1].cost_pressure = 0.1;
+    c[2].cost_pressure = 0.5;
+    c[2].holder_rank = kVerifiedHolder;
 
     auto d = score_and_select(c.data(), c.size(), default_weights(), true);
     EXPECT_EQ(c[d.dispatch].id, 3);

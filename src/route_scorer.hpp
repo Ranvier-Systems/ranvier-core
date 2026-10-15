@@ -134,8 +134,23 @@ struct ScoreCandidate {
     // under-allowance candidate, and probe order only separates equal loads
     // (deterministic, cluster-consistent). The former first-under-cap rule
     // stranded the coldest backend (BACKLOG section 27, fitted suite
-    // 2026-10-02).
+    // 2026-10-02). A holder_rank below 2 outranks this key (and load): a
+    // verified holder or the designated replica beats a colder stranger.
     uint32_t probe_rank = std::numeric_limits<uint32_t>::max();
+
+    // Replication-by-diversion dispatch tie key (BACKLOG section 28), filled
+    // by the router only when the anchor forfeits and
+    // routing.replication.max_holders >= 1:
+    //   0 = verified holder (fresh native stream shows the prefix resident),
+    //   1 = designated replica (first probe-order under-allowance stranger
+    //       while no holder is under allowance),
+    //   2 = none (default; the anchor keeps 2 and is governed by the
+    //       clean-placement preference).
+    // Ranks after the clean-placement-winner preference and before
+    // cost_pressure, so it only separates candidates of equal dispatch score
+    // and never touches placement: a holder is a dispatch target, never the
+    // learned home.
+    uint8_t holder_rank = 2;
 };
 
 // Outcome of one scoring pass. Indices refer to the caller's candidate array.
@@ -182,9 +197,12 @@ inline double dispatch_score(const ScoreCandidate& c, const ScoringWeights& w,
 // Dispatch tie order:   score desc, "clean placement winner" first (the
 //                       placement winner keeps its seat whenever it forfeited
 //                       nothing — zero load hinge and zero cost hinge), lower
-//                       cost_pressure, lower load, lower probe_rank, lower id.
+//                       holder_rank, lower cost_pressure, lower load, lower
+//                       probe_rank, lower id.
 //
-// The dispatch tie keys encode the divert targets: least-cost for the
+// The dispatch tie keys encode the divert targets: a verified holder, then the
+// designated replica, when the router filled holder_rank (replication by
+// diversion; all 2 otherwise, so the key is inert); then least-cost for the
 // small-request fast lane, least-loaded for every strategy (BOUNDED_LOAD
 // included — probe order breaks equal loads only, so the spillover target is
 // the coldest under-allowance candidate, not the first one the probe sequence
@@ -249,6 +267,8 @@ inline ScoreDecision score_and_select(const ScoreCandidate* candidates, size_t c
             const bool b_pref = placement_clean && (best == decision.placement);
             if (c_pref != b_pref) {
                 wins = c_pref;
+            } else if (c.holder_rank != b.holder_rank) {
+                wins = c.holder_rank < b.holder_rank;
             } else if (c.cost_pressure != b.cost_pressure) {
                 wins = c.cost_pressure < b.cost_pressure;
             } else if (c.load != b.load) {
