@@ -947,14 +947,42 @@ format:
 	@echo "Formatting C++ code..."
 	@find src tests -name "*.cpp" -o -name "*.hpp" | xargs clang-format -i
 
-# Run clang-tidy static analysis (requires clang-tidy and compile_commands.json)
+# Run clang-tidy static analysis (requires clang-tidy and compile_commands.json).
+# clang-tidy parses with clang while compile_commands.json comes from the GCC
+# build, so:
+#   - Seastar's cacheline.hh uses std::hardware_destructive_interference_size,
+#     which libstdc++ only defines when __GCC_DESTRUCTIVE_SIZE is set. GCC
+#     predefines it and clang does not, so every Seastar TU fails to parse
+#     without the defines below (the same values the clang fuzz build passes,
+#     see stream_parser_fuzz in CMakeLists.txt).
+#   - GCC-only flags (-Wno-maybe-uninitialized, -fmax-errors) are unknown to
+#     clang; silence those diagnostics rather than report them per TU.
+# LINT_FILES narrows the run (default: every src/*.cpp), e.g.
+#   make lint LINT_FILES="src/router_service.cpp src/config_loader.cpp"
+# clang-tidy is not in the production base image; ranvier-sanitize
+# (Dockerfile.sanitize) carries it:
+#   docker run --rm -v "$$PWD:/src" -w /src ranvier-sanitize:latest make lint
+LINT_BUILD_DIR ?= build
+LINT_FILES ?= $(shell find src -name "*.cpp")
+LINT_EXTRA_ARGS := \
+	--extra-arg=-D__GCC_DESTRUCTIVE_SIZE=64 \
+	--extra-arg=-D__GCC_CONSTRUCTIVE_SIZE=64 \
+	--extra-arg=-Wno-unknown-warning-option \
+	--extra-arg=-Wno-unused-command-line-argument
 lint:
-	@echo "Running clang-tidy..."
-	@if [ ! -f build/compile_commands.json ]; then \
-		echo "Error: compile_commands.json not found. Run 'make build' first."; \
+	@command -v clang-tidy >/dev/null 2>&1 || { \
+	    echo "Error: clang-tidy not found on PATH."; \
+	    echo "       Use the ranvier-sanitize image (Dockerfile.sanitize):"; \
+	    echo "         docker run --rm -v \"\$$PWD:/src\" -w /src ranvier-sanitize:latest make lint"; \
+	    exit 1; \
+	}
+	@if [ ! -f $(LINT_BUILD_DIR)/compile_commands.json ]; then \
+		echo "Error: $(LINT_BUILD_DIR)/compile_commands.json not found."; \
+		echo "       Configure first: cmake -B $(LINT_BUILD_DIR) -DWITH_KV_EVENTS=ON"; \
 		exit 1; \
 	fi
-	@find src -name "*.cpp" | xargs clang-tidy -p build
+	@echo "Running clang-tidy..."
+	@clang-tidy -p $(LINT_BUILD_DIR) $(LINT_EXTRA_ARGS) $(LINT_FILES)
 
 # ============================================================================
 # Helm Chart Targets
@@ -1128,7 +1156,7 @@ help:
 	@echo ""
 	@echo "Code quality:"
 	@echo "  make format         - Format C++ code with clang-format"
-	@echo "  make lint           - Run clang-tidy static analysis"
+	@echo "  make lint           - Run clang-tidy static analysis (LINT_FILES=... to narrow; needs clang-tidy, e.g. ranvier-sanitize image)"
 	@echo ""
 	@echo "Helm chart (Kubernetes deployment):"
 	@echo "  make helm-lint      - Lint the Helm chart"
