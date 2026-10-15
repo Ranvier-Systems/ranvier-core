@@ -1178,6 +1178,40 @@ TEST_F(RouterServiceTest, NativeVerifiedColdRedirectsToVerifiedHolder) {
     EXPECT_EQ(stats.verified_hits, 0u);
 }
 
+TEST_F(RouterServiceTest, NativeVerifiedColdRedirectsToLeastLoadedHolder) {
+    // Two fresh holders of an evicted home's prefix: the lighter takes the
+    // hit and becomes the learned home; equal loads go to the lower id.
+    register_three_backends();
+    std::vector<int32_t> tokens = {721, 722, 723, 724};
+    const uint64_t hash = hash_prefix(tokens.data(), tokens.size(), 1);
+    RouterService::insert_route_for_testing(tokens, 1);
+    for (BackendId id : {1, 2, 3}) RouterService::set_native_fresh_for_testing(id);
+    RouterService::update_prefix_hash_index_for_testing(hash, 2);
+    RouterService::update_prefix_hash_index_for_testing(hash, 3);
+
+    {
+        BackendRequestGuard g2a(2), g2b(2), g3(3);  // loads: 2 -> 2, 3 -> 1
+        auto result = router_->route_request(tokens);
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 3);
+        EXPECT_EQ(result.original_selected, 3);
+        EXPECT_TRUE(result.cache_hit);
+    }
+    {
+        BackendRequestGuard g2(2), g3(3);  // equal loads
+        auto result = router_->route_request(tokens);
+        ASSERT_TRUE(result.backend_id.has_value());
+        EXPECT_EQ(result.backend_id.value(), 2);
+        EXPECT_EQ(result.original_selected, 2);
+    }
+    // Honored, redirected and verified-hit stay pairwise disjoint (I-8).
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.holder_redirects, 2u);
+    EXPECT_EQ(stats.verified_cold_honored, 0u);
+    EXPECT_EQ(stats.verified_hits, 0u);
+    EXPECT_EQ(stats.verified_downgrades, 0u);
+}
+
 TEST_F(RouterServiceTest, NativeHolderWithoutFreshStreamIsNotARedirectTarget) {
     register_two_backends();
     std::vector<int32_t> tokens = {781, 782, 783, 784};
