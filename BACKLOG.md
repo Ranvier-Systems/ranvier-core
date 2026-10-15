@@ -1874,7 +1874,9 @@ image the GPU session pulls carries everything.
 - [x] `/review` (Hard Rules) on Steps 3–4: the spillover block is the hottest path that changes (2026-10-15, clean).
 - [x] `/doc` after Step 7: unit tests listed above, docs, this section's boxes (2026-10-15).
 - [ ] Deferred gates (developer's Docker): `make test-unit` after Steps 1–5 (passed 2026-10-15);
-      `make lint` before each push; `make test-integration-fast` after Step 6 (the parser and
+      `make lint` before each push (not yet run: clang-tidy is absent on the host; run it in
+      the sanitize image); `make test-integration-fast` after Step 6 (passed 2026-10-15 on a
+      fresh `make docker-build`; the parser and
       compare-file changes have no unit tests; `tests/integration/test_load_aware_routing.py`
       covers the divert counters' names).
 
