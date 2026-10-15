@@ -25,7 +25,7 @@ argument-hint: [change-description]
 | 7. Benchmark | see `/benchmark` | Performance regressions (TTFT, cache-hit) | Routing-decision or hot-path changes |
 | 8. Deploy checks | `make helm-lint`, `make helm-template` | Chart validity | Helm/deploy changes |
 
-Also available: `make lint` (clang-tidy; needs `build/compile_commands.json`), `make format` (clang-format over src+tests).
+Also available: `make lint` (clang-tidy; needs `build/compile_commands.json` and clang-tidy, which the `ranvier-sanitize` image carries; `LINT_FILES="src/a.cpp src/b.cpp"` narrows it to the changed files), `make format` (clang-format over src+tests).
 
 **Gotcha:** `make fuzz-run-stream-parser` requires the default-allocator base image (`Dockerfile.base.default-alloc`) — on the production base image, Seastar's per-shard allocator crashes libFuzzer with `munmap_chunk: invalid pointer`. The Makefile detects this and prints the unblock recipe; see `tests/fuzz/README.md`.
 

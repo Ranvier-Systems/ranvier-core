@@ -292,6 +292,11 @@ RANVIER_P2C_LOAD_BIAS=2             # primary affinity bias for P2C
 # "Cache-miss placement".
 RANVIER_MISS_PLACEMENT=hash
 
+# Replication by diversion (needs kv_events): 0 = off (default), 1 = holder-aware
+# dispatch, >= 2 = designate one replica per prefix and cap the holders. See
+# cache-residency-routing.md "Replication by diversion".
+RANVIER_REPLICATION_MAX_HOLDERS=0
+
 # vLLM PagedAttention block alignment for the FNV-1a prefix hash (default: 16)
 RANVIER_BLOCK_ALIGNMENT=16
 
@@ -316,6 +321,8 @@ routing:
   gpu_load_weight: 0.0          # scraped GPU score out of the divert signal
   capacity_headroom_weight: 0.0
   miss_placement: least_loaded  # hash | least_loaded (cache-miss placement)
+  replication:
+    max_holders: 0              # replication by diversion (needs kv_events); 0 = off
   enable_prefix_boundary: true  # Detect system message boundaries
   min_prefix_boundary_tokens: 4
   accept_client_prefix_boundary: false  # Accept prefix_token_count / prefix_boundaries
@@ -337,6 +344,7 @@ routing:
 | `gpu_load_weight` | `0.0` | Weight of the scraped vLLM load score in the divert signal. Was `10.0` until 2026-10-05 |
 | `capacity_headroom_weight` | `0.0` | Weight of scraped KV usage in the divert signal. Was `5.0` until 2026-10-05 |
 | `p2c_load_bias` | `2` | Switch to secondary only when `secondary + bias < primary` |
+| `replication.max_holders` | `0` | Replication by diversion (0–64, needs `kv_events`); see Unified Route Scoring and [cache-residency-routing.md](cache-residency-routing.md) |
 | `miss_placement` | `least_loaded` | Was `hash` until 2026-10-05. `hash` places a new prefix in its hash bucket; `least_loaded` on the candidate holding the fewest learned-route tokens, then fewest routes, then lowest load, then probe order |
 | `enable_prefix_boundary` | `true` | Detect system message boundaries for multi-turn |
 | `min_prefix_boundary_tokens` | `4` | Minimum system message tokens to use as boundary |
@@ -399,7 +407,7 @@ Both `bounded_load` and `p2c` use **capacity-adjusted load** (active requests bl
 
 Bounded-load diversion is only as good as the load it reads. Until 2026-10-05 the composite load was shard-local in-flight requests plus `gpu_load_weight` (10) times the scraped vLLM score plus `capacity_headroom_weight` (5) times scraped KV usage, refreshed once per health interval (5 s) and identical on every shard of a node. On a 3-node × 8-shard deployment that made the in-flight term ~1/24 of the node's queue and the scraped terms a 5 s-old blend that moved every backend together, so the policy either never diverted or diverted everything, and with `bounded_load_epsilon` 0.25 the cap at ~1 in-flight per backend was 1–2: nearly any load diverted (25–30% of requests), spending the affinity without reaching the tail. The 13B 20-user fitted row sat at +3…+21% P99 against round-robin across twelve runs of placement and divert variants.
 
-The defaults now read the node-local in-flight count (`cross_shard_load_sync: true`, 100 ms broadcast), drop the scraped terms from the divert signal (`gpu_load_weight` and `capacity_headroom_weight` 0; the scrape still runs for observability and residency routing), and divert only at twice the mean (`bounded_load_epsilon` 1.0). Measured on 8×A100 with 3 Ranvier nodes (`docs/benchmarks/benchmark-results-current.md`, combo and confirmation legs): 13B 20 users P99 TTFT −60.4 / −57.5 / −55.2% in three repeats across both arm orders, P50 −28%, KV prefix hits 69–73%, diverts 23–27%, route consistency 50–53%; 13B 10 users −34.5% with KV hits 82%; 8B 20 users −22.6% (was −17%); 13B 30 users −16.4% in the eviction regime. The request distribution across backends stayed uneven (Gini 0.09–0.12): the tail was queue depth, not request count, and a divert policy that sees the queue live and acts only on a real one removes it without giving back affinity. Set `cross_shard_load_sync: false` on a single-shard process (the timer is skipped anyway) or where the ~1,100 SMP messages/s on 8 shards matter more than tail latency. `miss_placement: least_loaded` is the third default from the same day: on its own it never moved the tail, but under the live divert policy it needs fewer diverts (one home per prefix), and against `hash` with the same signal, three repeats each, it gave −57.5% vs −51.8% median P99, 69–73% vs 49–55% KV hits, 50–53% vs 39–45% consistency and 23–27% vs 30–33% diverts. `hash` is the right choice on a single node without gossip, where the convergence rules have nothing to do. The counter `router_miss_placements_rebalanced_total` counts misses placed off their hash bucket. Placement balances prefix *count*, not popularity: a single prefix carrying a large share of traffic still needs replication, which this knob does not do.
+The defaults now read the node-local in-flight count (`cross_shard_load_sync: true`, 100 ms broadcast), drop the scraped terms from the divert signal (`gpu_load_weight` and `capacity_headroom_weight` 0; the scrape still runs for observability and residency routing), and divert only at twice the mean (`bounded_load_epsilon` 1.0). Measured on 8×A100 with 3 Ranvier nodes (`docs/benchmarks/benchmark-results-current.md`, combo and confirmation legs): 13B 20 users P99 TTFT −60.4 / −57.5 / −55.2% in three repeats across both arm orders, P50 −28%, KV prefix hits 69–73%, diverts 23–27%, route consistency 50–53%; 13B 10 users −34.5% with KV hits 82%; 8B 20 users −22.6% (was −17%); 13B 30 users −16.4% in the eviction regime. The request distribution across backends stayed uneven (Gini 0.09–0.12): the tail was queue depth, not request count, and a divert policy that sees the queue live and acts only on a real one removes it without giving back affinity. Set `cross_shard_load_sync: false` on a single-shard process (the timer is skipped anyway) or where the ~1,100 SMP messages/s on 8 shards matter more than tail latency. `miss_placement: least_loaded` is the third default from the same day: on its own it never moved the tail, but under the live divert policy it needs fewer diverts (one home per prefix), and against `hash` with the same signal, three repeats each, it gave −57.5% vs −51.8% median P99, 69–73% vs 49–55% KV hits, 50–53% vs 39–45% consistency and 23–27% vs 30–33% diverts. `hash` is the right choice on a single node without gossip, where the convergence rules have nothing to do. The counter `router_miss_placements_rebalanced_total` counts misses placed off their hash bucket. Placement balances prefix *count*, not popularity: a single prefix carrying a large share of traffic still needs replication, which this knob does not do (`routing.replication.max_holders` does it by diversion; see [cache-residency-routing.md](cache-residency-routing.md)).
 
 ### X-Backend-ID Header
 
@@ -473,7 +481,7 @@ dispatch score(b) = prefix_weight * affinity(b)
                   [+ price terms on the miss path]
 ```
 
-At the neutral defaults (`prefix_weight 0`, `load_weight 1`) the anchor keeps its seat exactly while at or under the allowance, and forfeits past it — the same keep/divert frontier as the per-strategy rules. Divert targets are encoded in the deterministic tie-break order: least-loaded for every strategy, with jump-probe order breaking equal loads under bounded-load (then lowest id). Bounded-load used to spill to the first under-cap bucket in probe order; that pushed load off hot anchors without ever pulling it toward the coldest backend and stranded one backend per fleet in the 2026-10-02 fitted suite (BACKLOG §27), so the divert now goes to the coldest candidate. The median allowance auto-adapts to any workload, model size, or cluster size — no per-model tuning needed; `bounded_load`/`p2c` use capacity-adjusted load, `jump`/`modular` use composite load (`local_active_requests + gpu_load_score * gpu_load_weight`).
+At the neutral defaults (`prefix_weight 0`, `load_weight 1`) the anchor keeps its seat exactly while at or under the allowance, and forfeits past it — the same keep/divert frontier as the per-strategy rules. Divert targets are encoded in the deterministic tie-break order: least-loaded for every strategy, with jump-probe order breaking equal loads under bounded-load (then lowest id). With `routing.replication.max_holders >= 1` and the native stream on, a bounded-load ART divert prefers a verified holder of the prefix, then a designated replica, ahead of load (see Unified Route Scoring). Bounded-load used to spill to the first under-cap bucket in probe order; that pushed load off hot anchors without ever pulling it toward the coldest backend and stranded one backend per fleet in the 2026-10-02 fitted suite (BACKLOG §27), so the divert now goes to the coldest candidate. The median allowance auto-adapts to any workload, model size, or cluster size — no per-model tuning needed; `bounded_load`/`p2c` use capacity-adjusted load, `jump`/`modular` use composite load (`local_active_requests + gpu_load_score * gpu_load_weight`).
 
 See `route_scorer.hpp` for the scorer and `compute_load_allowance()` in `router_service.cpp` for the allowance math; the miss-path hash strategies keep their own integrated load logic — see `bounded_load_select()` and `p2c_select()`.
 
@@ -556,7 +564,9 @@ dispatch(b)  = placement(b)
              - cost_weight * cost_hinge(b)
 ```
 
-`placement` argmax → `original_selected` (the learn target, stable inputs only); `dispatch` argmax → the backend serving this request. Tie-breaks are deterministic: placement prefers the anchor then lower composite load then lower id; dispatch prefers a clean placement winner (no forfeited term), then lower cost pressure, then lower load, then jump-probe order, then lower id.
+`placement` argmax → `original_selected` (the learn target, stable inputs only); `dispatch` argmax → the backend serving this request. Tie-breaks are deterministic: placement prefers the anchor then lower composite load then lower id; dispatch prefers a clean placement winner (no forfeited term), then lower `holder_rank`, then lower cost pressure, then lower load, then jump-probe order, then lower id.
+
+`holder_rank` is the replication-by-diversion key (0 verified holder, 1 designated replica, 2 none). It is filled only when an ART hit's anchor forfeits under bounded-load with `routing.replication.max_holders >= 1` and a fresh native stream, so it is inert (all 2) otherwise. It is a tie key, not a weight: with `prefix_weight` at its default 0 affinity is inert, and stickiness has to live in the dispatch tie order. It never touches placement, so a holder is a dispatch target and never the learned home. See [cache-residency-routing.md](cache-residency-routing.md) § Replication by diversion.
 
 | Weight | Default | Env | Meaning |
 |--------|---------|-----|---------|
@@ -566,6 +576,10 @@ dispatch(b)  = placement(b)
 | `cost_weight` | `1.0` | `RANVIER_SCORING_COST_WEIGHT` | Scale of the cost-budget hinge (inert unless `cost_routing.enabled`). |
 | `price_weight` | `1.0` | `RANVIER_SCORING_PRICE_WEIGHT` | Hardware-price preference strength; `0` disables the cache-miss cheaper-hardware divert. |
 | `slo_weight` | `0.0` | `RANVIER_SCORING_SLO_WEIGHT` | Reserved seam for a future latency/SLO term; parsed but not read. |
+
+| Option | Default | Env | Meaning |
+|--------|---------|-----|---------|
+| `replication.max_holders` | `0` | `RANVIER_REPLICATION_MAX_HOLDERS` | Replication by diversion, 0–64. `0` = off (least-loaded spillover). `1` = an over-allowance ART hit goes to an under-allowance verified holder before any stranger. `>= 2` = also designate one probe-order replica per prefix while no holder is under allowance and holders < cap, and at the cap stay on the least-loaded holder. Needs `kv_events`. |
 
 **Default-weight parity:** at the defaults above, every term reduces to its legacy rule — the per-step keys (`bounded_load_epsilon`, `p2c_load_bias`, `load_imbalance_factor/floor`, `cache_residency_threshold`, `cost_routing.*`, per-backend `cost_per_hour`) keep their authority and an un-tuned config routes exactly as the former sequential override pipeline did. The weights are the seam for BACKLOG §20.1: precise KV-event residency (P0.1) grades `affinity(b)` per backend instead of gating it, and an SLO term plugs into the reserved weight. Pool-role awareness (P0.3, below) composes as a candidate *filter* on this same pass.
 

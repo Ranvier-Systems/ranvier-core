@@ -1700,7 +1700,7 @@ KV hit rate to move, in either direction, and read it before P99.
 
 ### Prerequisites
 
-- [ ] Branch restarted from `main` after PR 674 (done 2026-10-14; `claude/sleepy-lamport-wxly0b`).
+- [x] Branch restarted from `main` after PR 674 (done 2026-10-14; `claude/sleepy-lamport-wxly0b`).
 - [x] `ctx->learn_target_backend` is assigned from `learn_target` (= `original_selected`,
       `http_controller.cpp` ~2244) and re-pointed only on connect failover to the backend that
       actually served (~829), never to a load-divert target. A replica is therefore a dispatch
@@ -1720,7 +1720,7 @@ KV hit rate to move, in either direction, and read it before P99.
   load, loses to rank 0 at higher load; holder_rank never changes `decision.placement`;
   `load_diverted` still set when dispatch leaves the placement.
 - **Concerns:** None Seastar-related (pure header). Keep `ScoreCandidate` trivially copyable.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-15)
 
 #### Step 2: `routing.replication.max_holders` config
 - **Files:** `src/config_schema.hpp` (RoutingConfig), `src/config_loader.cpp` (env
@@ -1734,7 +1734,7 @@ KV hit rate to move, in either direction, and read it before P99.
 - **Tests:** env + YAML parse, env wins over YAML, 65 rejected with the message, default 0.
 - **Concerns:** Hard Rule #10 (validating parse via `get_env_as`). Hot-reloadable like the other
   routing knobs (shard-local config copy, Rule #1).
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-15)
 
 #### Step 3: Verified-holder dispatch (rule 1)
 - **Depends on:** Steps 1, 2
@@ -1760,7 +1760,7 @@ KV hit rate to move, in either direction, and read it before P99.
   set (≤ 64) and the per-hash holder set (bounded by `MAX_ENTRIES_PER_BACKEND` × backends in the
   index). No cross-shard call: `prefix_hash_index` is per-shard and already fed by the subscriber.
   Hash computed once per forfeiting hit, the cost the spillover block already pays.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-15)
 
 #### Step 4: Deterministic replica designation and the holder cap (rules 2 and 3)
 - **Depends on:** Step 3
@@ -1783,7 +1783,12 @@ KV hit rate to move, in either direction, and read it before P99.
   stateless by construction (that is the point; a shard-local "replica hint" map was rejected
   because three nodes × N shards would designate N×3 different replicas). Verify `dispatch_ids`
   preserves `live_backends`' sorted order so the probe index is cluster-consistent.
-- **Status:** [ ] Pending
+- **As built:** the probe walk reuses the spillover's existing `probe_rank` fill (lowest
+  rank among the eligible candidates = first in probe order), and the designated candidate must
+  have a fresh native stream of its own, or it could never be confirmed or counted toward the
+  cap (and designation would fire with the stream stale). Cap 1 marks holders only, never
+  narrows. A backend the n probes never reach carries no probe rank and cannot be designated.
+- **Status:** [x] Done (2026-10-15)
 
 #### Step 5: Verified-cold path hands the home to the least-loaded replica
 - **Depends on:** Step 3
@@ -1793,7 +1798,7 @@ KV hit rate to move, in either direction, and read it before P99.
   not change the ordering (load, then lower id) and the honored/redirect counters stay pairwise
   disjoint per decision (invariant I-8 in the surrounding comments). Add one test: home evicted,
   two fresh holders at different loads → the lighter one, `original_selected` = it.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-15)
 
 #### Step 6: Observability and benchmark plumbing
 - **Depends on:** Steps 3, 4
@@ -1812,7 +1817,7 @@ KV hit rate to move, in either direction, and read it before P99.
 - **Done when:** a compare file from a stream-on run prints the three counters per arm and the
   header shows `replication=2`; `--replication 2` without `--kv-events` warns in the log and the
   header.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-15)
 
 #### Step 7: Documentation
 - **Depends on:** Steps 1–4
@@ -1820,7 +1825,7 @@ KV hit rate to move, in either direction, and read it before P99.
   replication by diversion, the three rules, the cap, why designation is deterministic, why
   learning never moves), `docs/internals/prefix-affinity-routing.md` (dispatch tie order and the
   env/YAML tables), `CHANGELOG.md` (Added, default off), `BACKLOG.md` (this section's checkboxes)
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-15)
 
 #### Step 8: GPU session and verdict
 - **Depends on:** Steps 6, 7 merged and in the GHCR image
@@ -1866,10 +1871,16 @@ Steps 1 and 2 are independent and can land in one PR; 3–5 in a second; 6–7 i
 image the GPU session pulls carries everything.
 
 ### Post-Implementation
-- [ ] `/review` (Hard Rules) on Steps 3–4: the spillover block is the hottest path that changes.
-- [ ] `/doc` after Step 7: unit tests listed above, docs, this section's boxes.
-- [ ] Deferred gates (developer's Docker): `make test-unit` after Steps 1–5;
-      `make lint` before each push; `make test-integration-fast` after Step 6 (the parser and
+- [x] `/review` (Hard Rules) on Steps 3–4: the spillover block is the hottest path that changes (2026-10-15, clean).
+- [x] `/doc` after Step 7: unit tests listed above, docs, this section's boxes (2026-10-15).
+- [x] Deferred gates (developer's Docker): `make test-unit` after Steps 1–5 (passed 2026-10-15);
+      `make lint` before each push (2026-10-15, clang-tidy in the sanitize image on
+      router_service.cpp and config_loader.cpp with -D__GCC_DESTRUCTIVE_SIZE=64
+      -D__GCC_CONSTRUCTIVE_SIZE=64 so Seastar's cacheline.hh parses under clang: no findings
+      in the section 28 changes; the two pre-existing ones, a dead store in the startup log's
+      strategy_name and reserve() on the moved-from pending_local_routes, are fixed on the same
+      branch; `make lint` now carries the defines); `make test-integration-fast` after Step 6 (passed 2026-10-15 on a
+      fresh `make docker-build`; the parser and
       compare-file changes have no unit tests; `tests/integration/test_load_aware_routing.py`
       covers the divert counters' names).
 

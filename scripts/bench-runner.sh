@@ -12,6 +12,7 @@
 #   ./scripts/bench-runner.sh --suite epsilon          # Historical Leg V1: bounded-load epsilon 0.5, x3
 #   ./scripts/bench-runner.sh --suite fitted           # 13B (10u, 20u, 30u) with a prefix set that fits its KV cache, x3
 #   ./scripts/bench-runner.sh --suite low              # Exploratory: 70B, 64-user stress
+#   ./scripts/bench-runner.sh --suite kvrepl           # Rows 17/18 with replication by diversion (BACKLOG §28 Step 8), x3
 #   ./scripts/bench-runner.sh --suite all              # rebaseline + epsilon + fitted + low
 #   ./scripts/bench-runner.sh --suite custom --file runs.txt  # Custom run file
 #   ./scripts/bench-runner.sh --dry-run                # Preview what would run
@@ -240,7 +241,7 @@ USAGE:
     ./scripts/bench-runner.sh [OPTIONS]
 
 OPTIONS:
-    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, saturation, kvevents, kvablate, kvreset, low, all, custom
+    --suite NAME        Which benchmark suite to run: rebaseline (default), epsilon, fitted, placement, baseline, saturation, kvevents, kvablate, kvreset, kvrepl, low, all, custom
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
@@ -445,9 +446,38 @@ BUILT-IN SUITES:
       Measured 2026-10-13, 8/8 acked every arm: -23.7 / -19.4 / -21.3 (median -21.3, 3/3);
       the order gap fell from 9 points to 4 and the row's number moves from -26.7 to -21.3.
 
+    kvrepl (2 configs x 2 arms x 3 repeats, ~2h50m) — replication by diversion (BACKLOG
+      section 28): kvevents rows 17 and 18 with --replication 2 (routing.replication
+      .max_holders), so an over-allowance ART hit goes to a verified holder of its prefix,
+      else to one probe-order designated replica, and at two holders stays on the
+      least-loaded holder instead of minting a third copy.
+      1. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2 --num-prefixes 16 --prefix-max-tokens 4000  (row 17)
+      2. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2  (row 18, 50-prefix set)
+      Read first: router_replica_designations_total > 0 on the prefix arm of the first
+      compare ("replication" row), else designation never fired and the suite measured
+      holder-aware dispatch alone; then router_replica_dispatches_total > 0, else the
+      stream never confirmed a replica (replicas evaporated before overflow reached them)
+      and the mechanism is untested, not refuted.
+      Pre-registered reading, row 18 (+23.1 / +14.7 / +18.9% P99 vs least_loaded without
+      replication). Read the KV hit rate before P99; replication can move it either way:
+        CONSISTENT IMPROVEMENT (3/3 negative) with KV hit >= 23%: the finding. Flip
+          max_holders to 2 by default ONLY if row 17 also holds.
+        MIXED with replica_dispatches >> 0 and KV >= 23-30%: the mechanism works and
+          capacity does not; next is the cap (try 3) or KV-aware dispatch, not more
+          replication logic.
+        CONSISTENT REGRESSION with replica_dispatches ~ 0 and designations >> 0: replicas
+          do not survive long enough to be read; replication by diversion is refuted on
+          this fleet (the next idea needs a pinned, engine-side replica).
+        CONSISTENT REGRESSION with replica_dispatches >> 0 and KV below 23%: replicas
+          evicted the rest of the set; replication costs more cache than it saves here.
+          Stop; the README line is the "which regime you are in" claim.
+      Row 17 (fitted 20u, control -12.5%) must not regress: 3/3 within a point of the
+      control. If it regresses while row 18 improves, the hotness gate (section 28 Step 9).
+      Needs an image carrying section 28 Steps 1-6; --resume 4 runs row 18 alone.
+
     all = rebaseline + epsilon + fitted + placement + baseline + saturation + kvevents +
-      kvablate + kvreset + low (every suite; the historical epsilon and placement rows
-      included — pass --skip to drop them).
+      kvablate + kvreset + low + kvrepl (every suite; the historical epsilon and placement
+      rows included — pass --skip to drop them).
 
     Retired (see .dev-context/benchmark-accuracy-audit-2026-09-30.md):
       - prefix-ratio 0.5/0.7 sweep: SHARED_PREFIX_RATIO only governs 20% of the
@@ -465,11 +495,11 @@ BUILT-IN SUITES:
       now identical to fitted on a 2.2.0 image; keep it for re-running the leg
       against an older image or with --miss-placement hash on the rr arm.
 
-    rebaseline, epsilon, fitted, placement, baseline, saturation, kvevents and kvreset default to --repeat 3; pass --repeat 1 for a smoke run.
+    rebaseline, epsilon, fitted, placement, baseline, saturation, kvevents, kvreset and kvrepl default to --repeat 3; pass --repeat 1 for a smoke run.
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
-      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | saturation | kvevents | kvablate | kvreset | low
+      add_run <suite> "<label>" <bench.sh args...>     # suite: rebaseline | epsilon | fitted | placement | baseline | saturation | kvevents | kvablate | kvreset | kvrepl | low
     Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
@@ -540,6 +570,7 @@ done
 #   kvevents   = fitted 20u + 50-prefix 20u vs least_loaded with --kv-events (--suite kvevents)
 #   kvablate   = fitted 20u vs least_loaded, --kv-events with materialize off / depth 4096 / both, x1 (--suite kvablate)
 #   kvreset    = 8B 20u vs round-robin with the between-arm KV reset working (--suite kvreset)
+#   kvrepl     = kvevents rows 17/18 with --replication 2, replication by diversion (--suite kvrepl)
 #   low        = exploratory runs outside any headline  (--suite low, all)
 #
 # Run numbers are assigned in definition order within the selected suite.
@@ -552,7 +583,7 @@ add_run() {
     local args="$*"
 
     case "$SUITE" in
-        rebaseline|epsilon|fitted|placement|baseline|saturation|kvevents|kvablate|kvreset|low) [[ "$suite" != "$SUITE" ]] && return ;;
+        rebaseline|epsilon|fitted|placement|baseline|saturation|kvevents|kvablate|kvreset|kvrepl|low) [[ "$suite" != "$SUITE" ]] && return ;;
         all)    ;;  # include everything
         *)      return ;;  # custom suite doesn't use add_run
     esac
@@ -755,6 +786,21 @@ define_runs() {
         --warmup --duration 15m --users 64 --spawn-rate 4 \
         --model meta-llama/Llama-3.1-8B-Instruct
 
+    # --- kvrepl: replication by diversion (BACKLOG section 28 Step 8) ------------
+    # The kvevents rows with --replication 2. Defined last so the existing rows keep
+    # their --suite all numbers. Read the compare's "replication" row first:
+    # designations > 0, then dispatches > 0, before any P99 (see --help).
+    add_run kvrepl "13B 20u/10m A/B vs least_loaded, fitted set, kv-events, replication 2" \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2 \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192 \
+        --num-prefixes 16 --prefix-max-tokens 4000
+
+    add_run kvrepl "13B 20u/10m A/B vs least_loaded, 50-prefix set, kv-events, replication 2" \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2 \
+        --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192
+
     # --- Custom file ----------------------------------------------------------
     if [[ "$SUITE" == "custom" ]]; then
         if [[ -z "$CUSTOM_FILE" ]]; then
@@ -786,7 +832,7 @@ define_runs
 # so the post-suite aggregation can gather each config's repeats. See BACKLOG §25.
 # A single run is not a result (review F3): the headline suites default to
 # three repeats so the aggregate can issue a CONSISTENT / MIXED verdict.
-if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" || "$SUITE" == "placement" || "$SUITE" == "baseline" || "$SUITE" == "saturation" || "$SUITE" == "kvevents" || "$SUITE" == "kvreset" ) ]]; then
+if [[ "$REPEAT_SET" = false && ( "$SUITE" == "rebaseline" || "$SUITE" == "epsilon" || "$SUITE" == "fitted" || "$SUITE" == "placement" || "$SUITE" == "baseline" || "$SUITE" == "saturation" || "$SUITE" == "kvevents" || "$SUITE" == "kvreset" || "$SUITE" == "kvrepl" ) ]]; then
     REPEAT=3
     log_info "Suite '$SUITE' defaults to --repeat 3 (pass --repeat 1 for a smoke run)"
 fi

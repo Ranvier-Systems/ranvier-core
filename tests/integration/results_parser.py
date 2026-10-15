@@ -196,6 +196,15 @@ class BenchmarkResults:
     # stream (after a reset or a trimmed backfill), decided by the gossip gate.
     native_stream_completes_total: Optional[int] = None
     native_absence_untrusted_total: Optional[int] = None
+    # Replication by diversion (BACKLOG §28, "router_replica_*"; nonzero only
+    # with routing.replication.max_holders >= 1 and the stream on).
+    # replica_dispatches: over-allowance ART hits served by a verified holder
+    # other than the home; replica_designations: hits sent to the probe-order
+    # designated replica; replica_holders_saturated: hits at the holder cap with
+    # every holder over allowance, kept on the least-loaded holder.
+    replica_dispatches_total: Optional[int] = None
+    replica_designations_total: Optional[int] = None
+    replica_holders_saturated_total: Optional[int] = None
     # Per-backend request distribution — printed as a sorted list so prefix-
     # concentration hot-spotting shows up directly in the comparison output.
     # Aggregated across ALL ranvier nodes (see parse_prometheus_report).
@@ -669,9 +678,15 @@ _NATIVE_KEYS = (
     "native_stream_completes_total",
     "native_absence_untrusted_total",
 )
+# Replication-by-diversion counters (router_service.cpp "router_replica_*").
+_REPLICA_KEYS = (
+    "replica_dispatches_total",
+    "replica_designations_total",
+    "replica_holders_saturated_total",
+)
 _PROM_NATIVE_RES = {
     k: re.compile(r"^(?:seastar_)?ranvier_router_" + k + r"(?:\{[^}]*\})?\s+([0-9.eE+-]+)")
-    for k in _NATIVE_KEYS
+    for k in _NATIVE_KEYS + _REPLICA_KEYS
 }
 # NOTE: backend_active_requests is an instantaneous gauge — it reads ~0 when
 # scraped after traffic has drained at end-of-run, so it is a poor distribution
@@ -713,7 +728,7 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
     for line in content.splitlines():
         if not line or line.startswith("#"):
             continue
-        if "_native_" in line:
+        if "_native_" in line or "_replica_" in line:
             for key, rx in _PROM_NATIVE_RES.items():
                 m = rx.match(line)
                 if m:
@@ -850,7 +865,7 @@ def parse_prometheus_report(report_dir: str) -> Dict[str, Any]:
         return {}
 
     sum_keys = ("load_aware_fallbacks_total", "residency_route_downgrades_total",
-                "cache_states_sent_total", "cache_states_received_total") + _NATIVE_KEYS
+                "cache_states_sent_total", "cache_states_received_total") + _NATIVE_KEYS + _REPLICA_KEYS
     sums: Dict[str, int] = {}
     active: Dict[str, float] = {}
     routed: Dict[str, float] = {}
@@ -1093,7 +1108,7 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.cache_states_received_total = prom["cache_states_received_total"]
     if "residency_cache_size" in prom:
         results.residency_cache_size = prom["residency_cache_size"]
-    for key in _NATIVE_KEYS:
+    for key in _NATIVE_KEYS + _REPLICA_KEYS:
         if key in prom:
             setattr(results, key, prom[key])
     if "nodes_scraped" in prom:
@@ -1842,6 +1857,29 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
                 )
             lines.append(f"  native KV events (baseline): {_native_row(baseline)}")
             lines.append(f"  native KV events (new):      {_native_row(new)}")
+
+            def _replica_row(r) -> str:
+                return ", ".join(
+                    f"{k[len('replica_'):-len('_total')]}={_fmt_count(getattr(r, k, None))}"
+                    for k in _REPLICA_KEYS
+                )
+            rep_holders = (_manifest_replication_max_holders(new.source_file)
+                           or _manifest_replication_max_holders(baseline.source_file))
+            lines.append(f"  replication (baseline):      {_replica_row(baseline)}")
+            lines.append(f"  replication (new):           {_replica_row(new)}"
+                         + (f"  [max_holders={rep_holders}]" if rep_holders else ""))
+            if rep_holders and rep_holders >= 2 and not (new.replica_designations_total or 0):
+                lines.append(
+                    "  -> replication REQUESTED (max_holders >= 2) but replica_designations=0 on the new "
+                    "arm: designation never fired, so this run measured holder-aware dispatch alone "
+                    "(BACKLOG §28 Step 8, read first)."
+                )
+            elif (rep_holders and (new.replica_designations_total or 0) > 0
+                  and not (new.replica_dispatches_total or 0)):
+                lines.append(
+                    "  -> replica_dispatches=0 with designations > 0: the stream never confirmed a "
+                    "replica (evicted before overflow reached it); the mechanism is untested, not refuted."
+                )
             if kv_requested and not _native_any(new):
                 lines.append(
                     "  -> native KV events REQUESTED (--kv-events) but kv_ops=0 on the new arm: the ZMQ "
@@ -2278,6 +2316,20 @@ def _manifest_kv_events_enabled(path: Optional[str]) -> bool:
         return False
     routing = m.get("routing") or {}
     return str(routing.get("kv_events_enabled", "")).lower() == "true"
+
+
+def _manifest_replication_max_holders(path: Optional[str]) -> int:
+    """routing.replication_max_holders from the manifest beside `path`
+    (bench.sh --replication); 0 for no manifest, older manifests or a bad value."""
+    if not path:
+        return 0
+    m = load_manifest(path)
+    if not m:
+        return 0
+    try:
+        return int((m.get("routing") or {}).get("replication_max_holders", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def load_manifest(path: str) -> Optional[Dict[str, Any]]:

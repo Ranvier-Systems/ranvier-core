@@ -405,6 +405,27 @@ struct RoutingConfig {
     // deeper than 2,048 tokens was downgraded with certainty.
     uint32_t kv_native_indexed_depth = 2048;
 
+    // Replication by diversion (BACKLOG section 28): the most backends that
+    // may hold one prefix, anchor included, before overflow stops minting
+    // replicas. Acts only when an ART hit's anchor forfeits its BOUNDED_LOAD
+    // allowance and the native stream is fresh for the candidates read,
+    // within kv_native_indexed_depth:
+    //   0  = off: today's least-loaded spillover, byte for byte.
+    //   1  = holder-aware dispatch only: an under-allowance verified holder
+    //        outranks every stranger; no replica is ever designated.
+    //   >= 2 = also designate a replica (the first probe-order under-allowance
+    //        stranger) while no holder is under allowance and holders < cap,
+    //        and at the cap with every holder over allowance send the request
+    //        to the least-loaded holder instead of a stranger.
+    // Off by default until measured. Row 18 of the native KV-event suite
+    // (50-prefix 13B 20u) read +23.1 / +14.7 / +18.9% P99 against least-loaded
+    // with a quarter of requests diverted to strangers whose one-off copies
+    // were evicted before anything read them (holder_redirects 0 in 376
+    // verified-cold decisions); the GPU verdict decides the default.
+    // Env: RANVIER_REPLICATION_MAX_HOLDERS. YAML: routing.replication.max_holders.
+    // Range 0..64 (the live-set bound).
+    uint32_t replication_max_holders = 0;
+
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }

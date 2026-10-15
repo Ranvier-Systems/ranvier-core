@@ -84,6 +84,8 @@ protected:
         // Dashboard env vars
         unsetenv("RANVIER_DASHBOARD_ENABLED");
         unsetenv("RANVIER_DASHBOARD_CORS");
+        // Replication by diversion
+        unsetenv("RANVIER_REPLICATION_MAX_HOLDERS");
     }
 
     void TearDown() override {
@@ -2687,6 +2689,66 @@ TEST_F(ConfigTest, ScoringRejectsResidencyWeightAboveOne) {
     auto error = RanvierConfig::validate(config);
     ASSERT_TRUE(error.has_value());
     EXPECT_NE(error->find("scoring.residency_weight"), std::string::npos);
+}
+
+// =============================================================================
+// Replication by diversion (routing.replication.max_holders)
+// =============================================================================
+
+TEST_F(ConfigTest, ReplicationMaxHoldersDefaultsOff) {
+    // 0 = off: dispatch is byte-for-byte the least-loaded spillover. Pinned
+    // so a default flip is the GPU verdict's decision (BACKLOG section 28).
+    auto config = RanvierConfig::defaults();
+    EXPECT_EQ(config.routing.replication_max_holders, 0u);
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, ReplicationMaxHoldersParsesFromYaml) {
+    auto config = RanvierConfig::load_from_string(R"(
+routing:
+  replication:
+    max_holders: 2
+)");
+    EXPECT_EQ(config.routing.replication_max_holders, 2u);
+    // Siblings under routing keep their defaults.
+    EXPECT_DOUBLE_EQ(config.routing.bounded_load_epsilon, 1.0);
+}
+
+TEST_F(ConfigTest, ReplicationMaxHoldersParsesFromEnv) {
+    setenv("RANVIER_REPLICATION_MAX_HOLDERS", "3", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_EQ(config.routing.replication_max_holders, 3u);
+    unsetenv("RANVIER_REPLICATION_MAX_HOLDERS");
+}
+
+TEST_F(ConfigTest, ReplicationMaxHoldersEnvWinsOverYaml) {
+    setenv("RANVIER_REPLICATION_MAX_HOLDERS", "1", 1);
+    auto config = RanvierConfig::load_from_string(R"(
+routing:
+  replication:
+    max_holders: 4
+)");
+    EXPECT_EQ(config.routing.replication_max_holders, 1u);
+    unsetenv("RANVIER_REPLICATION_MAX_HOLDERS");
+}
+
+TEST_F(ConfigTest, ReplicationMaxHoldersInvalidEnvIsIgnored) {
+    setenv("RANVIER_REPLICATION_MAX_HOLDERS", "two", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_EQ(config.routing.replication_max_holders, 0u);
+    unsetenv("RANVIER_REPLICATION_MAX_HOLDERS");
+}
+
+TEST_F(ConfigTest, ReplicationMaxHoldersValidatedToLiveSetBound) {
+    RanvierConfig config;
+    config.routing.replication_max_holders = 64;
+    EXPECT_FALSE(RanvierConfig::validate(config).has_value());
+
+    config.routing.replication_max_holders = 65;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_EQ(*error, "routing.replication.max_holders must be between 0 and 64");
 }
 
 // =============================================================================

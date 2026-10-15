@@ -23,6 +23,7 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -264,6 +265,9 @@ struct ShardLocalState {
         uint64_t native_verified_cold_honored = 0;  // Verified-cold ART hits kept on the home (no other verified holder): re-prefill there
         uint64_t native_holder_redirects = 0;       // Verified-cold ART hits served by another verified holder of the same prefix
         uint64_t native_verified_depth_skips = 0;   // Fresh-stream ART hits deeper than the indexed depth: probabilistic path used
+        uint64_t replica_dispatches = 0;            // Over-allowance ART hits dispatched to a verified holder other than the home (replication by diversion)
+        uint64_t replica_designations = 0;          // Over-allowance ART hits dispatched to the designated replica (no holder under allowance, below the holder cap)
+        uint64_t replica_holders_saturated = 0;     // Over-allowance ART hits with the holder cap reached and every holder over allowance: dispatch narrowed to the holders
         uint64_t native_routes_materialized = 0;    // PUSH routes inserted from BlockStored token chains
         uint64_t native_materialize_trust_skips = 0; // Materializations refused by a higher-trust route
         uint64_t remote_routes_trust_refused = 0;    // Gossip REMOTE announcements refused by a higher-trust LOCAL/PUSH route
@@ -316,6 +320,9 @@ struct ShardLocalState {
             native_verified_cold_honored = 0;
             native_holder_redirects = 0;
             native_verified_depth_skips = 0;
+            replica_dispatches = 0;
+            replica_designations = 0;
+            replica_holders_saturated = 0;
             native_routes_materialized = 0;
             native_materialize_trust_skips = 0;
             remote_routes_trust_refused = 0;
@@ -373,6 +380,9 @@ struct ShardLocalState {
         // Depth the native index tracks (kv_events.max_indexed_token_depth);
         // verified residency is undefined for routing depths beyond it.
         uint32_t kv_native_indexed_depth = 2048;
+        // Replication by diversion holder cap (routing.replication.max_holders);
+        // 0 = off, 1 = holder-aware dispatch only, >= 2 = designation + cap.
+        uint32_t replication_max_holders = 0;
     } config;
 
     // ========================================================================
@@ -563,6 +573,35 @@ struct ShardLocalState {
         return native_residency_fresh(id) && native_kv.complete.contains(id);
     }
 
+    // Rule #4: holder scans write into a fixed buffer sized by the live-set
+    // bound (LocalDiscovery::MAX_KNOWN_BACKENDS); no allocation per request.
+    static constexpr size_t MAX_VERIFIED_HOLDERS = 64;
+    using VerifiedHolders = std::array<BackendId, MAX_VERIFIED_HOLDERS>;
+
+    // Backends other than `exclude` that are live, role-eligible, and shown
+    // holding `hash` by prefix_hash_index on a fresh native stream of their
+    // own. The freshness check is what makes an entry a stored block: route
+    // learning writes the same index, so an entry for a backend without fresh
+    // trust may be a learned-route claim. Writes up to out.size() ids in index
+    // order and returns the count; callers that pick one order by their own
+    // keys. Rule #17: bounded by the per-hash holder set x the live set.
+    size_t verified_holders_of(uint64_t hash, const std::vector<BackendId>& live_backends,
+                               BackendId exclude, VerifiedHolders& out) const {
+        auto it = prefix_hash_index.find(hash);
+        if (it == prefix_hash_index.end()) return 0;
+        size_t count = 0;
+        for (BackendId cand : it->second) {
+            if (count == out.size()) break;
+            if (cand == exclude) continue;
+            if (std::find(live_backends.begin(), live_backends.end(), cand) ==
+                live_backends.end()) continue;
+            if (!role_eligible(cand)) continue;
+            if (!native_residency_fresh(cand)) continue;
+            out[count++] = cand;
+        }
+        return count;
+    }
+
     void mark_native_complete(BackendId id) {
         if (!native_kv.complete.contains(id) &&
             native_kv.complete.size() >= NativeKvState::MAX_BACKENDS) {
@@ -718,6 +757,8 @@ struct ShardLocalState {
         // Native KV-event verified-residency freshness and indexed depth
         config.kv_residency_freshness_ttl = cfg.kv_residency_freshness_ttl;
         config.kv_native_indexed_depth = cfg.kv_native_indexed_depth;
+        // Replication by diversion holder cap
+        config.replication_max_holders = cfg.replication_max_holders;
 
         // Pre-allocate cross-shard load snapshot storage (one entry per shard)
         // Resized to smp::count so we can index by shard_id without bounds checks.
@@ -775,6 +816,8 @@ struct ShardLocalState {
         // Native KV-event verified-residency freshness and indexed depth
         config.kv_residency_freshness_ttl = cfg.kv_residency_freshness_ttl;
         config.kv_native_indexed_depth = cfg.kv_native_indexed_depth;
+        // Replication by diversion holder cap
+        config.replication_max_holders = cfg.replication_max_holders;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -1795,6 +1838,16 @@ static BackendId least_loaded_placement(
     return candidates[best];
 }
 
+static const char* hash_strategy_name(RoutingConfig::HashStrategy strategy) {
+    switch (strategy) {
+    case RoutingConfig::HashStrategy::BOUNDED_LOAD: return "bounded_load";
+    case RoutingConfig::HashStrategy::P2C:          return "p2c";
+    case RoutingConfig::HashStrategy::MODULAR:      return "modular";
+    case RoutingConfig::HashStrategy::JUMP:
+    default:                                        return "jump";
+    }
+}
+
 RouterService::RouterService() : RouterService(RoutingConfig{}) {}
 
 RouterService::RouterService(const RoutingConfig& config)
@@ -1813,19 +1866,14 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     }
 
     // Log active hash strategy for operational visibility
-    const char* strategy_name = "jump";
-    switch (routing_config.hash_strategy) {
-    case RoutingConfig::HashStrategy::BOUNDED_LOAD: strategy_name = "bounded_load"; break;
-    case RoutingConfig::HashStrategy::P2C:          strategy_name = "p2c"; break;
-    case RoutingConfig::HashStrategy::MODULAR:      strategy_name = "modular"; break;
-    case RoutingConfig::HashStrategy::JUMP:
-    default:                                        strategy_name = "jump"; break;
-    }
-    log_router.info("Hash strategy: {} (epsilon={}, p2c_bias={}), miss placement: {}",
+    const char* strategy_name = hash_strategy_name(routing_config.hash_strategy);
+    log_router.info("Hash strategy: {} (epsilon={}, p2c_bias={}), miss placement: {}, "
+                    "replication max_holders: {}",
                     strategy_name, routing_config.bounded_load_epsilon,
                     routing_config.p2c_load_bias,
                     routing_config.miss_placement == RoutingConfig::MissPlacement::LEAST_LOADED
-                        ? "least_loaded" : "hash");
+                        ? "least_loaded" : "hash",
+                    routing_config.replication_max_holders);
 
     // When the hash strategy has built-in load awareness, the external median
     // override (load_imbalance_factor/floor) is not applied. Honor the
@@ -2272,6 +2320,21 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             seastar::metrics::description("ART hits on a fresh native stream routed deeper than "
                                          "kv_events.max_indexed_token_depth: verification "
                                          "skipped, probabilistic residency used")),
+        seastar::metrics::make_counter("router_replica_dispatches_total",
+            [] { return g_shard_state ? g_shard_state->stats.replica_dispatches : 0UL; },
+            seastar::metrics::description("ART hits whose home was over its load allowance, "
+                                         "dispatched to another backend the native stream shows "
+                                         "holding the prefix (routing.replication.max_holders >= 1)")),
+        seastar::metrics::make_counter("router_replica_designations_total",
+            [] { return g_shard_state ? g_shard_state->stats.replica_designations : 0UL; },
+            seastar::metrics::description("Over-allowance ART hits with no holder under allowance, "
+                                         "dispatched to the probe-order designated replica "
+                                         "(routing.replication.max_holders >= 2)")),
+        seastar::metrics::make_counter("router_replica_holders_saturated_total",
+            [] { return g_shard_state ? g_shard_state->stats.replica_holders_saturated : 0UL; },
+            seastar::metrics::description("Over-allowance ART hits at the holder cap with every "
+                                         "holder over allowance: dispatch narrowed to the "
+                                         "least-loaded holder instead of a stranger")),
         seastar::metrics::make_counter("router_native_stream_resets_total",
             [] { return g_shard_state ? g_shard_state->stats.native_resets : 0UL; },
             seastar::metrics::description("Native KV streams reset after a sequence gap or "
@@ -3315,25 +3378,19 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     } else {
                         native_decided = true;
                         native_verified_cold = true;
+                        // Least-loaded other verified holder, then lower id.
+                        ShardLocalState::VerifiedHolders holders;
+                        const size_t holder_count = state.verified_holders_of(
+                            request_hash, live_backends, art_backend, holders);
                         BackendId holder = 0;
                         uint64_t holder_load = 0;
-                        if (idx_it != state.prefix_hash_index.end()) {
-                            for (BackendId cand : idx_it->second) {
-                                if (cand == art_backend) continue;
-                                if (std::find(live_backends.begin(), live_backends.end(), cand) ==
-                                    live_backends.end()) continue;
-                                if (!state.role_eligible(cand)) continue;
-                                // A holder is only as good as its own stream: an
-                                // entry for a backend without fresh native trust
-                                // may be a learned-route claim (route learning
-                                // writes the same index), not a stored block.
-                                if (!state.native_residency_fresh(cand)) continue;
-                                uint64_t load = get_composite_backend_load(cand);
-                                if (holder == 0 || load < holder_load ||
-                                    (load == holder_load && cand < holder)) {
-                                    holder = cand;
-                                    holder_load = load;
-                                }
+                        for (size_t h = 0; h < holder_count; ++h) {
+                            const BackendId cand = holders[h];
+                            uint64_t load = get_composite_backend_load(cand);
+                            if (holder == 0 || load < holder_load ||
+                                (load == holder_load && cand < holder)) {
+                                holder = cand;
+                                holder_load = load;
                             }
                         }
                         if (holder != 0) {
@@ -3785,6 +3842,30 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     // outrank load (the first-under-cap rule stranded the coldest backend,
     // see bounded_load_select). Filled only for under-allowance candidates so
     // the saturated case falls through to the least-loaded key unchanged.
+    //
+    // Replication by diversion (routing.replication.max_holders >= 1, BACKLOG
+    // section 28) marks the same forfeiting hits' under-allowance verified
+    // holders holder_rank 0, so a backend the native stream shows holding
+    // the prefix outranks every colder stranger: the divert is a hit instead
+    // of a one-off prefill whose copy is evicted before anything reads it.
+    // Only placement (original_selected) is learned, so a holder is never a
+    // second home. Inert with the stream off (TTL 0) or beyond the indexed
+    // depth, where the index cannot vouch for anything; the hit path's
+    // depth-skip counter already counted that request.
+    //
+    // With max_holders >= 2 and no holder under allowance, holders (anchor
+    // included) are counted at any load:
+    //   below the cap: the lowest-probe-rank under-allowance stranger with a
+    //     fresh stream is the designated replica (holder_rank 1). Stateless:
+    //     same hash, same sorted live set, so every shard on every node sends
+    //     this prefix's overflow to the same backend, which the stream then
+    //     confirms as a holder. Probe order chooses only where a prefix's
+    //     first replica is born, never the target of every divert. A fresh
+    //     stream is required so the replica can be confirmed and counted.
+    //   at the cap: scored narrows to the holders, so the least-loaded holder
+    //     serves the hit over allowance (a queued hit on a warm backend beat a
+    //     cold prefill on every epsilon of the saturation suite).
+    bool holders_saturated = false;
     if (load_term && strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD &&
         art_hit && load_hinge(scored[anchor_index].load, allowance) > 0.0) {
         prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
@@ -3797,12 +3878,96 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 cand.probe_rank = static_cast<uint32_t>(probe);
             }
         }
+
+        if (state.config.replication_max_holders >= 1 &&
+            state.config.kv_residency_freshness_ttl.count() > 0 &&
+            prefix_len <= state.config.kv_native_indexed_depth) {
+            ShardLocalState::VerifiedHolders holders;
+            const size_t holder_count =
+                state.verified_holders_of(prefix_hash, live_backends, selected, holders);
+            // dispatch_ids filters the sorted live set in order, so it is
+            // sorted too and scored is index-aligned with it.
+            bool holder_under_allowance = false;
+            for (size_t h = 0; h < holder_count; ++h) {
+                auto pos = std::lower_bound(dispatch_ids.begin(), dispatch_ids.end(), holders[h]);
+                if (pos == dispatch_ids.end() || *pos != holders[h]) continue;
+                auto& cand = scored[static_cast<size_t>(pos - dispatch_ids.begin())];
+                if (load_hinge(cand.load, allowance) == 0.0) {
+                    cand.holder_rank = kHolderRankVerified;
+                    holder_under_allowance = true;
+                }
+            }
+
+            const uint32_t max_holders = state.config.replication_max_holders;
+            const size_t holders_total = holder_count + 1;  // the anchor included
+            if (max_holders >= 2 && !holder_under_allowance) {
+                if (holders_total < max_holders) {
+                    // Only under-allowance candidates carry a probe rank, and
+                    // every holder is over allowance here, so the probe-ranked
+                    // candidates are exactly the non-anchor, non-holder ones.
+                    size_t designated = scored.size();
+                    for (size_t i = 0; i < scored.size(); ++i) {
+                        const auto& cand = scored[i];
+                        if (cand.is_anchor ||
+                            cand.probe_rank == std::numeric_limits<uint32_t>::max()) continue;
+                        if (!state.native_residency_fresh(cand.id)) continue;
+                        if (designated == scored.size() ||
+                            cand.probe_rank < scored[designated].probe_rank) {
+                            designated = i;
+                        }
+                    }
+                    if (designated != scored.size()) {
+                        scored[designated].holder_rank = kHolderRankDesignated;
+                    }
+                } else {
+                    // Every holder is over allowance (none was marked above).
+                    // The holder buffer is <= MAX_VERIFIED_HOLDERS, so the
+                    // membership scan is bounded by 64 x the live set.
+                    std::erase_if(scored, [&](const ScoreCandidate& cand) {
+                        if (cand.is_anchor) return false;
+                        return std::find(holders.begin(), holders.begin() +
+                                             static_cast<ptrdiff_t>(holder_count),
+                                         cand.id) ==
+                               holders.begin() + static_cast<ptrdiff_t>(holder_count);
+                    });
+                    for (auto& cand : scored) {
+                        if (!cand.is_anchor) cand.holder_rank = kHolderRankVerified;
+                    }
+                    holders_saturated = true;
+                }
+            }
+        }
     }
 
     const ScoreDecision decision =
         score_and_select(scored.data(), scored.size(), weights, load_term);
     const BackendId placement_backend = scored[decision.placement].id;
     const BackendId final_backend = scored[decision.dispatch].id;
+
+    {
+        const ScoreCandidate& dispatched = scored[decision.dispatch];
+        if (holders_saturated) {
+            state.stats.replica_holders_saturated++;
+            log_router.debug("[{}] Replica cap: backend {} over allowance, holder cap {} "
+                             "reached with every holder over allowance; least-loaded holder "
+                             "{} serves the hit (load={:.1f})",
+                             request_id, selected, state.config.replication_max_holders,
+                             final_backend, dispatched.load);
+        }
+        if (!dispatched.is_anchor && dispatched.holder_rank == kHolderRankVerified) {
+            state.stats.replica_dispatches++;
+            log_router.debug("[{}] Replica dispatch: backend {} over allowance, verified "
+                             "holder {} serves the hit (load={:.1f})",
+                             request_id, selected, final_backend, dispatched.load);
+        } else if (dispatched.holder_rank == kHolderRankDesignated) {
+            state.stats.replica_designations++;
+            log_router.debug("[{}] Replica designation: backend {} over allowance, no holder "
+                             "under allowance; probe-order replica {} takes the hit "
+                             "(probe_rank={}, load={:.1f})",
+                             request_id, selected, final_backend, dispatched.probe_rank,
+                             dispatched.load);
+        }
+    }
 
     // Placement divert == the hardware-price preference fired. Stable and
     // learned: original_selected follows it so the route pins the prefix to
@@ -4598,11 +4763,12 @@ seastar::future<> RouterService::flush_local_route_batch() {
         return seastar::make_ready_future<>();
     }
 
-    // Atomically take ownership of pending routes.
-    // Re-reserve immediately so the buffer doesn't regrow through multiple
-    // reallocations (0→1→2→4→...→128) on the next fill cycle.
-    auto batch = std::move(state.pending_local_routes);
-    state.pending_local_routes.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
+    // Atomically take ownership of pending routes. The swap leaves the shard a
+    // pre-reserved empty buffer, so the next fill cycle doesn't regrow through
+    // multiple reallocations (0→1→2→4→...→128).
+    std::vector<PendingLocalRoute> batch;
+    batch.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
+    batch.swap(state.pending_local_routes);
     state.stats.local_batch_flushes++;
 
     // Deduplicate: same (token_hash, backend) → keep first, skip rest
@@ -6299,7 +6465,9 @@ RouterService::NativeKvStatsSnapshot RouterService::get_native_kv_stats() {
             st.native_verified_hits, st.native_verified_downgrades,
             st.native_verified_cold_honored, st.native_holder_redirects,
             st.native_routes_materialized, st.native_materialize_trust_skips,
-            st.native_completes, st.native_absence_untrusted};
+            st.native_completes, st.native_absence_untrusted,
+            st.native_verified_depth_skips, st.replica_dispatches,
+            st.replica_designations, st.replica_holders_saturated};
 }
 
 void RouterService::set_native_fresh_for_testing(BackendId id, bool complete) {
@@ -6326,6 +6494,26 @@ void RouterService::set_fail_open_for_testing(bool active) {
 void RouterService::update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id) {
     if (!g_shard_state) return;
     shard_state().prefix_hash_index[prefix_hash].insert(backend_id);
+}
+
+std::vector<BackendId> RouterService::replica_probe_order_for_testing(
+        const std::vector<int32_t>& tokens) {
+    std::vector<BackendId> order;
+    if (!g_shard_state) return order;
+    auto& state = shard_state();
+    const auto live = state.get_live_backends();
+    const size_t prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
+    const uint64_t hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
+    const auto n = static_cast<int32_t>(live.size());
+    order.reserve(live.size());
+    for (int32_t probe = 0; probe < n; ++probe) {
+        const BackendId id =
+            live[static_cast<size_t>(jump_consistent_hash(hash + static_cast<uint64_t>(probe), n))];
+        if (std::find(order.begin(), order.end(), id) == order.end()) {
+            order.push_back(id);
+        }
+    }
+    return order;
 }
 
 void RouterService::learn_route_for_testing(std::vector<int32_t> tokens, BackendId backend) {
