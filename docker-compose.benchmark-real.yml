@@ -204,6 +204,7 @@ services:
       - RANVIER_KV_EVENTS_ENABLED=${RANVIER_KV_EVENTS_ENABLED:-false}
       - RANVIER_KV_EVENTS_MATERIALIZE=${RANVIER_KV_EVENTS_MATERIALIZE:-false}
       - RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}
+      - RANVIER_REPLICATION_MAX_HOLDERS=${RANVIER_REPLICATION_MAX_HOLDERS:-0}
       # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
       # vLLM's Python endpoint exactly when the engine is busy, censoring the
       # cache-usage signal at peak pressure (the instants residency routing
@@ -307,6 +308,7 @@ services:
       - RANVIER_KV_EVENTS_ENABLED=${RANVIER_KV_EVENTS_ENABLED:-false}
       - RANVIER_KV_EVENTS_MATERIALIZE=${RANVIER_KV_EVENTS_MATERIALIZE:-false}
       - RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}
+      - RANVIER_REPLICATION_MAX_HOLDERS=${RANVIER_REPLICATION_MAX_HOLDERS:-0}
       # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
       # vLLM's Python endpoint exactly when the engine is busy, censoring the
       # cache-usage signal at peak pressure (the instants residency routing
@@ -410,6 +412,7 @@ services:
       - RANVIER_KV_EVENTS_ENABLED=${RANVIER_KV_EVENTS_ENABLED:-false}
       - RANVIER_KV_EVENTS_MATERIALIZE=${RANVIER_KV_EVENTS_MATERIALIZE:-false}
       - RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}
+      - RANVIER_REPLICATION_MAX_HOLDERS=${RANVIER_REPLICATION_MAX_HOLDERS:-0}
       # vLLM /metrics scrape timeout. The shipped 200ms default is exceeded by
       # vLLM's Python endpoint exactly when the engine is busy, censoring the
       # cache-usage signal at peak pressure (the instants residency routing

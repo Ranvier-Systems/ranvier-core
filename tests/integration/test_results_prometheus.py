@@ -157,3 +157,28 @@ def test_counter_reset_mid_run_does_not_go_negative(tmp_path):
     agg = parse_prometheus_report(str(tmp_path))
     assert agg["load_aware_fallbacks_total"] == 0
     assert agg["backend_routed_total"] == {"1": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# Replication-by-diversion counters (BACKLOG §28): "router_replica_*", not
+# "_native_", so they need their own match; summed across nodes and shards.
+# ---------------------------------------------------------------------------
+
+def _replica_dump(dispatches, designations, saturated):
+    return "\n".join([
+        f'seastar_ranvier_router_replica_dispatches_total{{shard="0"}} {dispatches}',
+        f'seastar_ranvier_router_replica_dispatches_total{{shard="1"}} {dispatches}',
+        f'seastar_ranvier_router_replica_designations_total{{shard="0"}} {designations}',
+        f'seastar_ranvier_router_replica_holders_saturated_total{{shard="0"}} {saturated}',
+        'seastar_ranvier_router_native_kv_ops_total{shard="0"} 50',
+    ]) + "\n"
+
+
+def test_replica_counters_summed_across_nodes_and_shards(tmp_path):
+    for n in (1, 2, 3):
+        (tmp_path / f"prometheus_metrics_node{n}.txt").write_text(_replica_dump(2, 3, 1))
+    agg = parse_prometheus_report(str(tmp_path))
+    assert agg["replica_dispatches_total"] == 3 * 2 * 2   # three nodes x two shards
+    assert agg["replica_designations_total"] == 9
+    assert agg["replica_holders_saturated_total"] == 3
+    assert agg["native_kv_ops_total"] == 150               # native keys unaffected

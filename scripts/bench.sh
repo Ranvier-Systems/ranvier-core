@@ -318,6 +318,14 @@ BENCHMARK OPTIONS:
     --kv-events-depth N Native index depth, kv_events.max_indexed_token_depth (default
                         2048). Fitted-set prefixes are 2,000-4,000 tokens; 4096 covers
                         them so verified lookups at the full prefix depth can succeed.
+    --replication N     Replication by diversion, routing.replication.max_holders (BACKLOG
+                        section 28; sets RANVIER_REPLICATION_MAX_HOLDERS, server default 0
+                        = off). 1 = an over-allowance ART hit goes to a verified holder
+                        before any stranger; >= 2 = also designate one probe-order replica
+                        per prefix and stop at N holders. Needs --kv-events: without the
+                        stream there are no verified holders and the knob does nothing
+                        (warned in the log and the compare header). Both --compare arms
+                        get it; only the prefix arm reads it.
     --warmup            Run a short warm-up before the main benchmark (adds ~1m 10s).
                         With --compare, warm-up runs PER ARM after each mode restart so
                         both arms are identically primed.
@@ -544,6 +552,7 @@ KV_EVENTS_PORT_START=5557    # --kv-events-port-start: publisher port of vLLM in
 KV_EVENTS_REPLAY_OFFSET=100  # replay ROUTER socket of each instance = its publisher port + 100
 KV_EVENTS_MATERIALIZE=""     # --kv-events-materialize on|off: PUSH routes from BlockStored chains (server default off since 2026-10-13)
 KV_EVENTS_DEPTH=""           # --kv-events-depth N: kv_events.max_indexed_token_depth (server default 2048)
+REPLICATION=""               # --replication N: routing.replication.max_holders (server default 0 = off)
 SKIP_SETUP=false
 SKIP_VLLM=false
 VLLM_HOST="localhost"
@@ -596,6 +605,7 @@ while [[ $# -gt 0 ]]; do
         --kv-events-port-start) KV_EVENTS_PORT_START="$2"; shift 2 ;;
         --kv-events-materialize) KV_EVENTS_MATERIALIZE="$2"; shift 2 ;;
         --kv-events-depth) KV_EVENTS_DEPTH="$2"; shift 2 ;;
+        --replication)    REPLICATION="$2"; shift 2 ;;
         --skip-setup)     SKIP_SETUP=true; shift ;;
         --skip-vllm)      SKIP_VLLM=true; shift ;;
         --vllm-host)      VLLM_HOST="$2"; shift 2 ;;
@@ -1207,6 +1217,7 @@ if [[ "$DRY_RUN" = true ]]; then
     [[ -n "$HASH_STRATEGY" ]] && echo "  Hash Strategy:   $HASH_STRATEGY"
     [[ -n "$BOUNDED_LOAD_EPSILON" ]] && echo "  Bounded Epsilon: $BOUNDED_LOAD_EPSILON"
     [[ -n "$CACHE_RESIDENCY_THRESHOLD" ]] && echo "  Residency Thresh: $CACHE_RESIDENCY_THRESHOLD"
+    [[ -n "$REPLICATION" ]] && echo "  Replication:     max_holders=$REPLICATION"
     echo "  Max Tokens:      $MAX_TOKENS"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
     echo "  vLLM Version:    $VLLM_VERSION"
@@ -1674,6 +1685,16 @@ if [[ "$KV_EVENTS" = true ]]; then
         log_warn "--kv-events with externally managed vLLM: backend i must already publish on port $((KV_EVENTS_PORT_START))+i-1 of its own host (--kv-events-config), or the subscriber connects to nothing and the compare header shows router_native_kv_ops_total=0."
     fi
 fi
+# --replication: replication by diversion (BACKLOG section 28). Validated here
+# because an out-of-range value fails the servers' config validation at start.
+if [[ -n "$REPLICATION" ]]; then
+    [[ "$REPLICATION" =~ ^[0-9]+$ && "$REPLICATION" -le 64 ]] || { log_error "--replication must be an integer 0..64 (got: $REPLICATION)"; exit 1; }
+    export RANVIER_REPLICATION_MAX_HOLDERS="$REPLICATION"
+    log_info "Replication by diversion: max_holders=$REPLICATION (RANVIER_REPLICATION_MAX_HOLDERS)"
+    if [[ "$REPLICATION" -ge 1 && "$KV_EVENTS" != true ]]; then
+        log_warn "--replication $REPLICATION without --kv-events: no native stream means no verified holders, so replication cannot fire and this run measures plain least-loaded spillover."
+    fi
+fi
 # Residency routing toggle (#527). The flag takes precedence over a bare
 # RANVIER_CACHE_RESIDENCY_THRESHOLD=... env prefix; both reach the servers now
 # that docker-compose.benchmark-real.yml passes the variable through.
@@ -1958,6 +1979,7 @@ write_manifest() {
         printf '    "kv_events_enabled": "%s",\n' "$(_json_escape "${RANVIER_KV_EVENTS_ENABLED:-false}")"
         printf '    "kv_events_materialize": "%s",\n' "$(_json_escape "${RANVIER_KV_EVENTS_MATERIALIZE:-false}")"
         printf '    "kv_events_max_indexed_token_depth": "%s",\n' "$(_json_escape "${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}")"
+        printf '    "replication_max_holders": "%s",\n' "$(_json_escape "${RANVIER_REPLICATION_MAX_HOLDERS:-0}")"
         printf '    "kv_events_port_start": "%s"\n' "$(_json_escape "$([[ "$KV_EVENTS" = true ]] && echo "$KV_EVENTS_PORT_START")")"
         printf '  },\n'
         # workload knobs — the block results_parser.py compares for comparability.
@@ -2624,9 +2646,12 @@ if [[ "$COMPARE" = true ]]; then
             echo "vLLM KV cache NOT reset between arms (--no-kv-reset; Ranvier-only restart)"
         fi
         if [[ "$KV_EVENTS" = true ]]; then
-            echo "Native KV events: ON (--kv-events; vLLM --kv-events-config zmq on ports ${KV_EVENTS_PORT_START}+, RANVIER_KV_EVENTS_ENABLED=true, materialize=${RANVIER_KV_EVENTS_MATERIALIZE:-false}, indexed depth=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}); router_native_kv_ops_total at end of arm: ${BASELINE_MODE}=${NATIVE_OPS_BASELINE} prefix=${NATIVE_OPS_PREFIX}"
+            echo "Native KV events: ON (--kv-events; vLLM --kv-events-config zmq on ports ${KV_EVENTS_PORT_START}+, RANVIER_KV_EVENTS_ENABLED=true, materialize=${RANVIER_KV_EVENTS_MATERIALIZE:-false}, indexed depth=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}, replication=${RANVIER_REPLICATION_MAX_HOLDERS:-0}); router_native_kv_ops_total at end of arm: ${BASELINE_MODE}=${NATIVE_OPS_BASELINE} prefix=${NATIVE_OPS_PREFIX}"
         else
             echo "Native KV events: off (residency estimated from the vLLM /metrics scrape)"
+            if [[ "${RANVIER_REPLICATION_MAX_HOLDERS:-0}" -ge 1 ]]; then
+                echo "WARNING: --replication ${RANVIER_REPLICATION_MAX_HOLDERS} without --kv-events: replication cannot fire without verified holders; this run measured plain least-loaded spillover."
+            fi
         fi
         echo "Ranvier Env: $(env | grep '^RANVIER_' | sort | tr '\n' ' ')"
         echo ""

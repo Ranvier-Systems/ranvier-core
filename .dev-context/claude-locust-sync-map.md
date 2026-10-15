@@ -67,11 +67,19 @@ the full exported name; C++ registers without the prefix.
 | `seastar_ranvier_prefix_boundary_skipped` | `prefix_boundary_skipped` | metrics_service.hpp |
 | `router_cluster_sync_invalid` | `router_cluster_sync_invalid` | gossip_service.cpp |
 | `router_cluster_sync_untrusted` | `router_cluster_sync_untrusted` | gossip_service.cpp |
+| `seastar_ranvier_router_replica_dispatches_total` | `router_replica_dispatches_total` | router_service.cpp |
+| `seastar_ranvier_router_replica_designations_total` | `router_replica_designations_total` | router_service.cpp |
+| `seastar_ranvier_router_replica_holders_saturated_total` | `router_replica_holders_saturated_total` | router_service.cpp |
 
 Note: the gossip metrics above do **not** get the `seastar_ranvier_` prefix in
 the Python code because `get_metric_value()` does a substring match — the full
 exported name is `seastar_ranvier_router_cluster_sync_invalid` but the
 substring `router_cluster_sync_invalid` matches it.
+
+The three `router_replica_*` counters (replication by diversion, BACKLOG §28)
+are read by `tests/integration/results_parser.py` only (`_REPLICA_KEYS`, from
+the end-of-arm `/metrics` dumps bench.sh captures), not by the locustfiles.
+They change no hash input, so `locustfile_real.py` needs nothing.
 
 ## Request body schema (http_controller.cpp, request_rewriter.hpp)
 
