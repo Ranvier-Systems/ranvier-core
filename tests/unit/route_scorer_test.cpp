@@ -22,9 +22,9 @@ namespace {
 
 constexpr uint32_t kNoProbe = std::numeric_limits<uint32_t>::max();
 
-constexpr uint8_t kVerifiedHolder = 0;
-constexpr uint8_t kDesignatedReplica = 1;
-constexpr uint8_t kNoHolder = 2;
+constexpr uint8_t kVerifiedHolder = kHolderRankVerified;
+constexpr uint8_t kDesignatedReplica = kHolderRankDesignated;
+constexpr uint8_t kNoHolder = kHolderRankNone;
 
 // The router builds candidate arrays in a fixed buffer and copies them freely.
 static_assert(std::is_trivially_copyable_v<ScoreCandidate>);

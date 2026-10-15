@@ -24,6 +24,7 @@
 #include <chrono>
 #include <map>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <seastar/net/inet_address.hh>
@@ -90,6 +91,28 @@ protected:
     void register_three_backends() {
         register_two_backends();
         RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080));
+    }
+
+    // Replication-by-diversion fixture: BOUNDED_LOAD with its load term on at
+    // the shipped epsilon (1.0), the given holder cap, three backends.
+    void configure_replication(uint32_t max_holders, size_t backends = 3) {
+        cfg_.load_aware_routing = true;
+        cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+        cfg_.bounded_load_epsilon = 1.0;
+        cfg_.replication_max_holders = max_holders;
+        recreate_router(cfg_);
+        for (size_t i = 1; i <= backends; ++i) {
+            std::string ip = "10.0.0." + std::to_string(i);
+            RouterService::register_backend_for_testing(static_cast<BackendId>(i),
+                                                        make_addr(ip.c_str(), 8080));
+        }
+    }
+
+    // A backend's fresh native stream showing `tokens`' routing prefix stored.
+    static void mark_verified_holder(const std::vector<int32_t>& tokens, BackendId id) {
+        RouterService::set_native_fresh_for_testing(id);
+        RouterService::update_prefix_hash_index_for_testing(
+            hash_prefix(tokens.data(), tokens.size(), 1), id);
     }
 };
 
@@ -1415,6 +1438,144 @@ TEST_F(RouterServiceTest, NativeVerifiedPathSkippedBeyondIndexedDepth) {
     EXPECT_EQ(verified.backend_id.value(), 1);
     EXPECT_TRUE(verified.cache_hit);
     EXPECT_EQ(RouterService::get_native_kv_stats().verified_cold_honored, 1u);
+}
+
+// =============================================================================
+// 1g. Replication by Diversion (routing.replication.max_holders, BACKLOG §28)
+// =============================================================================
+// When an ART hit's home forfeits its BOUNDED_LOAD allowance, a verified holder
+// under allowance outranks every colder stranger (rule 1). Loads below are in
+// flight on this shard; epsilon 1.0 over three backends. The home is marked a
+// verified holder too, so the hit path's verified-cold redirect never fires
+// and the anchor stays backend 1.
+
+TEST_F(RouterServiceTest, ReplicaDispatchPrefersVerifiedHolderOverColderStranger) {
+    configure_replication(1);
+    std::vector<int32_t> tokens = {1801, 1802, 1803, 1804};
+    RouterService::insert_route_for_testing(tokens, 1);
+    mark_verified_holder(tokens, 1);
+    mark_verified_holder(tokens, 2);
+
+    // Loads [6, 1, 0]: cap = ceil(7/3 * 2) = 5, allowance 4; the home
+    // forfeits. Least-loaded alone would pick stranger 3.
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 6; ++i) guards.emplace_back(1);
+    guards.emplace_back(2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 2);
+    EXPECT_TRUE(result.cache_hit);
+    EXPECT_EQ(result.original_selected, 1);  // the home stays the learned target
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.replica_dispatches, 1u);
+    EXPECT_EQ(stats.replica_designations, 0u);
+    EXPECT_EQ(stats.replica_holders_saturated, 0u);
+    EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 1u);
+}
+
+TEST_F(RouterServiceTest, ReplicaDispatchIgnoresHolderWithoutFreshStream) {
+    configure_replication(1);
+    std::vector<int32_t> tokens = {1811, 1812, 1813, 1814};
+    RouterService::insert_route_for_testing(tokens, 1);
+    mark_verified_holder(tokens, 1);
+    // Backend 2 is in the index but its own stream is not fresh: the entry
+    // may be a learned-route claim. Today's least-loaded spillover applies.
+    RouterService::update_prefix_hash_index_for_testing(
+        hash_prefix(tokens.data(), tokens.size(), 1), 2);
+
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 6; ++i) guards.emplace_back(1);
+    guards.emplace_back(2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 3);
+    EXPECT_EQ(result.original_selected, 1);
+    EXPECT_EQ(RouterService::get_native_kv_stats().replica_dispatches, 0u);
+}
+
+TEST_F(RouterServiceTest, ReplicaDispatchOffAtZeroMaxHolders) {
+    configure_replication(0);
+    std::vector<int32_t> tokens = {1821, 1822, 1823, 1824};
+    RouterService::insert_route_for_testing(tokens, 1);
+    mark_verified_holder(tokens, 1);
+    mark_verified_holder(tokens, 2);
+
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 6; ++i) guards.emplace_back(1);
+    guards.emplace_back(2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 3);  // least-loaded, as today
+    EXPECT_EQ(result.original_selected, 1);
+    EXPECT_EQ(RouterService::get_native_kv_stats().replica_dispatches, 0u);
+}
+
+TEST_F(RouterServiceTest, ReplicaDispatchOffWhenStreamDisabled) {
+    // TTL 0 is the loader's value whenever kv_events is disabled.
+    cfg_.kv_residency_freshness_ttl = std::chrono::seconds(0);
+    configure_replication(2);
+    std::vector<int32_t> tokens = {1826, 1827, 1828, 1829};
+    RouterService::insert_route_for_testing(tokens, 1);
+    mark_verified_holder(tokens, 1);
+    mark_verified_holder(tokens, 2);
+
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 6; ++i) guards.emplace_back(1);
+    guards.emplace_back(2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 3);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.replica_dispatches, 0u);
+    EXPECT_EQ(stats.replica_designations, 0u);
+    EXPECT_EQ(stats.replica_holders_saturated, 0u);
+}
+
+TEST_F(RouterServiceTest, ReplicaDispatchSkippedBeyondIndexedDepth) {
+    // Routing depth 4 > indexed depth 2: the index cannot vouch for this
+    // prefix, so the spillover is today's. The hit path counted the depth
+    // skip once; the spillover must not count it again.
+    cfg_.kv_native_indexed_depth = 2;
+    configure_replication(1);
+    std::vector<int32_t> tokens = {1831, 1832, 1833, 1834};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.9);  // gossip: resident
+    mark_verified_holder(tokens, 1);
+    mark_verified_holder(tokens, 2);
+
+    std::vector<BackendRequestGuard> guards;
+    for (int i = 0; i < 6; ++i) guards.emplace_back(1);
+    guards.emplace_back(2);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 3);
+    EXPECT_EQ(result.original_selected, 1);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.replica_dispatches, 0u);
+    EXPECT_EQ(stats.verified_depth_skips, 1u);
+}
+
+TEST_F(RouterServiceTest, ReplicaDispatchLeavesCleanHomeAlone) {
+    configure_replication(2);
+    std::vector<int32_t> tokens = {1836, 1837, 1838, 1839};
+    RouterService::insert_route_for_testing(tokens, 1);
+    mark_verified_holder(tokens, 1);
+    mark_verified_holder(tokens, 2);
+
+    // Idle fleet: cap 1, allowance 0, the home at load 0 is clean and keeps
+    // its seat over a verified holder (the clean-placement key ranks first).
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.replica_dispatches, 0u);
+    EXPECT_EQ(stats.replica_designations, 0u);
+    EXPECT_EQ(stats.replica_holders_saturated, 0u);
 }
 
 // ----- BACKLOG §21 Phase 5a: verified_resident_subset seam -----

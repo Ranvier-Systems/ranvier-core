@@ -39,6 +39,11 @@
 
 namespace ranvier {
 
+// ScoreCandidate::holder_rank values (replication by diversion).
+inline constexpr uint8_t kHolderRankVerified = 0;
+inline constexpr uint8_t kHolderRankDesignated = 1;
+inline constexpr uint8_t kHolderRankNone = 2;
+
 // Per-signal weights for the unified route score. Exposed via
 // RoutingConfig::scoring (YAML routing.scoring.*, env RANVIER_SCORING_*).
 struct ScoringWeights {
@@ -150,7 +155,7 @@ struct ScoreCandidate {
     // cost_pressure, so it only separates candidates of equal dispatch score
     // and never touches placement: a holder is a dispatch target, never the
     // learned home.
-    uint8_t holder_rank = 2;
+    uint8_t holder_rank = kHolderRankNone;
 };
 
 // Outcome of one scoring pass. Indices refer to the caller's candidate array.

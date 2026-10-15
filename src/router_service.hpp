@@ -818,6 +818,11 @@ public:
         uint64_t materialize_trust_skips = 0;
         uint64_t completes = 0;
         uint64_t absence_untrusted = 0;
+        uint64_t verified_depth_skips = 0;
+        // Replication by diversion (routing.replication.max_holders).
+        uint64_t replica_dispatches = 0;
+        uint64_t replica_designations = 0;
+        uint64_t replica_holders_saturated = 0;
     };
     static NativeKvStatsSnapshot get_native_kv_stats();
 
