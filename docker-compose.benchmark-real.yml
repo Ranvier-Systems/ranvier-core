@@ -139,6 +139,10 @@ services:
         hard: -1
     volumes:
       - /tmp:/tmp  # For core dumps
+      # Ranvier's tokenizer (bench.sh --tokenizer, or the model's tokenizer.json from
+      # the HF cache under --kv-events). Default is the bundled GPT-2 file, unused
+      # unless RANVIER_TOKENIZER_PATH points here (BACKLOG section 29).
+      - ${RANVIER_TOKENIZER_HOST_FILE:-./assets/gpt2.json}:/app/tokenizer/tokenizer.json:ro
     # Routing DB on a container-local tmpfs so no ART/backend state carries
     # across arms, legs or runs. /tmp above is a HOST bind mount shared by all
     # three nodes: a DB there survives `rm`/`down -v` and is replayed by
@@ -169,6 +173,9 @@ services:
       # Must match the model family of RANVIER_TOKENIZER_PATH.
       # Values: "none" (default), "llama3", "chatml", "mistral", "llama2" (alias "codellama"), "kimi"
       - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
+      # The model's own tokenizer.json (bench.sh sets the mount above); the native
+      # KV index only answers when Ranvier tokenizes as vLLM does (BACKLOG section 29).
+      - RANVIER_TOKENIZER_PATH=${RANVIER_TOKENIZER_PATH:-assets/gpt2.json}
       # Disable Rust/Rayon parallelism - worker threads conflict with Seastar's per-shard allocator
       - RAYON_NUM_THREADS=1
       # Tokenizer thread pool - offloads tokenization from Seastar reactor
@@ -259,6 +266,10 @@ services:
         hard: -1
     volumes:
       - /tmp:/tmp  # For core dumps
+      # Ranvier's tokenizer (bench.sh --tokenizer, or the model's tokenizer.json from
+      # the HF cache under --kv-events). Default is the bundled GPT-2 file, unused
+      # unless RANVIER_TOKENIZER_PATH points here (BACKLOG section 29).
+      - ${RANVIER_TOKENIZER_HOST_FILE:-./assets/gpt2.json}:/app/tokenizer/tokenizer.json:ro
     # Routing DB on a container-local tmpfs so no ART/backend state carries
     # across arms, legs or runs. /tmp above is a HOST bind mount shared by all
     # three nodes: a DB there survives `rm`/`down -v` and is replayed by
@@ -280,6 +291,9 @@ services:
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
       - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
+      # The model's own tokenizer.json (bench.sh sets the mount above); the native
+      # KV index only answers when Ranvier tokenizes as vLLM does (BACKLOG section 29).
+      - RANVIER_TOKENIZER_PATH=${RANVIER_TOKENIZER_PATH:-assets/gpt2.json}
       - RAYON_NUM_THREADS=1
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}
@@ -363,6 +377,10 @@ services:
         hard: -1
     volumes:
       - /tmp:/tmp  # For core dumps
+      # Ranvier's tokenizer (bench.sh --tokenizer, or the model's tokenizer.json from
+      # the HF cache under --kv-events). Default is the bundled GPT-2 file, unused
+      # unless RANVIER_TOKENIZER_PATH points here (BACKLOG section 29).
+      - ${RANVIER_TOKENIZER_HOST_FILE:-./assets/gpt2.json}:/app/tokenizer/tokenizer.json:ro
     # Routing DB on a container-local tmpfs so no ART/backend state carries
     # across arms, legs or runs. /tmp above is a HOST bind mount shared by all
     # three nodes: a DB there survives `rm`/`down -v` and is replayed by
@@ -384,6 +402,9 @@ services:
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
       - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
+      # The model's own tokenizer.json (bench.sh sets the mount above); the native
+      # KV index only answers when Ranvier tokenizes as vLLM does (BACKLOG section 29).
+      - RANVIER_TOKENIZER_PATH=${RANVIER_TOKENIZER_PATH:-assets/gpt2.json}
       - RAYON_NUM_THREADS=1
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}

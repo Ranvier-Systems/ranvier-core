@@ -2084,6 +2084,11 @@ untouched. Cost so far: the native index holds entries nothing reads (bounded at
   present wherever vLLM has loaded the model) when `--kv-events` is set.
 - **Done when:** a stream-on compare header names the tokenizer and template, and the Step 1
   counter is > 0 on the prefix arm.
+- **Status:** [x] Code done (2026-10-16): `bench.sh --chat-template` / `--tokenizer` (HF-cache default
+  under `--kv-events`, resolved symlink bind-mounted as `/app/tokenizer/tokenizer.json`), manifest
+  `tokenizer_path`, header and log warning when unaligned; compose mount + env on all three nodes;
+  kvevents / kvrepl rows pass `--chat-template llama2`; `locustfile_real.py` renders `llama2` for the
+  client-tokenize path. The counter half of "done when" is Step 7's smoke.
 
 #### Step 6: Documentation and corrected records
 - **Files:** `docs/internals/cache-residency-routing.md` (Verified residency: the alignment

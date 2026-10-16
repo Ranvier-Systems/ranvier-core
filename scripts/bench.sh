@@ -326,6 +326,17 @@ BENCHMARK OPTIONS:
                         stream there are no verified holders and the knob does nothing
                         (warned in the log and the compare header). Both --compare arms
                         get it; only the prefix arm reads it.
+    --chat-template FMT Ranvier's chat template (RANVIER_CHAT_TEMPLATE_FORMAT; also sent to
+                        Locust): none | llama3 | chatml | mistral | llama2 (alias codellama)
+                        | kimi. Must render the backend's template, or Ranvier's routing
+                        keys never match what vLLM caches (BACKLOG section 29). CodeLlama
+                        Instruct is llama2.
+    --tokenizer PATH    The model's tokenizer.json for Ranvier (bind-mounted read-only into
+                        the three nodes as /app/tokenizer/tokenizer.json). With --kv-events
+                        and no --tokenizer, the model's tokenizer.json is taken from the
+                        host's Hugging Face cache (where vLLM loaded it). Without either,
+                        Ranvier uses the bundled GPT-2 tokenizer, which matches no
+                        production model; --kv-events then warns in the log and header.
     --warmup            Run a short warm-up before the main benchmark (adds ~1m 10s).
                         With --compare, warm-up runs PER ARM after each mode restart so
                         both arms are identically primed.
@@ -553,6 +564,8 @@ KV_EVENTS_REPLAY_OFFSET=100  # replay ROUTER socket of each instance = its publi
 KV_EVENTS_MATERIALIZE=""     # --kv-events-materialize on|off: PUSH routes from BlockStored chains (server default off since 2026-10-13)
 KV_EVENTS_DEPTH=""           # --kv-events-depth N: kv_events.max_indexed_token_depth (server default 2048)
 REPLICATION=""               # --replication N: routing.replication.max_holders (server default 0 = off)
+CHAT_TEMPLATE=""             # --chat-template FMT: RANVIER_CHAT_TEMPLATE_FORMAT (server default none)
+TOKENIZER=""                 # --tokenizer PATH: the model's tokenizer.json (default with --kv-events: HF cache)
 SKIP_SETUP=false
 SKIP_VLLM=false
 VLLM_HOST="localhost"
@@ -606,6 +619,8 @@ while [[ $# -gt 0 ]]; do
         --kv-events-materialize) KV_EVENTS_MATERIALIZE="$2"; shift 2 ;;
         --kv-events-depth) KV_EVENTS_DEPTH="$2"; shift 2 ;;
         --replication)    REPLICATION="$2"; shift 2 ;;
+        --chat-template)  CHAT_TEMPLATE="$2"; shift 2 ;;
+        --tokenizer)      TOKENIZER="$2"; shift 2 ;;
         --skip-setup)     SKIP_SETUP=true; shift ;;
         --skip-vllm)      SKIP_VLLM=true; shift ;;
         --vllm-host)      VLLM_HOST="$2"; shift 2 ;;
@@ -1218,6 +1233,8 @@ if [[ "$DRY_RUN" = true ]]; then
     [[ -n "$BOUNDED_LOAD_EPSILON" ]] && echo "  Bounded Epsilon: $BOUNDED_LOAD_EPSILON"
     [[ -n "$CACHE_RESIDENCY_THRESHOLD" ]] && echo "  Residency Thresh: $CACHE_RESIDENCY_THRESHOLD"
     [[ -n "$REPLICATION" ]] && echo "  Replication:     max_holders=$REPLICATION"
+    [[ -n "$CHAT_TEMPLATE" ]] && echo "  Chat Template:   $CHAT_TEMPLATE"
+    [[ -n "$TOKENIZER" ]] && echo "  Tokenizer:       $TOKENIZER"
     echo "  Max Tokens:      $MAX_TOKENS"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
     echo "  vLLM Version:    $VLLM_VERSION"
@@ -1695,6 +1712,47 @@ if [[ -n "$REPLICATION" ]]; then
         log_warn "--replication $REPLICATION without --kv-events: no native stream means no verified holders, so replication cannot fire and this run measures plain least-loaded spillover."
     fi
 fi
+# --chat-template / --tokenizer (BACKLOG section 29). The native KV index only
+# answers for a request when Ranvier tokenizes exactly as vLLM does, so with
+# --kv-events the model's own tokenizer.json is the default: vLLM ran on this
+# host and left it in the Hugging Face cache. A snapshot's tokenizer.json is a
+# symlink into ../../blobs, so the resolved file is bind-mounted on its own
+# (mounting the snapshot directory would leave the link dangling).
+resolve_hf_tokenizer() {
+    local hub="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
+    local snapshots="$hub/models--${1//\//--}/snapshots"
+    ls -t "$snapshots"/*/tokenizer.json 2>/dev/null | head -1
+}
+case "$CHAT_TEMPLATE" in
+    "") ;;
+    none|llama3|chatml|mistral|llama2|codellama|kimi) export RANVIER_CHAT_TEMPLATE_FORMAT="$CHAT_TEMPLATE" ;;
+    *) log_error "--chat-template must be none, llama3, chatml, mistral, llama2, codellama or kimi (got: $CHAT_TEMPLATE)"; exit 1 ;;
+esac
+if [[ -z "$TOKENIZER" && "$KV_EVENTS" = true ]]; then
+    TOKENIZER="$(resolve_hf_tokenizer "$MODEL")"
+    if [[ -n "$TOKENIZER" ]]; then
+        log_info "Tokenizer: $TOKENIZER (model's own, from the Hugging Face cache)"
+    else
+        log_warn "--kv-events: no tokenizer.json for $MODEL in the Hugging Face cache (${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}); pass --tokenizer PATH. Falling back to the bundled GPT-2 tokenizer."
+    fi
+fi
+if [[ -n "$TOKENIZER" ]]; then
+    [[ -f "$TOKENIZER" ]] || { log_error "--tokenizer: not a file: $TOKENIZER"; exit 1; }
+    export RANVIER_TOKENIZER_HOST_FILE="$(readlink -f "$TOKENIZER")"
+    export RANVIER_TOKENIZER_PATH="/app/tokenizer/tokenizer.json"
+fi
+TOKENIZER_ALIGNMENT_WARNING=""
+if [[ "$KV_EVENTS" = true ]]; then
+    if [[ -z "$TOKENIZER" ]]; then
+        TOKENIZER_ALIGNMENT_WARNING="Ranvier uses the bundled GPT-2 tokenizer"
+    fi
+    if [[ "${RANVIER_CHAT_TEMPLATE_FORMAT:-none}" == "none" ]]; then
+        TOKENIZER_ALIGNMENT_WARNING="${TOKENIZER_ALIGNMENT_WARNING:+$TOKENIZER_ALIGNMENT_WARNING and }the chat template is 'none'"
+    fi
+    if [[ -n "$TOKENIZER_ALIGNMENT_WARNING" ]]; then
+        log_warn "--kv-events but ${TOKENIZER_ALIGNMENT_WARNING}: Ranvier will not tokenize as vLLM does, so native KV events can never match a routing key (router_native_routing_key_matches_total stays 0). Pass --chat-template and --tokenizer (BACKLOG section 29)."
+    fi
+fi
 # Residency routing toggle (#527). The flag takes precedence over a bare
 # RANVIER_CACHE_RESIDENCY_THRESHOLD=... env prefix; both reach the servers now
 # that docker-compose.benchmark-real.yml passes the variable through.
@@ -1971,6 +2029,7 @@ write_manifest() {
         printf '    "backpressure_enable_priority_queue": "%s",\n' "$(_json_escape "${RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE:-false}")"
         printf '    "backpressure_tier_capacity": "%s",\n' "$(_json_escape "${RANVIER_BACKPRESSURE_TIER_CAPACITY:-64,128,256,512}")"
         printf '    "chat_template_format": "%s",\n' "$(_json_escape "${RANVIER_CHAT_TEMPLATE_FORMAT:-none}")"
+        printf '    "tokenizer_path": "%s",\n' "$(_json_escape "${RANVIER_TOKENIZER_HOST_FILE:-assets/gpt2.json (bundled)}")"
         printf '    "tokenizer_thread_pool_enabled": "%s",\n' "$(_json_escape "${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}")"
         printf '    "health_vllm_metrics_timeout_ms": "%s",\n' "$(_json_escape "${RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS:-1000}")"
         # Native KV-event mode (--kv-events). results_parser prints the native
@@ -2646,7 +2705,10 @@ if [[ "$COMPARE" = true ]]; then
             echo "vLLM KV cache NOT reset between arms (--no-kv-reset; Ranvier-only restart)"
         fi
         if [[ "$KV_EVENTS" = true ]]; then
-            echo "Native KV events: ON (--kv-events; vLLM --kv-events-config zmq on ports ${KV_EVENTS_PORT_START}+, RANVIER_KV_EVENTS_ENABLED=true, materialize=${RANVIER_KV_EVENTS_MATERIALIZE:-false}, indexed depth=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}, replication=${RANVIER_REPLICATION_MAX_HOLDERS:-0}); router_native_kv_ops_total at end of arm: ${BASELINE_MODE}=${NATIVE_OPS_BASELINE} prefix=${NATIVE_OPS_PREFIX}"
+            echo "Native KV events: ON (--kv-events; vLLM --kv-events-config zmq on ports ${KV_EVENTS_PORT_START}+, RANVIER_KV_EVENTS_ENABLED=true, materialize=${RANVIER_KV_EVENTS_MATERIALIZE:-false}, indexed depth=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}, replication=${RANVIER_REPLICATION_MAX_HOLDERS:-0}, chat template=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}, tokenizer=${RANVIER_TOKENIZER_HOST_FILE:-bundled gpt2}); router_native_kv_ops_total at end of arm: ${BASELINE_MODE}=${NATIVE_OPS_BASELINE} prefix=${NATIVE_OPS_PREFIX}"
+            if [[ -n "$TOKENIZER_ALIGNMENT_WARNING" ]]; then
+                echo "WARNING: --kv-events but ${TOKENIZER_ALIGNMENT_WARNING}: Ranvier did not tokenize as vLLM does, so no native KV event could match a routing key; read every native counter below as unaligned (BACKLOG section 29)."
+            fi
         else
             echo "Native KV events: off (residency estimated from the vLLM /metrics scrape)"
             if [[ "${RANVIER_REPLICATION_MAX_HOLDERS:-0}" -ge 1 ]]; then
