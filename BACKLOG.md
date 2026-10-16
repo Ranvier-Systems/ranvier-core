@@ -2065,7 +2065,12 @@ untouched. Cost so far: the native index holds entries nothing reads (bounded at
   the fixture is small JSON and can be.
 - **Concerns:** if `Encode` adds special tokens on its own, BOS doubles; the fixture catches it.
 
-- **Status:** [x] Done (2026-10-16): harness and gated test built; **fixture not yet captured** (needs a vLLM backend or HF access; see `tests/tokenizer_parity/README.md`).
+- **Status:** [x] Done and **passing** (2026-10-16): 7/7 cases. Ranvier's path (`llama2` rendering,
+  Strategy 4 system prefix, tokenizers-cpp on CodeLlama's `tokenizer.json`) reproduces the reference
+  ids. The fixture came from transformers 4.x (`codellama/CodeLlama-13b-Instruct-hf`), gated by a
+  known-answer check against the vLLM 0.15.1 `/tokenize` output from the bench box. transformers 5.x
+  was rejected by that check: it drops the word-start marker after `<s>` (29961 where vLLM has 518).
+  The fixture is committed as `tests/tokenizer_parity/llama2_reference_tokens.json`.
 
 #### Step 5: Benchmark plumbing for an aligned run
 - **Files:** `scripts/bench.sh` (`--tokenizer PATH` → `RANVIER_TOKENIZER_PATH`, mounted read-only
