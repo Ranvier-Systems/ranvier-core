@@ -111,6 +111,12 @@ def ids_from_vllm(url, model, messages):
 
 def ids_from_transformers(tokenizer, messages):
     ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+    # Recent transformers return a BatchEncoding (dict-like) here rather than a
+    # list; older ones return the list itself.
+    if hasattr(ids, "keys") and "input_ids" in ids:
+        ids = ids["input_ids"]
+    if ids and isinstance(ids[0], list):  # batched shape [[...]]
+        ids = ids[0]
     return [int(t) for t in ids]
 
 
