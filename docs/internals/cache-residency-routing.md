@@ -124,6 +124,16 @@ disables downgrades entirely (pre-feature behavior).
 
 ## Verified residency (native KV events)
 
+> **Alignment requirement (2026-10-16, BACKLOG §29).** The native index only answers for a
+> request when Ranvier hashes the same token ids vLLM stores: the configured tokenizer must be
+> the model's own (`assets.tokenizer_path`, not the bundled `gpt2.json`) and `chat_template_format`
+> must render the backend's chat template. With either one wrong, no stream entry can ever match a
+> routing key, and every "verified" signal below silently reads the router's own learned-route
+> entries instead. Every GPU benchmark through 2026-10-16 ran unaligned (GPT-2 tokenizer,
+> template `none`, CodeLlama served with the Llama-2 template, which Ranvier has no format for),
+> so the measurements quoted in this section, and in "Replication by diversion" below, describe
+> that unaligned state. §29 adds the format, an exact boundary and a self-check.
+
 When a backend opts into the native vLLM KV-event stream (`kv_events:`
 section + per-backend port; build flag `WITH_KV_EVENTS`), residency for that
 backend graduates from the probabilistic estimate above to a VERIFIED,
