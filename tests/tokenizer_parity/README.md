@@ -116,3 +116,46 @@ are **not** reproduced by Ranvier's formatter — image parts are dropped at
 `src/request_rewriter.hpp` (non-string `content` is skipped). Those cases are
 excluded here so parity reflects Ranvier's actual routing surface. If K3
 multimodal traffic becomes a target, that gap needs its own design.
+
+# Llama 2 / CodeLlama Instruct parity (BACKLOG §29)
+
+The benchmark fleet serves `meta-llama/CodeLlama-13b-Instruct-hf`, which renders
+the Llama 2 chat template. Until §29, Ranvier ran it with the bundled GPT-2
+tokenizer and template `none`, so its routing hashes and the native KV-event
+stream's hashes never met. The `llama2` format (alias `codellama`) and the
+model's own `tokenizer.json` are the fix; this check proves them.
+
+Unlike Kimi, CodeLlama ships a fast `tokenizer.json`, so there is no conversion
+step: the file in the model's Hugging Face snapshot is the contract. Ranvier's
+`assets.tokenizer_path` and vLLM must load the same one.
+
+**1. Capture the backend's IDs** (from a running vLLM, preferred; or offline with
+transformers):
+
+```bash
+python3 llama2_tokenizer_parity.py --vllm http://localhost:8000 \
+    --model meta-llama/CodeLlama-13b-Instruct-hf \
+    --emit-fixture llama2_reference_tokens.json
+```
+
+**2. Replay them through Ranvier's path** (the gated C++ test renders each case
+with `RequestRewriter::extract_text_with_boundary_info` + `ChatTemplate(llama2)`
+and encodes with tokenizers-cpp):
+
+```bash
+cmake -B build -DRANVIER_BUILD_LLAMA2_PARITY_TEST=ON && cmake --build build --target llama2_tokenizer_parity_test
+RANVIER_LLAMA2_TOKENIZER_JSON=$(ls ~/.cache/huggingface/hub/models--meta-llama--CodeLlama-13b-Instruct-hf/snapshots/*/tokenizer.json | head -1) \
+RANVIER_LLAMA2_PARITY_FIXTURE=$PWD/tests/tokenizer_parity/llama2_reference_tokens.json \
+    ./build/llama2_tokenizer_parity_test
+```
+
+It checks, per case, that the full encoding equals the backend's IDs (failures
+name the first diverging token), and that the encoding of the rendered system
+prefix is a token-for-token prefix of the full encoding, so the routing boundary
+(Strategy 4) lands where the backend has the same tokens. The fixture is small
+JSON and can be committed once captured; the tokenizer stays out of the repo.
+
+A doubled BOS (`[1, 1, ...]`) means `Encode` adds special tokens on top of the
+template's literal `<s>`; a mismatch at token 1 or 2 points at the `[INST]`
+spacing; a prefix failure points at a token straddling the end of the
+`<</SYS>>\n\n` block.

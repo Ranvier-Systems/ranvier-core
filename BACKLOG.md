@@ -2016,6 +2016,8 @@ untouched. Cost so far: the native index holds entries nothing reads (bounded at
 - **Concerns:** Rule #4 (ring and set capped at 64 by construction), Rule #1 (shard-local), no
   timer (Rule #5 avoided), Rule #17 n/a (O(1) per op).
 
+- **Status:** [x] Done (2026-10-16): ring of 64 with a linear scan; counter, TTL-sweep warning, startup warning, parser row.
+
 #### Step 2: `llama2` chat-template format
 - **Files:** `src/chat_template.hpp`, `tests/unit/chat_template_test.cpp`,
   `src/config_loader.cpp` (accepted values; message), docs tables
@@ -2032,6 +2034,8 @@ untouched. Cost so far: the native index holds entries nothing reads (bounded at
 - **Concerns:** none Seastar-related (pure header). Copy the template source and revision into the
   code comment, as the other formats do.
 
+- **Status:** [x] Done (2026-10-16): `llama2`, `llama-2`, `codellama`. String tests run in the sandbox (60/60 chat-template tests).
+
 #### Step 3: Exact system boundary for `llama2`
 - **Files:** `src/http_controller.cpp` (boundary strategies), `src/request_rewriter.hpp`
   (`system_prefix_end` for the folded system block), `src/boundary_detector.hpp` if a helper
@@ -2046,6 +2050,8 @@ untouched. Cost so far: the native index holds entries nothing reads (bounded at
   comment); fitted prefixes are 2,000–4,000 tokens, so check `tokenization_cache_max_text`
   covers them or every request pays the FFI call.
 
+- **Status:** [x] Done (2026-10-16): `ChatTemplate::boundary_from_system_prefix`; Strategy 2 skipped for `llama2`.
+
 #### Step 4: Tokenizer parity, gated, mirroring the Kimi test
 - **Files:** `tests/tokenizer_parity/llama2_tokenizer_parity.py` (emits a fixture from vLLM
   `/tokenize` with messages, or from `transformers.apply_chat_template`),
@@ -2058,6 +2064,8 @@ untouched. Cost so far: the native index holds entries nothing reads (bounded at
   tokens are a prefix of the full encoding. The tokenizer is not vendored (Llama 2 licence);
   the fixture is small JSON and can be.
 - **Concerns:** if `Encode` adds special tokens on its own, BOS doubles; the fixture catches it.
+
+- **Status:** [x] Done (2026-10-16): harness and gated test built; **fixture not yet captured** (needs a vLLM backend or HF access; see `tests/tokenizer_parity/README.md`).
 
 #### Step 5: Benchmark plumbing for an aligned run
 - **Files:** `scripts/bench.sh` (`--tokenizer PATH` → `RANVIER_TOKENIZER_PATH`, mounted read-only
