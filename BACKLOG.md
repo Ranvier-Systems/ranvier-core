@@ -2096,6 +2096,11 @@ untouched. Cost so far: the native index holds entries nothing reads (bounded at
   (template table), `docs/benchmarks/benchmark-results-current.md` (annotate the kvevents /
   kvablate / kvrepl rows as unaligned), `scripts/bench-runner.sh` `--help` (same), `CHANGELOG.md`
 - **Description:** state plainly which earlier conclusions were unaligned and therefore open.
+- **Status:** [x] Done (2026-10-16): alignment requirement and self-checks up front in
+  `cache-residency-routing.md` (replacing the interim caveat); template table and tokenizer
+  requirement in `prefix-affinity-routing.md`; results doc banner, per-item notes, archive rows
+  marked unaligned, kvrepl run recorded as Still-open item 11 and the aligned rerun as item 12;
+  runner `--help` for kvevents / kvablate / kvrepl; CHANGELOG.
 
 #### Step 7: GPU session
 - **Depends on:** Steps 1–6 in the GHCR image

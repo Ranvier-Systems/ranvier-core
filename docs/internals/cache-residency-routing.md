@@ -124,15 +124,46 @@ disables downgrades entirely (pre-feature behavior).
 
 ## Verified residency (native KV events)
 
-> **Alignment requirement (2026-10-16, BACKLOG §29).** The native index only answers for a
-> request when Ranvier hashes the same token ids vLLM stores: the configured tokenizer must be
-> the model's own (`assets.tokenizer_path`, not the bundled `gpt2.json`) and `chat_template_format`
-> must render the backend's chat template. With either one wrong, no stream entry can ever match a
-> routing key, and every "verified" signal below silently reads the router's own learned-route
-> entries instead. Every GPU benchmark through 2026-10-16 ran unaligned (GPT-2 tokenizer,
-> template `none`, CodeLlama served with the Llama-2 template, which Ranvier has no format for),
-> so the measurements quoted in this section, and in "Replication by diversion" below, describe
-> that unaligned state. §29 adds the format, an exact boundary and a self-check.
+### Requirement: Ranvier must tokenize as the backend does
+
+The stream mirrors the backend's cache in the backend's token ids: the ledger hashes vLLM's
+stored ids at every 16-token block boundary into `prefix_hash_index`, and an ART hit looks up
+`hash_prefix` of Ranvier's **own** ids of the request in that same index. The two meet only when
+both sides produce the same ids for the same request, which takes two settings:
+
+- **Tokenizer** (`assets.tokenizer_path`, `RANVIER_TOKENIZER_PATH`): the served model's own
+  `tokenizer.json`. The bundled `assets/gpt2.json` matches no production model.
+- **Chat template** (`assets.chat_template_format`, `RANVIER_CHAT_TEMPLATE_FORMAT`): the format
+  that renders the backend's template byte for byte. vLLM's `/v1/chat/completions` applies the
+  model's template, so `none` never matches it. CodeLlama-Instruct and Llama-2-chat are
+  `llama2` (alias `codellama`); see the template table in `prefix-affinity-routing.md`.
+
+Either one wrong makes every stream key disjoint from every routing key, and nothing fails: the
+index fills, `kv_ops` climbs, and the only entries a lookup can find are the router's own
+learned routes, so "verified" hits read healthy while the stream contributes nothing.
+
+**Self-checks.**
+
+- At startup, with `kv_events` on, a warning when the template is `none` or the tokenizer path is
+  the bundled `gpt2.json`.
+- `router_native_routing_key_matches_total` counts stream UPSERTs whose hash equals a routing
+  key the router recently computed (a 64-entry ring per shard, keys within
+  `max_indexed_token_depth`). It is the direct signal that the two key spaces meet: it should
+  climb on any workload with repeated prefixes. Shard 0 logs a warning once if it is still 0
+  after 10,000 UPSERTs.
+- `tests/tokenizer_parity/` checks Ranvier's `llama2` rendering and tokenization against ids
+  captured from vLLM `/tokenize` (gated test, `RANVIER_BUILD_LLAMA2_PARITY_TEST`).
+
+For `llama2` the routing boundary is the tokenized system prefix (boundary Strategy 4), never the
+character-ratio estimate, so the boundary depth lands on a token the backend has at that
+position. `bench.sh --kv-events` takes the model's tokenizer from the host's Hugging Face cache
+and `--chat-template` sets the format; the compare header names both and warns when unaligned.
+
+**Every GPU benchmark through 2026-10-16 ran unaligned** (GPT-2 tokenizer, template `none`), so
+the stream measurements quoted in this section and in "Replication by diversion" below are open
+questions, not results (BACKLOG §29; `benchmark-results-current.md`).
+
+### How verified residency works
 
 When a backend opts into the native vLLM KV-event stream (`kv_events:`
 section + per-backend port; build flag `WITH_KV_EVENTS`), residency for that
@@ -276,7 +307,9 @@ the spillover does not count it again. **What it risks:** a replica is a
 second copy of a 2,000–4,000-token prefix in a fleet whose cache already cannot
 hold one copy of the set, so it trades KV capacity for queueing and can lose
 that trade. Read the KV hit rate before P99. The GPU verdict (BACKLOG §28
-Step 8, `bench-runner.sh --suite kvrepl`) decides the default.
+Step 8, `bench-runner.sh --suite kvrepl`) decides the default. Its 2026-10-16 run was
+unaligned (see the requirement above): designations fired, no replica was ever visible, and
+the verdict was inconclusive, so the default stays 0 until the aligned rerun.
 
 Cost on the hot path: one prefix hash per forfeiting hit (already paid by the
 spillover), a scan of the hash's holder set against the live set into a fixed
