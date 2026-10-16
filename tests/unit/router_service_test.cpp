@@ -1777,6 +1777,119 @@ TEST_F(ReplicaDesignationTest, AtCapKeepsHomeWhenItIsTheLightestHolder) {
     EXPECT_EQ(RouterService::load_aware_fallbacks_for_testing(), 0u);
 }
 
+// =============================================================================
+// 1h. Native key-space self-check (BACKLOG §29)
+// =============================================================================
+// A native UPSERT proves alignment only by landing on a key the router looked
+// up. Fixture: alignment 1, so a 4-token request hashes at depth 4.
+
+namespace {
+NativeKvOp upsert_op(BackendId backend, uint64_t hash, uint64_t ts_ms = 1000) {
+    return NativeKvOp{NativeKvOp::Kind::UPSERT, backend, hash, ts_ms};
+}
+}  // namespace
+
+TEST_F(RouterServiceTest, NativeUpsertOnRecentRoutingKeyCountsAsMatch) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {2001, 2002, 2003, 2004};
+    router_->route_request(tokens);  // a miss: the hash fallback looks the key up
+
+    NativeKvOp op = upsert_op(1, hash_prefix(tokens.data(), tokens.size(), 1));
+    RouterService::apply_native_kv_ops_local(&op, 1);
+    EXPECT_EQ(RouterService::get_native_kv_stats().routing_key_matches, 1u);
+}
+
+TEST_F(RouterServiceTest, NativeUpsertOnUnroutedKeyIsNotAMatch) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {2011, 2012, 2013, 2014};
+    router_->route_request(tokens);
+
+    NativeKvOp op = upsert_op(1, hash_prefix(tokens.data(), tokens.size(), 1) + 1);
+    RouterService::apply_native_kv_ops_local(&op, 1);
+    EXPECT_EQ(RouterService::get_native_kv_stats().routing_key_matches, 0u);
+}
+
+TEST_F(RouterServiceTest, RoutingKeysNotRecordedWithStreamOff) {
+    cfg_.kv_residency_freshness_ttl = std::chrono::seconds(0);  // kv_events disabled
+    recreate_router(cfg_);
+    register_two_backends();
+    std::vector<int32_t> tokens = {2021, 2022, 2023, 2024};
+    router_->route_request(tokens);
+
+    NativeKvOp op = upsert_op(1, hash_prefix(tokens.data(), tokens.size(), 1));
+    RouterService::apply_native_kv_ops_local(&op, 1);
+    EXPECT_EQ(RouterService::get_native_kv_stats().routing_key_matches, 0u);
+}
+
+TEST_F(RouterServiceTest, RoutingKeysBeyondIndexedDepthNotRecorded) {
+    // The ledger never publishes past the indexed depth, so such a key could
+    // never match and must not count toward the self-check.
+    cfg_.kv_native_indexed_depth = 2;
+    recreate_router(cfg_);
+    register_two_backends();
+    std::vector<int32_t> tokens = {2031, 2032, 2033, 2034};
+    router_->route_request(tokens);
+
+    NativeKvOp op = upsert_op(1, hash_prefix(tokens.data(), tokens.size(), 1));
+    RouterService::apply_native_kv_ops_local(&op, 1);
+    EXPECT_EQ(RouterService::get_native_kv_stats().routing_key_matches, 0u);
+}
+
+TEST_F(RouterServiceTest, RecentRoutingKeysEvictOldestPastCapacity) {
+    register_two_backends();
+    std::vector<std::vector<int32_t>> requests;
+    for (int32_t i = 0; i < 65; ++i) {
+        requests.push_back({3000 + 4 * i, 3001 + 4 * i, 3002 + 4 * i, 3003 + 4 * i});
+        router_->route_request(requests.back());
+    }
+
+    NativeKvOp oldest = upsert_op(1, hash_prefix(requests[0].data(), 4, 1));
+    RouterService::apply_native_kv_ops_local(&oldest, 1);
+    EXPECT_EQ(RouterService::get_native_kv_stats().routing_key_matches, 0u);
+
+    NativeKvOp newest = upsert_op(1, hash_prefix(requests[64].data(), 4, 1));
+    RouterService::apply_native_kv_ops_local(&newest, 1);
+    EXPECT_EQ(RouterService::get_native_kv_stats().routing_key_matches, 1u);
+}
+
+TEST_F(RouterServiceTest, KeyAlignmentWarnsOncePastTheUpsertFloor) {
+    register_two_backends();
+    std::vector<NativeKvOp> unrelated;
+    unrelated.reserve(10000);
+    for (uint64_t i = 0; i < 10000; ++i) {
+        unrelated.push_back(upsert_op(1, 0x5eed0000ULL + i));
+    }
+
+    // Floor not reached: 9,999 upserts.
+    RouterService::apply_native_kv_ops_local(unrelated.data(), 9999);
+    std::vector<int32_t> tokens = {2041, 2042, 2043, 2044};
+    router_->route_request(tokens);
+    EXPECT_FALSE(RouterService::check_native_key_alignment_for_testing());
+
+    // Floor reached with zero matches: warns, then never again.
+    RouterService::apply_native_kv_ops_local(&unrelated[9999], 1);
+    EXPECT_TRUE(RouterService::check_native_key_alignment_for_testing());
+    EXPECT_FALSE(RouterService::check_native_key_alignment_for_testing());
+}
+
+TEST_F(RouterServiceTest, KeyAlignmentSilentWithoutRoutingOrWithAMatch) {
+    register_two_backends();
+    std::vector<NativeKvOp> unrelated;
+    unrelated.reserve(10000);
+    for (uint64_t i = 0; i < 10000; ++i) {
+        unrelated.push_back(upsert_op(1, 0x5eed0000ULL + i));
+    }
+    RouterService::apply_native_kv_ops_local(unrelated.data(), unrelated.size());
+    // Nothing routed with the stream on yet (a cold-start backfill): no verdict.
+    EXPECT_FALSE(RouterService::check_native_key_alignment_for_testing());
+
+    std::vector<int32_t> tokens = {2051, 2052, 2053, 2054};
+    router_->route_request(tokens);
+    NativeKvOp match = upsert_op(2, hash_prefix(tokens.data(), tokens.size(), 1));
+    RouterService::apply_native_kv_ops_local(&match, 1);
+    EXPECT_FALSE(RouterService::check_native_key_alignment_for_testing());
+}
+
 // ----- BACKLOG §21 Phase 5a: verified_resident_subset seam -----
 // The telemetry emitter calls this each window to find which of its hot-prefix
 // membership hashes its own backend verifies resident. It mirrors the routing

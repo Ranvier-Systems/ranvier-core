@@ -2001,9 +2001,10 @@ untouched. Cost so far: the native index holds entries nothing reads (bounded at
 - **Files:** `src/router_service.{hpp,cpp}` (ShardLocalState, `apply_native_kv_ops_local`, the
   hit-path verified block, TTL sweep, metrics block), `src/application.cpp` (startup warning),
   `tests/unit/router_service_test.cpp`, `tests/integration/results_parser.py`
-- **Description:** keep a fixed ring of the last 64 routing hashes per shard (the request hash
-  the hit path and the spillover already compute when the stream is on), with a matching
-  flat_hash_set for O(1) membership. On each native UPSERT, count
+- **Description:** keep a fixed ring of the last 64 distinct routing hashes per shard (the hashes
+  the miss path, the hit path and the spillover already compute, recorded only with the stream on
+  and within the indexed depth); membership is a 64-entry linear scan, so no second container.
+  On each native UPSERT, count
   `router_native_routing_key_matches_total` when its hash is in the ring. On the existing TTL
   sweep (no new timer), warn once per process when `native_upserts` exceeds a floor (say 10,000)
   and matches are still 0: "native KV events never matched a routing key: tokenizer or chat
@@ -2090,12 +2091,10 @@ untouched. Cost so far: the native index holds entries nothing reads (bounded at
 
 ### Open decisions
 
-1. Startup behaviour on a detected mismatch with `kv_events.enabled`: warn (default above) or
-   refuse to start?
-2. Format name: `llama2` (template family) or `codellama` (the model we run)? One name plus an
-   alias is cheap.
-3. Tokenizer for the benchmark: mount from the HF cache (Step 5 default), or require an explicit
-   `--tokenizer` path every time?
+Decided 2026-10-16 (owner): **warn** on a detected mismatch (do not refuse); format **`llama2`**
+with **`codellama`** accepted as an alias; benchmark tokenizer **mounted from the HF cache**
+(Step 5 default). Steps 1–4 approved for implementation. Still open:
+
 4. Rerun scope after alignment: kvevents + kvrepl only, or also kvablate and the §27 row-16
    saturation question?
 5. A designation-only knob for §28 (designation without holder dispatch), to isolate what moved

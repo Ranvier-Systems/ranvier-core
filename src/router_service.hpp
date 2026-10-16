@@ -769,6 +769,10 @@ public:
     // walks, so tests can name the probe-first candidate.
     static std::vector<BackendId> replica_probe_order_for_testing(const std::vector<int32_t>& tokens);
 
+    // Run the TTL sweep's native key-space check (testing only); true when it
+    // warned. Warns at most once per shard state.
+    static bool check_native_key_alignment_for_testing();
+
     // ==========================================================================
     // Native KV-Event Support (vLLM block-granular stream → exact residency)
     // ==========================================================================
@@ -828,6 +832,7 @@ public:
         uint64_t replica_dispatches = 0;
         uint64_t replica_designations = 0;
         uint64_t replica_holders_saturated = 0;
+        uint64_t routing_key_matches = 0;
     };
     static NativeKvStatsSnapshot get_native_kv_stats();
 

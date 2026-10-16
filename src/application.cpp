@@ -148,6 +148,9 @@ seastar::future<> Application::init_tokenizer() {
                     log_main.info("Chat template format: {} (tokenization will match vLLM)",
                                   chat_template_format_name(tpl_fmt));
                 }
+                if (auto warning = RanvierConfig::kv_events_alignment_warning(_config)) {
+                    log_main.warn("{}", *warning);
+                }
 
                 // Start sharded tokenizer service (one instance per core for thread safety)
                 return _tokenizer.start().then([this] {

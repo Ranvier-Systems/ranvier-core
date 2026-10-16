@@ -67,6 +67,7 @@ the full exported name; C++ registers without the prefix.
 | `seastar_ranvier_prefix_boundary_skipped` | `prefix_boundary_skipped` | metrics_service.hpp |
 | `router_cluster_sync_invalid` | `router_cluster_sync_invalid` | gossip_service.cpp |
 | `router_cluster_sync_untrusted` | `router_cluster_sync_untrusted` | gossip_service.cpp |
+| `seastar_ranvier_router_native_routing_key_matches_total` | `router_native_routing_key_matches_total` | router_service.cpp |
 | `seastar_ranvier_router_replica_dispatches_total` | `router_replica_dispatches_total` | router_service.cpp |
 | `seastar_ranvier_router_replica_designations_total` | `router_replica_designations_total` | router_service.cpp |
 | `seastar_ranvier_router_replica_holders_saturated_total` | `router_replica_holders_saturated_total` | router_service.cpp |
