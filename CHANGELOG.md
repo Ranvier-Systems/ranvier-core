@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `chat_template_format: llama2` (aliases `llama-2`, `codellama`) for Llama 2 chat and
+  CodeLlama Instruct, rendered byte-identical to the models' template; its routing boundary is
+  the tokenized system prefix, never the character estimate. Checked against vLLM `/tokenize`
+  by a gated parity test (`tests/tokenizer_parity/`, `RANVIER_BUILD_LLAMA2_PARITY_TEST`).
+- Token-alignment self-checks for the native KV-event stream (BACKLOG §29): a startup warning
+  when `kv_events` runs with template `none` or the bundled `gpt2.json` tokenizer; counter
+  `router_native_routing_key_matches_total` (stream UPSERTs landing on a key the router
+  recently routed on), with a once-only warning if it is still 0 after 10,000 UPSERTs; and the
+  `results_parser.py compare` row and warning for it.
+- `bench.sh --chat-template FMT` and `--tokenizer PATH` (bind-mounted into the three nodes;
+  under `--kv-events` the model's own `tokenizer.json` is taken from the host's Hugging Face
+  cache by default). Manifest `tokenizer_path`, both named in the compare header, warned when
+  unaligned. The kvevents and kvrepl suite rows pass `--chat-template llama2`; Locust's
+  client-tokenize renderer gains `llama2`.
 - Replication by diversion, **off by default** (`routing.replication.max_holders`, env
   `RANVIER_REPLICATION_MAX_HOLDERS`, 0–64, hot-reloadable; BACKLOG §28). Acts only when an
   ART hit's home forfeits its bounded-load allowance and the native KV-event stream is fresh
@@ -69,6 +83,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and KV; the pre-registered reading is in the suite's help text and the results doc.
 
 ### Documentation
+- **Correction (2026-10-16, BACKLOG §29):** every stream-on GPU run to date (first contact,
+  kvablate, kvevents, kvmat, kvrepl) was unaligned: Ranvier routed on GPT-2 ids of untemplated
+  text while vLLM cached CodeLlama ids of the Llama-2 template, so no native KV event could match
+  a routing key. The measured P99s stand; the readings "the stream is neutral on rows 17/18" and
+  "replicas evaporate" do not, and are reopened in `benchmark-results-current.md`,
+  `cache-residency-routing.md` and the runner's `--help`. The 2026-10-16 kvrepl run is
+  inconclusive; `routing.replication.max_holders` stays 0.
 - Native KV-event suite measured on the verified-cold policy (2026-10-13, image `a298ad6`): the
   migration storm is gone (0 verified evictions, 107–134 cold hits re-prefilled on their home per
   arm); with the prefix arm starting against freshly started publishers the stream reads −10.3%

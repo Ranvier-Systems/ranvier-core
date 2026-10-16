@@ -368,6 +368,19 @@ release as `ranvier-benchmark-runs-2026-10-09.tar.gz`.
 
 ## Native KV-event suite and the 8B reset row (measured 2026-10-13)
 
+> **Unaligned; the stream verdicts below are reopened (2026-10-16, BACKLOG §29).** Every
+> stream-on run in this section, the first-contact and `kvablate` runs (Still open, item 7),
+> the kvmat ablation and the 2026-10-16 `kvrepl` run routed on GPT-2 ids of the untemplated
+> text while vLLM cached CodeLlama ids of the Llama-2 chat template, so no native KV event could
+> ever match a routing key. `verified_hits` were the home's own learned-route entries,
+> `verified_cold_honored` and "verified evictions" were request hashes with no learned entry at
+> that depth, `holder_redirects` / `replica_dispatches` 0 were structural, and materialized
+> routes could never be looked up. The P99s, KV hit rates and the 8B reset row stand as
+> measured; what does not stand is any reading of them as "exact residency is neutral" or
+> "replicas evaporate". Those questions are open until the aligned rerun (`--chat-template
+> llama2` with the model's tokenizer, now the kvevents / kvrepl rows' default; read
+> `routing_key_matches` > 0 first).
+
 **Question.** With the verified-cold policy of 2026-10-11 (a hit whose home verifiably evicted
 the prefix goes to another verified holder or stays home; never re-placed) and the completeness
 rule that followed it, does the native vLLM KV-event stream earn its place on the two rows that
@@ -692,12 +705,12 @@ before termination after all): summaries in this tree, raw data as a release ass
 | Fitted suite under 2.2.0 defaults, incl. new 30u row (2026-10-06/07) | `results/2026-10-07-fitted-2.2.0/` |
 | Baseline suite: prefix vs least-loaded (2026-10-08) | `results/2026-10-08-baseline-least-loaded/` |
 | Saturation suite: ε 0.5 / 0.25 vs least-loaded at 30u, 50-prefix 20u vs least-loaded (2026-10-09) | `results/2026-10-09-saturation/` |
-| Native KV-event suite on the verified-cold policy: fitted 20u + 50-prefix 20u vs least-loaded, ×3 (2026-10-13) | `results/2026-10-13-kvevents/` |
+| Native KV-event suite on the verified-cold policy: fitted 20u + 50-prefix 20u vs least-loaded, ×3 (2026-10-13); unaligned, §29 | `results/2026-10-13-kvevents/` |
 | 8B 20u vs round-robin with the between-arm KV reset acknowledged, ×3 (2026-10-13) | `results/2026-10-13-kvreset/` |
-| kvmat: fitted 20u vs least-loaded, stream on, materialization off, ×3 (2026-10-13) | `results/2026-10-13-kvmat/` |
-| Row 18: 50-prefix 20u vs least-loaded, stream on, materialization off, ×3 (2026-10-14) | `results/2026-10-14-kvevents/` |
-| Native KV events, first contact: 3 stream-off control reps + the first live-stream run (2026-10-10) | `results/2026-10-10-kvevents-first-contact/` (compare files only; raw dirs lost with the instance) |
-| kvablate: materialize off / depth 4096 / both vs least-loaded, ×1 (2026-10-11) | `results/2026-10-11-kvablate/` (compare files only) |
+| kvmat: fitted 20u vs least-loaded, stream on, materialization off, ×3 (2026-10-13); unaligned, §29 | `results/2026-10-13-kvmat/` |
+| Row 18: 50-prefix 20u vs least-loaded, stream on, materialization off, ×3 (2026-10-14); unaligned, §29 | `results/2026-10-14-kvevents/` |
+| Native KV events, first contact: 3 stream-off control reps + the first live-stream run (2026-10-10); unaligned, §29 | `results/2026-10-10-kvevents-first-contact/` (compare files only; raw dirs lost with the instance) |
+| kvablate: materialize off / depth 4096 / both vs least-loaded, ×1 (2026-10-11); unaligned, §29 | `results/2026-10-11-kvablate/` (compare files only) |
 
 The raw run directories (Locust CSVs, per-request logs, vLLM logs, per-node Ranvier logs where
 captured; 4.6 GB, 610 MB compressed) are attached to the
@@ -1159,6 +1172,9 @@ nothing to do.
    (50-prefix, was +23%; not reproduced, see item 10); every second-arm rep regressed 12–73
    points with 3.4× the materialized routes from the replayed first-arm history. Resolved by
    item 9: materialization was the whole effect; row 17 is neutral at −13.2 / −10.1 / −12.7%.
+   *Unaligned (2026-10-16, BACKLOG §29): no event in these runs could match a routing key, so
+   the "verified evictions" were not block evictions and materialized routes were never read.
+   The measured P99s stand; the mechanisms above are not established.*
 8. ~~Same session, after 7: `bench-runner.sh --suite kvreset`.~~ Done 2026-10-13: −23.7 /
    −19.4 / −21.3% (median −21.3, 3/3) with `8/8` acked on every arm; the order gap fell from 9
    points to 4 and the row's number moves from −26.7% to −21.3%. README updated.
@@ -1177,12 +1193,22 @@ nothing to do.
    and is withdrawn. The stream is neutral on both rows, stays opt-in, and is closed as a
    signal question; the next mechanism is hot-prefix replication (BACKLOG §27). Archive:
    `results/2026-10-14-kvevents/`.
-11. Next GPU session, if the eviction regime is pursued: replication by diversion (plan:
-   BACKLOG §28; suite `kvrepl` once implemented). Holder-aware, sticky diverts so one prefix's
-   overflow builds and then reads one replica instead of being sprayed over seven strangers.
-   Pre-registered reading is in §28 Step 8; acceptance unchanged from BACKLOG §27: row 18 (now
-   +19…+23% on the stream-off and stream-on configurations alike) turns to an improvement without
-   KV or route consistency falling below today's 23–30% / 49–52%, and row 17 holds at the control.
+   *Reopened 2026-10-16: the run was unaligned (BACKLOG §29), so `holder_redirects` 0 was
+   structural and "neutral" is unmeasured; see item 12.*
+11. ~~Next GPU session: replication by diversion (`--suite kvrepl`, BACKLOG §28 Step 8).~~ Ran
+   2026-10-16 on image `8b118dd`, ×3: **inconclusive**. Row 17 −12.5 / −20.0 / −15.1% (holds),
+   row 18 +1.0 / −2.5 / +10.9% (MIXED, against +23.1 / +14.7 / +18.9% two days earlier), KV in
+   the old 23–32% band. `replica_designations` 143–174 per prefix arm but `replica_dispatches`,
+   `replica_holders_saturated` and `holder_redirects` 0 on all six arms: the run was unaligned
+   (§29), so no replica was ever visible. What it measured is designation alone, a lead on row
+   18 and not a result; `max_holders` stays 0.
+12. Next GPU session (BACKLOG §29 Step 7): one smoke rep of row 18 with `--kv-events
+   --replication 2 --chat-template llama2` (tokenizer from the HF cache); read
+   `routing_key_matches` > 0, then `verified_hits` and `holder_redirects` or
+   `replica_dispatches` > 0, and stop if matches stay 0. Then `--suite kvevents` and
+   `--suite kvrepl` ×3, aligned, as pre-registered in §27 / §28 Step 8 (acceptance unchanged:
+   row 18 turns to an improvement without KV or route consistency falling below 23–30% /
+   49–52%, and row 17 holds at the control).
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 

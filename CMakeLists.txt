@@ -1408,6 +1408,26 @@ if(Seastar_FOUND)
         gtest_discover_tests(kimi_tokenizer_parity_test)
     endif()
 
+    # Gated llama2 / CodeLlama tokenizer FFI parity test (BACKLOG section 29).
+    # Same shape as the Kimi test: OFF by default (the model's tokenizer.json
+    # is not vendored); skips at run time unless RANVIER_LLAMA2_TOKENIZER_JSON
+    # and RANVIER_LLAMA2_PARITY_FIXTURE are set. See tests/tokenizer_parity/README.md.
+    option(RANVIER_BUILD_LLAMA2_PARITY_TEST
+           "Build the gated llama2 tokenizer FFI parity test" OFF)
+    if(RANVIER_BUILD_LLAMA2_PARITY_TEST)
+        add_executable(llama2_tokenizer_parity_test
+          tests/unit/llama2_tokenizer_parity_test.cpp
+        )
+        target_include_directories(llama2_tokenizer_parity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(llama2_tokenizer_parity_test
+          PRIVATE
+          tokenizers_cpp
+          rapidjson_interface
+          GTest::gtest_main
+        )
+        gtest_discover_tests(llama2_tokenizer_parity_test)
+    endif()
+
     # TokenizerThreadPool Unit Tests (Requires Seastar types for header includes)
     # Tests dedicated thread pool for non-blocking FFI offload (Rule #4, #11)
     add_executable(tokenizer_thread_pool_test

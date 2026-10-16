@@ -899,6 +899,14 @@ struct RanvierConfig {
     // Validate configuration, returns error message if invalid, nullopt if valid
     static std::optional<std::string> validate(const RanvierConfig& config);
 
+    // With kv_events on, the native index can only answer for a request when
+    // Ranvier tokenizes exactly as the backend does (BACKLOG section 29).
+    // Returns the startup warning when the config cannot be aligned with any
+    // templated chat model: chat_template_format "none", or the bundled GPT-2
+    // tokenizer. A warning, not a validation error: a mismatch leaves the
+    // stream inert, it does not misroute.
+    static std::optional<std::string> kv_events_alignment_warning(const RanvierConfig& config);
+
 private:
     // Apply environment variable overrides
     void apply_env_overrides();

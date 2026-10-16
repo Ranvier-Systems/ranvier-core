@@ -196,6 +196,11 @@ class BenchmarkResults:
     # stream (after a reset or a trimmed backfill), decided by the gossip gate.
     native_stream_completes_total: Optional[int] = None
     native_absence_untrusted_total: Optional[int] = None
+    # routing_key_matches: native UPSERTs that landed on a key the router
+    # looked up (BACKLOG §29). 0 with kv_ops flowing means Ranvier and vLLM
+    # tokenize differently and every other native counter reads learned-route
+    # entries, not the backends' caches. None on images before the counter.
+    native_routing_key_matches_total: Optional[int] = None
     # Replication by diversion (BACKLOG §28, "router_replica_*"; nonzero only
     # with routing.replication.max_holders >= 1 and the stream on).
     # replica_dispatches: over-allowance ART hits served by a verified holder
@@ -677,6 +682,7 @@ _NATIVE_KEYS = (
     "native_stream_resets_total",
     "native_stream_completes_total",
     "native_absence_untrusted_total",
+    "native_routing_key_matches_total",
 )
 # Replication-by-diversion counters (router_service.cpp "router_replica_*").
 _REPLICA_KEYS = (
@@ -1885,6 +1891,14 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
                     "  -> native KV events REQUESTED (--kv-events) but kv_ops=0 on the new arm: the ZMQ "
                     "stream never delivered; this arm ran on probabilistic residency. Check the vLLM "
                     "--kv-events-config publisher and RANVIER_KV_EVENTS_ENABLED before reading the result."
+                )
+            elif new.native_routing_key_matches_total == 0:
+                lines.append(
+                    "  -> native KV events flowing but routing_key_matches=0 on the new arm: no "
+                    "stream entry ever landed on a routing key, so Ranvier and vLLM tokenize "
+                    "differently (tokenizer or chat template). Every verified / holder / replica "
+                    "counter above read learned-route entries, not the backends' caches "
+                    "(BACKLOG §29)."
                 )
             elif _native_any(new):
                 lines.append(

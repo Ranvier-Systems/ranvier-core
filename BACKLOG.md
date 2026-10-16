@@ -1530,6 +1530,17 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   one home per prefix the verified-cold path has nowhere to send a hit, so the stream changes what
   the router knows and no routing decision. Neutral on both rows, opt-in, closed as a signal
   question. The eviction regime is the replication half of the holder-aware divert item below.**
+  **Correction 2026-10-16 (§29): every native-stream reading above was taken with Ranvier routing
+  on GPT-2 ids of the untemplated text and vLLM storing CodeLlama ids of the templated prompt, so
+  no stream entry ever matched a routing key. `verified_hits` were the home's own learned-route
+  entry in the shared index; `verified_cold_honored` and the 10-10/11 "verified evictions" were
+  hashes with no learned entry at the request's (estimated) boundary depth; `holder_redirects` 0
+  was structural. The 10-11 storm diagnosis (a downgrade per absent entry → re-placement →
+  re-learn) still explains the damage and its fix, but "evicted" was never true. Materialized
+  PUSH routes (keyed on vLLM ids) could not capture Ranvier lookups either; their 10-13
+  second-arm effect more plausibly came through `route_tokens_by_backend`, which least-loaded
+  miss placement balances on. The P99 / KV / Gini numbers are real; "the stream is neutral" is
+  unmeasured, not established.**
   **10-11 static check of that policy (branch `claude/festive-thompson-ta0tgj`): freshness proved
   only that the subscription was alive, since heartbeats restore it within 5 s of a RESET over the
   purged index and a node starting against warm vLLMs backfills only the replay buffer; absence
@@ -1581,7 +1592,9 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   workload has one holder per prefix; row 18 read +23.1 / +14.7 / +18.9 with exact residency.
   The second half, replicating a hot single-holder prefix, is therefore the whole remaining item:
   the divert target has to be created before any divert policy can use it. Record: "Row 18 with
-  materialization off" in the results doc. **Plan: §28 below.**
+  materialization off" in the results doc. **Plan: §28 below.** _Corrected 2026-10-16:_ the
+  0-in-376 could not have been anything else, since the stream never matched a routing key (§29);
+  whether row 18 has one holder per prefix is unmeasured.
 - [ ] **[LOW] KV-event subscriber: a duplicate live frame after a connect-backfill resets the
   backend.** The SUB socket connects before the backfill, so a batch published during the replay
   window arrives twice; the live loop treats any sequence below the expected one as a publisher
@@ -1623,6 +1636,13 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   which regime you are in."
 
 ## 28. Hot-Prefix Replication by Diversion (2026-10-14)
+
+> **Correction 2026-10-16 (§29):** the premise below, that diverts created replicas which then
+> evaporated (`holder_redirects` 0 in 376 verified-cold decisions), was never measured. On every
+> GPU benchmark so far Ranvier routed on GPT-2 token ids of the plain message text, while vLLM
+> stored CodeLlama ids of the chat-templated prompt. So no native-stream entry could ever land on a
+> key the router reads, and a replica could not have been seen even if it survived. Steps 1–7
+> stand as built. Step 8 measured designation only; see its status.
 
 Plan for the remaining half of the §27 holder-aware divert item. Written after row 18 of the
 native KV-event suite read +23.1 / +14.7 / +18.9% P99 against least-loaded with exact residency
@@ -1848,7 +1868,29 @@ KV hit rate to move, in either direction, and read it before P99.
     honest README line is the §27 "which regime you are in" claim.
 - **Row 17 (fitted 20u, control −12.5%):** must not regress (3/3 within a point of the control).
   If it regresses while row 18 improves, Step 9.
-- **Status:** [ ] Pending
+- **Status:** [x] Ran 2026-10-16 (image `8b118dd`, ×3 alternating order, KV reset 8/8 every arm).
+  **INCONCLUSIVE: no replica could be read; default stays `max_holders = 0`.**
+
+  | Row | P99 vs least_loaded (3 reps) | KV hit | Before (stream on, no replication) |
+  |---|---|---|---|
+  | 17, fitted 20u | −12.5 / −20.0 / −15.1% | 70.3 / 69.9 / 68.7% | −13.2 / −10.1 / −12.7% (control −12.5%) |
+  | 18, 50-prefix 20u | +1.0 / −2.5 / +10.9% (MIXED) | 24.5 / 30.9 / 29.5% | +23.1 / +14.7 / +18.9% |
+
+  - Read-first check failed in an informative way: `replica_designations` 143–174 per prefix arm,
+    but `replica_dispatches`, `replica_holders_saturated` and `holder_redirects` were 0 on all six.
+    `saturated = 0` excludes the pre-registered "replicas evaporate" reading: at cap 2 a
+    confirmed replica counts toward the cap even over allowance, so it would have fired. The cause
+    is §29: the stream's keys and the router's keys never meet, so no second holder is visible.
+    None of the four pre-registered outcomes applies (each assumes replicas were read).
+  - What it did measure is **designation alone**: each prefix's overflow goes to one fixed
+    probe-order backend instead of the coldest. Row 17 holds (Step 9 not triggered). Row 18's
+    median moved +18.9 → +1.0% with KV unchanged in the old 23–32% band, but MIXED, against
+    reps from another day (2026-10-14), with 1.5–1.9% timeouts in both arms (P99 excludes them)
+    and Gini up to 0.14–0.18 (from 0.10–0.11). A lead, not a result.
+  - Next: §29 first, then rerun `--suite kvrepl` with aligned tokens (read first:
+    `holder_redirects` or `replica_dispatches` > 0). A designation-only arm (designation on,
+    holder dispatch off) would separate the two rules; it needs a knob, since `max_holders >= 2`
+    enables both together.
 
 #### Step 9 (conditional): Hotness gate
 - **Only if** Step 8 shows row 17 regressing with replication on.
@@ -1883,6 +1925,213 @@ image the GPU session pulls carries everything.
       fresh `make docker-build`; the parser and
       compare-file changes have no unit tests; `tests/integration/test_load_aware_routing.py`
       covers the divert counters' names).
+
+---
+
+## 29. Token Alignment for the Native KV-Event Stream (2026-10-16)
+
+Scoping only: decisions in "Open decisions" below come first, then `/implement` per step.
+
+### The finding
+
+The native KV-event stream (§20.1 P0.1, `kv_events`) only helps if a key vLLM publishes is a key
+the router looks up: `prefix_hash_index` is keyed by `hash_prefix(tokens, depth, 16)`, the router
+hashes **its own** token ids of the request, and the ledger (`src/kv_event_ledger.hpp`) hashes
+**vLLM's** stored token ids at every block boundary. On every GPU benchmark to date those two
+token sequences differed from the second token, for two independent reasons:
+
+1. **Tokenizer.** `assets.tokenizer_path` defaults to `assets/gpt2.json` (`config_schema.hpp`),
+   the only tokenizer in the image, and nothing (compose, `bench.sh`, the image) sets
+   `RANVIER_TOKENIZER_PATH`. Ranvier routes on GPT-2 ids; vLLM stores CodeLlama SentencePiece ids.
+2. **Chat template.** `chat_template_format` defaults to `none` (plain content joined with
+   `\n`), while vLLM's `/v1/chat/completions` applies the model's template. CodeLlama-Instruct
+   uses the Llama-2 template, which Ranvier has no format for (`llama3`, `chatml`, `mistral`,
+   `kimi` only). vLLM `/tokenize` on the bench box, 2026-10-16:
+   - messages `[system: "You are a helpful assistant.", user: "hi"]` →
+     `[1, 518, 25580, 29962, 3532, 14816, 29903, 6778, 13, 3492, 526, 263]`
+     (`<s> [INST] <<SYS>>\n You are a`)
+   - prompt `"You are a helpful assistant.\nhi"` → `[1, 887, 526, 263, ...]`. Even the first word
+     differs (3492 vs 887: SentencePiece marks a word after a newline differently), so no offset
+     aligns the two.
+
+Either mismatch alone makes every stream-side hash disjoint from every routing hash.
+
+**What that invalidates.** Every reading of the stream: `verified_hits` were the home's own
+learned-route entry (route learning writes the same index, and entries of fresh-stream
+backends survive the TTL rebuild); `verified_cold_honored` and the 10-10/11 "verified
+evictions" were request hashes with no learned entry at the (estimated, per-request) boundary
+depth; `holder_redirects` and `replica_dispatches` 0 were structural; materialized PUSH routes
+(keyed on vLLM ids) could never match a lookup. §27's "the stream is neutral on rows 17/18" and
+§28's "replicas evaporated" are unmeasured. Corrected in place in §27 and §28.
+
+**What it does not.** Prefix affinity itself (ART, consistent hashing, learning, gossip): those
+keys only need to be self-consistent, and GPT-2 ids are. The headline benchmark numbers, vLLM's
+KV hit rates, and every P99 as measured stand. Stream-off rows (the 8B / Llama-3.1 rows) are
+untouched. Cost so far: the native index holds entries nothing reads (bounded at
+`MAX_ENTRIES_PER_BACKEND` = 65,536 per backend per shard).
+
+### Options considered
+
+- **A. Client tokenization (no code, benchmark only).** `bench.sh --client-tokenize`: Locust
+  sends `prompt_token_ids` to `/v1/completions`, vLLM stores exactly those ids, Ranvier routes on
+  them (`RANVIER_ACCEPT_CLIENT_TOKENS=1` is the compose default). Aligned by construction, but
+  only for this benchmark; the locust image has no `assets/`, so its tokenizer falls back to
+  `from_pretrained(VLLM_MODEL)`, which needs Hugging Face access to the gated meta-llama repo, and
+  tokenization moves outside the TTFT timer (both arms). The fastest valid rerun of `kvrepl`.
+- **B. Server-side alignment (this plan).** The model's own tokenizer, a `llama2` template, an
+  exact system boundary for it, and a self-check that makes any future mismatch loud. Needed for
+  any real deployment that turns `kv_events` on; A cannot help there.
+
+### Decisions taken here (change them before Step 1 if you disagree)
+
+- **A self-check, not only a config fix.** This went unnoticed through every stream-on GPU session since
+  2026-10-10 because nothing compared the two key spaces. The router must say when stream keys never meet routing
+  keys (Step 1), so a mis-set tokenizer or template is a logged warning on the first run, not a
+  campaign later.
+- **Warn, not refuse, at startup.** A mismatch degrades the stream to inert, it does not misroute,
+  so refusing to start would trade availability for a feature that is off by default. (Open
+  decision 1 if you want refusal under `kv_events.enabled`.)
+- **Exact boundary for `llama2` from system-prefix tokenization** (`http_controller.cpp`
+  Strategy 4), skipping the character-ratio estimate (Strategy 2), which can overshoot into user
+  text and put the routing hash on a per-request key.
+
+### Implementation Steps
+
+#### Step 1: Key-space self-check
+- **Files:** `src/router_service.{hpp,cpp}` (ShardLocalState, `apply_native_kv_ops_local`, the
+  hit-path verified block, TTL sweep, metrics block), `src/application.cpp` (startup warning),
+  `tests/unit/router_service_test.cpp`, `tests/integration/results_parser.py`
+- **Description:** keep a fixed ring of the last 64 distinct routing hashes per shard (the hashes
+  the miss path, the hit path and the spillover already compute, recorded only with the stream on
+  and within the indexed depth); membership is a 64-entry linear scan, so no second container.
+  On each native UPSERT, count
+  `router_native_routing_key_matches_total` when its hash is in the ring. On the existing TTL
+  sweep (no new timer), warn once per process when `native_upserts` exceeds a floor (say 10,000)
+  and matches are still 0: "native KV events never matched a routing key: tokenizer or chat
+  template differs from the backend's". At startup, warn when `kv_events.enabled` and either
+  `chat_template_format == none` or `tokenizer_path` is the bundled `assets/gpt2.json`. Parser:
+  add the counter to the native row and a "keys never matched" warning line.
+- **Tests:** UPSERT of a recently routed hash counts; of an unrelated hash does not; ring evicts
+  the oldest at 64; the warning fires once and only past the floor.
+- **Concerns:** Rule #4 (ring and set capped at 64 by construction), Rule #1 (shard-local), no
+  timer (Rule #5 avoided), Rule #17 n/a (O(1) per op).
+
+- **Status:** [x] Done (2026-10-16): ring of 64 with a linear scan; counter, TTL-sweep warning, startup warning, parser row.
+
+#### Step 2: `llama2` chat-template format
+- **Files:** `src/chat_template.hpp`, `tests/unit/chat_template_test.cpp`,
+  `src/config_loader.cpp` (accepted values; message), docs tables
+- **Description:** `ChatTemplateFormat::llama2` reproducing the CodeLlama-Instruct / Llama-2-chat
+  `tokenizer_config.json` template: the first system message's content is folded into the first
+  user turn as `<<SYS>>\n{system}\n<</SYS>>\n\n{user}`; each user turn renders
+  `<s>[INST] {content.strip()} [/INST]`; each assistant turn ` {content.strip()} </s>`; no
+  generation prompt (implicit after `[/INST]`); no system → `<s>[INST] {user} [/INST]`. Contents
+  are stripped as the template does. Check the rendering against the model's own
+  `tokenizer_config.json` `chat_template` before coding, not this summary. `format_single_message` (multi-depth) is approximate for the
+  same reason as `mistral`; `message_start_marker` is empty (`[INST]` is several tokens).
+- **Tests:** string-level renderings for system+user, user-only, multi-turn and whitespace-padded
+  content, against the Jinja template's output.
+- **Concerns:** none Seastar-related (pure header). Copy the template source and revision into the
+  code comment, as the other formats do.
+
+- **Status:** [x] Done (2026-10-16): `llama2`, `llama-2`, `codellama`. String tests run in the sandbox (60/60 chat-template tests).
+
+#### Step 3: Exact system boundary for `llama2`
+- **Files:** `src/http_controller.cpp` (boundary strategies), `src/request_rewriter.hpp`
+  (`system_prefix_end` for the folded system block), `src/boundary_detector.hpp` if a helper
+  moves, `tests/unit/boundary_detector_test.cpp`
+- **Description:** for `llama2` skip Strategy 2 and use Strategy 4: tokenize the rendered
+  system-prefix substring `<s>[INST] <<SYS>>\n{system}\n<</SYS>>\n\n`. This is exact only if no
+  token straddles the end of that substring; the Llama tokenizer encodes `\n` as the byte token 13,
+  so it should hold, and Step 4's parity fixture proves it per case.
+- **Tests:** boundary equals the system-prefix token count for a fixture; ratio strategy not
+  consulted for `llama2`; other formats unchanged.
+- **Concerns:** Strategy 4 relies on the tokenization cache for the system prefix (see its
+  comment); fitted prefixes are 2,000–4,000 tokens, so check `tokenization_cache_max_text`
+  covers them or every request pays the FFI call.
+
+- **Status:** [x] Done (2026-10-16): `ChatTemplate::boundary_from_system_prefix`; Strategy 2 skipped for `llama2`.
+
+#### Step 4: Tokenizer parity, gated, mirroring the Kimi test
+- **Files:** `tests/tokenizer_parity/llama2_tokenizer_parity.py` (emits a fixture from vLLM
+  `/tokenize` with messages, or from `transformers.apply_chat_template`),
+  `tests/unit/llama2_tokenizer_parity_test.cpp` (opt-in build flag like
+  `RANVIER_BUILD_KIMI_PARITY_TEST`, skips unless `RANVIER_LLAMA2_TOKENIZER_JSON` and
+  `RANVIER_LLAMA2_PARITY_FIXTURE` are set), `tests/tokenizer_parity/README.md`
+- **Description:** assert that `ChatTemplate(llama2)` + `tokenizers::Tokenizer::FromBlobJSON(...)`
+  + `Encode` (Ranvier's exact FFI path) reproduces vLLM's ids for each fixture conversation,
+  including the `<s>` → id 1 mapping and the `▁[` after BOS, and that the Strategy 4 prefix
+  tokens are a prefix of the full encoding. The tokenizer is not vendored (Llama 2 licence);
+  the fixture is small JSON and can be.
+- **Concerns:** if `Encode` adds special tokens on its own, BOS doubles; the fixture catches it.
+
+- **Status:** [x] Done and **passing** (2026-10-16): 7/7 cases. Ranvier's path (`llama2` rendering,
+  Strategy 4 system prefix, tokenizers-cpp on CodeLlama's `tokenizer.json`) reproduces the reference
+  ids. The fixture came from transformers 4.x (`codellama/CodeLlama-13b-Instruct-hf`), gated by a
+  known-answer check against the vLLM 0.15.1 `/tokenize` output from the bench box. transformers 5.x
+  was rejected by that check: it drops the word-start marker after `<s>` (29961 where vLLM has 518).
+  The fixture is committed as `tests/tokenizer_parity/llama2_reference_tokens.json`.
+
+#### Step 5: Benchmark plumbing for an aligned run
+- **Files:** `scripts/bench.sh` (`--tokenizer PATH` → `RANVIER_TOKENIZER_PATH`, mounted read-only
+  into the three nodes; `--chat-template FMT` → `RANVIER_CHAT_TEMPLATE_FORMAT`, which compose
+  already forwards to Locust too; manifest fields `tokenizer_path`, `chat_template_format` in the
+  routing block; a warning when `--kv-events` runs with the bundled tokenizer or `none`),
+  `docker-compose.benchmark-real.yml` (mount + env on all three nodes),
+  `scripts/bench-runner.sh` (kvevents / kvrepl rows pass both flags), `.dev-context/claude-locust-sync-map.md`
+- **Description:** default the tokenizer to the model's own `tokenizer.json` from the host's
+  Hugging Face cache (`~/.cache/huggingface/hub/models--<org>--<name>/snapshots/*/tokenizer.json`,
+  present wherever vLLM has loaded the model) when `--kv-events` is set.
+- **Done when:** a stream-on compare header names the tokenizer and template, and the Step 1
+  counter is > 0 on the prefix arm.
+- **Status:** [x] Code done (2026-10-16): `bench.sh --chat-template` / `--tokenizer` (HF-cache default
+  under `--kv-events`, resolved symlink bind-mounted as `/app/tokenizer/tokenizer.json`), manifest
+  `tokenizer_path`, header and log warning when unaligned; compose mount + env on all three nodes;
+  kvevents / kvrepl rows pass `--chat-template llama2`; `locustfile_real.py` renders `llama2` for the
+  client-tokenize path. The counter half of "done when" is Step 7's smoke.
+
+#### Step 6: Documentation and corrected records
+- **Files:** `docs/internals/cache-residency-routing.md` (Verified residency: the alignment
+  requirement up front, replacing the interim caveat), `docs/internals/prefix-affinity-routing.md`
+  (template table), `docs/benchmarks/benchmark-results-current.md` (annotate the kvevents /
+  kvablate / kvrepl rows as unaligned), `scripts/bench-runner.sh` `--help` (same), `CHANGELOG.md`
+- **Description:** state plainly which earlier conclusions were unaligned and therefore open.
+- **Status:** [x] Done (2026-10-16): alignment requirement and self-checks up front in
+  `cache-residency-routing.md` (replacing the interim caveat); template table and tokenizer
+  requirement in `prefix-affinity-routing.md`; results doc banner, per-item notes, archive rows
+  marked unaligned, kvrepl run recorded as Still-open item 11 and the aligned rerun as item 12;
+  runner `--help` for kvevents / kvablate / kvrepl; CHANGELOG.
+
+#### Step 7: GPU session
+- **Depends on:** Steps 1–6 in the GHCR image
+- **Smoke first:** one `--kv-events --replication 2 --tokenizer <codellama> --chat-template llama2`
+  rep of row 18. Read first: `native_routing_key_matches` > 0, then `verified_hits` and
+  `holder_redirects` or `replica_dispatches` > 0. If matches stay 0, stop: parity is still wrong.
+- **Then:** `--suite kvevents` (rows 17/18, replication off) to re-ask whether exact residency
+  changes anything, and `--suite kvrepl` ×3 to run §28 Step 8 as pre-registered. Materialization
+  (`--suite kvablate`) is worth one rep again, since its earlier effect could not have been
+  through matched keys.
+
+### Open decisions
+
+Decided 2026-10-16 (owner): **warn** on a detected mismatch (do not refuse); format **`llama2`**
+with **`codellama`** accepted as an alias; benchmark tokenizer **mounted from the HF cache**
+(Step 5 default). Steps 1–4 approved for implementation. Still open:
+
+4. Rerun scope after alignment: kvevents + kvrepl only, or also kvablate and the §27 row-16
+   saturation question?
+5. A designation-only knob for §28 (designation without holder dispatch), to isolate what moved
+   row 18 on 2026-10-16?
+
+### Dependencies
+
+```
+1 (self-check) ──────────────────────────────┐
+2 (llama2 template) ─> 3 (exact boundary) ─> 4 (parity) ─> 5 (bench plumbing) ─> 7 (GPU)
+                                              └─> 6 (docs) ──────────────┘
+```
+Steps 1–4 can land in one PR (code + unit tests); 5–6 in a second, so the image the GPU session
+pulls carries both.
 
 ---
 

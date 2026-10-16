@@ -1151,6 +1151,44 @@ TEST_F(RequestRewriterTest, BoundaryInfoSystemPrefixMultipleContiguous) {
     EXPECT_EQ(result->system_text, "You are helpful.\nBe concise.");
 }
 
+// --- llama2: the system prefix is the folded <<SYS>> block (BACKLOG §29) ---
+
+TEST_F(RequestRewriterTest, BoundaryInfoLlama2SystemPrefixIsTheSysBlock) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "hi"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(
+        body, /*need_formatted_messages=*/false,
+        ChatTemplate(ChatTemplateFormat::llama2));
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->text,
+        "<s>[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\n\nhi [/INST]");
+    ASSERT_TRUE(result->has_system_prefix);
+    // Strategy 4 tokenizes exactly this substring: everything the template
+    // renders before the first user token, shared by every request that
+    // carries the same system prompt.
+    EXPECT_EQ(result->text.substr(0, result->system_prefix_end),
+        "<s>[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\n\n");
+    EXPECT_EQ(result->system_text, "You are a helpful assistant.");
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoLlama2SystemPrefixSharedAcrossUserTurns) {
+    auto extract = [](const char* user) {
+        std::string body = std::string(R"({"messages": [{"role": "system", "content": "S"},)") +
+                           R"({"role": "user", "content": ")" + user + R"("}]})";
+        return RequestRewriter::extract_text_with_boundary_info(
+            body, /*need_formatted_messages=*/false, ChatTemplate(ChatTemplateFormat::llama2));
+    };
+    auto a = extract("first question");
+    auto b = extract("a different one");
+    ASSERT_TRUE(a.has_value() && b.has_value());
+    EXPECT_EQ(a->text.substr(0, a->system_prefix_end), b->text.substr(0, b->system_prefix_end));
+}
+
 // --- Kimi default-system injection (matches chat_template.jinja) ---
 
 TEST_F(RequestRewriterTest, BoundaryInfoKimiInjectsDefaultSystemWhenAbsent) {

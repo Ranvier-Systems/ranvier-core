@@ -1641,7 +1641,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         // tokenization_cache_max_text, every request will make a blocking FFI
         // call (5-13ms).  Ensure tokenization_cache_max_text >= the largest
         // expected system prefix size.
-        if (!prefix_boundary_set && text_extraction.has_value() && !was_truncated) {
+        // Skipped where the template needs an exact system-prefix boundary
+        // (ChatTemplate::boundary_from_system_prefix): Strategy 4 below.
+        if (!prefix_boundary_set && text_extraction.has_value() && !was_truncated &&
+            !_config.chat_template.boundary_from_system_prefix()) {
             auto ratio_result = detect_boundaries_by_char_ratio(
                 tokens.size(), *text_extraction, bd_config);
             if (ratio_result.detected) {

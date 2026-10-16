@@ -2752,6 +2752,42 @@ TEST_F(ConfigTest, ReplicationMaxHoldersValidatedToLiveSetBound) {
 }
 
 // =============================================================================
+// kv_events token alignment warning (BACKLOG §29)
+// =============================================================================
+
+TEST_F(ConfigTest, AlignmentWarningSilentWithKvEventsOff) {
+    RanvierConfig config;  // gpt2.json + "none", but the stream is off
+    EXPECT_FALSE(RanvierConfig::kv_events_alignment_warning(config).has_value());
+}
+
+TEST_F(ConfigTest, AlignmentWarningNamesBothDefaultsWhenStreamOn) {
+    RanvierConfig config;
+    config.kv_events.enabled = true;
+    auto warning = RanvierConfig::kv_events_alignment_warning(config);
+    ASSERT_TRUE(warning.has_value());
+    EXPECT_NE(warning->find("chat_template_format"), std::string::npos);
+    EXPECT_NE(warning->find("GPT-2"), std::string::npos);
+}
+
+TEST_F(ConfigTest, AlignmentWarningNamesOnlyTheTemplate) {
+    RanvierConfig config;
+    config.kv_events.enabled = true;
+    config.assets.tokenizer_path = "/models/codellama/tokenizer.json";
+    auto warning = RanvierConfig::kv_events_alignment_warning(config);
+    ASSERT_TRUE(warning.has_value());
+    EXPECT_NE(warning->find("chat_template_format"), std::string::npos);
+    EXPECT_EQ(warning->find("GPT-2"), std::string::npos);
+}
+
+TEST_F(ConfigTest, AlignmentWarningSilentWhenAligned) {
+    RanvierConfig config;
+    config.kv_events.enabled = true;
+    config.assets.tokenizer_path = "/models/codellama/tokenizer.json";
+    config.assets.chat_template_format = "llama2";
+    EXPECT_FALSE(RanvierConfig::kv_events_alignment_warning(config).has_value());
+}
+
+// =============================================================================
 // Native KV-Events configuration (kv_events.*)
 // =============================================================================
 

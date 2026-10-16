@@ -202,7 +202,22 @@ Client-provided boundaries take precedence over automatic detection.
 When using client-provided `prompt_token_ids` with `prefix_token_count`, the tokenization must match Ranvier's internal format. The internal format depends on the configured chat template:
 
 - **No chat template (default)**: Messages are concatenated with `\n` separators: `{system_content}\n{user_content}\n...`
-- **With chat template** (llama3, chatml, mistral): Messages are formatted using the template, matching vLLM's `apply_chat_template()` output
+- **With chat template**: Messages are formatted using the template, matching vLLM's `apply_chat_template()` output
+
+| `chat_template_format` | Models | Notes |
+|---|---|---|
+| `none` (default) | none | Contents joined with `\n`; matches no served model's chat path |
+| `llama3` | Llama 3 / 3.1 Instruct | Header tokens per message |
+| `chatml` | Qwen 2 / 2.5, Yi, DeepSeek | `<\|im_start\|>role\n…<\|im_end\|>` |
+| `mistral` | Mistral Instruct | `[INST] … [/INST]` |
+| `llama2` (aliases `llama-2`, `codellama`) | Llama 2 chat, CodeLlama Instruct | `<s>[INST] <<SYS>>\n…\n<</SYS>>\n\n…`, contents trimmed; the boundary is the tokenized system prefix, never the character estimate |
+| `kimi` | Kimi K2 / K3 | No BOS, turns concatenated |
+
+The template only helps with the matching tokenizer: `assets.tokenizer_path`
+(`RANVIER_TOKENIZER_PATH`) must be the served model's `tokenizer.json`. Affinity itself only needs
+self-consistent keys, so the bundled GPT-2 tokenizer works for it, but the native KV-event stream
+needs both to match the backend exactly (`cache-residency-routing.md`, "Requirement: Ranvier must
+tokenize as the backend does").
 
 Ensure your `prefix_token_count` is computed against the same format Ranvier uses. When in doubt, use the automatic system message detection (Option 1) instead of client-provided boundaries.
 
@@ -305,6 +320,10 @@ RANVIER_ENABLE_PREFIX_BOUNDARY=true
 RANVIER_MIN_PREFIX_BOUNDARY_TOKENS=4
 RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=false
 RANVIER_ENABLE_MULTI_DEPTH_ROUTING=false
+
+# Tokenizer and chat template (must match the served model; required for kv_events)
+RANVIER_TOKENIZER_PATH=/path/to/model/tokenizer.json
+RANVIER_CHAT_TEMPLATE_FORMAT=llama2   # none | llama3 | chatml | mistral | llama2 | kimi
 ```
 
 ### YAML Configuration

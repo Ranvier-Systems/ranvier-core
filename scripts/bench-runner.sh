@@ -388,8 +388,8 @@ BUILT-IN SUITES:
       is progress; an unchanged consistent regression means verified residency alone
       does not fix the eviction regime and the holder-aware divert (BACKLOG section 27)
       is the next change.
-      17. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --num-prefixes 16 --prefix-max-tokens 4000
-      18. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off  (50-prefix set)
+      17. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --chat-template llama2 --num-prefixes 16 --prefix-max-tokens 4000
+      18. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --chat-template llama2  (50-prefix set)
       Measured 2026-10-13 with materialization ON (verified-cold policy, image a298ad6;
       0 evictions, 107-134 cold hits re-prefilled per arm): row 17 +73.0 / -10.3 / +25.7,
       row 18 +24.6 / +2.1 / +12.5. The prefix-first reps (-10.3, +2.1) sat at or above the
@@ -406,6 +406,11 @@ BUILT-IN SUITES:
       Row 18 verdict: neutral; the stream fixes neither row's standing vs least_loaded and
       is closed as a signal question. The eviction regime is a replication question
       (BACKLOG section 27). Both rows stay in the suite as the stream-on regression check.
+      UNALIGNED (2026-10-16, BACKLOG section 29): every number in this entry routed on GPT-2
+      ids of untemplated text while vLLM cached CodeLlama ids of the llama2 template, so no
+      event could match a routing key; the P99s stand, the stream readings do not. The rows
+      now pass --chat-template llama2 (tokenizer from the HF cache under --kv-events); read
+      the compare's routing_key_matches > 0 before anything else.
 
     kvablate (3 configs x 2 arms x 1 repeat, ~1h25m) — separates the two things the native
       stream does to routing, after kvevents run 1 (2026-10-10, stream live: kv_ops 2.0M)
@@ -435,6 +440,9 @@ BUILT-IN SUITES:
       downgrade of a verified-cold hit to miss placement re-learned the prefix elsewhere on
       every evicted block (~110 home migrations per arm). Policy changed on the branch
       (verified-cold -> another verified holder, else stay home); rerun kvevents on that image.
+      UNALIGNED (2026-10-16, BACKLOG section 29): no event could match a routing key, so the
+      "verified evictions" were not block evictions and materialized routes were never read.
+      Not re-flagged: worth one aligned rep (pass --chat-template llama2 via a custom row).
 
     kvreset (1 config x 2 arms x 3 repeats, ~1h15m) — the 8B 20u row with the between-arm
       KV reset acknowledged. The reset exists for this row (2026-10-06: prefix-first
@@ -451,8 +459,8 @@ BUILT-IN SUITES:
       .max_holders), so an over-allowance ART hit goes to a verified holder of its prefix,
       else to one probe-order designated replica, and at two holders stays on the
       least-loaded holder instead of minting a third copy.
-      1. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2 --num-prefixes 16 --prefix-max-tokens 4000  (row 17)
-      2. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2  (row 18, 50-prefix set)
+      1. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2 --chat-template llama2 --num-prefixes 16 --prefix-max-tokens 4000  (row 17)
+      2. 13B 20 users 10m   --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2 --chat-template llama2  (row 18, 50-prefix set)
       Read first: router_replica_designations_total > 0 on the prefix arm of the first
       compare ("replication" row), else designation never fired and the suite measured
       holder-aware dispatch alone; then router_replica_dispatches_total > 0, else the
@@ -473,6 +481,10 @@ BUILT-IN SUITES:
           Stop; the README line is the "which regime you are in" claim.
       Row 17 (fitted 20u, control -12.5%) must not regress: 3/3 within a point of the
       control. If it regresses while row 18 improves, the hotness gate (section 28 Step 9).
+      Ran 2026-10-16 UNALIGNED (BACKLOG section 29): designations 143-174 per prefix arm,
+      replica_dispatches / holder_redirects 0 everywhere, so no replica was ever visible;
+      row 17 -12.5/-20.0/-15.1, row 18 +1.0/-2.5/+10.9 (designation alone; inconclusive).
+      Read routing_key_matches > 0 first, then the replication row.
       Needs an image carrying section 28 Steps 1-6; --resume 4 runs row 18 alone.
 
     all = rebaseline + epsilon + fitted + placement + baseline + saturation + kvevents +
@@ -735,14 +747,19 @@ define_runs() {
     # 2026-10-09). Read the first compare's kv_ops counter before trusting any of it.
     # Measured: row 17 -13.2/-10.1/-12.7 (kvmat 2026-10-13), row 18 +23.1/+14.7/+18.9
     # (2026-10-14), both with materialization off: the stream is neutral on both rows.
+    # Those numbers are UNALIGNED (BACKLOG section 29): Ranvier hashed GPT-2 ids of the
+    # untemplated text, vLLM CodeLlama ids of the llama2 template, so no event ever
+    # matched a routing key. --chat-template llama2 aligns them; with --kv-events the
+    # model's tokenizer.json comes from the HF cache. Read the compare's
+    # routing_key_matches before anything else.
     add_run kvevents "13B 20u/10m A/B vs least_loaded, fitted set, native KV events" \
-        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --chat-template llama2 \
         --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 10m --users 20 --max-model-len 8192 \
         --num-prefixes 16 --prefix-max-tokens 4000
 
     add_run kvevents "13B 20u/10m A/B vs least_loaded, 50-prefix set, native KV events" \
-        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --chat-template llama2 \
         --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 10m --users 20 --max-model-len 8192
 
@@ -790,14 +807,15 @@ define_runs() {
     # The kvevents rows with --replication 2. Defined last so the existing rows keep
     # their --suite all numbers. Read the compare's "replication" row first:
     # designations > 0, then dispatches > 0, before any P99 (see --help).
+    # Aligned as the kvevents rows are (--chat-template llama2; tokenizer from the HF cache).
     add_run kvrepl "13B 20u/10m A/B vs least_loaded, fitted set, kv-events, replication 2" \
-        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2 \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2 --chat-template llama2 \
         --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 10m --users 20 --max-model-len 8192 \
         --num-prefixes 16 --prefix-max-tokens 4000
 
     add_run kvrepl "13B 20u/10m A/B vs least_loaded, 50-prefix set, kv-events, replication 2" \
-        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2 \
+        --compare --baseline-mode least_loaded --kv-events --kv-events-materialize off --replication 2 --chat-template llama2 \
         --model meta-llama/CodeLlama-13b-Instruct-hf \
         --warmup --duration 10m --users 20 --max-model-len 8192
 

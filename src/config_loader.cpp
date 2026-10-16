@@ -21,6 +21,7 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 #include <yaml-cpp/yaml.h>
 
@@ -2045,6 +2046,31 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
 // =============================================================================
 // Validation
 // =============================================================================
+
+std::optional<std::string> RanvierConfig::kv_events_alignment_warning(const RanvierConfig& config) {
+    if (!config.kv_events.enabled) {
+        return std::nullopt;
+    }
+    std::string problems;
+    if (config.assets.chat_template_format.empty() || config.assets.chat_template_format == "none") {
+        problems += "assets.chat_template_format is 'none' (the backend renders a chat template)";
+    }
+    constexpr std::string_view kBundledTokenizer = "gpt2.json";
+    const std::string& path = config.assets.tokenizer_path;
+    if (path.size() >= kBundledTokenizer.size() &&
+        path.compare(path.size() - kBundledTokenizer.size(), kBundledTokenizer.size(),
+                     kBundledTokenizer) == 0) {
+        if (!problems.empty()) problems += "; ";
+        problems += "assets.tokenizer_path is the bundled GPT-2 tokenizer (" + path + ")";
+    }
+    if (problems.empty()) {
+        return std::nullopt;
+    }
+    return "kv_events is enabled but Ranvier will not tokenize as the backends do: " + problems +
+           ". Native KV events will never match a routing key and verified residency, holder "
+           "redirects and replica dispatch stay inert. Use the model's own tokenizer.json and its "
+           "chat template format.";
+}
 
 std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) {
     // Validate server ports

@@ -265,6 +265,7 @@ struct ShardLocalState {
         uint64_t native_verified_cold_honored = 0;  // Verified-cold ART hits kept on the home (no other verified holder): re-prefill there
         uint64_t native_holder_redirects = 0;       // Verified-cold ART hits served by another verified holder of the same prefix
         uint64_t native_verified_depth_skips = 0;   // Fresh-stream ART hits deeper than the indexed depth: probabilistic path used
+        uint64_t native_routing_key_matches = 0;    // Native UPSERTs whose hash is a recent routing key: router and vLLM hash the same tokens (BACKLOG section 29)
         uint64_t replica_dispatches = 0;            // Over-allowance ART hits dispatched to a verified holder other than the home (replication by diversion)
         uint64_t replica_designations = 0;          // Over-allowance ART hits dispatched to the designated replica (no holder under allowance, below the holder cap)
         uint64_t replica_holders_saturated = 0;     // Over-allowance ART hits with the holder cap reached and every holder over allowance: dispatch narrowed to the holders
@@ -320,6 +321,7 @@ struct ShardLocalState {
             native_verified_cold_honored = 0;
             native_holder_redirects = 0;
             native_verified_depth_skips = 0;
+            native_routing_key_matches = 0;
             replica_dispatches = 0;
             replica_designations = 0;
             replica_holders_saturated = 0;
@@ -602,6 +604,42 @@ struct ShardLocalState {
         return count;
     }
 
+    // Key-space self-check (BACKLOG section 29). The native index answers for a
+    // request only when Ranvier hashes the same token ids vLLM stores; with a
+    // different tokenizer or chat template every stream key is disjoint from
+    // every routing key and the verified signals silently read learned-route
+    // entries instead. These are the last kRecentRoutingKeys distinct routing
+    // hashes looked up with the stream on; a native UPSERT landing on one is
+    // the proof of alignment. Rule #4: fixed ring, linear scan (64 compares).
+    static constexpr size_t kRecentRoutingKeys = 64;
+    struct RecentRoutingKeys {
+        std::array<uint64_t, kRecentRoutingKeys> hashes{};
+        size_t size = 0;
+        size_t next = 0;
+
+        bool contains(uint64_t hash) const {
+            for (size_t i = 0; i < size; ++i) {
+                if (hashes[i] == hash) return true;
+            }
+            return false;
+        }
+
+        void note(uint64_t hash) {
+            if (contains(hash)) return;
+            hashes[next] = hash;
+            next = (next + 1) % kRecentRoutingKeys;
+            if (size < kRecentRoutingKeys) ++size;
+        }
+    } recent_routing_keys;
+    bool routing_key_mismatch_warned = false;
+
+    // Only keys the index could hold: stream on and within the indexed depth.
+    void note_routing_key(uint64_t hash, size_t prefix_len) {
+        if (config.kv_residency_freshness_ttl.count() == 0) return;
+        if (prefix_len > config.kv_native_indexed_depth) return;
+        recent_routing_keys.note(hash);
+    }
+
     void mark_native_complete(BackendId id) {
         if (!native_kv.complete.contains(id) &&
             native_kv.complete.size() >= NativeKvState::MAX_BACKENDS) {
@@ -855,6 +893,8 @@ struct ShardLocalState {
         native_kv.fresh.clear();
         native_kv.complete.clear();
         native_kv.index_entries.clear();
+        recent_routing_keys = RecentRoutingKeys{};
+        routing_key_mismatch_warned = false;
 
         // Clear cross-shard load sync state
         for (auto& snapshot : shard_load_snapshots) {
@@ -2320,6 +2360,12 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             seastar::metrics::description("ART hits on a fresh native stream routed deeper than "
                                          "kv_events.max_indexed_token_depth: verification "
                                          "skipped, probabilistic residency used")),
+        seastar::metrics::make_counter("router_native_routing_key_matches_total",
+            [] { return g_shard_state ? g_shard_state->stats.native_routing_key_matches : 0UL; },
+            seastar::metrics::description("Native KV UPSERTs whose prefix hash is a recent routing key; "
+                                         "0 with upserts flowing means Ranvier and vLLM tokenize "
+                                         "differently (tokenizer or chat template) and the native "
+                                         "index can never answer for a request")),
         seastar::metrics::make_counter("router_replica_dispatches_total",
             [] { return g_shard_state ? g_shard_state->stats.replica_dispatches : 0UL; },
             seastar::metrics::description("ART hits whose home was over its load allowance, "
@@ -2586,6 +2632,30 @@ static void swap_in_rebuilt_index(
 // Named coroutine (not lambda) to avoid Rule #16 Lambda Coroutine Fiasco
 // when called from smp::submit_to. Yields between tree phases so each
 // phase's synchronous traversal runs in its own reactor timeslice.
+// Native UPSERTs applied before a never-matched key space is reported. High
+// enough that a cold start (subscriber backfill before any request) cannot
+// trip it; at benchmark rates it is reached within the first minute.
+static constexpr uint64_t kRoutingKeyMismatchUpsertFloor = 10000;
+
+// Warns once per shard when native UPSERTs keep arriving but none has landed on
+// a routing key this shard looked up with the stream on (BACKLOG section 29).
+// Returns true when it warned. Runs on the TTL sweep, so no timer of its own.
+static bool check_native_key_alignment(ShardLocalState& state) {
+    if (state.routing_key_mismatch_warned) return false;
+    if (state.stats.native_upserts < kRoutingKeyMismatchUpsertFloor) return false;
+    if (state.recent_routing_keys.size == 0) return false;  // nothing routed with the stream on
+    if (state.stats.native_routing_key_matches > 0) return false;
+    state.routing_key_mismatch_warned = true;
+    log_router.warn("Native KV events: {} upserts applied and none matched a routing key: "
+                    "Ranvier and the backends tokenize requests differently, so the native "
+                    "index cannot answer for any request (verified residency, holder "
+                    "redirects and replica dispatch stay inert). Set assets.tokenizer_path to "
+                    "the model's own tokenizer.json and assets.chat_template_format to the "
+                    "backend's chat template.",
+                    state.stats.native_upserts);
+    return true;
+}
+
 seastar::future<> RouterService::ttl_cleanup_on_shard(
     std::chrono::steady_clock::time_point default_cutoff,
     absl::flat_hash_map<BackendId, std::chrono::steady_clock::time_point> backend_cutoffs) {
@@ -2593,6 +2663,11 @@ seastar::future<> RouterService::ttl_cleanup_on_shard(
     auto& state = shard_state();
     RadixTree* tree = state.tree.get();
     if (!tree) co_return;
+
+    // Every shard sees every native op, so shard 0 alone is enough to report.
+    if (seastar::this_shard_id() == 0) {
+        check_native_key_alignment(state);
+    }
 
     // Phase 1: Expire old routes (marks leaves as empty)
     // Compression-aware: routes to compressed backends get longer TTLs
@@ -3365,6 +3440,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 if (native_stream_fresh && within_indexed_depth) {
                     uint64_t request_hash = hash_prefix(tokens.data(), prefix_len,
                                                         state.config.block_alignment);
+                    state.note_routing_key(request_hash, prefix_len);
                     auto idx_it = state.prefix_hash_index.find(request_hash);
                     bool resident = idx_it != state.prefix_hash_index.end() &&
                                     idx_it->second.contains(art_backend);
@@ -3465,6 +3541,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     // hash fallback. Dispatch to configured hash strategy.
     if (!art_hit) {
         prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
+        state.note_routing_key(prefix_hash, prefix_len);
 
         // Miss-path candidate filter, two composed exclusions:
         //   - the residency-cold backend (the downgrade above only fires when
@@ -3869,6 +3946,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     if (load_term && strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD &&
         art_hit && load_hinge(scored[anchor_index].load, allowance) > 0.0) {
         prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
+        state.note_routing_key(prefix_hash, prefix_len);
         const auto n = static_cast<int32_t>(dispatch_ids.size());
         for (int32_t probe = 0; probe < n; ++probe) {
             int32_t idx = jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n);
@@ -6225,6 +6303,9 @@ void RouterService::apply_native_kv_ops_local(const NativeKvOp* ops, size_t coun
         const NativeKvOp& op = ops[i];
         switch (op.kind) {
         case NativeKvOp::Kind::UPSERT: {
+            if (state.recent_routing_keys.contains(op.prefix_hash)) {
+                state.stats.native_routing_key_matches++;
+            }
             // Shares the bespoke-protocol timestamp map so a native store at
             // t=2 blocks a stale HTTP evict at t=1 (and vice versa).
             auto key = ShardLocalState::PrefixBackendKey{op.prefix_hash, op.backend};
@@ -6467,7 +6548,8 @@ RouterService::NativeKvStatsSnapshot RouterService::get_native_kv_stats() {
             st.native_routes_materialized, st.native_materialize_trust_skips,
             st.native_completes, st.native_absence_untrusted,
             st.native_verified_depth_skips, st.replica_dispatches,
-            st.replica_designations, st.replica_holders_saturated};
+            st.replica_designations, st.replica_holders_saturated,
+            st.native_routing_key_matches};
 }
 
 void RouterService::set_native_fresh_for_testing(BackendId id, bool complete) {
@@ -6494,6 +6576,11 @@ void RouterService::set_fail_open_for_testing(bool active) {
 void RouterService::update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id) {
     if (!g_shard_state) return;
     shard_state().prefix_hash_index[prefix_hash].insert(backend_id);
+}
+
+bool RouterService::check_native_key_alignment_for_testing() {
+    if (!g_shard_state) return false;
+    return check_native_key_alignment(shard_state());
 }
 
 std::vector<BackendId> RouterService::replica_probe_order_for_testing(

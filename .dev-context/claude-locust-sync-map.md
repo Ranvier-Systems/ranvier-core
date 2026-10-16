@@ -4,7 +4,7 @@ When modifying either the C++ router or the Python load test files, check this
 map to ensure both sides stay in sync.  Mismatches cause **silent** wrong
 metrics (cache-hit tracking, latency breakdowns) rather than visible errors.
 
-Last verified: 2026-02-20
+Last verified: 2026-10-16 (chat template rows); 2026-02-20 (rest)
 
 ## Files involved
 
@@ -37,6 +37,8 @@ breaks for the `CLIENT_TOKENIZE` fallback path.
 |--------|-----|-------|
 | `tokenize_system_messages()` | `extract_system_messages()` | Join: `"\n"` between messages, **no** trailing newline |
 | `hash_prompt_prefix()` — system role only | `extract_system_messages()` — `role == "system"` | Which messages are the "prefix" |
+| `_format_messages_as_prompt()` (client-tokenize path; reads `RANVIER_CHAT_TEMPLATE_FORMAT`) | `ChatTemplate::format()` (`chat_template.hpp`) | Byte-identical rendering per format. `llama2` (alias `llama-2`, `codellama`): `<s>[INST] <<SYS>>\n…\n<</SYS>>\n\n` + user, contents trimmed, ` [/INST]` closes a user turn, assistant ` … </s>`. A drift here moves the client-side boundary off Ranvier's |
+| — (Locust never tokenizes the default chat path) | `assets.tokenizer_path` (`RANVIER_TOKENIZER_PATH`; `bench.sh --tokenizer`, HF-cache default under `--kv-events`) | Not a Python↔C++ coupling but a Ranvier↔vLLM one: with the native KV stream, the tokenizer and template must match the backend's or `router_native_routing_key_matches_total` stays 0 (BACKLOG §29) |
 
 ## Response headers (http_controller.cpp)
 
@@ -67,6 +69,7 @@ the full exported name; C++ registers without the prefix.
 | `seastar_ranvier_prefix_boundary_skipped` | `prefix_boundary_skipped` | metrics_service.hpp |
 | `router_cluster_sync_invalid` | `router_cluster_sync_invalid` | gossip_service.cpp |
 | `router_cluster_sync_untrusted` | `router_cluster_sync_untrusted` | gossip_service.cpp |
+| `seastar_ranvier_router_native_routing_key_matches_total` | `router_native_routing_key_matches_total` | router_service.cpp |
 | `seastar_ranvier_router_replica_dispatches_total` | `router_replica_dispatches_total` | router_service.cpp |
 | `seastar_ranvier_router_replica_designations_total` | `router_replica_designations_total` | router_service.cpp |
 | `seastar_ranvier_router_replica_holders_saturated_total` | `router_replica_holders_saturated_total` | router_service.cpp |
@@ -95,6 +98,7 @@ They change no hash input, so `locustfile_real.py` needs nothing.
 - [ ] **Renaming a metric?** Update both C++ registration and Python query string.
 - [ ] **Changing hash constants or algorithm?** Update both `router_service.cpp` and `locustfile_real.py`.
 - [ ] **Changing `extract_system_messages()` format?** Update `tokenize_system_messages()` in Python.
+- [ ] **Adding or changing a chat template format?** Mirror it in `_format_messages_as_prompt()` (`locustfile_real.py`) and the `--chat-template` value list in `scripts/bench.sh`.
 - [ ] **Adding/removing response headers?** Update `get_backend_from_response()` or `verify_routing_mode_matches()`.
 - [ ] **Changing admin API params?** Update `register_backends_on_all_nodes()` in both locustfiles.
 - [ ] **Adding a new hash strategy?** Document in `predict_backend_from_hash()` docstring; consider Python impl.

@@ -98,7 +98,8 @@ Environment Variables:
                                   If file doesn't exist, falls back to loading from VLLM_MODEL
         CHAT_TEMPLATE_FORMAT    - Chat template format for tokenization (default: none)
                                   Must match RANVIER_CHAT_TEMPLATE_FORMAT on the server.
-                                  Values: "none" (legacy), "llama3", "chatml", "mistral"
+                                  Values: "none" (legacy), "llama3", "chatml", "mistral",
+                                  "llama2" (alias "codellama"; CodeLlama Instruct)
                                   When set, tokenize_messages() and messages_to_prompt()
                                   format messages according to the model's chat template.
 
@@ -266,6 +267,28 @@ def _format_messages_as_prompt(messages: List[dict], include_generation_prompt: 
             else:
                 # assistant
                 result += f"{content}</s>"
+        return result
+
+    elif fmt in ("llama2", "llama-2", "codellama"):
+        # Mirrors C++ format_llama2() in chat_template.hpp (BACKLOG section 29):
+        # the leading system message folds into the first user turn, every user
+        # turn opens with <s>[INST], and |trim covers the folded content as a
+        # whole (only the user text's trailing whitespace goes after a system
+        # block). A system-only list renders the open block, which is exactly
+        # the prefix Ranvier's boundary tokenizes.
+        close = "\n<</SYS>>\n\n"
+        result = ""
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system" and not result:
+                result = "<s>[INST] <<SYS>>\n" + content + close
+            elif role == "assistant":
+                result += " " + content.strip() + " </s>"
+            elif result.endswith(close):
+                result = (result + content).rstrip() + " [/INST]"
+            else:
+                result += "<s>[INST] " + content.strip() + " [/INST]"
         return result
 
     else:
