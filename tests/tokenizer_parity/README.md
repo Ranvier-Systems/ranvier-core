@@ -138,6 +138,13 @@ python3 llama2_tokenizer_parity.py --vllm http://localhost:8000 \
     --emit-fixture llama2_reference_tokens.json
 ```
 
+The reference must tokenize the way the backend does. transformers 5.x rebuilds
+the Llama tokenizer without the SentencePiece word-start marker after `<s>`
+(`29961` "[" where vLLM 0.15.1 has `518` "▁["), so with `--source transformers`
+install the backend's major version (`pip install 'transformers<5'`). The
+harness checks the first case against the vLLM-observed ids for CodeLlama and
+refuses to write a fixture that disagrees.
+
 **2. Replay them through Ranvier's path** (the gated C++ test renders each case
 with `RequestRewriter::extract_text_with_boundary_info` + `ChatTemplate(llama2)`
 and encodes with tokenizers-cpp):

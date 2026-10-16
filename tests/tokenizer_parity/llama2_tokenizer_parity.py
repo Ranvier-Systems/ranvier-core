@@ -96,6 +96,21 @@ CASES = [
 ]
 
 
+# vLLM 0.15.1 /tokenize for CASES[0] on meta-llama/CodeLlama-13b-Instruct-hf
+# (bench box, 2026-10-16): <s> ▁[ INST ] ▁<< SY S >> \n You ▁are ▁a. A reference
+# that disagrees is not the backend's tokenization (e.g. transformers 5.x
+# rebuilds the Llama tokenizer without the word-start marker after <s>, giving
+# 29961 "[" where vLLM has 518 "▁["), and must not become the fixture.
+KNOWN_BACKEND_PREFIX = {
+    "codellama": [1, 518, 25580, 29962, 3532, 14816, 29903, 6778, 13, 3492, 526, 263],
+}
+
+
+def known_prefix_for(model):
+    name = model.lower()
+    return next((ids for key, ids in KNOWN_BACKEND_PREFIX.items() if key in name), None)
+
+
 def ids_from_vllm(url, model, messages):
     body = {"messages": messages, "add_generation_prompt": True}
     if model:
@@ -148,6 +163,18 @@ def main():
             ids = ids_from_transformers(tokenizer, case["messages"])
         cases.append({"name": case["name"], "messages": case["messages"], "token_ids": ids})
         print(f"{case['name']}: {len(ids)} tokens, first {ids[:10]}")
+
+    known = known_prefix_for(args.model)
+    if known is not None:
+        got = cases[0]["token_ids"][:len(known)]
+        if got != known:
+            print(f"ERROR: {CASES[0]['name']} starts {got}, but the backend (vLLM) produced "
+                  f"{known}. This source does not tokenize as the backend does; refusing to "
+                  "write the fixture. With --source transformers, use the backend's "
+                  "transformers major version (pip install 'transformers<5'), or capture "
+                  "from vLLM with --vllm.", file=sys.stderr)
+            return 1
+        print(f"known-answer check passed: {CASES[0]['name']} matches the vLLM reference")
 
     fixture = {"model": args.model, "source": source, "cases": cases}
     if args.emit_fixture:
