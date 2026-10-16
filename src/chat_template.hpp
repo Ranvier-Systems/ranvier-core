@@ -269,6 +269,17 @@ public:
         }
     }
 
+    // True when the shared-prefix boundary must come from tokenizing the
+    // rendered system prefix rather than from the character-ratio estimate.
+    // The estimate can land past the end of the system text, and a routing
+    // hash taken there covers user tokens: a key unique to the request, which
+    // never matches another request or a backend's stored blocks. Templates
+    // with a single-token message marker get an exact boundary from the
+    // marker scan instead.
+    bool boundary_from_system_prefix() const {
+        return _format == ChatTemplateFormat::llama2;
+    }
+
     // Estimate the extra characters the template adds per message (for reserve).
     size_t overhead_per_message() const {
         switch (_format) {

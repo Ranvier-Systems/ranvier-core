@@ -613,6 +613,16 @@ TEST_F(ChatTemplateLlama2Test, LaterSystemMessageRendersAsUserTurn) {
               "<s>[INST] u [/INST] a </s><s>[INST] s [/INST]");
 }
 
+TEST(ChatTemplateBoundary, OnlyLlama2TakesTheSystemPrefixBoundary) {
+    EXPECT_TRUE(ChatTemplate(ChatTemplateFormat::llama2).boundary_from_system_prefix());
+    for (auto fmt : {ChatTemplateFormat::none, ChatTemplateFormat::llama3,
+                     ChatTemplateFormat::chatml, ChatTemplateFormat::mistral,
+                     ChatTemplateFormat::kimi}) {
+        EXPECT_FALSE(ChatTemplate(fmt).boundary_from_system_prefix())
+            << chat_template_format_name(fmt);
+    }
+}
+
 TEST_F(ChatTemplateLlama2Test, NoGenerationPromptAndNoMarker) {
     std::string out;
     tpl.append_generation_prompt(out);
