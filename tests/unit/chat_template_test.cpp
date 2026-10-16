@@ -1,7 +1,7 @@
 // Ranvier Core - Chat Template Unit Tests
 //
 // Tests for pre-compiled chat template formatting (llama3, chatml, mistral,
-// kimi) and the parse/name helper functions.
+// llama2, kimi) and the parse/name helper functions.
 
 #include "chat_template.hpp"
 #include <gtest/gtest.h>
@@ -537,9 +537,86 @@ TEST_F(RoundtripTest, AllCanonicalNamesRoundtrip) {
                      ChatTemplateFormat::llama3,
                      ChatTemplateFormat::chatml,
                      ChatTemplateFormat::mistral,
+                     ChatTemplateFormat::llama2,
                      ChatTemplateFormat::kimi}) {
         auto name = chat_template_format_name(fmt);
         EXPECT_EQ(parse_chat_template_format(name), fmt)
             << "Roundtrip failed for: " << name;
     }
+}
+
+// =============================================================================
+// Llama 2 chat / CodeLlama Instruct (BACKLOG §29)
+// =============================================================================
+// Expected strings are the reference Jinja template's rendering; token-level
+// parity with the backend is the gated llama2_tokenizer_parity_test.
+
+TEST_F(ParseChatTemplateFormatTest, Llama2Aliases) {
+    EXPECT_EQ(parse_chat_template_format("llama2"), ChatTemplateFormat::llama2);
+    EXPECT_EQ(parse_chat_template_format("llama-2"), ChatTemplateFormat::llama2);
+    EXPECT_EQ(parse_chat_template_format("codellama"), ChatTemplateFormat::llama2);
+    EXPECT_EQ(chat_template_format_name(ChatTemplateFormat::llama2), "llama2");
+}
+
+class ChatTemplateLlama2Test : public ::testing::Test {
+protected:
+    ChatTemplate tpl{ChatTemplateFormat::llama2};
+
+    std::string render(std::initializer_list<std::pair<const char*, const char*>> msgs) {
+        std::string out;
+        bool first = true;
+        for (const auto& [role, content] : msgs) {
+            tpl.format_message(out, role, content, first);
+            first = false;
+        }
+        tpl.append_generation_prompt(out);
+        return out;
+    }
+};
+
+TEST_F(ChatTemplateLlama2Test, SystemFoldsIntoFirstUserTurn) {
+    // vLLM /tokenize on CodeLlama-13b-Instruct (2026-10-16) began
+    // <s> [INST] <<SYS>>\n You ... for this conversation.
+    EXPECT_EQ(render({{"system", "You are a helpful assistant."}, {"user", "hi"}}),
+              "<s>[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\n\nhi [/INST]");
+}
+
+TEST_F(ChatTemplateLlama2Test, UserOnly) {
+    EXPECT_EQ(render({{"user", "hi"}}), "<s>[INST] hi [/INST]");
+}
+
+TEST_F(ChatTemplateLlama2Test, MultiTurnOpensEveryUserTurnWithBos) {
+    EXPECT_EQ(render({{"system", "S"}, {"user", "u1"}, {"assistant", "a1"}, {"user", "u2"}}),
+              "<s>[INST] <<SYS>>\nS\n<</SYS>>\n\nu1 [/INST] a1 </s><s>[INST] u2 [/INST]");
+}
+
+TEST_F(ChatTemplateLlama2Test, TrimsLikeTheTemplate) {
+    // No system: the user content is trimmed on both sides.
+    EXPECT_EQ(render({{"user", "  hi \n"}}), "<s>[INST] hi [/INST]");
+    // After the system block the trim covers the folded content, so only the
+    // user text's trailing whitespace goes, and the system text is untouched.
+    EXPECT_EQ(render({{"system", " S "}, {"user", "  hi \n"}}),
+              "<s>[INST] <<SYS>>\n S \n<</SYS>>\n\n  hi [/INST]");
+    EXPECT_EQ(render({{"user", "q"}, {"assistant", "  a  "}}),
+              "<s>[INST] q [/INST] a </s>");
+}
+
+TEST_F(ChatTemplateLlama2Test, BlankUserAfterSystemTrimsTheBlockNewlines) {
+    EXPECT_EQ(render({{"system", "S"}, {"user", "  "}}),
+              "<s>[INST] <<SYS>>\nS\n<</SYS>> [/INST]");
+}
+
+TEST_F(ChatTemplateLlama2Test, LaterSystemMessageRendersAsUserTurn) {
+    // The reference raises on this (roles must alternate); route on a stable
+    // approximation rather than drop the message.
+    EXPECT_EQ(render({{"user", "u"}, {"assistant", "a"}, {"system", "s"}}),
+              "<s>[INST] u [/INST] a </s><s>[INST] s [/INST]");
+}
+
+TEST_F(ChatTemplateLlama2Test, NoGenerationPromptAndNoMarker) {
+    std::string out;
+    tpl.append_generation_prompt(out);
+    EXPECT_TRUE(out.empty());
+    EXPECT_TRUE(tpl.message_start_marker().empty());
+    EXPECT_TRUE(tpl.default_system_prompt().empty());
 }

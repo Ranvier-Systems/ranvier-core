@@ -17,6 +17,7 @@
 //   - llama3:  Llama 3 / 3.1 / 3.2 / 4 family
 //   - chatml:  ChatML (Qwen 2/2.5, Yi, DeepSeek, etc.)
 //   - mistral: Mistral Instruct v1/v2/v3
+//   - llama2:  Llama 2 chat / CodeLlama Instruct
 //
 // IMPORTANT: The tokenizer JSON (RANVIER_TOKENIZER_PATH) must be from the
 // same model family.  These templates emit special token strings (e.g.
@@ -54,6 +55,12 @@ enum class ChatTemplateFormat {
     // System message is prepended inside the first [INST] block.
     mistral,
 
+    // Llama 2 chat / CodeLlama Instruct format.
+    // The leading system message is folded into the first user turn:
+    //   <s>[INST] <<SYS>>\n{system}\n<</SYS>>\n\n{user} [/INST] {assistant} </s>
+    // and every later user turn opens with its own <s>[INST].
+    llama2,
+
     // Kimi K2 / K3 (Moonshot) format.
     // Each message: {role-token}{role}<|im_middle|>{content}<|im_end|>
     //   role-token ∈ { <|im_user|>, <|im_assistant|>, <|im_system|> }
@@ -82,6 +89,9 @@ inline ChatTemplateFormat parse_chat_template_format(std::string_view name) {
     if (name == "mistral") {
         return ChatTemplateFormat::mistral;
     }
+    if (name == "llama2" || name == "llama-2" || name == "codellama") {
+        return ChatTemplateFormat::llama2;
+    }
     if (name == "kimi" || name == "kimi-k2" || name == "kimi-k3" ||
         name == "moonshot") {
         return ChatTemplateFormat::kimi;
@@ -95,6 +105,7 @@ inline std::string_view chat_template_format_name(ChatTemplateFormat fmt) {
         case ChatTemplateFormat::llama3:  return "llama3";
         case ChatTemplateFormat::chatml:  return "chatml";
         case ChatTemplateFormat::mistral: return "mistral";
+        case ChatTemplateFormat::llama2:  return "llama2";
         case ChatTemplateFormat::kimi:    return "kimi";
         case ChatTemplateFormat::none:    return "none";
     }
@@ -137,6 +148,9 @@ public:
                 break;
             case ChatTemplateFormat::mistral:
                 format_mistral(out, role, content, is_first);
+                break;
+            case ChatTemplateFormat::llama2:
+                format_llama2(out, role, content);
                 break;
             case ChatTemplateFormat::kimi:
                 format_kimi(out, role, content, is_first);
@@ -188,6 +202,23 @@ public:
                     out.append("</s>");
                 }
                 break;
+            case ChatTemplateFormat::llama2:
+                // Approximate, like mistral: the system block only exists folded
+                // into the first user turn.
+                if (role == "system") {
+                    out.append("<<SYS>>\n");
+                    out.append(content);
+                    out.append("\n<</SYS>>\n\n");
+                } else if (role == "user") {
+                    out.append("[INST] ");
+                    out.append(trim(content));
+                    out.append(" [/INST]");
+                } else {
+                    out.push_back(' ');
+                    out.append(trim(content));
+                    out.append(" </s>");
+                }
+                break;
             case ChatTemplateFormat::kimi:
                 // No BOS for individual message tokenization (mirrors llama3).
                 out.append(kimi_role_token(role));
@@ -214,7 +245,8 @@ public:
                 out.append("<|im_start|>assistant\n");
                 break;
             case ChatTemplateFormat::mistral:
-                // Mistral's generation prompt is implicit (after [/INST])
+            case ChatTemplateFormat::llama2:
+                // Generation prompt is implicit (after [/INST])
                 break;
             case ChatTemplateFormat::kimi:
                 out.append("<|im_assistant|>assistant<|im_middle|>");
@@ -244,6 +276,7 @@ public:
             case ChatTemplateFormat::llama3:  return 60;  // header + eot tokens
             case ChatTemplateFormat::chatml:  return 30;  // im_start/end tokens
             case ChatTemplateFormat::mistral: return 20;  // [INST] markers
+            case ChatTemplateFormat::llama2:  return 30;  // <s>[INST] / <<SYS>> markers
             case ChatTemplateFormat::kimi:    return 45;  // role + im_middle + im_end
         }
         return 5;
@@ -391,6 +424,67 @@ private:
             // assistant
             out.append(content);
             out.append("</s>");
+        }
+    }
+
+    // Jinja's |trim (Python str.strip) on ASCII whitespace.
+    static std::string_view trim(std::string_view s) {
+        constexpr std::string_view kWs = " \t\n\r\f\v";
+        const auto first = s.find_first_not_of(kWs);
+        if (first == std::string_view::npos) return {};
+        return s.substr(first, s.find_last_not_of(kWs) - first + 1);
+    }
+
+    static void rtrim(std::string& s) {
+        constexpr std::string_view kWs = " \t\n\r\f\v";
+        const auto last = s.find_last_not_of(kWs);
+        s.erase(last == std::string::npos ? 0 : last + 1);
+    }
+
+    // --- Llama 2 chat / CodeLlama Instruct format ---
+    // Template (Llama-2-chat and CodeLlama-Instruct tokenizer_config.json):
+    //   {% if messages[0]['role'] == 'system' %}{% set loop_messages = messages[1:] %}
+    //     {% set system_message = messages[0]['content'] %}
+    //   {% else %}{% set loop_messages = messages %}{% set system_message = false %}{% endif %}
+    //   {% for message in loop_messages %}
+    //     {% if loop.index0 == 0 and system_message != false %}
+    //       {% set content = '<<SYS>>\n' + system_message + '\n<</SYS>>\n\n' + message['content'] %}
+    //     {% else %}{% set content = message['content'] %}{% endif %}
+    //     {% if message['role'] == 'user' %}{{ bos_token + '[INST] ' + content | trim + ' [/INST]' }}
+    //     {% elif message['role'] == 'assistant' %}{{ ' ' + content | trim + ' ' + eos_token }}{% endif %}
+    //   {% endfor %}
+    // The trim applies to the folded content as a whole: after a system block
+    // only the user text's trailing whitespace goes (its leading whitespace sits
+    // mid-string), and the system text is never trimmed. Approximations, where
+    // the reference would raise or render nothing: a system message that is not
+    // first renders as a user turn, and a system-only conversation leaves the
+    // block open. Routing keys on the system/user prefix, which is exact.
+    static constexpr std::string_view kLlama2SystemClose = "\n<</SYS>>\n\n";
+
+    static void format_llama2(std::string& out,
+                              std::string_view role,
+                              std::string_view content) {
+        if (role == "system" && out.empty()) {
+            out.append("<s>[INST] <<SYS>>\n");
+            out.append(content);
+            out.append(kLlama2SystemClose);
+        } else if (role == "assistant") {
+            out.push_back(' ');
+            out.append(trim(content));
+            out.append(" </s>");
+        } else if (out.size() >= kLlama2SystemClose.size() &&
+                   std::string_view(out).substr(out.size() - kLlama2SystemClose.size()) ==
+                       kLlama2SystemClose) {
+            // First user turn after the system block: trimming the folded
+            // content trims back from the end of the user text, and through
+            // the block's closing newlines when the user text is blank.
+            out.append(content);
+            rtrim(out);
+            out.append(" [/INST]");
+        } else {
+            out.append("<s>[INST] ");
+            out.append(trim(content));
+            out.append(" [/INST]");
         }
     }
 

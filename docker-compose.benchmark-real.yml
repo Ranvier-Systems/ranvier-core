@@ -167,7 +167,7 @@ services:
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
       # Chat template format for tokenization alignment with vLLM.
       # Must match the model family of RANVIER_TOKENIZER_PATH.
-      # Values: "none" (default), "llama3", "chatml", "mistral"
+      # Values: "none" (default), "llama3", "chatml", "mistral", "llama2" (alias "codellama"), "kimi"
       - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
       # Disable Rust/Rayon parallelism - worker threads conflict with Seastar's per-shard allocator
       - RAYON_NUM_THREADS=1
