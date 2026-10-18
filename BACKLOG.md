@@ -39,6 +39,8 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 26. [Kimi (Moonshot) Model Support (2026-07-18)](#26-kimi-moonshot-model-support-2026-07-18)
 27. [Strategic Assessment (2026-10-02)](#27-strategic-assessment-2026-10-02)
 28. [Hot-Prefix Replication by Diversion (2026-10-14)](#28-hot-prefix-replication-by-diversion-2026-10-14)
+29. [Token Alignment for the Native KV-Event Stream (2026-10-16)](#29-token-alignment-for-the-native-kv-event-stream-2026-10-16)
+30. [Backend Alignment Probe for the Native KV-Event Stream (2026-10-18)](#30-backend-alignment-probe-for-the-native-kv-event-stream-2026-10-18)
 
 ---
 
@@ -2175,6 +2177,210 @@ with **`codellama`** accepted as an alias; benchmark tokenizer **mounted from th
 ```
 Steps 1–4 can land in one PR (code + unit tests); 5–6 in a second, so the image the GPU session
 pulls carries both.
+
+---
+
+## 30. Backend Alignment Probe for the Native KV-Event Stream (2026-10-18)
+
+Scoping only: decisions in "Open decisions" below come first, then `/implement` per step.
+
+### The problem
+
+§29 made alignment *possible* (the `llama2` template, the model's tokenizer, the exact boundary)
+and *visible after the fact* (`router_native_routing_key_matches_total`, a once-only warning at
+10,000 UPSERTs with no match, a startup warning on template `none` or the bundled `gpt2.json`).
+None of that *checks* alignment. The startup warning is a heuristic over two config values: a
+real tokenizer with the wrong template, or the right template with a sibling model's tokenizer,
+passes it silently. The counter needs traffic with repeated prefixes, someone who knows to read
+it, and a backend whose stream has published 10,000 UPSERTs. Every stream-on GPU run from
+2026-10-10 to 2026-10-16 measured an inert stream, and nothing in the logs said so.
+
+A misaligned stream is not neutral either. Absence on a complete stream is trusted as eviction
+(§20.1, 2026-10-11 completeness rule), and an aligned key is never present when the keys are
+disjoint, so every ART hit on that backend becomes "verified cold": the home re-prefills
+(`verified_cold_honored`) and the probabilistic residency gate that would otherwise apply never
+runs. A misaligned backend is therefore *worse* off than one with the stream off.
+
+The fix is to ask the backend. vLLM's `POST /tokenize` takes the same `messages` a chat request
+carries and returns the token ids its own chat template and tokenizer produce (it is how the
+2026-10-16 mismatch was found by hand, and how `tests/tokenizer_parity/` captures its fixture).
+Rendering a fixed probe conversation through Ranvier's own routing path and comparing the two id
+sequences answers "will this backend's stream ever match my keys?" in one request, at
+registration time, with no traffic.
+
+### What "aligned" has to mean
+
+Routing hashes only the request's prefix: the system-prefix boundary (Strategy 4 for `llama2`),
+capped at `prefix_token_length` and at `kv_native_indexed_depth`, aligned down to
+`block_alignment`. Ranvier's templates render the conversation, not necessarily vLLM's
+generation prompt (`llama3`'s assistant header, for example), so a divergence in the tail can be
+harmless. The verdict is therefore keyed on the first divergence index `d` against the probe's
+routing prefix `p` (its boundary in tokens, aligned down):
+
+- **aligned**: `d >= p` (every routing-relevant block hashes identically);
+- **misaligned**: `d < p`, reported with `d` and the two ids at `d` (decoded when cheap);
+- **unsupported**: no `/tokenize` (404/405, non-vLLM engine); says nothing about alignment;
+- **failed**: timeout, connect error, unparsable body; retried with backoff, never a verdict.
+
+The probe conversation must give a boundary of several blocks (a system message of ~150 tokens:
+the exact length matters less than crossing several 16-token boundaries) and include the
+characters that broke alignment before: a newline after the first word, leading/trailing
+whitespace, a code fence, non-ASCII. `tests/tokenizer_parity/llama2_tokenizer_parity.py`
+`CASES` are the model.
+
+### Options considered
+
+- **A. Config heuristics only (today).** Free, catches the two commonest mistakes, misses the
+  rest. Kept as the first line.
+- **B. Startup refusal.** Backends register and leave at runtime (K8s, admin API); there is
+  nothing to probe at startup, and refusing to start over one backend is the wrong blast radius.
+- **C. Per-backend probe at stream start, with a verdict that changes behaviour.** Probe each
+  backend when its stream first becomes fresh and again after a publisher restart (the COMPLETE
+  op `mark_native_complete` handles, which a model swap also produces). Recommended.
+- **D. Continuous sampling** (re-tokenize a sample of live requests through `/tokenize`). Exact,
+  but it doubles tokenization load on the backend and puts request content on a second path. The
+  §29 counter already gives a cheap live signal. Not worth it.
+
+### Decisions taken here (change them before Step 1 if you disagree)
+
+- The probe runs on **shard 0** inside **HealthService's loop** (no new timer, Rule #5; its gate
+  already guards in-flight checks), for backends whose native stream is fresh, at most one probe
+  per backend per cycle, bounded concurrency like the health checks.
+- It reuses HealthService's raw HTTP/1.1 pattern (`scrape_vllm_metrics`): `seastar::connect` to
+  the resolved `socket_address` (no DNS, Rule #12), one deadline over connect + write + read,
+  response capped (Rule #4; ~200 ids is a few KB, cap at 64 KB).
+- Ranvier's side goes through the **same code as routing**: the request body is built from the
+  probe messages, rendered by `RequestRewriter::extract_text_with_boundary_info` with the
+  configured `ChatTemplate`, and tokenized with `TokenizerService::encode_threaded_async`
+  (Rule #17: no 5-13 ms encode on the reactor). A probe that re-implements rendering would test
+  itself.
+- The probe logic (build body, parse `/tokenize`, compare, classify) is a header with pure
+  functions, so the verdict rules are unit-tested without Seastar I/O; HealthService only gets a
+  callback, as the load-score delegation already does (keeps it out of test binaries' link set).
+- Verdict state is a bounded per-backend map on shard 0 (`MAX_TRACKED_BACKENDS` = 256, Rule #4);
+  the behavioural bit (below) is broadcast to every shard, because `native_absence_trusted` is
+  read per shard.
+
+### Implementation Steps
+
+#### Step 1: Probe core (pure functions + tests)
+- **Files:** `src/alignment_probe.hpp` (new), `tests/unit/alignment_probe_test.cpp` (new),
+  `CMakeLists.txt`
+- **Description:** the fixed probe conversation; `build_tokenize_body(messages)` →
+  `{"messages": [...], "add_generation_prompt": true}`; `parse_tokenize_response(body)` →
+  `std::optional<std::vector<int32_t>>` (vLLM `{"tokens": [...], "count": N, ...}`; bounded
+  length, rejects non-integers); `classify(ranvier_ids, backend_ids, routing_prefix_tokens,
+  block_alignment)` → `{verdict, first_divergence, ranvier_id, backend_id}`; the routing-prefix
+  computation from `TextWithBoundaryInfo` and the config caps.
+- **Tests:** equal sequences; divergence before / at / after the prefix; block-alignment edge
+  (divergence inside the last partial block is harmless); empty / truncated / non-JSON bodies;
+  oversize arrays; the 2026-10-16 case reconstructed (GPT-2 ids vs `[1, 518, 25580, ...]` →
+  misaligned at 0).
+- **Concerns:** none runtime; rapidjson only.
+- **Status:** [ ] Pending
+
+#### Step 2: The probe on shard 0
+- **Depends on:** Step 1
+- **Files:** `src/health_service.hpp/.cpp` (an optional `alignment_probe` callback invoked once
+  per loop cycle with the backend list), `src/alignment_probe.cpp` (new: the I/O — POST
+  `/tokenize` with deadline, Ranvier-side render + `encode_threaded_async`, classify, record),
+  `src/application.cpp` (construct and wire the callback when `kv_events.enabled`)
+- **Description:** eligibility is "stream fresh on shard 0 and no verdict since the backend's
+  last COMPLETE", read through a RouterService accessor. `unsupported` is final until the next
+  COMPLETE; `failed` backs off (next cycle, then 2, 4, 8 cycles; capped). A verdict logs once per
+  backend per change: `info` for aligned (with `p` and the id count), `warn` for misaligned with
+  `d`, the two ids, and the configured template and tokenizer path.
+- **Concerns:** Rule #4 (verdict map, response cap), Rule #5 (HealthService gate held across the
+  probe), Rule #12 (resolved address only), Rule #17 (thread-pool encode). Async flow: needs the
+  `/implement` Pass 0 diagram (HealthService loop → probe → tokenizer pool → classify → shard-0
+  record → broadcast).
+- **Status:** [ ] Pending
+
+#### Step 3: What a misaligned verdict does
+- **Depends on:** Step 2, Open decision 1
+- **Files:** `src/router_service.cpp/.hpp` (`native_kv.misaligned` set per shard, bounded by
+  `NativeKvState::MAX_BACKENDS`; `native_absence_trusted` and the verified-holder scan exclude
+  misaligned backends; an `invoke_on_all` setter), `src/config_schema.hpp` +
+  `src/config_loader.cpp` (`kv_events.alignment_probe: off | warn | quarantine`, env
+  `RANVIER_KV_EVENTS_ALIGNMENT_PROBE`), tests in `router_service_test.cpp` and `config_test.cpp`
+- **Description:** under `quarantine` (recommended default), a misaligned backend's stream stops
+  vouching for absence and stops counting as a holder, so its ART hits fall back to the
+  probabilistic gate: exactly the stream-off behaviour, which is the most a misaligned stream
+  can safely claim. `aligned` or a later COMPLETE + aligned verdict lifts it. `warn` records and
+  logs only. `off` skips the probe.
+- **Concerns:** cross-shard broadcast (`smp::submit_to` / `invoke_on_all`), bounded set; hot path
+  gains one set lookup on an already-branchy path. `docs/internals/cache-residency-routing.md`
+  changes in the same step (authoritative deep-dive).
+- **Status:** [ ] Pending
+
+#### Step 4: Observability
+- **Depends on:** Step 2
+- **Files:** `src/router_service.cpp` or the probe (counters
+  `router_native_alignment_probes_total` split by verdict as four counters, gauge
+  `router_native_misaligned_backends`), `src/http_controller.cpp` (`/admin/backends/metrics`
+  gains `kv_alignment: aligned | misaligned@<d> | unsupported | pending`),
+  `tests/integration/results_parser.py` (native rows: probe verdicts; compare warning when any
+  backend is misaligned), `scripts/bench.sh` (compare header: `alignment probe: aligned 8/8`),
+  `.dev-context/claude-locust-sync-map.md` (metric names)
+- **Concerns:** Rule #6 (deregister in stop()); metric-name sync with the parser.
+- **Status:** [ ] Pending
+
+#### Step 5: Integration test against the mock backend
+- **Depends on:** Steps 2–4
+- **Files:** `tests/integration/mock_backend.py` (`POST /tokenize` returning a configurable id
+  list, or 404), `tests/integration/test_kv_alignment_probe.py` (new), compose/config as needed
+- **Description:** the mock cannot tokenize like a real model, so the integration test covers
+  plumbing, not correctness: a mock returning ids that cannot match → `misaligned` counter, admin
+  field and (under `quarantine`) the absence-untrusted path; a mock returning 404 →
+  `unsupported`, no warning. Correctness of the aligned verdict is the unit tests plus the GPU
+  check in Step 7. Needs a mock that also publishes a minimal KV-event stream for eligibility, or
+  a test hook that marks the stream fresh; pick whichever is smaller when implementing.
+- **Status:** [ ] Pending
+
+#### Step 6: Documentation
+- **Files:** `docs/internals/cache-residency-routing.md` ("Self-checks": the probe first, then
+  the counter and the heuristics), `docs/internals/prefix-affinity-routing.md` (one line under
+  the template table), `CHANGELOG.md`, this section's statuses
+- **Status:** [ ] Pending
+
+#### Step 7: GPU check (rides the next GPU session; no dedicated run)
+- **Depends on:** Steps 1–6 in the image
+- **Read:** on the next stream-on run, the header reads `alignment probe: aligned 8/8` with
+  `--chat-template llama2`. Then one deliberately wrong arm (e.g. `--chat-template none` with the
+  CodeLlama tokenizer, one 10-minute rep) must read `misaligned 8/8` and, under `quarantine`,
+  `verified_cold_honored` ≈ 0 with residency downgrades reappearing, i.e. stream-off behaviour.
+  The 8B Llama-3.1 stream run (recommended separately) is the first check of `llama3`: a
+  generation-prompt-only divergence must read aligned.
+- **Status:** [ ] Pending
+
+### Open decisions
+
+1. **Default action on misaligned: `quarantine` (recommended) or `warn`?** §29 decided "warn"
+   for the *heuristic*, which can be wrong; the probe is not a heuristic, and a misaligned stream
+   costs the probabilistic gate (see "The problem"), so quarantine only restores stream-off
+   behaviour.
+2. **Probe the `/v1/completions` shape too?** Routing for a raw `prompt` tokenizes the string as
+   is, while vLLM adds BOS per its tokenizer config. One extra `/tokenize {"prompt": ...}` case
+   would cover it; recommended only if completions traffic matters for the stream.
+3. **Re-probe cadence beyond COMPLETE?** COMPLETE covers publisher restarts (model swaps
+   included). A periodic re-probe (hourly) would catch a hot template change without a restart,
+   which vLLM does not support today. Recommended: no.
+4. **Surface the verdict in `/health` or readiness?** A misaligned backend still serves correct
+   responses, so it should not fail readiness. Recommended: no; metrics and the admin field only.
+
+### Dependencies
+
+```
+1 (core) ─> 2 (probe on shard 0) ─┬─> 3 (quarantine) ─┬─> 5 (integration) ─> 6 (docs) ─> 7 (GPU)
+                                  └─> 4 (metrics) ────┘
+```
+Steps 1–2 can land in one PR (logic + I/O, warn-only behaviour), 3–6 in a second.
+
+### Post-Implementation
+- [ ] `/review` (Hard Rules) on Steps 2–3: shard-0 I/O in HealthService and the hot-path check.
+- [ ] `/doc` after Step 6.
+- [ ] Deferred gates (developer's Docker): `make test-unit` after Steps 1, 3; `make lint`;
+      `make test-integration-fast` after Step 5.
 
 ---
 
