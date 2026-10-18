@@ -160,8 +160,12 @@ position. `bench.sh --kv-events` takes the model's tokenizer from the host's Hug
 and `--chat-template` sets the format; the compare header names both and warns when unaligned.
 
 **Every GPU benchmark through 2026-10-16 ran unaligned** (GPT-2 tokenizer, template `none`), so
-the stream measurements quoted in this section and in "Replication by diversion" below are open
-questions, not results (BACKLOG §29; `benchmark-results-current.md`).
+the stream measurements quoted in this section before that date are not results (BACKLOG §29).
+**Aligned, 2026-10-17/18** (CodeLlama-13B, 8×A100, vs least-loaded): the stream moved the fitted
+20u row from −6.4% P99 (aligned keys, stream off) to −18.1% (3/3), and the 50-prefix 20u row
+from +13.5% to −1.7% (no reliable effect), with `holder_redirects` 100–221 per arm. On the
+fitted row it raises KV hit; on the eviction row its gain is load spread alone
+(`benchmark-results-current.md`, "Aligned native KV events and replication").
 
 ### How verified residency works
 
@@ -308,8 +312,11 @@ second copy of a 2,000–4,000-token prefix in a fleet whose cache already canno
 hold one copy of the set, so it trades KV capacity for queueing and can lose
 that trade. Read the KV hit rate before P99. The GPU verdict (BACKLOG §28
 Step 8, `bench-runner.sh --suite kvrepl`) decides the default. Its 2026-10-16 run was
-unaligned (see the requirement above): designations fired, no replica was ever visible, and
-the verdict was inconclusive, so the default stays 0 until the aligned rerun.
+unaligned and inconclusive. The aligned run (2026-10-18, cap 2): the fitted 20u row improves
+from −18.1% to −23.1% P99 vs least-loaded (3/3, KV 70–74% → 80–82%, replicas read more often
+than minted); the 50-prefix 20u eviction row reads MIXED at −6.4% (KV unchanged, 2.5–4.5
+replicas minted per replica read). The pre-registered rule needs both rows, so the default
+stays 0; setting 2 is reasonable where the hot set fits in the fleet's cache.
 
 Cost on the hot path: one prefix hash per forfeiting hit (already paid by the
 spillover), a scan of the hash's holder set against the live set into a fixed

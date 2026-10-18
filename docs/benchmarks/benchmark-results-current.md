@@ -366,6 +366,91 @@ prefix count, not popularity). Backlog §27 carries the item with these numbers 
 Archive: `docs/benchmarks/results/2026-10-09-saturation/`; raw run directories on the v2.2.0
 release as `ranvier-benchmark-runs-2026-10-09.tar.gz`.
 
+## Aligned native KV events and replication (measured 2026-10-17/18)
+
+**Question.** With Ranvier finally tokenizing as vLLM does (BACKLOG §29: the model's own
+`tokenizer.json`, the `llama2` chat template, the system-prefix boundary), does the native
+KV-event stream change rows 17 and 18 against least-loaded, how much of any change is the new
+routing keys rather than the stream, and does replication by diversion (§28,
+`routing.replication.max_holders` 2) now work as designed?
+
+**Method.** Same 8×A100 instance throughout, image `e46cb25`, `--kv-events-materialize off`,
+`--chat-template llama2`, tokenizer from the host's Hugging Face cache (CodeLlama-13B-Instruct),
+KV reset acked 8/8 on every arm, alternating arm order. Three runs:
+`--suite kvevents` ×3 (2026-10-17, replication off); an aligned stream-off control ×1 (2026-10-18,
+`--suite custom`, same tokenizer and template without `--kv-events`); `--suite kvrepl` ×3
+(2026-10-18). Every stream-on prefix arm read `routing_key_matches` 730–3,791 (0 on every
+least-loaded arm), `stream_resets` 0, `absence_untrusted` 0, `verified_evictions` 0. P99s on the
+50-prefix row exclude 1.3–2.1% timeouts on both arms.
+
+**Row 17 (fitted 13B 20u), P99 TTFT vs least-loaded**
+
+| Configuration | Reps (order: rr / prefix / rr) | Runner verdict | KV hit | Gini | Prefix-arm P99 |
+|---|---|---|---|---|---|
+| Stream off, unaligned (control, 2026-10-08/10) | −12.5% (range −7.1 … −13.2) | | 61–68% | 0.08–0.10 | |
+| Stream off, aligned keys (×1) | −6.4% | | 64.8% | 0.114 | 1,557 ms |
+| Stream on, aligned, replication off | −18.1 / −21.8 / −17.3% | **CONSISTENT IMPROVEMENT**, median −18.1% | 70.0–74.3% | 0.067–0.079 | 1,381–1,451 ms |
+| Stream on, aligned, replication 2 | −23.1 / −24.2 / −21.9% | **CONSISTENT IMPROVEMENT**, median −23.1% (IQR −23.6…−22.5) | 80.4–82.2% | 0.071–0.089 | 1,299–1,326 ms |
+
+P50 −27 to −28% and throughput +7 to +8% on every stream-on rep, no timeouts.
+
+**Row 18 (50-prefix 13B 20u), P99 TTFT vs least-loaded**
+
+| Configuration | Reps (order: rr / prefix / rr) | Runner verdict | KV hit | Gini | Prefix-arm P99 |
+|---|---|---|---|---|---|
+| Stream off, unaligned (2026-10-09) | +22.9 / +24.9 / +21.7% | CONSISTENT REGRESSION | 23–32% | 0.10–0.11 | |
+| Stream on, unaligned (2026-10-14) | +23.1 / +14.7 / +18.9% | CONSISTENT REGRESSION | 24–30% | | 3,771–3,981 ms |
+| Stream off, aligned keys (×1) | +13.5% | | 31.2% | 0.147 | 3,933 ms |
+| Stream on, aligned, replication off | −1.7 / −13.4 / +4.0% | NO RELIABLE EFFECT (IQR −7.5…+1.2) | 29.0–37.1% | 0.095–0.105 | 3,484 / 3,510 / 3,786 ms |
+| Stream on, aligned, replication 2 | +2.9 / −6.4 / −11.8% | MIXED, median −6.4% (IQR −9.1…−1.7) | 26.2–33.4% | 0.085–0.140 | 3,325 / 3,512 / 3,081 ms |
+
+**Counters (prefix arms).**
+
+| | `verified_hits` | `holder_redirects` | `verified_cold_honored` | Replica designations / dispatches / holders saturated |
+|---|---|---|---|---|
+| Row 17, replication off | 400–456 | 152–208 | 23–31 | — |
+| Row 17, replication 2 | 402–514 | 112–221 | 14–18 | 47–61 / 79–109 / 31–35 |
+| Row 18, replication off | 292–354 | 100–156 | 212–232 | — |
+| Row 18, replication 2 | 266–315 | 150–168 | 209–236 | 133–162 / 33–52 / 16–20 |
+
+**Reading.**
+
+1. **Alignment worked.** For the first time the stream's keys and the router's keys meet
+   (`routing_key_matches` > 0 on every stream-on prefix arm) and `holder_redirects` is nonzero
+   (100–221 per arm, 0 on every earlier run): a hit whose home has evicted the prefix now goes to
+   another backend the stream shows holding it.
+2. **The stream, not the new keys, is the gain.** With aligned keys and the stream off, row 17
+   sits inside the old control's range (−6.4% against −7.1 … −13.2%) and row 18 is still a
+   regression (+13.5%). With the stream on, row 17 gains about 11 points over the matching-order
+   control and row 18 about 10–15. Least-loaded's own P99 moves between days and instances, so the
+   absolute prefix-arm P99 is the cleaner measure: 110–175 ms lower on row 17 (7–11%) and
+   150–450 ms on row 18 (4–11%). One control rep per row: direction, not size.
+3. **How the stream helps differs by row.** Row 17 gains KV (65% → 70–74%) and balance (Gini
+   0.114 → 0.07–0.08). Row 18 gains no KV (31% either way); its whole gain is the spread from
+   holder redirects (Gini 0.147 → ~0.10).
+4. **Replication at cap 2 helps the fitted row.** Every row-17 rep beat its matching-order
+   replication-off rep by 2.4–5.0 points, KV rose about 10 points, route-consistent P99 improved
+   21–26%, and replicas were read more often than they were minted (79–109 dispatches against
+   47–61 designations). §28 Step 8's row-17 condition ("must not regress") holds with room to spare.
+5. **Replication is roughly neutral on the eviction row.** Row 18 reads MIXED at −6.4% median;
+   the prefix arm's own P99 averaged ~3,306 ms against ~3,593 ms without replication (about 8%
+   lower, two of three order-matched reps better, one identical), KV no better (26–33% against
+   29–37%) and Gini wider on two reps. Most replicas go unread: 2.5–4.5 designations per
+   dispatch, because a second copy in a cache that holds about a third of the working set is
+   usually evicted before its prefix returns.
+
+**Verdict against the pre-registered reading (BACKLOG §28 Step 8).** Row 18 is the "MIXED with
+`replica_dispatches` ≫ 0 and KV ≥ 23–30%" outcome: the mechanism works and capacity does not.
+The default flips to `max_holders = 2` only on a consistent row-18 improvement with row 17
+holding, so **`max_holders` stays 0** and **`kv_events` stays opt-in**; both are owner decisions
+from here (BACKLOG §28/§29). The pre-registered next step for this outcome was "the cap (try 3)
+or KV-aware dispatch"; the designation-to-dispatch ratio argues against a third copy, so the
+open choice is a hotness gate (§28 Step 9) or KV-aware dispatch (§27).
+
+Archive: `results/2026-10-17-kvevents-aligned/` (aggregates and compare files),
+`results/2026-10-18-aligned-control/` (×1, compare files), `results/2026-10-18-kvrepl-aligned/`
+(aggregates and compare files).
+
 ## Native KV-event suite and the 8B reset row (measured 2026-10-13)
 
 > **Unaligned; the stream verdicts below are reopened (2026-10-16, BACKLOG §29).** Every
@@ -379,7 +464,9 @@ release as `ranvier-benchmark-runs-2026-10-09.tar.gz`.
 > measured; what does not stand is any reading of them as "exact residency is neutral" or
 > "replicas evaporate". Those questions are open until the aligned rerun (`--chat-template
 > llama2` with the model's tokenizer, now the kvevents / kvrepl rows' default; read
-> `routing_key_matches` > 0 first).
+> `routing_key_matches` > 0 first). **Answered 2026-10-17/18** in "Aligned native KV events and
+> replication" above: the aligned stream improves both rows, and replication at cap 2 helps row 17
+> and is roughly neutral on row 18.
 
 **Question.** With the verified-cold policy of 2026-10-11 (a hit whose home verifiably evicted
 the prefix goes to another verified holder or stays home; never re-placed) and the completeness
@@ -710,6 +797,9 @@ before termination after all): summaries in this tree, raw data as a release ass
 | kvmat: fitted 20u vs least-loaded, stream on, materialization off, ×3 (2026-10-13); unaligned, §29 | `results/2026-10-13-kvmat/` |
 | Row 18: 50-prefix 20u vs least-loaded, stream on, materialization off, ×3 (2026-10-14); unaligned, §29 | `results/2026-10-14-kvevents/` |
 | Native KV events, first contact: 3 stream-off control reps + the first live-stream run (2026-10-10); unaligned, §29 | `results/2026-10-10-kvevents-first-contact/` (compare files only; raw dirs lost with the instance) |
+| Aligned native KV events: fitted 20u + 50-prefix 20u vs least-loaded, `llama2` + CodeLlama tokenizer, ×3 (2026-10-17) | `results/2026-10-17-kvevents-aligned/` |
+| Aligned stream-off control: the same two rows without `--kv-events`, ×1 (2026-10-18) | `results/2026-10-18-aligned-control/` |
+| Aligned kvrepl: the same two rows with `--replication 2`, ×3 (2026-10-18) | `results/2026-10-18-kvrepl-aligned/` |
 | kvablate: materialize off / depth 4096 / both vs least-loaded, ×1 (2026-10-11); unaligned, §29 | `results/2026-10-11-kvablate/` (compare files only) |
 
 The raw run directories (Locust CSVs, per-request logs, vLLM logs, per-node Ranvier logs where
@@ -1202,13 +1292,18 @@ nothing to do.
    `replica_holders_saturated` and `holder_redirects` 0 on all six arms: the run was unaligned
    (§29), so no replica was ever visible. What it measured is designation alone, a lead on row
    18 and not a result; `max_holders` stays 0.
-12. Next GPU session (BACKLOG §29 Step 7): one smoke rep of row 18 with `--kv-events
-   --replication 2 --chat-template llama2` (tokenizer from the HF cache); read
-   `routing_key_matches` > 0, then `verified_hits` and `holder_redirects` or
-   `replica_dispatches` > 0, and stop if matches stay 0. Then `--suite kvevents` and
-   `--suite kvrepl` ×3, aligned, as pre-registered in §27 / §28 Step 8 (acceptance unchanged:
-   row 18 turns to an improvement without KV or route consistency falling below 23–30% /
-   49–52%, and row 17 holds at the control).
+12. ~~Next GPU session (BACKLOG §29 Step 7): the aligned smoke, `--suite kvevents` and `--suite
+   kvrepl`.~~ Done 2026-10-17/18 on image `e46cb25`, plus an aligned stream-off control ×1
+   ("Aligned native KV events and replication" above). Row 17: stream on −18.1% median (3/3),
+   with replication 2 −23.1% (3/3); stream off with aligned keys −6.4%. Row 18: stream on −1.7%
+   median (NO RELIABLE EFFECT), with replication 2 −6.4% (MIXED); stream off with aligned keys
+   +13.5%. The stream is the gain; replication helps row 17 and is roughly neutral on row 18.
+   `max_holders` stays 0 and `kv_events` stays opt-in pending the owner's decision.
+13. Next, if row 18 is pursued: a hotness gate on replica designation (BACKLOG §28 Step 9), since
+   2.5–4.5 replicas were minted per replica read, or KV-aware dispatch (BACKLOG §27). A third
+   holder (the pre-registered "try cap 3") would mostly add unread copies. Materialization
+   (`--suite kvablate` with `--chat-template llama2`) is worth one aligned rep, since its earlier
+   effect could not have come through matched keys.
 
 ### Superseded: 2026-07-13 campaign (commit `817a1b5`)
 
