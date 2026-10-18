@@ -1541,6 +1541,11 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
   second-arm effect more plausibly came through `route_tokens_by_backend`, which least-loaded
   miss placement balances on. The P99 / KV / Gini numbers are real; "the stream is neutral" is
   unmeasured, not established.**
+  **Aligned 2026-10-17/18 (§29 Step 7): the stream is not neutral. Row 17 −18.1% (3/3) with the
+  stream against −6.4% with aligned keys and the stream off (×1); row 18 −1.7% (no reliable
+  effect) against +13.5%. `holder_redirects` 100–221 per arm. Row 18's gain is load spread, not
+  KV (31% either way). With replication 2 (§28): row 17 −23.1% (3/3), row 18 −6.4% (MIXED).
+  The eviction regime is still open: a hotness gate (§28 Step 9) or KV-aware dispatch.**
   **10-11 static check of that policy (branch `claude/festive-thompson-ta0tgj`): freshness proved
   only that the subscription was alive, since heartbeats restore it within 5 s of a RESET over the
   purged index and a node starting against warm vLLMs backfills only the replay buffer; absence
@@ -1643,6 +1648,10 @@ vs a ~250k-token hot set) where both arms were cache-cold and routing could not 
 > stored CodeLlama ids of the chat-templated prompt. So no native-stream entry could ever land on a
 > key the router reads, and a replica could not have been seen even if it survived. Steps 1–7
 > stand as built. Step 8 measured designation only; see its status.
+>
+> **Aligned 2026-10-18:** with §29 in the image, the premise is measurable and partly true:
+> on row 18 replicas are minted 2.5–4.5 times per read, so most are evicted before reuse. See
+> Step 8's status.
 
 Plan for the remaining half of the §27 holder-aware divert item. Written after row 18 of the
 native KV-event suite read +23.1 / +14.7 / +18.9% P99 against least-loaded with exact residency
@@ -1891,9 +1900,31 @@ KV hit rate to move, in either direction, and read it before P99.
     `holder_redirects` or `replica_dispatches` > 0). A designation-only arm (designation on,
     holder dispatch off) would separate the two rules; it needs a knob, since `max_holders >= 2`
     enables both together.
+- **Status, aligned rerun:** [x] Ran 2026-10-18 (image `e46cb25`, `--chat-template llama2`, CodeLlama
+  tokenizer from the HF cache, ×3 alternating order, KV reset 8/8 every arm).
+  **Row 17 holds and improves; row 18 MIXED. Default stays `max_holders = 0` (owner decision open).**
+
+  | Row | P99 vs least_loaded (3 reps) | Runner verdict | KV hit | Same row, replication off (2026-10-17) |
+  |---|---|---|---|---|
+  | 17, fitted 20u | −23.1 / −24.2 / −21.9% | CONSISTENT IMPROVEMENT, −23.1% | 80.4–82.2% | −18.1 / −21.8 / −17.3%, KV 70–74% |
+  | 18, 50-prefix 20u | +2.9 / −6.4 / −11.8% | MIXED, −6.4% | 26.2–33.4% | −1.7 / −13.4 / +4.0%, KV 29–37% |
+
+  - Read-first passed: designations 47–61 (row 17) and 133–162 (row 18) per prefix arm,
+    dispatches 79–109 and 33–52, holders saturated 31–35 and 16–20.
+  - Row 17: every rep beats its order-matched replication-off rep by 2.4–5.0 points; replicas are
+    read more often than minted. Step 9 is not triggered.
+  - Row 18: the pre-registered "MIXED with `replica_dispatches` ≫ 0 and KV ≥ 23–30%" outcome
+    (mechanism works, capacity does not). Prefix-arm P99 ~8% lower in absolute terms; KV no better;
+    2.5–4.5 designations per dispatch. The prescribed next step was "the cap (try 3) or KV-aware
+    dispatch"; with most second copies unread, a third holder is the weaker candidate, and a
+    hotness gate on designation (Step 9's mechanism, triggered by row 18 instead of row 17) the
+    stronger one.
+  - Archive: `docs/benchmarks/results/2026-10-18-kvrepl-aligned/`.
 
 #### Step 9 (conditional): Hotness gate
-- **Only if** Step 8 shows row 17 regressing with replication on.
+- **Only if** Step 8 shows row 17 regressing with replication on. (It did not, 2026-10-18; the
+  same mechanism is now the leading candidate for row 18's unread replicas: designate only
+  prefixes seen again within the window. Owner decision.)
 - **Files:** `src/router_service.cpp` (a routing-owned `StreamSummary` touched where the hot-prefix
   telemetry touch already sits ~3541, decayed in `ttl_cleanup_on_shard` rather than by a new timer),
   `src/config_schema.hpp` (`routing.replication.min_hits_per_window`), tests, docs
@@ -2111,6 +2142,13 @@ untouched. Cost so far: the native index holds entries nothing reads (bounded at
   changes anything, and `--suite kvrepl` ×3 to run §28 Step 8 as pre-registered. Materialization
   (`--suite kvablate`) is worth one rep again, since its earlier effect could not have been
   through matched keys.
+- **Status:** [x] Done 2026-10-17/18 (image `e46cb25`). `routing_key_matches` 730–3,791 on every
+  stream-on prefix arm, 0 on every least-loaded arm; `holder_redirects` 100–221. `--suite kvevents`
+  ×3: row 17 −18.1% (CONSISTENT IMPROVEMENT), row 18 −1.7% (NO RELIABLE EFFECT). Aligned
+  stream-off control ×1 (not pre-registered; added to separate the stream from the new keys):
+  row 17 −6.4%, row 18 +13.5%. `--suite kvrepl` ×3: see §28 Step 8. Archives
+  `docs/benchmarks/results/2026-10-17-kvevents-aligned/`, `2026-10-18-aligned-control/`,
+  `2026-10-18-kvrepl-aligned/`. kvablate not rerun.
 
 ### Open decisions
 
@@ -2118,10 +2156,15 @@ Decided 2026-10-16 (owner): **warn** on a detected mismatch (do not refuse); for
 with **`codellama`** accepted as an alias; benchmark tokenizer **mounted from the HF cache**
 (Step 5 default). Steps 1–4 approved for implementation. Still open:
 
-4. Rerun scope after alignment: kvevents + kvrepl only, or also kvablate and the §27 row-16
-   saturation question?
+4. ~~Rerun scope after alignment.~~ kvevents + kvrepl + an aligned stream-off control ran
+   2026-10-17/18. Still unrun aligned: kvablate (one rep) and the §27 row-16 saturation question.
 5. A designation-only knob for §28 (designation without holder dispatch), to isolate what moved
-   row 18 on 2026-10-16?
+   row 18 on 2026-10-16? (Less pressing now that holder dispatch is visible and measured.)
+6. Defaults after the aligned runs: `routing.replication.max_holders` (the pre-registered rule
+   keeps 0; 2 helped the fitted row), and whether to recommend `kv_events` with a matching
+   template and tokenizer (it stays opt-in until decided).
+7. Row 18's next mechanism: a hotness gate on replica designation (§28 Step 9) or KV-aware
+   dispatch (§27).
 
 ### Dependencies
 

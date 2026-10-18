@@ -83,6 +83,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and KV; the pre-registered reading is in the suite's help text and the results doc.
 
 ### Documentation
+- **Aligned native KV-event and replication results (2026-10-17/18, BACKLOG §29 Step 7, §28
+  Step 8):** with the `llama2` template and the model's tokenizer, the stream improves the fitted
+  13B 20u row from −6.4% P99 vs least-loaded (aligned keys, stream off) to −18.1% (3/3) and the
+  50-prefix 20u row from +13.5% to −1.7% (no reliable effect). Replication at `max_holders` 2
+  takes the fitted row to −23.1% (3/3) and reads MIXED at −6.4% on the 50-prefix row, where most
+  replicas are evicted before reuse. `max_holders` stays 0 and `kv_events` opt-in by default.
 - **Correction (2026-10-16, BACKLOG §29):** every stream-on GPU run to date (first contact,
   kvablate, kvevents, kvmat, kvrepl) was unaligned: Ranvier routed on GPT-2 ids of untemplated
   text while vLLM cached CodeLlama ids of the Llama-2 template, so no native KV event could match

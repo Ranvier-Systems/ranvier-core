@@ -411,6 +411,10 @@ BUILT-IN SUITES:
       event could match a routing key; the P99s stand, the stream readings do not. The rows
       now pass --chat-template llama2 (tokenizer from the HF cache under --kv-events); read
       the compare's routing_key_matches > 0 before anything else.
+      Measured ALIGNED 2026-10-17 (image e46cb25, x3): row 17 -18.1 / -21.8 / -17.3 (3/3,
+      KV 70-74%), row 18 -1.7 / -13.4 / +4.0 (no reliable effect, KV 29-37%);
+      routing_key_matches 1.5k-3.8k, holder_redirects 100-208. Aligned stream-off control
+      (x1, 2026-10-18): row 17 -6.4, row 18 +13.5, so the stream is the gain.
 
     kvablate (3 configs x 2 arms x 1 repeat, ~1h25m) — separates the two things the native
       stream does to routing, after kvevents run 1 (2026-10-10, stream live: kv_ops 2.0M)
@@ -485,6 +489,10 @@ BUILT-IN SUITES:
       replica_dispatches / holder_redirects 0 everywhere, so no replica was ever visible;
       row 17 -12.5/-20.0/-15.1, row 18 +1.0/-2.5/+10.9 (designation alone; inconclusive).
       Read routing_key_matches > 0 first, then the replication row.
+      Measured ALIGNED 2026-10-18 (image e46cb25, x3): row 17 -23.1 / -24.2 / -21.9 (3/3,
+      KV 80-82%, dispatches 79-109 > designations 47-61); row 18 +2.9 / -6.4 / -11.8 (MIXED,
+      KV 26-33%, designations 133-162 per 33-52 dispatches). Row 17 holds; row 18 is the
+      "mechanism works, capacity does not" outcome, so max_holders stays 0 by default.
       Needs an image carrying section 28 Steps 1-6; --resume 4 runs row 18 alone.
 
     all = rebaseline + epsilon + fitted + placement + baseline + saturation + kvevents +
