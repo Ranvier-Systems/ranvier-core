@@ -19,8 +19,10 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/reactor.hh>  // seastar::connect
 #include <seastar/core/with_timeout.hh>
 #include <seastar/net/api.hh>
+#include <seastar/net/inet_address.hh>
 
 using namespace seastar;
 
