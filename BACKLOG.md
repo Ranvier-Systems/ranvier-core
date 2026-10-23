@@ -2277,7 +2277,10 @@ whitespace, a code fence, non-ASCII. `tests/tokenizer_parity/llama2_tokenizer_pa
   oversize arrays; the 2026-10-16 case reconstructed (GPT-2 ids vs `[1, 518, 25580, ...]` →
   misaligned at 0).
 - **Concerns:** none runtime; rapidjson only.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-23): `src/alignment_probe.hpp`, 25 tests in
+  `tests/unit/alignment_probe_test.cpp` (compiled and passing in the sandbox against real RapidJSON
+  headers with a gtest shim; the CMake target `alignment_probe_test` is new). Also checks that the
+  probe conversation yields a system prefix under all five templates, and parses chunked bodies.
 
 #### Step 2: The probe on shard 0
 - **Depends on:** Step 1

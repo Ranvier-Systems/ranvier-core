@@ -479,6 +479,19 @@ target_link_libraries(chat_template_test
 )
 gtest_discover_tests(chat_template_test)
 
+# AlignmentProbe Unit Tests (Pure C++, header-only; BACKLOG section 30)
+# RequestRewriter is included for the routing-path check, hence RapidJSON.
+add_executable(alignment_probe_test
+  tests/unit/alignment_probe_test.cpp
+)
+target_include_directories(alignment_probe_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(alignment_probe_test
+  PRIVATE
+  GTest::gtest_main
+  rapidjson_interface
+)
+gtest_discover_tests(alignment_probe_test)
+
 # BoundaryDetector Unit Tests (Pure C++, header-only)
 add_executable(boundary_detector_test
   tests/unit/boundary_detector_test.cpp
