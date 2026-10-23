@@ -21,6 +21,7 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/metrics.hh>
 #include <seastar/core/reactor.hh>  // seastar::connect
 #include <seastar/core/with_timeout.hh>
 #include <seastar/net/api.hh>
@@ -38,6 +39,54 @@ AlignmentProber::AlignmentProber(Config cfg, sharded<TokenizerService>& tokenize
       _tokenizer(tokenizer),
       _chat_body(alignment_probe::build_chat_body()) {
     _state.reserve(MAX_TRACKED_BACKENDS);
+}
+
+void AlignmentProber::start() {
+    namespace sm = seastar::metrics;
+    // Counters count probe outcomes; the gauges are the current state, which
+    // is what an end-of-run dump should be read for (a probe runs at engine
+    // start, before any measured window).
+    _metrics.add_group("ranvier", {
+        sm::make_counter("router_native_alignment_probes_aligned_total", _stats.aligned,
+            sm::description("Alignment probes whose backend /tokenize matched Ranvier's "
+                            "routing tokens over the routing prefix (BACKLOG section 30)")),
+        sm::make_counter("router_native_alignment_probes_misaligned_total", _stats.misaligned,
+            sm::description("Alignment probes that found Ranvier and the backend tokenizing "
+                            "the routing prefix differently")),
+        sm::make_counter("router_native_alignment_probes_unsupported_total", _stats.unsupported,
+            sm::description("Alignment probes answered with no /tokenize (404/405/501)")),
+        sm::make_counter("router_native_alignment_probes_failed_total", _stats.failed,
+            sm::description("Alignment probes that failed (transport or parse); retried")),
+        sm::make_gauge("router_native_aligned_backends",
+            sm::description("Backends whose latest alignment verdict is aligned"),
+            [this] { return static_cast<double>(backends_with(Verdict::ALIGNED)); }),
+        sm::make_gauge("router_native_misaligned_backends",
+            sm::description("Backends whose latest alignment verdict is misaligned: their "
+                            "native KV events can never match a routing key"),
+            [this] { return static_cast<double>(backends_with(Verdict::MISALIGNED)); }),
+        sm::make_gauge("router_native_unsupported_backends",
+            sm::description("Backends with a live stream but no /tokenize: alignment unverified"),
+            [this] { return static_cast<double>(backends_with(Verdict::UNSUPPORTED)); }),
+        sm::make_gauge("router_native_quarantined_backends",
+            sm::description("Misaligned backends whose stream is quarantined "
+                            "(kv_events.alignment_probe: quarantine): stream-off routing"),
+            [this] {
+                return _cfg.quarantine ? static_cast<double>(backends_with(Verdict::MISALIGNED))
+                                       : 0.0;
+            }),
+    });
+}
+
+void AlignmentProber::stop() {
+    _metrics.clear();
+}
+
+size_t AlignmentProber::backends_with(Verdict v) const {
+    size_t n = 0;
+    for (const auto& [id, st] : _state) {
+        if (st.has_verdict && st.result.verdict == v) ++n;
+    }
+    return n;
 }
 
 std::optional<Result> AlignmentProber::verdict(BackendId id) const {

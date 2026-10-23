@@ -807,6 +807,7 @@ void Application::init_health_checker() {
         pc.indexed_depth = _config.kv_events.max_indexed_token_depth;
         pc.tokenizer_path = _config.assets.tokenizer_path;
         _alignment_prober = std::make_unique<AlignmentProber>(std::move(pc), _tokenizer);
+        _alignment_prober->start();  // metrics (Rule #6: stop() after the health loop)
         auto* prober = _alignment_prober.get();
         _health_checker->set_alignment_probe_hook(
             [prober](HealthService::BackendList backends) {
@@ -1890,8 +1891,13 @@ seastar::future<> Application::stop_core_services(
 
     if (_health_checker) {
         parallel_stops.push_back(
-            _health_checker->stop().then([] {
+            _health_checker->stop().then([this] {
                 log_main.debug("  Health checker stopped");
+                // The loop awaited any probe in flight; the prober's metrics
+                // can go now (Rule #6).
+                if (_alignment_prober) {
+                    _alignment_prober->stop();
+                }
             }).handle_exception([](auto ep) {
                 log_main.warn("  Health checker stop error (ignored)");
             })

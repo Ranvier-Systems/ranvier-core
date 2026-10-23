@@ -31,6 +31,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <seastar/core/future.hh>
+#include <seastar/core/metrics_registration.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/net/socket_defs.hh>
 
@@ -63,6 +64,11 @@ public:
 
     AlignmentProber(Config cfg, seastar::sharded<TokenizerService>& tokenizer);
 
+    // Shard 0. start() registers the metrics; stop() deregisters them (Rule #6)
+    // and must run after HealthService::stop(), which awaits any probe in flight.
+    void start();
+    void stop();
+
     // Shard 0 only. Probes every eligible backend in `backends` (bounded
     // concurrency) and prunes state for backends no longer listed.
     seastar::future<> run_cycle(std::vector<std::pair<BackendId, seastar::socket_address>> backends);
@@ -71,6 +77,9 @@ public:
     std::optional<alignment_probe::Result> verdict(BackendId id) const;
 
     Stats stats() const { return _stats; }
+
+    // Backends whose current verdict is `v` (gauges; FAILED is never stored).
+    size_t backends_with(alignment_probe::Verdict v) const;
 
     // Rule #4: one entry per tracked backend (same bound as HealthService).
     static constexpr size_t MAX_TRACKED_BACKENDS = 256;
@@ -119,6 +128,7 @@ private:
     uint64_t _cycle = 0;
     uint64_t _state_overflow_drops = 0;
     Stats _stats;
+    seastar::metrics::metric_groups _metrics;
 };
 
 }  // namespace ranvier

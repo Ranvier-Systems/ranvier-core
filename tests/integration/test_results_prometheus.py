@@ -182,3 +182,37 @@ def test_replica_counters_summed_across_nodes_and_shards(tmp_path):
     assert agg["replica_designations_total"] == 9
     assert agg["replica_holders_saturated_total"] == 3
     assert agg["native_kv_ops_total"] == 150               # native keys unaffected
+
+
+# ---------------------------------------------------------------------------
+# Alignment-probe gauges (BACKLOG §30): end-of-arm values summed over nodes,
+# never differenced (the probe runs at engine start, before the main run).
+# ---------------------------------------------------------------------------
+
+def _alignment_dump(aligned, misaligned, quarantined):
+    return "\n".join([
+        f'seastar_ranvier_router_native_aligned_backends{{shard="0"}} {aligned}',
+        f'seastar_ranvier_router_native_misaligned_backends{{shard="0"}} {misaligned}',
+        'seastar_ranvier_router_native_unsupported_backends{shard="0"} 0',
+        f'seastar_ranvier_router_native_quarantined_backends{{shard="0"}} {quarantined}',
+        'seastar_ranvier_router_native_alignment_probes_aligned_total{shard="0"} 9',
+    ]) + "\n"
+
+
+def test_alignment_gauges_summed_over_nodes_not_differenced(tmp_path):
+    for n in (1, 2, 3):
+        # The start snapshot already holds the verdicts: a counter would read 0.
+        (tmp_path / f"prometheus_metrics_start_node{n}.txt").write_text(_alignment_dump(7, 1, 1))
+        (tmp_path / f"prometheus_metrics_node{n}.txt").write_text(_alignment_dump(7, 1, 1))
+    agg = parse_prometheus_report(str(tmp_path))
+    assert agg["counters_differenced"] is True
+    assert agg["native_aligned_backends"] == 21
+    assert agg["native_misaligned_backends"] == 3
+    assert agg["native_unsupported_backends"] == 0
+    assert agg["native_quarantined_backends"] == 3
+
+
+def test_alignment_gauges_absent_on_older_images(tmp_path):
+    (tmp_path / "prometheus_metrics_node1.txt").write_text(_replica_dump(1, 1, 1))
+    agg = parse_prometheus_report(str(tmp_path))
+    assert "native_misaligned_backends" not in agg

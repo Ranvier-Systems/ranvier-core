@@ -2341,7 +2341,14 @@ whitespace, a code fence, non-ASCII. `tests/tokenizer_parity/llama2_tokenizer_pa
   backend is misaligned), `scripts/bench.sh` (compare header: `alignment probe: aligned 8/8`),
   `.dev-context/claude-locust-sync-map.md` (metric names)
 - **Concerns:** Rule #6 (deregister in stop()); metric-name sync with the parser.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-23): counters `router_native_alignment_probes_{aligned,misaligned,
+  unsupported,failed}_total` and gauges `router_native_{aligned,misaligned,unsupported,quarantined}
+  _backends`, registered by the prober on shard 0 (deregistered after the health loop stops). The
+  parser reads the gauges, not the counters: counters are differenced against the start-of-run
+  snapshot and a probe runs at engine start, so they would read 0. `/admin/backends/metrics` gains
+  `kv_alignment` and `kv_quarantined` (shard-local, from the broadcast verdict); the compare gains
+  two "alignment probe" rows and a warning on any misaligned pair; `bench.sh` adds the prefix arm's
+  verdicts to the header and warns. Parser tests: gauges summed over nodes, not differenced.
 
 #### Step 5: Integration test against the mock backend
 - **Depends on:** Steps 2–4

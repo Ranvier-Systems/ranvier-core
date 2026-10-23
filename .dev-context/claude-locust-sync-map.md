@@ -70,6 +70,7 @@ the full exported name; C++ registers without the prefix.
 | `router_cluster_sync_invalid` | `router_cluster_sync_invalid` | gossip_service.cpp |
 | `router_cluster_sync_untrusted` | `router_cluster_sync_untrusted` | gossip_service.cpp |
 | `seastar_ranvier_router_native_routing_key_matches_total` | `router_native_routing_key_matches_total` | router_service.cpp |
+| `seastar_ranvier_router_native_{aligned,misaligned,unsupported,quarantined}_backends` | `router_native_*_backends` (gauges, shard 0; read from the end dump, never differenced) | alignment_prober.cpp |
 | `seastar_ranvier_router_replica_dispatches_total` | `router_replica_dispatches_total` | router_service.cpp |
 | `seastar_ranvier_router_replica_designations_total` | `router_replica_designations_total` | router_service.cpp |
 | `seastar_ranvier_router_replica_holders_saturated_total` | `router_replica_holders_saturated_total` | router_service.cpp |

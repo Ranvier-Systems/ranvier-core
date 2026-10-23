@@ -210,6 +210,15 @@ class BenchmarkResults:
     replica_dispatches_total: Optional[int] = None
     replica_designations_total: Optional[int] = None
     replica_holders_saturated_total: Optional[int] = None
+    # Alignment probe (BACKLOG §30, "router_native_*_backends" gauges on each
+    # node's shard 0): backends by latest verdict at the end of the arm, summed
+    # over nodes (each node probes every backend, so 8 backends x 3 nodes = 24).
+    # misaligned > 0 means those backends' streams can never match a routing
+    # key; quarantined counts the ones routed as stream-off because of it.
+    native_aligned_backends: Optional[int] = None
+    native_misaligned_backends: Optional[int] = None
+    native_unsupported_backends: Optional[int] = None
+    native_quarantined_backends: Optional[int] = None
     # Per-backend request distribution — printed as a sorted list so prefix-
     # concentration hot-spotting shows up directly in the comparison output.
     # Aggregated across ALL ranvier nodes (see parse_prometheus_report).
@@ -690,9 +699,17 @@ _REPLICA_KEYS = (
     "replica_designations_total",
     "replica_holders_saturated_total",
 )
+# Alignment-probe gauges (alignment_prober.cpp, BACKLOG §30). Gauges, so they
+# are read from the end-of-arm dump and never differenced against the start.
+_ALIGNMENT_KEYS = (
+    "native_aligned_backends",
+    "native_misaligned_backends",
+    "native_unsupported_backends",
+    "native_quarantined_backends",
+)
 _PROM_NATIVE_RES = {
     k: re.compile(r"^(?:seastar_)?ranvier_router_" + k + r"(?:\{[^}]*\})?\s+([0-9.eE+-]+)")
-    for k in _NATIVE_KEYS + _REPLICA_KEYS
+    for k in _NATIVE_KEYS + _REPLICA_KEYS + _ALIGNMENT_KEYS
 }
 # NOTE: backend_active_requests is an instantaneous gauge — it reads ~0 when
 # scraped after traffic has drained at end-of-run, so it is a poor distribution
@@ -890,6 +907,9 @@ def parse_prometheus_report(report_dir: str) -> Dict[str, Any]:
             if k in part:
                 delta = int(part[k]) - int(start.get(k, 0))
                 sums[k] = sums.get(k, 0) + max(delta, 0)  # a restart mid-run resets to 0
+        for k in _ALIGNMENT_KEYS:
+            if k in part:
+                sums[k] = sums.get(k, 0) + int(part[k])  # gauge: end value, not a delta
         if "residency_cache_size" in part:
             v = int(part["residency_cache_size"])
             res_size = v if res_size is None else max(res_size, v)
@@ -1114,7 +1134,7 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.cache_states_received_total = prom["cache_states_received_total"]
     if "residency_cache_size" in prom:
         results.residency_cache_size = prom["residency_cache_size"]
-    for key in _NATIVE_KEYS + _REPLICA_KEYS:
+    for key in _NATIVE_KEYS + _REPLICA_KEYS + _ALIGNMENT_KEYS:
         if key in prom:
             setattr(results, key, prom[key])
     if "nodes_scraped" in prom:
@@ -1886,6 +1906,23 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
                     "  -> replica_dispatches=0 with designations > 0: the stream never confirmed a "
                     "replica (evicted before overflow reached it); the mechanism is untested, not refuted."
                 )
+            def _alignment_row(r) -> str:
+                return ", ".join(
+                    f"{k[len('native_'):-len('_backends')]}={_fmt_count(getattr(r, k, None))}"
+                    for k in _ALIGNMENT_KEYS
+                )
+            if any(getattr(r, k, None) is not None for r in (baseline, new) for k in _ALIGNMENT_KEYS):
+                lines.append(f"  alignment probe (baseline):  {_alignment_row(baseline)}")
+                lines.append(f"  alignment probe (new):       {_alignment_row(new)}"
+                             "  [backends by verdict, summed over nodes]")
+                if (new.native_misaligned_backends or 0) > 0:
+                    lines.append(
+                        f"  -> alignment probe: {new.native_misaligned_backends} backend-node pair(s) "
+                        "MISALIGNED on the new arm: Ranvier and those backends tokenize the routing "
+                        "prefix differently, so their streams can never match a routing key "
+                        f"({new.native_quarantined_backends or 0} quarantined to stream-off routing). "
+                        "Check --chat-template and --tokenizer (BACKLOG §30)."
+                    )
             if kv_requested and not _native_any(new):
                 lines.append(
                     "  -> native KV events REQUESTED (--kv-events) but kv_ops=0 on the new arm: the ZMQ "
