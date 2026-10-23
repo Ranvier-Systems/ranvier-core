@@ -2360,7 +2360,15 @@ whitespace, a code fence, non-ASCII. `tests/tokenizer_parity/llama2_tokenizer_pa
   `unsupported`, no warning. Correctness of the aligned verdict is the unit tests plus the GPU
   check in Step 7. Needs a mock that also publishes a minimal KV-event stream for eligibility, or
   a test hook that marks the stream fresh; pick whichever is smaller when implementing.
-- **Status:** [ ] Pending
+- **Status:** [x] Written (2026-10-23), not yet run: the mock publishes a real stream rather than a
+  test hook marking it fresh, since a hook would need a production admin endpoint. `mock_backend.py`
+  gains `POST /tokenize` (all-zero ids, or 404 via `/admin/tokenize-mode`) and an optional ZMQ PUB
+  publisher (`MOCK_KV_EVENTS_PORT`, `/admin/kv-events?action=start|clear|stop`: hand-encoded msgpack
+  AllBlocksCleared and empty keepalive batches, checked against `kv_event_decoder.hpp` in the
+  sandbox); the mock image installs `pyzmq==26.2.0`; compose enables `kv_events` on node 1 only and
+  binds the publisher on backend1. `test_kv_alignment_probe.py` registers its own backend id with
+  `kv_events_port`, waits for `misaligned@0` + quarantined, then switches to 404, clears, and waits
+  for `unsupported` with the quarantine lifted. Added to `test-integration-full` and `-fast`.
 
 #### Step 6: Documentation
 - **Files:** `docs/internals/cache-residency-routing.md` ("Self-checks": the probe first, then

@@ -47,10 +47,26 @@ Test-only knobs (all default to off so the happy path is unchanged):
     - ``MOCK_GPU_CACHE_USAGE`` env var: initial usage fraction (0.0-1.0).
     - ``POST /admin/cache-usage?perc=N``: update the reported usage at runtime
       (residency = 1 - usage; high usage makes this backend look cache-cold).
+
+* Alignment probe target (BACKLOG section 30)
+    - ``POST /tokenize`` answers like vLLM's (``{"count", "max_model_len",
+      "tokens"}``) with ids no real conversation tokenizes to (all zeros), so
+      Ranvier's probe reads it as misaligned; or 404, read as unsupported.
+    - ``POST /admin/tokenize-mode?mode=ids|404`` switches between the two.
+
+* Native KV-event stream (BACKLOG section 30; needs pyzmq)
+    - ``MOCK_KV_EVENTS_PORT`` env var: bind a ZMQ PUB socket on that port
+      (vLLM's ``--kv-events-config`` publisher shape: frames [topic, seq as 8
+      bytes big-endian, msgpack KVEventBatch]). Silent until started.
+    - ``POST /admin/kv-events?action=start|clear|stop``: start publishing
+      (an AllBlocksCleared batch, then empty keepalive batches every 0.5 s),
+      publish one more AllBlocksCleared (an engine restart, as far as the
+      subscriber can tell), or stop.
 """
 
 import json
 import os
+import struct
 import sys
 import threading
 import time
@@ -116,6 +132,80 @@ _request_log_lock = threading.Lock()
 # trip any reasonable client timeout; daemon_threads=True ensures the worker
 # is reaped on server shutdown.
 TIMEOUT_FAILURE_SLEEP_S = 60.0
+
+
+# Alignment probe target (BACKLOG section 30). All-zero ids: no real
+# conversation tokenizes to them, so the probe is guaranteed to read the
+# backend as misaligned at token 0. "404" makes /tokenize unsupported.
+VALID_TOKENIZE_MODES = frozenset({"ids", "404"})
+_tokenize_mode = "ids"
+TOKENIZE_IDS = [0] * 256
+
+KV_EVENTS_PORT = int(os.environ.get("MOCK_KV_EVENTS_PORT", "0") or "0")
+
+
+def _kv_event_batch(clear: bool) -> bytes:
+    """A msgpack KVEventBatch, hand-encoded: [ts: float64, events].
+
+    ``clear`` carries one AllBlocksCleared event (["AllBlocksCleared"]); otherwise
+    the events array is empty (a keepalive). See src/kv_event_decoder.hpp.
+    """
+    ts = b"\xcb" + struct.pack(">d", time.time())
+    events = b"\x91\x91\xb0AllBlocksCleared" if clear else b"\x90"
+    return b"\x92" + ts + events
+
+
+class KvEventPublisher:
+    """Minimal vLLM KV-event publisher: enough for a stream to be live."""
+
+    INTERVAL_S = 0.5
+
+    def __init__(self, port: int):
+        import zmq  # optional dependency, only when MOCK_KV_EVENTS_PORT is set
+        self._socket = zmq.Context.instance().socket(zmq.PUB)
+        self._socket.bind(f"tcp://*:{port}")
+        self._lock = threading.Lock()
+        self._publishing = False
+        self._pending_clear = False
+        self._seq = 0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def command(self, action: str) -> dict:
+        with self._lock:
+            if action == "start":
+                self._publishing = True
+                self._pending_clear = True
+            elif action == "clear":
+                self._pending_clear = True
+            elif action == "stop":
+                self._publishing = False
+            return {"publishing": self._publishing, "seq": self._seq}
+
+    def _run(self):
+        while True:
+            with self._lock:
+                frame = None
+                if self._publishing:
+                    frame = [b"", self._seq.to_bytes(8, "big"),
+                             _kv_event_batch(self._pending_clear)]
+                    self._pending_clear = False
+                    self._seq += 1
+            if frame is not None:
+                try:
+                    self._socket.send_multipart(frame)
+                except Exception as e:  # keep publishing on a transient error
+                    print(f"[Backend {BACKEND_ID}] kv-event publish failed: {e}", flush=True)
+            time.sleep(self.INTERVAL_S)
+
+
+_kv_publisher = None
+if KV_EVENTS_PORT > 0:
+    try:
+        _kv_publisher = KvEventPublisher(KV_EVENTS_PORT)
+        print(f"[Backend {BACKEND_ID}] KV-event publisher bound on port {KV_EVENTS_PORT}",
+              flush=True)
+    except Exception as e:  # pyzmq missing or bind failure: endpoint reports 503
+        print(f"[Backend {BACKEND_ID}] KV-event publisher unavailable: {e}", flush=True)
 
 
 def _snapshot_state():
@@ -229,11 +319,59 @@ class MockBackendHandler(BaseHTTPRequestHandler):
             self._handle_admin_prefix_echo()
         elif parsed.path == "/admin/cache-usage":
             self._handle_admin_cache_usage()
+        elif parsed.path == "/tokenize":
+            self._handle_tokenize()
+        elif parsed.path == "/admin/tokenize-mode":
+            self._handle_admin_tokenize_mode()
+        elif parsed.path == "/admin/kv-events":
+            self._handle_admin_kv_events()
         else:
             print(f"[Backend {BACKEND_ID}] Unknown path: {parsed.path}", flush=True)
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
+
+    # ---- alignment probe target (BACKLOG section 30) --------------------------
+
+    def _handle_tokenize(self):
+        """POST /tokenize: vLLM-shaped ids that cannot match, or 404."""
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length > 0:
+            self.rfile.read(min(length, 1 << 20))  # drain the probe body
+        with _state_lock:
+            mode = _tokenize_mode
+        if mode == "404":
+            self._send_json(404, {"detail": "Not Found"})
+            return
+        self._send_json(200, {"count": len(TOKENIZE_IDS), "max_model_len": 8192,
+                              "tokens": TOKENIZE_IDS, "token_strs": None})
+
+    def _handle_admin_tokenize_mode(self):
+        """POST /admin/tokenize-mode?mode=ids|404"""
+        global _tokenize_mode
+        mode = parse_qs(urlparse(self.path).query).get("mode", ["ids"])[0]
+        if mode not in VALID_TOKENIZE_MODES:
+            self._send_json(400, {"error": f"invalid mode: {mode!r}",
+                                  "valid": sorted(VALID_TOKENIZE_MODES)})
+            return
+        with _state_lock:
+            _tokenize_mode = mode
+        print(f"[Backend {BACKEND_ID}] Tokenize mode set to: {mode}", flush=True)
+        self._send_json(200, {"tokenize_mode": mode})
+
+    def _handle_admin_kv_events(self):
+        """POST /admin/kv-events?action=start|clear|stop"""
+        action = parse_qs(urlparse(self.path).query).get("action", [""])[0]
+        if _kv_publisher is None:
+            self._send_json(503, {"error": "no KV-event publisher (MOCK_KV_EVENTS_PORT unset "
+                                           "or pyzmq missing)"})
+            return
+        if action not in ("start", "clear", "stop"):
+            self._send_json(400, {"error": f"invalid action: {action!r}"})
+            return
+        state = _kv_publisher.command(action)
+        print(f"[Backend {BACKEND_ID}] KV events {action}: {state}", flush=True)
+        self._send_json(200, state)
 
     # ---- admin endpoints -----------------------------------------------------
 

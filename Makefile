@@ -361,47 +361,50 @@ test-integration-full:
 	fi
 	@echo "Starting integration tests..."
 	@echo ""
-	@echo "=== Test Suite 1/14: Cluster Behavior ==="
+	@echo "=== Test Suite 1/15: Cluster Behavior ==="
 	@python3 tests/integration/test_cluster.py
 	@echo ""
-	@echo "=== Test Suite 2/14: Prefix Routing ==="
+	@echo "=== Test Suite 2/15: Prefix Routing ==="
 	@python3 tests/integration/test_prefix_routing.py
 	@echo ""
-	@echo "=== Test Suite 3/14: Graceful Shutdown ==="
+	@echo "=== Test Suite 3/15: Graceful Shutdown ==="
 	@python3 tests/integration/test_graceful_shutdown.py
 	@echo ""
-	@echo "=== Test Suite 4/14: Negative Paths ==="
+	@echo "=== Test Suite 4/15: Negative Paths ==="
 	@python3 tests/integration/test_negative_paths.py
 	@echo ""
-	@echo "=== Test Suite 5/14: Load-Aware Routing ==="
+	@echo "=== Test Suite 5/15: Load-Aware Routing ==="
 	@python3 tests/integration/test_load_aware_routing.py
 	@echo ""
-	@echo "=== Test Suite 6/14: Intelligence Layer ==="
+	@echo "=== Test Suite 6/15: Intelligence Layer ==="
 	@python3 -m pytest tests/integration/test_intelligence_layer.py -v -s
 	@echo ""
-	@echo "=== Test Suite 7/14: HTTP Pipeline ==="
+	@echo "=== Test Suite 7/15: HTTP Pipeline ==="
 	@python3 -m pytest tests/integration/test_http_pipeline.py -v -s
 	@echo ""
-	@echo "=== Test Suite 8/14: Streaming ==="
+	@echo "=== Test Suite 8/15: Streaming ==="
 	@python3 -m pytest tests/integration/test_streaming.py -v -s
 	@echo ""
-	@echo "=== Test Suite 9/14: Metrics ==="
+	@echo "=== Test Suite 9/15: Metrics ==="
 	@python3 -m pytest tests/integration/test_metrics.py -v -s
 	@echo ""
-	@echo "=== Test Suite 10/14: Persistence Recovery ==="
+	@echo "=== Test Suite 10/15: Persistence Recovery ==="
 	@python3 tests/integration/test_persistence_recovery.py
 	@echo ""
-	@echo "=== Test Suite 11/14: Health & Circuit Breaker ==="
+	@echo "=== Test Suite 11/15: Health & Circuit Breaker ==="
 	@python3 tests/integration/test_health_circuit_breaker.py
 	@echo ""
-	@echo "=== Test Suite 12/14: Config Loading ==="
+	@echo "=== Test Suite 12/15: Config Loading ==="
 	@python3 tests/integration/test_config_loading.py
 	@echo ""
-	@echo "=== Test Suite 13/14: Attribution Cardinality ==="
+	@echo "=== Test Suite 13/15: Attribution Cardinality ==="
 	@python3 tests/integration/test_attribution_cardinality.py
 	@echo ""
-	@echo "=== Test Suite 14/14: Admin Keys Usage ==="
+	@echo "=== Test Suite 14/15: Admin Keys Usage ==="
 	@python3 tests/integration/test_admin_keys_usage.py
+	@echo ""
+	@echo "=== Test Suite 15/15: KV Alignment Probe ==="
+	@python3 tests/integration/test_kv_alignment_probe.py
 
 # Run only the single-node-capable integration suites (fast path).
 # The speed win comes from skipping the slow multi-node suites
@@ -416,7 +419,7 @@ test-integration-fast:
 	@echo "Running Single-Node Integration Tests"
 	@echo "======================================"
 	@echo ""
-	@echo "Suites: test_http_pipeline, test_streaming, test_metrics, test_config_loading, test_attribution_cardinality, test_admin_keys_usage"
+	@echo "Suites: test_http_pipeline, test_streaming, test_metrics, test_config_loading, test_attribution_cardinality, test_admin_keys_usage, test_kv_alignment_probe"
 	@echo "(skipping multi-node suites: cluster, prefix_routing,"
 	@echo " load_aware_routing, negative_paths, graceful_shutdown,"
 	@echo " intelligence_layer)"
@@ -435,23 +438,26 @@ test-integration-fast:
 		pip3 install --user pytest || pip install --user pytest; \
 	fi
 	@echo ""
-	@echo "=== Test Suite 1/6: HTTP Pipeline ==="
+	@echo "=== Test Suite 1/7: HTTP Pipeline ==="
 	@python3 -m pytest tests/integration/test_http_pipeline.py -v -s
 	@echo ""
-	@echo "=== Test Suite 2/6: Streaming ==="
+	@echo "=== Test Suite 2/7: Streaming ==="
 	@python3 -m pytest tests/integration/test_streaming.py -v -s
 	@echo ""
-	@echo "=== Test Suite 3/6: Metrics ==="
+	@echo "=== Test Suite 3/7: Metrics ==="
 	@python3 -m pytest tests/integration/test_metrics.py -v -s
 	@echo ""
-	@echo "=== Test Suite 4/6: Config Loading ==="
+	@echo "=== Test Suite 4/7: Config Loading ==="
 	@python3 -m pytest tests/integration/test_config_loading.py -v -s
 	@echo ""
-	@echo "=== Test Suite 5/6: Attribution Cardinality ==="
+	@echo "=== Test Suite 5/7: Attribution Cardinality ==="
 	@python3 -m pytest tests/integration/test_attribution_cardinality.py -v -s
 	@echo ""
-	@echo "=== Test Suite 6/6: Admin Keys Usage ==="
+	@echo "=== Test Suite 6/7: Admin Keys Usage ==="
 	@python3 -m pytest tests/integration/test_admin_keys_usage.py -v -s
+	@echo ""
+	@echo "=== Test Suite 7/7: KV Alignment Probe ==="
+	@python3 -m pytest tests/integration/test_kv_alignment_probe.py -v -s
 
 # Run integration tests via pytest (single command, JUnit XML output for CI)
 # pytest discovers both unittest.TestCase and native pytest tests automatically

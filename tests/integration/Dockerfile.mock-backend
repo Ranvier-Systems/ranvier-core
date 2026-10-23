@@ -4,6 +4,10 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY mock_backend.py .
 
+# pyzmq backs the optional KV-event publisher (MOCK_KV_EVENTS_PORT); the mock
+# runs without it and reports the publisher unavailable.
+RUN pip install --no-cache-dir pyzmq==26.2.0
+
 # Make executable
 RUN chmod +x mock_backend.py
 
