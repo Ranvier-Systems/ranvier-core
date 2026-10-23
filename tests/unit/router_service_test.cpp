@@ -2132,6 +2132,73 @@ TEST_F(RouterServiceTest, ProbeStateIsNeverFreshWithStreamOff) {
     EXPECT_FALSE(RouterService::native_stream_probe_state(1).fresh);
 }
 
+// A quarantined stream (misaligned verdict, kv_events.alignment_probe:
+// quarantine) stops vouching for anything: the home's ART hit is not checked
+// against the index at all, so neither verified-cold nor verified-hit fires.
+TEST_F(RouterServiceTest, QuarantinedStreamIsNotConsultedForTheHome) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {721, 722, 723, 724};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_native_fresh_for_testing(1);
+    RouterService::set_native_alignment_local(
+        1, {RouterService::NativeAlignment::MISALIGNED, 0, /*quarantined=*/true});
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.verified_cold_honored, 0u);
+    EXPECT_EQ(stats.verified_hits, 0u);
+    EXPECT_EQ(stats.absence_untrusted, 0u);
+    // Still probe-eligible, so a restart with the right model can lift it.
+    EXPECT_TRUE(RouterService::native_stream_probe_state(1).fresh);
+}
+
+TEST_F(RouterServiceTest, QuarantinedBackendIsNeverAVerifiedHolder) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {725, 726, 727, 728};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.9);
+    RouterService::set_native_fresh_for_testing(1);
+    RouterService::set_native_fresh_for_testing(2);
+    RouterService::update_prefix_hash_index_for_testing(
+        hash_prefix(tokens.data(), tokens.size(), 1), 2);
+    RouterService::set_native_alignment_local(
+        2, {RouterService::NativeAlignment::MISALIGNED, 3, /*quarantined=*/true});
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);  // verified cold on the home, no holder
+    auto stats = RouterService::get_native_kv_stats();
+    EXPECT_EQ(stats.holder_redirects, 0u);
+    EXPECT_EQ(stats.verified_cold_honored, 1u);
+}
+
+TEST_F(RouterServiceTest, WarnOnlyVerdictLeavesTheStreamTrusted) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {729, 730, 731, 732};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_native_fresh_for_testing(1);
+    RouterService::set_native_alignment_local(
+        1, {RouterService::NativeAlignment::MISALIGNED, 0, /*quarantined=*/false});
+
+    router_->route_request(tokens);
+    EXPECT_EQ(RouterService::get_native_kv_stats().verified_cold_honored, 1u);
+}
+
+TEST_F(RouterServiceTest, AlignmentStateRoundTripsAndPendingClears) {
+    RouterService::set_native_alignment_local(
+        4, {RouterService::NativeAlignment::MISALIGNED, 17, true});
+    auto s = RouterService::native_alignment(4);
+    EXPECT_EQ(s.verdict, RouterService::NativeAlignment::MISALIGNED);
+    EXPECT_EQ(s.first_divergence, 17u);
+    EXPECT_TRUE(s.quarantined);
+
+    RouterService::set_native_alignment_local(4, {});
+    s = RouterService::native_alignment(4);
+    EXPECT_EQ(s.verdict, RouterService::NativeAlignment::PENDING);
+    EXPECT_FALSE(s.quarantined);
+}
+
 // =============================================================================
 // 2. Route TTL Expiration and Cleanup
 // =============================================================================

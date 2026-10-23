@@ -795,9 +795,11 @@ void Application::init_health_checker() {
     // Native-stream alignment probe (BACKLOG section 30): asks each backend with a
     // live KV-event stream whether its /tokenize agrees with Ranvier's routing
     // tokens. Inert without a stream (no backend is ever fresh), so it needs no
-    // build guard. Warn-only for now.
-    if (_config.kv_events.enabled && _tokenizer_started) {
+    // build guard. kv_events.alignment_probe: quarantine (default) | warn | off.
+    if (_config.kv_events.enabled && _tokenizer_started &&
+        _config.kv_events.alignment_probe != "off") {
         AlignmentProber::Config pc;
+        pc.quarantine = _config.kv_events.alignment_probe == "quarantine";
         pc.chat_template = ChatTemplate(
             parse_chat_template_format(_config.assets.chat_template_format));
         pc.block_alignment = _config.routing.block_alignment;
@@ -805,6 +807,7 @@ void Application::init_health_checker() {
         pc.indexed_depth = _config.kv_events.max_indexed_token_depth;
         pc.tokenizer_path = _config.assets.tokenizer_path;
         _alignment_prober = std::make_unique<AlignmentProber>(std::move(pc), _tokenizer);
+        _alignment_prober->start();  // metrics (Rule #6: stop() after the health loop)
         auto* prober = _alignment_prober.get();
         _health_checker->set_alignment_probe_hook(
             [prober](HealthService::BackendList backends) {
@@ -1888,8 +1891,13 @@ seastar::future<> Application::stop_core_services(
 
     if (_health_checker) {
         parallel_stops.push_back(
-            _health_checker->stop().then([] {
+            _health_checker->stop().then([this] {
                 log_main.debug("  Health checker stopped");
+                // The loop awaited any probe in flight; the prober's metrics
+                // can go now (Rule #6).
+                if (_alignment_prober) {
+                    _alignment_prober->stop();
+                }
             }).handle_exception([](auto ep) {
                 log_main.warn("  Health checker stop error (ignored)");
             })

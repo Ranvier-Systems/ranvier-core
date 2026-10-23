@@ -923,6 +923,9 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint32_t>("RANVIER_KV_EVENTS_REPLAY_TIMEOUT_MS")) {
         kv_events.replay_timeout_ms = *v;
     }
+    if (auto v = get_env("RANVIER_KV_EVENTS_ALIGNMENT_PROBE")) {
+        kv_events.alignment_probe = *v;
+    }
 
     // Cache events overrides
     if (auto v = get_env("RANVIER_CACHE_EVENTS_ENABLED")) {
@@ -1923,6 +1926,9 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             if (kv["replay_timeout_ms"]) {
                 config.kv_events.replay_timeout_ms = kv["replay_timeout_ms"].as<uint32_t>();
             }
+            if (kv["alignment_probe"]) {
+                config.kv_events.alignment_probe = kv["alignment_probe"].as<std::string>();
+            }
         }
 
         // Dashboard section
@@ -2176,6 +2182,10 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
         if (config.kv_events.replay_timeout_ms < 100 ||
             config.kv_events.replay_timeout_ms > 60000) {
             return "kv_events.replay_timeout_ms must be between 100 and 60000";
+        }
+        const auto& probe = config.kv_events.alignment_probe;
+        if (probe != "off" && probe != "warn" && probe != "quarantine") {
+            return "kv_events.alignment_probe must be off, warn or quarantine";
         }
     }
 

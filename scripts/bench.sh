@@ -2582,6 +2582,20 @@ native_kv_ops_total() {
     cat "$dir"/prometheus_metrics_node*.txt 2>/dev/null \
         | awk '/^(seastar_)?ranvier_router_native_kv_ops_total/ { s += $NF } END { printf "%d", s }'
 }
+# Alignment-probe verdicts at the end of an arm (BACKLOG section 30): the
+# router_native_<verdict>_backends gauges summed over nodes, as
+# "aligned=A misaligned=M unsupported=U quarantined=Q". Empty on images
+# without the probe.
+native_alignment_summary() {
+    local dir="$1"
+    cat "$dir"/prometheus_metrics_node*.txt 2>/dev/null | awk '
+        /^(seastar_)?ranvier_router_native_(aligned|misaligned|unsupported|quarantined)_backends/ {
+            name = $1; sub(/\{.*/, "", name); sub(/^(seastar_)?ranvier_router_native_/, "", name)
+            sub(/_backends$/, "", name); v[name] += $NF; seen = 1
+        }
+        END { if (seen) printf "aligned=%d misaligned=%d unsupported=%d quarantined=%d",
+                               v["aligned"], v["misaligned"], v["unsupported"], v["quarantined"] }'
+}
 reset_vllm_prefix_cache() {
     local label="$1" acked=0 total=0 i host port code
     for ((i=0; i<NUM_BACKENDS; i++)); do
@@ -2680,9 +2694,14 @@ if [[ "$COMPARE" = true ]]; then
     # materialization run in every routing mode), so both should be nonzero.
     NATIVE_OPS_BASELINE="n/a"
     NATIVE_OPS_PREFIX="n/a"
+    NATIVE_ALIGNMENT_PREFIX=""
     if [[ "$KV_EVENTS" = true ]]; then
         NATIVE_OPS_BASELINE=$(native_kv_ops_total "$REPORT_RR")
         NATIVE_OPS_PREFIX=$(native_kv_ops_total "$REPORT_PREFIX")
+        NATIVE_ALIGNMENT_PREFIX=$(native_alignment_summary "$REPORT_PREFIX")
+        if [[ "$NATIVE_ALIGNMENT_PREFIX" =~ misaligned=([1-9][0-9]*) ]]; then
+            log_warn "Alignment probe: ${BASH_REMATCH[1]} backend-node pair(s) MISALIGNED at the end of the prefix arm (${NATIVE_ALIGNMENT_PREFIX}): Ranvier and those backends tokenize differently. Check --chat-template and --tokenizer (BACKLOG section 30)."
+        fi
         if [[ "$NATIVE_OPS_PREFIX" == "0" ]]; then
             log_error "--kv-events requested but router_native_kv_ops_total is 0 at the end of the prefix arm: the ZMQ stream never delivered. Check /tmp/vllm_gpu*.log for the --kv-events-config publisher and the Ranvier logs for 'KV-event subscriber'. The compare header records it; read this run as probabilistic residency."
         else
@@ -2705,7 +2724,7 @@ if [[ "$COMPARE" = true ]]; then
             echo "vLLM KV cache NOT reset between arms (--no-kv-reset; Ranvier-only restart)"
         fi
         if [[ "$KV_EVENTS" = true ]]; then
-            echo "Native KV events: ON (--kv-events; vLLM --kv-events-config zmq on ports ${KV_EVENTS_PORT_START}+, RANVIER_KV_EVENTS_ENABLED=true, materialize=${RANVIER_KV_EVENTS_MATERIALIZE:-false}, indexed depth=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}, replication=${RANVIER_REPLICATION_MAX_HOLDERS:-0}, chat template=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}, tokenizer=${RANVIER_TOKENIZER_HOST_FILE:-bundled gpt2}); router_native_kv_ops_total at end of arm: ${BASELINE_MODE}=${NATIVE_OPS_BASELINE} prefix=${NATIVE_OPS_PREFIX}"
+            echo "Native KV events: ON (--kv-events; vLLM --kv-events-config zmq on ports ${KV_EVENTS_PORT_START}+, RANVIER_KV_EVENTS_ENABLED=true, materialize=${RANVIER_KV_EVENTS_MATERIALIZE:-false}, indexed depth=${RANVIER_KV_EVENTS_MAX_INDEXED_TOKEN_DEPTH:-2048}, replication=${RANVIER_REPLICATION_MAX_HOLDERS:-0}, chat template=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}, tokenizer=${RANVIER_TOKENIZER_HOST_FILE:-bundled gpt2}); router_native_kv_ops_total at end of arm: ${BASELINE_MODE}=${NATIVE_OPS_BASELINE} prefix=${NATIVE_OPS_PREFIX}; alignment probe (prefix arm, backend-node pairs): ${NATIVE_ALIGNMENT_PREFIX:-n/a}"
             if [[ -n "$TOKENIZER_ALIGNMENT_WARNING" ]]; then
                 echo "WARNING: --kv-events but ${TOKENIZER_ALIGNMENT_WARNING}: Ranvier did not tokenize as vLLM does, so no native KV event could match a routing key; read every native counter below as unaligned (BACKLOG section 29)."
             fi

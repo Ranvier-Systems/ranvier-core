@@ -2901,6 +2901,40 @@ kv_events:
     EXPECT_NE(error->find("replay_timeout_ms"), std::string::npos);
 }
 
+// Alignment probe (BACKLOG section 30): quarantine by default.
+TEST_F(ConfigTest, KvEventsAlignmentProbeDefaultsToQuarantine) {
+    auto config = RanvierConfig::defaults();
+    EXPECT_EQ(config.kv_events.alignment_probe, "quarantine");
+}
+
+TEST_F(ConfigTest, KvEventsAlignmentProbeParsesAndOverrides) {
+    auto config = RanvierConfig::load_from_string(R"(
+kv_events:
+  enabled: true
+  alignment_probe: warn
+)");
+    EXPECT_EQ(config.kv_events.alignment_probe, "warn");
+    EXPECT_FALSE(RanvierConfig::validate(config).has_value());
+
+    setenv("RANVIER_KV_EVENTS_ALIGNMENT_PROBE", "off", 1);
+    auto from_env = RanvierConfig::defaults();
+    EXPECT_EQ(from_env.kv_events.alignment_probe, "off");
+    unsetenv("RANVIER_KV_EVENTS_ALIGNMENT_PROBE");
+}
+
+TEST_F(ConfigTest, KvEventsAlignmentProbeRejectsUnknownMode) {
+    RanvierConfig config;
+    config.kv_events.enabled = true;
+    config.kv_events.alignment_probe = "refuse";
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("alignment_probe"), std::string::npos);
+
+    // Disabled feature: not enforced, like the other kv_events bounds.
+    config.kv_events.enabled = false;
+    EXPECT_FALSE(RanvierConfig::validate(config).has_value());
+}
+
 TEST_F(ConfigTest, StaticBackendsReplayPortRequiresEventsPort) {
     auto config = RanvierConfig::load_from_string(R"(
 backends:

@@ -217,7 +217,9 @@ The template only helps with the matching tokenizer: `assets.tokenizer_path`
 (`RANVIER_TOKENIZER_PATH`) must be the served model's `tokenizer.json`. Affinity itself only needs
 self-consistent keys, so the bundled GPT-2 tokenizer works for it, but the native KV-event stream
 needs both to match the backend exactly (`cache-residency-routing.md`, "Requirement: Ranvier must
-tokenize as the backend does").
+tokenize as the backend does"). With `kv_events` on, the alignment probe checks this per backend
+against its `/tokenize` and reports the verdict in `/admin/backends/metrics` (`kv_alignment`,
+`kv_quarantined`); a misaligned backend's stream is quarantined by default.
 
 Ensure your `prefix_token_count` is computed against the same format Ranvier uses. When in doubt, use the automatic system message detection (Option 1) instead of client-provided boundaries.
 

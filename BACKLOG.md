@@ -2322,7 +2322,14 @@ whitespace, a code fence, non-ASCII. `tests/tokenizer_parity/llama2_tokenizer_pa
 - **Concerns:** cross-shard broadcast (`smp::submit_to` / `invoke_on_all`), bounded set; hot path
   gains one set lookup on an already-branchy path. `docs/internals/cache-residency-routing.md`
   changes in the same step (authoritative deep-dive).
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-23): `kv_events.alignment_probe` (default `quarantine`; env
+  `RANVIER_KV_EVENTS_ALIGNMENT_PROBE`; validated when `kv_events.enabled`). The verdict is a
+  per-shard `native_kv.alignment` map rather than a bare set, so Step 4's admin field reads it
+  shard-locally; `native_residency_fresh` now excludes quarantined backends and the probe reads a
+  separate `native_stream_live`, so a quarantined stream stays probe-eligible. Every verdict change
+  is broadcast (`set_native_alignment_global`, a plain struct over `invoke_on_all`); removed
+  backends are cleared. Router tests: not consulted for the home, never a holder, warn leaves the
+  stream trusted, PENDING clears; config tests for default, YAML/env and validation.
 
 #### Step 4: Observability
 - **Depends on:** Step 2
@@ -2334,7 +2341,14 @@ whitespace, a code fence, non-ASCII. `tests/tokenizer_parity/llama2_tokenizer_pa
   backend is misaligned), `scripts/bench.sh` (compare header: `alignment probe: aligned 8/8`),
   `.dev-context/claude-locust-sync-map.md` (metric names)
 - **Concerns:** Rule #6 (deregister in stop()); metric-name sync with the parser.
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-23): counters `router_native_alignment_probes_{aligned,misaligned,
+  unsupported,failed}_total` and gauges `router_native_{aligned,misaligned,unsupported,quarantined}
+  _backends`, registered by the prober on shard 0 (deregistered after the health loop stops). The
+  parser reads the gauges, not the counters: counters are differenced against the start-of-run
+  snapshot and a probe runs at engine start, so they would read 0. `/admin/backends/metrics` gains
+  `kv_alignment` and `kv_quarantined` (shard-local, from the broadcast verdict); the compare gains
+  two "alignment probe" rows and a warning on any misaligned pair; `bench.sh` adds the prefix arm's
+  verdicts to the header and warns. Parser tests: gauges summed over nodes, not differenced.
 
 #### Step 5: Integration test against the mock backend
 - **Depends on:** Steps 2–4
@@ -2346,13 +2360,23 @@ whitespace, a code fence, non-ASCII. `tests/tokenizer_parity/llama2_tokenizer_pa
   `unsupported`, no warning. Correctness of the aligned verdict is the unit tests plus the GPU
   check in Step 7. Needs a mock that also publishes a minimal KV-event stream for eligibility, or
   a test hook that marks the stream fresh; pick whichever is smaller when implementing.
-- **Status:** [ ] Pending
+- **Status:** [x] Written (2026-10-23), not yet run: the mock publishes a real stream rather than a
+  test hook marking it fresh, since a hook would need a production admin endpoint. `mock_backend.py`
+  gains `POST /tokenize` (all-zero ids, or 404 via `/admin/tokenize-mode`) and an optional ZMQ PUB
+  publisher (`MOCK_KV_EVENTS_PORT`, `/admin/kv-events?action=start|clear|stop`: hand-encoded msgpack
+  AllBlocksCleared and empty keepalive batches, checked against `kv_event_decoder.hpp` in the
+  sandbox); the mock image installs `pyzmq==26.2.0`; compose enables `kv_events` on node 1 only and
+  binds the publisher on backend1. `test_kv_alignment_probe.py` registers its own backend id with
+  `kv_events_port`, waits for `misaligned@0` + quarantined, then switches to 404, clears, and waits
+  for `unsupported` with the quarantine lifted. Added to `test-integration-full` and `-fast`.
 
 #### Step 6: Documentation
 - **Files:** `docs/internals/cache-residency-routing.md` ("Self-checks": the probe first, then
   the counter and the heuristics), `docs/internals/prefix-affinity-routing.md` (one line under
   the template table), `CHANGELOG.md`, this section's statuses
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-23): `cache-residency-routing.md` "Self-checks" leads with the probe and
+  the quarantine (landed with Step 3), one line in `prefix-affinity-routing.md`, CHANGELOG, the
+  `kv_events_alignment_warning` comment, and these statuses. Step 7 rides the next GPU session.
 
 #### Step 7: GPU check (rides the next GPU session; no dedicated run)
 - **Depends on:** Steps 1–6 in the image

@@ -3676,6 +3676,21 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_backend_met
         oss << "      \"cost_budget_max\": " << cost_max << ",\n";
         oss << "      \"cost_headroom_percent\": " << cost_headroom << ",\n";
 
+        // Native-stream alignment probe verdict (BACKLOG section 30), held on
+        // every shard, so this read is shard-local.
+        const auto alignment = RouterService::native_alignment(b.id);
+        oss << "      \"kv_alignment\": \"";
+        switch (alignment.verdict) {
+            case RouterService::NativeAlignment::PENDING:     oss << "pending"; break;
+            case RouterService::NativeAlignment::ALIGNED:     oss << "aligned"; break;
+            case RouterService::NativeAlignment::UNSUPPORTED: oss << "unsupported"; break;
+            case RouterService::NativeAlignment::MISALIGNED:
+                oss << "misaligned@" << alignment.first_divergence;
+                break;
+        }
+        oss << "\",\n";
+        oss << "      \"kv_quarantined\": " << (alignment.quarantined ? "true" : "false") << ",\n";
+
         oss << "      \"vllm_metrics\": {\n";
         oss << "        \"valid\": " << (vllm.valid ? "true" : "false");
 

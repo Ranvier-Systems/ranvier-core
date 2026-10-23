@@ -13,8 +13,11 @@
 // started at sequence 0 or its cache was cleared since the last verdict), so
 // an engine restart or a model swap is re-probed. Failures back off.
 //
-// Warn-only: the verdict is logged and kept here. Quarantining a misaligned
-// backend's stream is section 30 Step 3.
+// Every verdict change is broadcast to all shards
+// (RouterService::set_native_alignment_global). With `quarantine` set, a
+// misaligned backend's stream stops vouching for anything there until a later
+// probe passes: stream-off routing for that backend. Without it (warn mode)
+// the verdict is only logged and reported.
 
 #pragma once
 
@@ -28,6 +31,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <seastar/core/future.hh>
+#include <seastar/core/metrics_registration.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/net/socket_defs.hh>
 
@@ -48,6 +52,7 @@ public:
         size_t indexed_depth = 2048;
         std::chrono::milliseconds timeout{2000};  // connect + request + response
         std::string tokenizer_path;               // for the misaligned warning only
+        bool quarantine = true;                   // kv_events.alignment_probe: quarantine
     };
 
     struct Stats {
@@ -59,6 +64,11 @@ public:
 
     AlignmentProber(Config cfg, seastar::sharded<TokenizerService>& tokenizer);
 
+    // Shard 0. start() registers the metrics; stop() deregisters them (Rule #6)
+    // and must run after HealthService::stop(), which awaits any probe in flight.
+    void start();
+    void stop();
+
     // Shard 0 only. Probes every eligible backend in `backends` (bounded
     // concurrency) and prunes state for backends no longer listed.
     seastar::future<> run_cycle(std::vector<std::pair<BackendId, seastar::socket_address>> backends);
@@ -67,6 +77,9 @@ public:
     std::optional<alignment_probe::Result> verdict(BackendId id) const;
 
     Stats stats() const { return _stats; }
+
+    // Backends whose current verdict is `v` (gauges; FAILED is never stored).
+    size_t backends_with(alignment_probe::Verdict v) const;
 
     // Rule #4: one entry per tracked backend (same bound as HealthService).
     static constexpr size_t MAX_TRACKED_BACKENDS = 256;
@@ -100,7 +113,10 @@ private:
     seastar::future<> probe_one(Candidate c);
     seastar::future<std::optional<alignment_probe::HttpResponse>>
         post_tokenize(seastar::socket_address addr);
-    void record(const Candidate& c, alignment_probe::Result r, std::string_view error);
+    // Stores the outcome and logs it; true when the verdict a shard acts on
+    // changed (never for FAILED, which keeps the previous verdict).
+    bool record(const Candidate& c, alignment_probe::Result r, std::string_view error);
+    seastar::future<> publish(BackendId id);  // broadcast _state[id] to every shard
 
     Config _cfg;
     seastar::sharded<TokenizerService>& _tokenizer;
@@ -112,6 +128,7 @@ private:
     uint64_t _cycle = 0;
     uint64_t _state_overflow_drops = 0;
     Stats _stats;
+    seastar::metrics::metric_groups _metrics;
 };
 
 }  // namespace ranvier

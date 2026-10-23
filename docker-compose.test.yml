@@ -49,6 +49,9 @@ services:
       - "21434:8000"
     environment:
       - BACKEND_ID=1
+      # ZMQ PUB socket for the alignment-probe suite (test_kv_alignment_probe.py);
+      # silent until POST /admin/kv-events?action=start.
+      - MOCK_KV_EVENTS_PORT=5557
 
   backend2:
     image: ranvier-mock-backend:latest
@@ -126,6 +129,10 @@ services:
       - RANVIER_AGENT_REGISTRY_ENABLED=true
       - RANVIER_AGENT_AUTO_DETECT=true
       - RANVIER_HEALTH_ENABLE_VLLM_METRICS=true
+      # Native KV events on node 1 only (test_kv_alignment_probe.py). Inert for
+      # every other suite: no backend registers a kv_events_port, so no stream
+      # is ever fresh and routing is unchanged.
+      - RANVIER_KV_EVENTS_ENABLED=true
       - RANVIER_COST_ROUTING_ENABLED=true
     command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M", "--config", "/tmp/ranvier.yaml"]
     depends_on:
