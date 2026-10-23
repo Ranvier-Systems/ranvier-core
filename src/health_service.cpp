@@ -215,6 +215,17 @@ future<> HealthService::run_loop() {
                 }
             }
 
+            // 4b. Native-stream alignment probe (BACKLOG section 30). Awaited
+            // here, under the loop's gate hold, like the scrape above.
+            if (_alignment_probe_hook) {
+                try {
+                    co_await _alignment_probe_hook(backends_to_check);
+                } catch (const std::exception& e) {
+                    // Rule #9: Log at warn level
+                    log_health.warn("Alignment probe cycle failed: {}", e.what());
+                }
+            }
+
             // 5. Sleep for configured interval
             co_await seastar::sleep(_config.check_interval);
         }

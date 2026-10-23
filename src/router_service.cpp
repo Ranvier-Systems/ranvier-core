@@ -547,6 +547,9 @@ struct ShardLocalState {
     struct NativeKvState {
         absl::flat_hash_map<BackendId, std::chrono::steady_clock::time_point> fresh;
         absl::flat_hash_set<BackendId> complete;  // bounded by MAX_BACKENDS (Rule #4)
+        // Times each backend was marked complete; the alignment probe re-runs
+        // when it changes (BACKLOG section 30). Bounded by MAX_BACKENDS (Rule #4).
+        absl::flat_hash_map<BackendId, uint64_t> complete_epoch;
         absl::flat_hash_map<BackendId, uint32_t> index_entries;
         static constexpr size_t MAX_BACKENDS = 256;               // Hard Rule #4
         static constexpr uint32_t MAX_ENTRIES_PER_BACKEND = 65536; // Hard Rule #4
@@ -646,6 +649,10 @@ struct ShardLocalState {
             return;  // bounded; an untracked backend keeps absence untrusted
         }
         native_kv.complete.insert(id);
+        if (native_kv.complete_epoch.contains(id) ||
+            native_kv.complete_epoch.size() < NativeKvState::MAX_BACKENDS) {
+            native_kv.complete_epoch[id]++;
+        }
     }
 
     // ========================================================================
@@ -6550,6 +6557,19 @@ RouterService::NativeKvStatsSnapshot RouterService::get_native_kv_stats() {
             st.native_verified_depth_skips, st.replica_dispatches,
             st.replica_designations, st.replica_holders_saturated,
             st.native_routing_key_matches};
+}
+
+RouterService::NativeStreamProbeState RouterService::native_stream_probe_state(BackendId id) {
+    if (!g_shard_state) return {};
+    const auto& state = shard_state();
+    NativeStreamProbeState out;
+    out.fresh = state.config.kv_residency_freshness_ttl.count() > 0 &&
+                state.native_residency_fresh(id);
+    if (auto it = state.native_kv.complete_epoch.find(id);
+        it != state.native_kv.complete_epoch.end()) {
+        out.complete_epoch = it->second;
+    }
+    return out;
 }
 
 void RouterService::set_native_fresh_for_testing(BackendId id, bool complete) {

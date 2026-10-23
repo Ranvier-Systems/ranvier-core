@@ -2096,6 +2096,43 @@ TEST_F(RouterServiceTest, MaterializeMakesVerifiedResidencyHit) {
 }
 
 // =============================================================================
+// 1i. Stream state for the alignment probe (BACKLOG §30)
+// =============================================================================
+// The probe re-runs when a stream's complete epoch changes (a publisher
+// restart or a cleared cache), and only while the stream is fresh.
+
+TEST_F(RouterServiceTest, ProbeStateCountsCompleteEpochs) {
+    auto before = RouterService::native_stream_probe_state(1);
+    EXPECT_FALSE(before.fresh);
+    EXPECT_EQ(before.complete_epoch, 0u);
+
+    NativeKvOp complete{NativeKvOp::Kind::COMPLETE, 1, 0, 1000};
+    RouterService::apply_native_kv_ops_local(&complete, 1);
+    auto first = RouterService::native_stream_probe_state(1);
+    EXPECT_TRUE(first.fresh);
+    EXPECT_EQ(first.complete_epoch, 1u);
+
+    // Heartbeats keep the stream fresh without starting a new epoch.
+    NativeKvOp alive{NativeKvOp::Kind::ALIVE, 1, 0, 2000};
+    RouterService::apply_native_kv_ops_local(&alive, 1);
+    EXPECT_EQ(RouterService::native_stream_probe_state(1).complete_epoch, 1u);
+
+    // A restarted publisher completes again: a new epoch, so the probe re-runs.
+    complete.ts_ms = 3000;
+    RouterService::apply_native_kv_ops_local(&complete, 1);
+    EXPECT_EQ(RouterService::native_stream_probe_state(1).complete_epoch, 2u);
+    EXPECT_EQ(RouterService::native_stream_probe_state(2).complete_epoch, 0u);
+}
+
+TEST_F(RouterServiceTest, ProbeStateIsNeverFreshWithStreamOff) {
+    cfg_.kv_residency_freshness_ttl = std::chrono::seconds(0);  // kv_events disabled
+    recreate_router(cfg_);
+    NativeKvOp complete{NativeKvOp::Kind::COMPLETE, 1, 0, 1000};
+    RouterService::apply_native_kv_ops_local(&complete, 1);
+    EXPECT_FALSE(RouterService::native_stream_probe_state(1).fresh);
+}
+
+// =============================================================================
 // 2. Route TTL Expiration and Cleanup
 // =============================================================================
 // TTL cleanup requires the Seastar reactor (run_ttl_cleanup uses smp::submit_to).

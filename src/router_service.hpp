@@ -836,6 +836,17 @@ public:
     };
     static NativeKvStatsSnapshot get_native_kv_stats();
 
+    // What the backend alignment probe (BACKLOG section 30) needs to know about
+    // a backend's native stream, read from the calling shard's state (the probe
+    // runs on shard 0). complete_epoch counts how often the stream was marked
+    // complete (publisher sequence 0, or AllBlocksCleared): a change means the
+    // engine restarted or its cache was reset, so the probe re-runs.
+    struct NativeStreamProbeState {
+        bool fresh = false;
+        uint64_t complete_epoch = 0;
+    };
+    static NativeStreamProbeState native_stream_probe_state(BackendId id);
+
     // Mark a backend's native stream fresh in shard-local state (testing only;
     // production freshness comes from applied ops / ALIVE heartbeats).
     // `complete` (default true, the steady state of a stream seen from

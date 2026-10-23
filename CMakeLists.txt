@@ -287,6 +287,7 @@ static GLOBAL: Jemalloc = Jemalloc;
     add_library(ranvier_core STATIC
       src/run_application.cpp
       src/agent_registry.cpp
+      src/alignment_prober.cpp
       src/application.cpp
       src/async_persistence.cpp
       src/config_loader.cpp
@@ -478,6 +479,19 @@ target_link_libraries(chat_template_test
   GTest::gtest_main
 )
 gtest_discover_tests(chat_template_test)
+
+# AlignmentProbe Unit Tests (Pure C++, header-only; BACKLOG section 30)
+# RequestRewriter is included for the routing-path check, hence RapidJSON.
+add_executable(alignment_probe_test
+  tests/unit/alignment_probe_test.cpp
+)
+target_include_directories(alignment_probe_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(alignment_probe_test
+  PRIVATE
+  GTest::gtest_main
+  rapidjson_interface
+)
+gtest_discover_tests(alignment_probe_test)
 
 # BoundaryDetector Unit Tests (Pure C++, header-only)
 add_executable(boundary_detector_test
@@ -1316,6 +1330,7 @@ if(Seastar_FOUND)
     add_executable(application_test
       tests/unit/application_test.cpp
       src/agent_registry.cpp
+      src/alignment_prober.cpp
       src/application.cpp
       src/config_loader.cpp
       src/config_loader_async.cpp
