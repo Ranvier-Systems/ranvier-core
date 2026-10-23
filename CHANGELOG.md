@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Backend alignment probe for the native KV-event stream (BACKLOG §30,
+  `kv_events.alignment_probe: quarantine | warn | off`, env `RANVIER_KV_EVENTS_ALIGNMENT_PROBE`,
+  default `quarantine`). From the health loop on shard 0, each backend with a live stream is
+  asked once per engine start (re-asked after an AllBlocksCleared or a publisher restart) whether
+  its `POST /tokenize` agrees with Ranvier's routing tokens for a fixed probe conversation, over
+  the prefix routing could hash. Misaligned is logged at warn with the first differing token and,
+  under `quarantine`, that backend's stream stops vouching for anything (not fresh, never a holder
+  or replica, absence never an eviction): stream-off routing until a later probe passes. A
+  misaligned stream was otherwise worse than none, since every ART hit on it read verified-cold.
+  Counters `router_native_alignment_probes_{aligned,misaligned,unsupported,failed}_total`, gauges
+  `router_native_{aligned,misaligned,unsupported,quarantined}_backends`, `kv_alignment` /
+  `kv_quarantined` in `/admin/backends/metrics`, compare rows and a `bench.sh` header field. The
+  mock backend gains `/tokenize` and an optional ZMQ KV-event publisher (`MOCK_KV_EVENTS_PORT`,
+  pyzmq) for the new `test_kv_alignment_probe.py` integration suite.
 - `chat_template_format: llama2` (aliases `llama-2`, `codellama`) for Llama 2 chat and
   CodeLlama Instruct, rendered byte-identical to the models' template; its routing boundary is
   the tokenized system prefix, never the character estimate. Checked against vLLM `/tokenize`

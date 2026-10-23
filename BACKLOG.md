@@ -2374,7 +2374,9 @@ whitespace, a code fence, non-ASCII. `tests/tokenizer_parity/llama2_tokenizer_pa
 - **Files:** `docs/internals/cache-residency-routing.md` ("Self-checks": the probe first, then
   the counter and the heuristics), `docs/internals/prefix-affinity-routing.md` (one line under
   the template table), `CHANGELOG.md`, this section's statuses
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-23): `cache-residency-routing.md` "Self-checks" leads with the probe and
+  the quarantine (landed with Step 3), one line in `prefix-affinity-routing.md`, CHANGELOG, the
+  `kv_events_alignment_warning` comment, and these statuses. Step 7 rides the next GPU session.
 
 #### Step 7: GPU check (rides the next GPU session; no dedicated run)
 - **Depends on:** Steps 1–6 in the image
