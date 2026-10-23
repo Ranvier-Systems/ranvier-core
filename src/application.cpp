@@ -795,9 +795,11 @@ void Application::init_health_checker() {
     // Native-stream alignment probe (BACKLOG section 30): asks each backend with a
     // live KV-event stream whether its /tokenize agrees with Ranvier's routing
     // tokens. Inert without a stream (no backend is ever fresh), so it needs no
-    // build guard. Warn-only for now.
-    if (_config.kv_events.enabled && _tokenizer_started) {
+    // build guard. kv_events.alignment_probe: quarantine (default) | warn | off.
+    if (_config.kv_events.enabled && _tokenizer_started &&
+        _config.kv_events.alignment_probe != "off") {
         AlignmentProber::Config pc;
+        pc.quarantine = _config.kv_events.alignment_probe == "quarantine";
         pc.chat_template = ChatTemplate(
             parse_chat_template_format(_config.assets.chat_template_format));
         pc.block_alignment = _config.routing.block_alignment;

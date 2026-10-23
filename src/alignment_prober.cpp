@@ -15,6 +15,8 @@
 
 #include <fmt/format.h>
 
+#include <limits>
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/loop.hh>
@@ -47,17 +49,30 @@ std::optional<Result> AlignmentProber::verdict(BackendId id) const {
 future<> AlignmentProber::run_cycle(std::vector<std::pair<BackendId, socket_address>> backends) {
     ++_cycle;
 
-    // Prune backends that left the registry, so a reused id starts unprobed.
+    // Prune backends that left the registry, so a reused id starts unprobed,
+    // and clear their verdict (and any quarantine) on every shard.
+    std::vector<BackendId> pruned;
     if (!_state.empty()) {
         absl::flat_hash_set<BackendId> listed;
         listed.reserve(backends.size());
         for (const auto& [id, addr] : backends) listed.insert(id);
         for (auto it = _state.begin(); it != _state.end();) {
             if (!listed.contains(it->first)) {
+                if (it->second.has_verdict) pruned.push_back(it->first);
                 _state.erase(it++);
             } else {
                 ++it;
             }
+        }
+    }
+    if (!pruned.empty()) {
+        try {
+            // Rule #2: concurrent, not a sequential await loop. publish() of an
+            // id no longer in _state broadcasts PENDING, which erases it.
+            co_await parallel_for_each(pruned, [this](BackendId id) { return publish(id); });
+        } catch (const std::exception& e) {
+            log_health.warn("Alignment probe: clearing verdicts of removed backends failed: {}",
+                            e.what());
         }
     }
 
@@ -165,7 +180,14 @@ future<> AlignmentProber::probe_one(Candidate c) {
     }
     // record() logs every outcome at the right level (warn for failures,
     // Rule #9), throttled by the backoff.
-    record(c, r, error);
+    if (!record(c, r, error)) co_return;
+    try {
+        co_await publish(c.id);
+    } catch (const std::exception& e) {
+        // Rule #9. The shards keep the previous verdict; the next epoch re-probes.
+        log_health.warn("Alignment probe: publishing backend {}'s verdict to the shards "
+                        "failed: {}", c.id, e.what());
+    }
 }
 
 future<std::optional<alignment_probe::HttpResponse>>
@@ -204,7 +226,7 @@ AlignmentProber::post_tokenize(socket_address addr) {
     co_return alignment_probe::parse_http_response(raw);
 }
 
-void AlignmentProber::record(const Candidate& c, Result r, std::string_view error) {
+bool AlignmentProber::record(const Candidate& c, Result r, std::string_view error) {
     auto it = _state.find(c.id);
     if (it == _state.end()) {
         if (_state.size() >= MAX_TRACKED_BACKENDS) {
@@ -212,7 +234,7 @@ void AlignmentProber::record(const Candidate& c, Result r, std::string_view erro
                 log_health.warn("Alignment probe: tracking cap of {} backends reached; "
                                 "backend {} stays unverified", MAX_TRACKED_BACKENDS, c.id);
             }
-            return;
+            return false;
         }
         it = _state.emplace(c.id, BackendState{}).first;
     }
@@ -233,12 +255,15 @@ void AlignmentProber::record(const Candidate& c, Result r, std::string_view erro
                             "retrying in {} health cycles",
                             c.id, c.addr, st.consecutive_failures, error, backoff);
         }
-        return;  // any earlier verdict stays as it was
+        return false;  // any earlier verdict (and quarantine) stays as it was
     }
 
-    const bool changed = !st.has_verdict || st.epoch != c.epoch ||
-                         st.result.verdict != r.verdict ||
-                         st.result.first_divergence != r.first_divergence;
+    const bool was_misaligned = st.has_verdict && st.result.verdict == Verdict::MISALIGNED;
+    // What the shards act on: the verdict and, for the admin field, where it
+    // diverged. A new epoch with the same answer needs no broadcast.
+    const bool shard_changed = !st.has_verdict || st.result.verdict != r.verdict ||
+                               st.result.first_divergence != r.first_divergence;
+    const bool log_it = shard_changed || st.epoch != c.epoch;
     st.has_verdict = true;
     st.epoch = c.epoch;
     st.result = r;
@@ -248,37 +273,69 @@ void AlignmentProber::record(const Candidate& c, Result r, std::string_view erro
     switch (r.verdict) {
         case Verdict::ALIGNED:
             ++_stats.aligned;
-            if (changed) {
+            if (log_it) {
                 log_health.info("Alignment probe: backend {} aligned: first {} routing-prefix "
-                                "tokens identical ({} of {} probe tokens match; template {})",
+                                "tokens identical ({} of {} probe tokens match; template {}){}",
                                 c.id, r.routing_prefix, r.first_divergence,
-                                _ranvier->ids.size(), template_name);
+                                _ranvier->ids.size(), template_name,
+                                was_misaligned && _cfg.quarantine ? "; quarantine lifted" : "");
             }
             break;
         case Verdict::MISALIGNED:
             ++_stats.misaligned;
-            if (changed) {
+            if (log_it) {
                 log_health.warn(
                     "Alignment probe: backend {} MISALIGNED: Ranvier and the backend first "
                     "differ at token {} (Ranvier id {}, backend id {}), inside the {}-token "
-                    "routing prefix. Its native KV events can never match a routing key. "
+                    "routing prefix. Its native KV events can never match a routing key; {}. "
                     "Check the chat template ({}) and tokenizer ({}) against the served "
                     "model (BACKLOG section 30)",
                     c.id, r.first_divergence, r.ranvier_id, r.backend_id, r.routing_prefix,
+                    _cfg.quarantine
+                        ? "its stream is quarantined (stream-off routing for this backend) "
+                          "until a probe passes"
+                        : "routing is unchanged (kv_events.alignment_probe: warn)",
                     template_name, _cfg.tokenizer_path);
             }
             break;
         case Verdict::UNSUPPORTED:
             ++_stats.unsupported;
-            if (changed) {
+            if (log_it) {
                 log_health.info("Alignment probe: backend {} has no /tokenize (HTTP {}); "
-                                "its stream's alignment is unverified",
-                                c.id, r.http_status);
+                                "its stream's alignment is unverified{}",
+                                c.id, r.http_status,
+                                was_misaligned && _cfg.quarantine ? "; quarantine lifted" : "");
             }
             break;
         case Verdict::FAILED:
             break;  // handled above
     }
+    return shard_changed;
+}
+
+future<> AlignmentProber::publish(BackendId id) {
+    RouterService::NativeAlignmentState s;
+    if (auto it = _state.find(id); it != _state.end() && it->second.has_verdict) {
+        const auto& r = it->second.result;
+        switch (r.verdict) {
+            case Verdict::ALIGNED:
+                s.verdict = RouterService::NativeAlignment::ALIGNED;
+                break;
+            case Verdict::MISALIGNED:
+                s.verdict = RouterService::NativeAlignment::MISALIGNED;
+                s.first_divergence = static_cast<uint32_t>(
+                    std::min<size_t>(r.first_divergence, std::numeric_limits<uint32_t>::max()));
+                s.quarantined = _cfg.quarantine;
+                break;
+            case Verdict::UNSUPPORTED:
+                s.verdict = RouterService::NativeAlignment::UNSUPPORTED;
+                break;
+            case Verdict::FAILED:
+                break;  // never stored as a verdict
+        }
+    }
+    // Anything else (no verdict, pruned) publishes PENDING, which clears it.
+    return RouterService::set_native_alignment_global(id, s);
 }
 
 }  // namespace ranvier

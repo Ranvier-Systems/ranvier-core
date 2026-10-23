@@ -713,6 +713,16 @@ struct KvEventsConfig {
     // Ranvier in front of warm backends.
     bool replay_on_connect = true;
     uint32_t replay_timeout_ms = 2000;
+
+    // Backend alignment probe (BACKLOG section 30). Each backend with a live
+    // stream is asked, once per engine start, whether its POST /tokenize agrees
+    // with Ranvier's routing tokens for a fixed conversation.
+    //   quarantine (default): a misaligned backend's stream stops vouching for
+    //     anything (not fresh, never a holder, absence never an eviction), so
+    //     the backend gets stream-off routing until a later probe passes;
+    //   warn: probe and log, routing unchanged;
+    //   off: no probe.
+    std::string alignment_probe = "quarantine";
 };
 
 // Static-config backend declaration.
@@ -903,8 +913,9 @@ struct RanvierConfig {
     // Ranvier tokenizes exactly as the backend does (BACKLOG section 29).
     // Returns the startup warning when the config cannot be aligned with any
     // templated chat model: chat_template_format "none", or the bundled GPT-2
-    // tokenizer. A warning, not a validation error: a mismatch leaves the
-    // stream inert, it does not misroute.
+    // tokenizer. A warning, not a validation error: the heuristic can be wrong,
+    // and the per-backend alignment probe (kv_events.alignment_probe) checks
+    // the real thing and quarantines a misaligned stream.
     static std::optional<std::string> kv_events_alignment_warning(const RanvierConfig& config);
 
 private:

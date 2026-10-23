@@ -144,6 +144,22 @@ learned routes, so "verified" hits read healthy while the stream contributes not
 
 **Self-checks.**
 
+- **The alignment probe** (BACKLOG §30, `kv_events.alignment_probe`, default `quarantine`). Shard 0
+  asks each backend with a live stream, from the health loop, whether it tokenizes like Ranvier:
+  it renders a fixed probe conversation through the routing path (RequestRewriter, the configured
+  template, the shard's tokenizer) and POSTs the same messages to the backend's `/tokenize`. The
+  verdict compares the two id sequences up to the routing prefix: the longest prefix routing could
+  hash for the probe (the system-prefix boundary or `prefix_token_length`, whichever is larger),
+  capped at `max_indexed_token_depth` and aligned down to the block size. A difference after it (a
+  generation prompt the template does not render) still reads **aligned**; one inside it reads
+  **misaligned**, logged at warn with the first differing token; no `/tokenize` reads
+  **unsupported**. It re-runs whenever the stream is marked complete again (an engine restart, an
+  AllBlocksCleared). Under `quarantine`, a misaligned backend's stream stops vouching for
+  anything on every shard: it is not fresh for routing, never a verified holder or a replica, and
+  its absence is never an eviction. That is exactly stream-off routing for that backend, and it
+  matters because a misaligned stream is otherwise *worse* than none: no routing key is ever
+  present in its index, so every ART hit on it reads verified-cold and skips the probabilistic
+  gate. A later aligned or unsupported verdict lifts it. `warn` probes and logs only; `off` skips.
 - At startup, with `kv_events` on, a warning when the template is `none` or the tokenizer path is
   the bundled `gpt2.json`.
 - `router_native_routing_key_matches_total` counts stream UPSERTs whose hash equals a routing

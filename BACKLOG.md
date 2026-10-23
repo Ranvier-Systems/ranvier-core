@@ -2322,7 +2322,14 @@ whitespace, a code fence, non-ASCII. `tests/tokenizer_parity/llama2_tokenizer_pa
 - **Concerns:** cross-shard broadcast (`smp::submit_to` / `invoke_on_all`), bounded set; hot path
   gains one set lookup on an already-branchy path. `docs/internals/cache-residency-routing.md`
   changes in the same step (authoritative deep-dive).
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-23): `kv_events.alignment_probe` (default `quarantine`; env
+  `RANVIER_KV_EVENTS_ALIGNMENT_PROBE`; validated when `kv_events.enabled`). The verdict is a
+  per-shard `native_kv.alignment` map rather than a bare set, so Step 4's admin field reads it
+  shard-locally; `native_residency_fresh` now excludes quarantined backends and the probe reads a
+  separate `native_stream_live`, so a quarantined stream stays probe-eligible. Every verdict change
+  is broadcast (`set_native_alignment_global`, a plain struct over `invoke_on_all`); removed
+  backends are cleared. Router tests: not consulted for the home, never a holder, warn leaves the
+  stream trusted, PENDING clears; config tests for default, YAML/env and validation.
 
 #### Step 4: Observability
 - **Depends on:** Step 2

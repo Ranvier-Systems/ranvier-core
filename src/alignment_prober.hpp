@@ -13,8 +13,11 @@
 // started at sequence 0 or its cache was cleared since the last verdict), so
 // an engine restart or a model swap is re-probed. Failures back off.
 //
-// Warn-only: the verdict is logged and kept here. Quarantining a misaligned
-// backend's stream is section 30 Step 3.
+// Every verdict change is broadcast to all shards
+// (RouterService::set_native_alignment_global). With `quarantine` set, a
+// misaligned backend's stream stops vouching for anything there until a later
+// probe passes: stream-off routing for that backend. Without it (warn mode)
+// the verdict is only logged and reported.
 
 #pragma once
 
@@ -48,6 +51,7 @@ public:
         size_t indexed_depth = 2048;
         std::chrono::milliseconds timeout{2000};  // connect + request + response
         std::string tokenizer_path;               // for the misaligned warning only
+        bool quarantine = true;                   // kv_events.alignment_probe: quarantine
     };
 
     struct Stats {
@@ -100,7 +104,10 @@ private:
     seastar::future<> probe_one(Candidate c);
     seastar::future<std::optional<alignment_probe::HttpResponse>>
         post_tokenize(seastar::socket_address addr);
-    void record(const Candidate& c, alignment_probe::Result r, std::string_view error);
+    // Stores the outcome and logs it; true when the verdict a shard acts on
+    // changed (never for FAILED, which keeps the previous verdict).
+    bool record(const Candidate& c, alignment_probe::Result r, std::string_view error);
+    seastar::future<> publish(BackendId id);  // broadcast _state[id] to every shard
 
     Config _cfg;
     seastar::sharded<TokenizerService>& _tokenizer;

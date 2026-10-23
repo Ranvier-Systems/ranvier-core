@@ -550,18 +550,34 @@ struct ShardLocalState {
         // Times each backend was marked complete; the alignment probe re-runs
         // when it changes (BACKLOG section 30). Bounded by MAX_BACKENDS (Rule #4).
         absl::flat_hash_map<BackendId, uint64_t> complete_epoch;
+        // Alignment probe verdicts (BACKLOG section 30), the same on every
+        // shard. Bounded by MAX_BACKENDS (Rule #4).
+        absl::flat_hash_map<BackendId, RouterService::NativeAlignmentState> alignment;
         absl::flat_hash_map<BackendId, uint32_t> index_entries;
         static constexpr size_t MAX_BACKENDS = 256;               // Hard Rule #4
         static constexpr uint32_t MAX_ENTRIES_PER_BACKEND = 65536; // Hard Rule #4
     } native_kv;
 
-    // True while the backend's native stream is fresh enough that absence
-    // from prefix_hash_index means "verified evicted" rather than "unknown".
-    bool native_residency_fresh(BackendId id) const {
+    // True while the subscription delivers: an op or heartbeat within the TTL.
+    bool native_stream_live(BackendId id) const {
         auto it = native_kv.fresh.find(id);
         if (it == native_kv.fresh.end()) return false;
         return std::chrono::steady_clock::now() - it->second
                    <= config.kv_residency_freshness_ttl;
+    }
+
+    // Quarantined by the alignment probe (BACKLOG section 30): its keys never
+    // match a routing key, so nothing it says (presence or absence) counts.
+    bool native_quarantined(BackendId id) const {
+        auto it = native_kv.alignment.find(id);
+        return it != native_kv.alignment.end() && it->second.quarantined;
+    }
+
+    // True while the backend's native stream is fresh enough that absence
+    // from prefix_hash_index means "verified evicted" rather than "unknown",
+    // and the stream is not quarantined. Every routing reader goes through here.
+    bool native_residency_fresh(BackendId id) const {
+        return native_stream_live(id) && !native_quarantined(id);
     }
 
     void touch_native_fresh(BackendId id) {
@@ -6563,13 +6579,42 @@ RouterService::NativeStreamProbeState RouterService::native_stream_probe_state(B
     if (!g_shard_state) return {};
     const auto& state = shard_state();
     NativeStreamProbeState out;
+    // Live, not native_residency_fresh: a quarantined stream must stay
+    // probe-eligible so a restart with the right model can lift it.
     out.fresh = state.config.kv_residency_freshness_ttl.count() > 0 &&
-                state.native_residency_fresh(id);
+                state.native_stream_live(id);
     if (auto it = state.native_kv.complete_epoch.find(id);
         it != state.native_kv.complete_epoch.end()) {
         out.complete_epoch = it->second;
     }
     return out;
+}
+
+void RouterService::set_native_alignment_local(BackendId id, NativeAlignmentState s) {
+    if (!g_shard_state) return;
+    auto& alignment = g_shard_state->native_kv.alignment;
+    if (s.verdict == NativeAlignment::PENDING && !s.quarantined) {
+        alignment.erase(id);
+        return;
+    }
+    if (!alignment.contains(id) &&
+        alignment.size() >= ShardLocalState::NativeKvState::MAX_BACKENDS) {
+        return;  // bounded; an untracked backend is never quarantined
+    }
+    alignment[id] = s;
+}
+
+seastar::future<> RouterService::set_native_alignment_global(BackendId id,
+                                                             NativeAlignmentState s) {
+    // Trivially copyable: no heap crosses the shard boundary (Rule #14).
+    return seastar::smp::invoke_on_all([id, s] { set_native_alignment_local(id, s); });
+}
+
+RouterService::NativeAlignmentState RouterService::native_alignment(BackendId id) {
+    if (!g_shard_state) return {};
+    const auto& alignment = g_shard_state->native_kv.alignment;
+    auto it = alignment.find(id);
+    return it == alignment.end() ? NativeAlignmentState{} : it->second;
 }
 
 void RouterService::set_native_fresh_for_testing(BackendId id, bool complete) {

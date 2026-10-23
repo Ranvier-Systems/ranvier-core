@@ -847,6 +847,24 @@ public:
     };
     static NativeStreamProbeState native_stream_probe_state(BackendId id);
 
+    // The alignment probe's verdict for a backend, held on every shard
+    // (BACKLOG section 30). A quarantined backend's stream stops vouching for
+    // anything: it is treated as not fresh, so its ART hits take the
+    // probabilistic gate, it is never a verified holder or a replica, and its
+    // absence is never read as eviction. That is stream-off behaviour, the
+    // most a stream whose keys never match a routing key can safely claim.
+    enum class NativeAlignment : uint8_t { PENDING, ALIGNED, MISALIGNED, UNSUPPORTED };
+    struct NativeAlignmentState {
+        NativeAlignment verdict = NativeAlignment::PENDING;
+        uint32_t first_divergence = 0;  // MISALIGNED only: first differing token
+        bool quarantined = false;
+    };
+    // Shard 0 caller; applies on every shard (a plain struct crosses, no heap).
+    // PENDING and not quarantined erases the entry.
+    static seastar::future<> set_native_alignment_global(BackendId id, NativeAlignmentState s);
+    static void set_native_alignment_local(BackendId id, NativeAlignmentState s);
+    static NativeAlignmentState native_alignment(BackendId id);  // calling shard
+
     // Mark a backend's native stream fresh in shard-local state (testing only;
     // production freshness comes from applied ops / ALIVE heartbeats).
     // `complete` (default true, the steady state of a stream seen from
