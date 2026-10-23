@@ -16,6 +16,7 @@
 #include "async_persistence.hpp"
 #include "config.hpp"
 #include "downstream_service.hpp"
+#include "alignment_prober.hpp"
 #include "health_service.hpp"
 #include "http_controller.hpp"
 #include "k8s_discovery_service.hpp"
@@ -195,6 +196,9 @@ private:
     bool _load_balancer_started = false;
 
     // Health monitoring
+    // Declared before _health_checker so it is destroyed after it: the health
+    // loop's hook points here (BACKLOG section 30).
+    std::unique_ptr<AlignmentProber> _alignment_prober;
     std::unique_ptr<HealthService> _health_checker;
 
     // Telemetry sink (per-shard counters + shard-0 periodic emitter).

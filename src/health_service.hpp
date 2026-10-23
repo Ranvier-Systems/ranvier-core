@@ -1,5 +1,8 @@
 #pragma once
 #include <chrono>
+#include <functional>
+#include <utility>
+#include <vector>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/metrics.hh>
@@ -34,6 +37,15 @@ public:
     // Stop cleanly
     seastar::future<> stop();
 
+    // Optional per-cycle hook, called on shard 0 after the vLLM metrics scrape
+    // with that cycle's backends and awaited inside the loop (so the loop's gate
+    // covers it). Used by the native-stream alignment probe (BACKLOG section 30);
+    // a callback keeps the prober out of HealthService's link set. Set it before
+    // start().
+    using BackendList = std::vector<std::pair<BackendId, seastar::socket_address>>;
+    using CycleHook = std::function<seastar::future<>(BackendList)>;
+    void set_alignment_probe_hook(CycleHook hook) { _alignment_probe_hook = std::move(hook); }
+
     // Get latest vLLM metrics for a backend (returns default if not available)
     VLLMMetrics get_vllm_metrics(BackendId id) const;
 
@@ -60,6 +72,8 @@ private:
     HealthServiceConfig _config;
     seastar::gate _gate; // Prevents shutdown while checking
     bool _running = false;
+
+    CycleHook _alignment_probe_hook;
 
     // Track the background loop future for clean shutdown (Rule #5)
     seastar::future<> _loop_future = seastar::make_ready_future<>();

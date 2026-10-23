@@ -287,6 +287,7 @@ static GLOBAL: Jemalloc = Jemalloc;
     add_library(ranvier_core STATIC
       src/run_application.cpp
       src/agent_registry.cpp
+      src/alignment_prober.cpp
       src/application.cpp
       src/async_persistence.cpp
       src/config_loader.cpp
@@ -1329,6 +1330,7 @@ if(Seastar_FOUND)
     add_executable(application_test
       tests/unit/application_test.cpp
       src/agent_registry.cpp
+      src/alignment_prober.cpp
       src/application.cpp
       src/config_loader.cpp
       src/config_loader_async.cpp

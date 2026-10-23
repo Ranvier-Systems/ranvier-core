@@ -2297,7 +2297,15 @@ whitespace, a code fence, non-ASCII. `tests/tokenizer_parity/llama2_tokenizer_pa
   probe), Rule #12 (resolved address only), Rule #17 (thread-pool encode). Async flow: needs the
   `/implement` Pass 0 diagram (HealthService loop → probe → tokenizer pool → classify → shard-0
   record → broadcast).
-- **Status:** [ ] Pending
+- **Status:** [x] Done (2026-10-23), warn-only: `src/alignment_prober.hpp/.cpp` (the class lives
+  in its own header so the pure one stays Seastar-free), `HealthService::set_alignment_probe_hook`,
+  wired in `Application::init_health_checker` when `kv_events.enabled`.
+  `RouterService::native_stream_probe_state` exposes freshness and a per-backend complete epoch
+  (`NativeKvState::complete_epoch`, bumped by `mark_native_complete`, so a COMPLETE op or an
+  AllBlocksCleared re-probes; the benchmark's between-arm KV reset therefore re-probes each arm),
+  with two router tests. The probe's tokenization is not wrapped in a timeout: `encode_threaded_async`
+  bounds its own waits and reads its `string_view` after suspending, so abandoning it would free the
+  text under it. Not compiled here (Seastar); deferred to `make test-unit`.
 
 #### Step 3: What a misaligned verdict does
 - **Depends on:** Step 2, Open decision 1
